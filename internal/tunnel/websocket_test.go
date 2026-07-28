@@ -72,3 +72,24 @@ func TestHTTPSRelayThroughProxyUsesStandardProxyTransport(t *testing.T) {
 		t.Fatal("Proxy is nil, want standard HTTPS proxy transport")
 	}
 }
+
+func TestHTTPSProxyURLIsAccepted(t *testing.T) {
+	proxyURL, err := resolveProxyURL("relay.example:443", "https://proxy.example:8443")
+	if err != nil {
+		t.Fatalf("resolveProxyURL: %v", err)
+	}
+	if proxyURL.Scheme != "https" || proxyURL.Host != "proxy.example:8443" {
+		t.Fatalf("proxy URL = %s, want https://proxy.example:8443", proxyURL)
+	}
+}
+
+func TestHTTPRelayThroughHTTPSProxyUsesConnectTunnel(t *testing.T) {
+	client := webSocketHTTPClient("http://relay.example/relay/b", "https://proxy.example:8443")
+	transport := client.Transport.(*http.Transport)
+	if transport.DialContext == nil {
+		t.Fatal("DialContext is nil, want TLS proxy CONNECT tunnel dialer")
+	}
+	if transport.Proxy != nil {
+		t.Fatal("Proxy is set, want direct WebSocket handshake over CONNECT tunnel")
+	}
+}

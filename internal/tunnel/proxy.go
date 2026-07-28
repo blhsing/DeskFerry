@@ -40,8 +40,9 @@ func resolveProxyURL(targetAddr, proxySpec string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse proxy URL: %w", err)
 	}
-	if proxyURL.Scheme != "http" {
-		return nil, fmt.Errorf("unsupported proxy scheme %q; only http CONNECT is supported", proxyURL.Scheme)
+	proxyURL.Scheme = strings.ToLower(proxyURL.Scheme)
+	if proxyURL.Scheme != "http" && proxyURL.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported proxy scheme %q; use http or https", proxyURL.Scheme)
 	}
 	if proxyURL.Host == "" {
 		return nil, errors.New("proxy host is required")

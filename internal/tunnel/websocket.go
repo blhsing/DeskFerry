@@ -215,6 +215,17 @@ func proxyConnectDialContext(proxyURL *url.URL) func(context.Context, string, st
 		if err != nil {
 			return nil, err
 		}
+		if proxyURL.Scheme == "https" {
+			tlsConn := tls.Client(conn, &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				ServerName: proxyURL.Hostname(),
+			})
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("TLS handshake with proxy %s failed: %w", proxyURLForLog(proxyURL), err)
+			}
+			conn = tlsConn
+		}
 		if err := writeProxyConnect(conn, proxyURL, address); err != nil {
 			conn.Close()
 			return nil, err

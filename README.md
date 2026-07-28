@@ -68,7 +68,7 @@ Relay web service
         |
         v
 agent.exe Windows service
-  outbound WebSockets to one or more relay services, optionally through HTTP proxy
+  outbound WebSockets to one or more relay services, optionally through an HTTP or HTTPS proxy
   per paired socket -> 127.0.0.1:3389
 ```
 
@@ -174,7 +174,7 @@ Useful checks:
 .\deskferry-agent-windows-amd64.exe -self-test -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk -relay-url http://217.142.228.117/relay/workdesk
 ```
 
-WebSocket mode uses standard proxy environment variables by default, such as `HTTP_PROXY` and `HTTPS_PROXY`. Use `-proxy http://proxy.example:8080` to force a proxy, or `-proxy direct` to bypass proxy discovery. For plain `http://` relay URLs behind a corporate proxy, DeskFerry opens an HTTP `CONNECT` tunnel first so the WebSocket upgrade reaches the relay unchanged.
+WebSocket mode uses standard proxy environment variables by default, such as `HTTP_PROXY` and `HTTPS_PROXY`. Use `-proxy http://proxy.example:8080` or `-proxy https://proxy.example:8443` to force a proxy, or `-proxy direct` to bypass proxy discovery. For plain `http://` relay URLs behind a corporate proxy, DeskFerry opens a `CONNECT` tunnel first so the WebSocket upgrade reaches the relay unchanged.
 
 ### 5. Run Windows Home App
 
@@ -223,7 +223,7 @@ Open DeskFerry Home, keep the local RDP port at `3389`, and manage the same rela
 127.0.0.1:3389
 ```
 
-The Android app keeps the tunnel alive through a foreground service while you switch to the RDP client. It maintains the same `home-agent` presence socket used by the relay dashboard and a `dashboard` WebSocket for live relay status updates.
+The Android app keeps the tunnel alive through a foreground service while you switch to the RDP client. It maintains the same `home-agent` presence socket used by the relay dashboard and a `dashboard` WebSocket for live relay status updates. Its Proxy field accepts `system`, `direct`, `http://host:port`, or `https://host:port`; optional Basic credentials can be included in the proxy URL.
 
 ## Deliverables
 
@@ -598,7 +598,7 @@ This repo currently contains:
 
 - The Azure relay is a simple in-memory broker. Restarting the App Service disconnects active sessions and clears room status.
 - Multiple App Service instances are not supported unless sticky routing or shared broker state is added.
-- The Go work agent supports direct, environment, and basic HTTP proxy URLs. NTLM proxy authentication is not implemented in the service.
+- The Go work and home agents support direct, environment, HTTP proxy, and HTTPS proxy modes. Proxy URLs may contain Basic credentials; NTLM proxy authentication is not implemented.
 - The Windows home app is an RDP launcher and tunnel endpoint, not a full RDP client.
 - The macOS home agent is a tunnel endpoint and `.rdp` launcher, not a full RDP client; use Microsoft Remote Desktop/Windows App or another macOS RDP client against `127.0.0.1:3389`.
 - The Android home app is also a tunnel endpoint, not a full RDP client; use a separate Android RDP client against `127.0.0.1:3389`.

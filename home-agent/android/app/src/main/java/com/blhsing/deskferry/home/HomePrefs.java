@@ -7,6 +7,7 @@ final class HomePrefs {
     static final String PREFS = "deskferry_home";
     static final String PREF_RELAY_URL = "relay_url";
     static final String PREF_LOCAL_PORT = "local_port";
+    static final String PREF_PROXY = "proxy";
     static final int DEFAULT_LOCAL_PORT = 3389;
 
     private HomePrefs() {
@@ -20,11 +21,16 @@ final class HomePrefs {
         return sanitizePort(prefs(context).getInt(PREF_LOCAL_PORT, DEFAULT_LOCAL_PORT));
     }
 
-    static void save(Context context, String relayUrl, int port) {
+    static String loadProxy(Context context) {
+        return prefs(context).getString(PREF_PROXY, ProxySettings.DEFAULT);
+    }
+
+    static void save(Context context, String relayUrl, int port, String proxy) {
         prefs(context)
                 .edit()
                 .putString(PREF_RELAY_URL, relayUrl)
                 .putInt(PREF_LOCAL_PORT, sanitizePort(port))
+                .putString(PREF_PROXY, proxy)
                 .apply();
     }
 

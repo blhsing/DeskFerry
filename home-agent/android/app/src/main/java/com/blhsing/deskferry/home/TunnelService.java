@@ -46,6 +46,7 @@ public class TunnelService extends Service {
     static final String ACTION_STATE = "com.blhsing.deskferry.home.STATE";
     static final String EXTRA_RELAY_URL = "relay_url";
     static final String EXTRA_LOCAL_PORT = "local_port";
+    static final String EXTRA_PROXY = "proxy";
 
     private static final String CHANNEL_ID = "deskferry_home";
     private static final int NOTIFICATION_ID = 7310;
@@ -78,10 +79,6 @@ public class TunnelService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        httpClient = new OkHttpClient.Builder()
-                .pingInterval(25, TimeUnit.SECONDS)
-                .retryOnConnectionFailure(true)
-                .build();
         createNotificationChannel();
     }
 
@@ -101,8 +98,11 @@ public class TunnelService extends Service {
         int requestedPort = intent != null && intent.hasExtra(EXTRA_LOCAL_PORT)
                 ? intent.getIntExtra(EXTRA_LOCAL_PORT, HomePrefs.DEFAULT_LOCAL_PORT)
                 : HomePrefs.loadLocalPort(this);
+        String requestedProxy = intent != null && intent.hasExtra(EXTRA_PROXY)
+                ? intent.getStringExtra(EXTRA_PROXY)
+                : HomePrefs.loadProxy(this);
         startForeground(NOTIFICATION_ID, buildNotification());
-        startTunnel(requestedRelay, requestedPort);
+        startTunnel(requestedRelay, requestedPort, requestedProxy);
         return START_STICKY;
     }
 
@@ -120,13 +120,18 @@ public class TunnelService extends Service {
         return null;
     }
 
-    private void startTunnel(String requestedRelay, int requestedPort) {
+    private void startTunnel(String requestedRelay, int requestedPort, String requestedProxy) {
         synchronized (lock) {
             stopTunnelLocked();
             try {
                 relayUrls = RelayUrls.normalizeRelayUrls(requestedRelay);
                 relayUrl = RelayUrls.joinRelayUrls(relayUrls);
                 localPort = sanitizePort(requestedPort);
+                OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
+                        .pingInterval(25, TimeUnit.SECONDS)
+                        .retryOnConnectionFailure(true);
+                ProxySettings.apply(clientBuilder, requestedProxy);
+                httpClient = clientBuilder.build();
                 serverSocket = new ServerSocket();
                 serverSocket.setReuseAddress(true);
                 serverSocket.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), localPort));
@@ -136,6 +141,7 @@ public class TunnelService extends Service {
                 updateState("Running", "Connecting", "Checking", null);
                 append("Listening on " + RelayUrls.rdpAddress(localPort) + ".");
                 append("Relay primary: " + relayUrls.get(0) + (relayUrls.size() > 1 ? " (" + (relayUrls.size() - 1) + " fallback)" : "") + ".");
+                append("Proxy: " + ProxySettings.forLog(requestedProxy) + ".");
                 startAcceptLoop();
                 startPresenceLoop();
                 startStatusLoop();
@@ -340,7 +346,7 @@ public class TunnelService extends Service {
                 .header("Authorization", "Bearer " + token)
                 .header("X-DeskFerry-Role", role)
                 .header("X-TunnelDesktop-Role", role)
-                .header("User-Agent", "DeskFerry-Android/0.5.4")
+                .header("User-Agent", "DeskFerry-Android/0.5.5")
                 .build();
     }
 

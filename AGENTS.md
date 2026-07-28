@@ -14,7 +14,7 @@ DeskFerry is a Go + .NET + Python + Android project for an outbound-only RDP ren
 - Graphical relay URL list UIs should use CRUD controls with inline or selected-row editing plus drag-to-reorder; avoid returning to semicolon-separated or multiline free-form entry for user-facing multi-value relay URLs.
 - Do not reintroduce generated client files or file-based pairing artifacts for the normal path.
 - The Azure relay WebSocket endpoint is `/relay/ws` for the overview room and `/relay/<room>/ws` for named rooms.
-- URL-only WebSocket clients should use standard proxy environment variables by default; explicit `-proxy direct` is the bypass path.
+- URL-only WebSocket clients should use standard proxy environment variables by default; explicit `http://` and `https://` proxy URLs are supported, and `-proxy direct` is the bypass path.
 - The home side can be the Windows home app in `home-agent/windows`, the macOS home agent in `home-agent/macos`, or the Android home app in `home-agent/android/`.
 - The Android app is a home-agent client only: it listens on Android loopback and connects out to the relay; it must not become a phone-hosted relay.
 - The Windows home app may keep a lightweight `home-agent` WebSocket open for dashboard presence, but RDP data uses `client` sockets.

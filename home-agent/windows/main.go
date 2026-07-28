@@ -147,7 +147,7 @@ func main() {
 	var smokeTest bool
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.StringVar(&listenAddr, "listen", "", "local RDP listen address")
-	flag.StringVar(&proxyFlag, "proxy", "", "proxy: env, direct, or http://host:port")
+	flag.StringVar(&proxyFlag, "proxy", "", "proxy: env, direct, or http(s)://host:port")
 	flag.BoolVar(&consoleMode, "console", false, "run in the foreground instead of the control panel")
 	flag.BoolVar(&smokeTest, "ui-smoke-test", false, "start and close the GUI")
 	flag.Parse()
@@ -252,7 +252,7 @@ func (a *clientApp) run(smokeTest bool) error {
 					Label{Text: "Local RDP address"},
 					LineEdit{AssignTo: &a.listenAddr, Text: a.cfg.ListenAddr, CueBanner: defaultListenAddr},
 					Label{Text: "Proxy"},
-					LineEdit{AssignTo: &a.proxy, Text: a.cfg.Proxy, CueBanner: "env, direct, or http://host:port"},
+					LineEdit{AssignTo: &a.proxy, Text: a.cfg.Proxy, CueBanner: "env, direct, or http(s)://host:port"},
 					Label{Text: "RDP username"},
 					LineEdit{AssignTo: &a.rdpUser, Text: a.cfg.RDPUser, CueBanner: `DOMAIN\user or user@example.com`},
 					Label{Text: "RDP password"},

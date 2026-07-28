@@ -49,6 +49,7 @@ public class MainActivity extends Activity {
     private EditText relayUrlAddField;
     private Button relayAddButton;
     private EditText localPortField;
+    private EditText proxyField;
     private TextView tunnelStatus;
     private TextView workStatus;
     private TextView homeStatus;
@@ -156,6 +157,10 @@ public class MainActivity extends Activity {
         localPortField.setInputType(InputType.TYPE_CLASS_NUMBER);
         configCard.addView(localPortField, matchWrap());
 
+        proxyField = field("Proxy: system, direct, or http(s)://host:port");
+        proxyField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        configCard.addView(proxyField, matchWrap());
+
         rdpAddress = label(RelayUrls.rdpAddress(HomePrefs.DEFAULT_LOCAL_PORT), 20, "#1F2933", true);
         rdpAddress.setPadding(0, dp(10), 0, 0);
         configCard.addView(rdpAddress);
@@ -228,10 +233,11 @@ public class MainActivity extends Activity {
         }
         setRelayUrls(relayUrls);
         localPortField.setText(String.valueOf(HomePrefs.loadLocalPort(this)));
+        proxyField.setText(HomePrefs.loadProxy(this));
     }
 
-    private void savePreferences(String relayUrl, int port) {
-        HomePrefs.save(this, relayUrl, port);
+    private void savePreferences(String relayUrl, int port, String proxy) {
+        HomePrefs.save(this, relayUrl, port, proxy);
     }
 
     private void toggleTunnel() {
@@ -242,10 +248,12 @@ public class MainActivity extends Activity {
         }
         String relayUrl;
         int port;
+        String proxy;
         try {
             List<String> normalizedRelayUrls = normalizedRelayUrlsFromRows();
             relayUrl = RelayUrls.joinRelayUrls(normalizedRelayUrls);
             port = parsePort(localPortField.getText().toString());
+            proxy = ProxySettings.normalize(proxyField.getText().toString());
         } catch (Exception ex) {
             Toast.makeText(this, ex.getMessage(), Toast.LENGTH_LONG).show();
             return;
@@ -258,12 +266,14 @@ public class MainActivity extends Activity {
         }
         setRelayUrls(relayUrls);
         localPortField.setText(String.valueOf(port));
-        savePreferences(relayUrl, port);
+        proxyField.setText(proxy);
+        savePreferences(relayUrl, port, proxy);
 
         Intent intent = new Intent(this, TunnelService.class)
                 .setAction(TunnelService.ACTION_START)
                 .putExtra(TunnelService.EXTRA_RELAY_URL, relayUrl)
-                .putExtra(TunnelService.EXTRA_LOCAL_PORT, port);
+                .putExtra(TunnelService.EXTRA_LOCAL_PORT, port)
+                .putExtra(TunnelService.EXTRA_PROXY, proxy);
         if (Build.VERSION.SDK_INT >= 26) {
             startForegroundService(intent);
         } else {
@@ -291,6 +301,7 @@ public class MainActivity extends Activity {
         startButton.setText(state.running ? "Stop Tunnel" : "Start Tunnel");
         setRelayRowsEnabled(!state.running);
         localPortField.setEnabled(!state.running);
+        proxyField.setEnabled(!state.running);
     }
 
     private void copyRdpTarget() {
