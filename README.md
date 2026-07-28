@@ -4,7 +4,7 @@
 
 DeskFerry is an outbound-only RDP rendezvous tunnel for a work PC that cannot accept inbound connections. The current architecture uses an Azure App Service relay at `https://test-officialwebsite.azurewebsites.net/relay/` and an OCI Always Free fallback relay at `http://217.142.228.117/relay/`. The Azure relay implementation is .NET, the OCI relay implementation is a lightweight Go service, and a protocol-compatible Python/FastAPI relay is also available under `relay/python/`. The work-side Windows service and the Windows, macOS, and Android home agents connect out to relay web services over WebSockets.
 
-Home apps accept one or more relay room URLs in priority order. The first URL is the primary relay; later URLs are fallbacks used when the primary cannot connect or cannot pair an RDP stream. The Windows, Android, and work-agent configurator UIs manage these URLs as ordered lists with add, edit, delete, and reorder controls. The work agent can connect to one or more relay room URLs at the same time, as long as they use the same room name. For example:
+Home apps accept one or more relay room URLs in priority order. The first URL is the primary relay; later URLs are fallbacks used when the primary cannot connect or cannot pair an RDP stream. The Windows and Android home apps organize those same-room URL lists into named work-destination profiles, so a user can choose among multiple work PCs without mixing different rooms into one fallback list. Existing single-list settings migrate automatically to a `Work` destination. The Windows, Android, and work-agent configurator UIs manage relay URLs as ordered lists with add, edit, delete, and reorder controls. The work agent can connect to one or more relay room URLs at the same time, as long as they use the same room name. For example:
 
 ```text
 https://test-officialwebsite.azurewebsites.net/relay/workdesk
@@ -178,7 +178,7 @@ WebSocket mode uses standard proxy environment variables by default, such as `HT
 
 ### 5. Run Windows Home App
 
-Start the Windows home app and manage the relay room URLs in priority order. The first URL is primary; later URLs are fallbacks:
+Start the Windows home app, choose or create a named destination, and manage that destination's relay room URLs in priority order. The first URL is primary; later URLs are fallbacks. Stop the tunnel before changing destinations:
 
 ```powershell
 .\deskferry-home-windows-amd64.exe -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk
@@ -217,7 +217,7 @@ Install the debug-signed APK:
 dist\android\deskferry-home-android-debug.apk
 ```
 
-Open DeskFerry Home, keep the local RDP port at `3389`, and manage the same relay room URLs as the work agent in the ordered URL list. In an Android RDP client, connect to:
+Open DeskFerry Home, keep the local RDP port at `3389`, and choose or create a named destination. Each destination stores the same relay room URLs as one work agent in its own ordered URL list. Stop the tunnel before changing destinations. In an Android RDP client, connect to:
 
 ```text
 127.0.0.1:3389
@@ -349,7 +349,8 @@ It:
 - A notification-area icon with open, connect, stop, Remote Desktop, and quit actions.
 - Windows Credential Manager integration for saved RDP login credentials.
 - Persistent home-app presence on the relay dashboard.
-- Primary/fallback relay URL lists for presence, status, and RDP stream connections, managed with add, update, delete, button reorder, and drag reorder controls.
+- Named work-destination profiles, each with its own primary/fallback relay URL list for presence, status, and RDP stream connections.
+- Destination add, rename, delete, and selection controls, plus relay URL add, update, delete, button reorder, and drag reorder controls.
 - A loopback RDP listener, normally `127.0.0.1:3390`.
 - Automatic Remote Desktop launch when the user clicks `Connect`.
 
@@ -376,7 +377,8 @@ It provides:
 - One outbound `client` WebSocket per local RDP connection.
 - A persistent `home-agent` presence WebSocket while the service is running.
 - A persistent `dashboard` WebSocket for real-time work-agent and stream status.
-- Primary/fallback relay URL lists for presence, status, and RDP stream connections, managed with add, inline edit, delete, button reorder, and drag reorder controls.
+- Named work-destination profiles, each with its own primary/fallback relay URL list for presence, status, and RDP stream connections.
+- Destination add, rename, delete, and selection controls, plus relay URL add, inline edit, delete, button reorder, and drag reorder controls.
 
 Good free Android RDP client options include Microsoft's Remote Desktop/Windows App client and the open-source FreeRDP-based aFreeRDP client. Configure the RDP client to connect to the DeskFerry local target shown in the Android app.
 

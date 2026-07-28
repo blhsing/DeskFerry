@@ -2,6 +2,7 @@ package com.blhsing.deskferry.home;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -23,10 +24,12 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.ArrayAdapter;
 import android.widget.EditText;
 import android.widget.GridLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -45,6 +48,13 @@ public class MainActivity extends Activity {
     };
 
     private final ArrayList<String> relayUrls = new ArrayList<>();
+    private final ArrayList<HomePrefs.Destination> destinations = new ArrayList<>();
+    private Spinner destinationSpinner;
+    private Button destinationAddButton;
+    private Button destinationRenameButton;
+    private Button destinationDeleteButton;
+    private int selectedDestination;
+    private boolean updatingDestinationSpinner;
     private LinearLayout relayUrlList;
     private EditText relayUrlAddField;
     private Button relayAddButton;
@@ -128,6 +138,34 @@ public class MainActivity extends Activity {
         root.addView(configCard, cardParams());
 
         configCard.addView(sectionTitle("Connection"));
+        LinearLayout destinationRow = new LinearLayout(this);
+        destinationRow.setOrientation(LinearLayout.HORIZONTAL);
+        destinationRow.setGravity(Gravity.CENTER_VERTICAL);
+        destinationSpinner = new Spinner(this);
+        destinationSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                if (!updatingDestinationSpinner) {
+                    selectDestination(position);
+                }
+            }
+
+            @Override
+            public void onNothingSelected(android.widget.AdapterView<?> parent) {
+            }
+        });
+        destinationRow.addView(destinationSpinner, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        destinationAddButton = compactButton("+");
+        destinationAddButton.setOnClickListener(v -> promptAddDestination());
+        destinationRow.addView(destinationAddButton, iconButtonParams());
+        destinationRenameButton = compactButton("Rename");
+        destinationRenameButton.setOnClickListener(v -> promptRenameDestination());
+        destinationRow.addView(destinationRenameButton, compactButtonParams());
+        destinationDeleteButton = compactButton("\u00d7");
+        destinationDeleteButton.setOnClickListener(v -> deleteDestination());
+        destinationRow.addView(destinationDeleteButton, iconButtonParams());
+        configCard.addView(destinationRow, matchWrap());
+
         relayUrlList = new LinearLayout(this);
         relayUrlList.setOrientation(LinearLayout.VERTICAL);
         relayUrlList.setOnDragListener((view, event) -> {
@@ -225,9 +263,13 @@ public class MainActivity extends Activity {
     }
 
     private void loadPreferences() {
+        destinations.clear();
+        destinations.addAll(HomePrefs.loadDestinations(this));
+        selectedDestination = HomePrefs.loadSelectedDestination(this, destinations.size());
+        refreshDestinationSpinner();
         List<String> relayUrls;
         try {
-            relayUrls = RelayUrls.normalizeRelayUrls(HomePrefs.loadRelayUrl(this));
+            relayUrls = RelayUrls.normalizeRelayUrls(destinations.get(selectedDestination).relayUrl);
         } catch (URISyntaxException ex) {
             relayUrls = Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL);
         }
@@ -237,7 +279,137 @@ public class MainActivity extends Activity {
     }
 
     private void savePreferences(String relayUrl, int port, String proxy) {
-        HomePrefs.save(this, relayUrl, port, proxy);
+        if (!destinations.isEmpty()) {
+            destinations.get(selectedDestination).relayUrl = relayUrl;
+        }
+        HomePrefs.saveDestinations(this, destinations, selectedDestination, port, proxy);
+    }
+
+    private void refreshDestinationSpinner() {
+        ArrayList<String> names = new ArrayList<>();
+        for (HomePrefs.Destination destination : destinations) {
+            names.add(destination.name);
+        }
+        updatingDestinationSpinner = true;
+        destinationSpinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, names));
+        if (!names.isEmpty()) {
+            selectedDestination = Math.max(0, Math.min(selectedDestination, names.size() - 1));
+            destinationSpinner.setSelection(selectedDestination);
+        }
+        updatingDestinationSpinner = false;
+        destinationDeleteButton.setEnabled(relayRowsEnabled && destinations.size() > 1);
+    }
+
+    private void commitSelectedDestination() {
+        if (!destinations.isEmpty() && selectedDestination >= 0 && selectedDestination < destinations.size()) {
+            destinations.get(selectedDestination).relayUrl = RelayUrls.joinRelayUrls(relayUrls);
+        }
+    }
+
+    private void selectDestination(int index) {
+        if (index < 0 || index >= destinations.size() || index == selectedDestination) {
+            return;
+        }
+        commitSelectedDestination();
+        selectedDestination = index;
+        try {
+            setRelayUrls(RelayUrls.normalizeRelayUrls(destinations.get(index).relayUrl));
+        } catch (URISyntaxException ex) {
+            setRelayUrls(Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL));
+        }
+        HomePrefs.saveDestinations(this, destinations, selectedDestination,
+                parsePortOrDefault(localPortField.getText().toString()));
+    }
+
+    private void promptAddDestination() {
+        promptDestinationName("Add destination", "", name -> {
+            commitSelectedDestination();
+            String unique = uniqueDestinationName(name, -1);
+            destinations.add(new HomePrefs.Destination(unique, RelayUrls.DEFAULT_RELAY_URL));
+            selectedDestination = destinations.size() - 1;
+            setRelayUrls(Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL));
+            refreshDestinationSpinner();
+            HomePrefs.saveDestinations(this, destinations, selectedDestination,
+                    parsePortOrDefault(localPortField.getText().toString()));
+        });
+    }
+
+    private void promptRenameDestination() {
+        if (destinations.isEmpty()) {
+            return;
+        }
+        promptDestinationName("Rename destination", destinations.get(selectedDestination).name, name -> {
+            destinations.get(selectedDestination).name = uniqueDestinationName(name, selectedDestination);
+            refreshDestinationSpinner();
+            HomePrefs.saveDestinations(this, destinations, selectedDestination,
+                    parsePortOrDefault(localPortField.getText().toString()));
+        });
+    }
+
+    private interface NameHandler {
+        void accept(String name);
+    }
+
+    private void promptDestinationName(String title, String initial, NameHandler handler) {
+        EditText input = field("Destination name");
+        input.setText(initial);
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setView(input)
+                .setPositiveButton("Save", (dialog, which) -> {
+                    String name = input.getText().toString().trim();
+                    if (name.isEmpty()) {
+                        Toast.makeText(this, "Destination name is required.", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    handler.accept(name);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void deleteDestination() {
+        if (destinations.size() <= 1) {
+            Toast.makeText(this, "Keep at least one destination.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        destinations.remove(selectedDestination);
+        selectedDestination = Math.min(selectedDestination, destinations.size() - 1);
+        try {
+            setRelayUrls(RelayUrls.normalizeRelayUrls(destinations.get(selectedDestination).relayUrl));
+        } catch (URISyntaxException ex) {
+            setRelayUrls(Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL));
+        }
+        refreshDestinationSpinner();
+        HomePrefs.saveDestinations(this, destinations, selectedDestination,
+                parsePortOrDefault(localPortField.getText().toString()));
+    }
+
+    private String uniqueDestinationName(String requested, int ignoredIndex) {
+        String base = requested.trim();
+        String candidate = base;
+        int suffix = 2;
+        while (destinationNameExists(candidate, ignoredIndex)) {
+            candidate = base + " " + suffix++;
+        }
+        return candidate;
+    }
+
+    private boolean destinationNameExists(String name, int ignoredIndex) {
+        for (int i = 0; i < destinations.size(); i++) {
+            if (i != ignoredIndex && destinations.get(i).name.equalsIgnoreCase(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private int parsePortOrDefault(String value) {
+        try {
+            return parsePort(value);
+        } catch (Exception ignored) {
+            return HomePrefs.DEFAULT_LOCAL_PORT;
+        }
     }
 
     private void toggleTunnel() {
@@ -300,6 +472,10 @@ public class MainActivity extends Activity {
         logView.setText(state.log);
         startButton.setText(state.running ? "Stop Tunnel" : "Start Tunnel");
         setRelayRowsEnabled(!state.running);
+        destinationSpinner.setEnabled(!state.running);
+        destinationAddButton.setEnabled(!state.running);
+        destinationRenameButton.setEnabled(!state.running);
+        destinationDeleteButton.setEnabled(!state.running && destinations.size() > 1);
         localPortField.setEnabled(!state.running);
         proxyField.setEnabled(!state.running);
     }

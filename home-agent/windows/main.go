@@ -40,11 +40,18 @@ const (
 )
 
 type config struct {
-	ListenAddr string   `json:"listen_addr"`
-	RelayAddr  string   `json:"relay_addr"`
-	RelayAddrs []string `json:"relay_addrs,omitempty"`
-	Proxy      string   `json:"proxy"`
-	RDPUser    string   `json:"rdp_user,omitempty"`
+	ListenAddr          string               `json:"listen_addr"`
+	RelayAddr           string               `json:"relay_addr"`
+	RelayAddrs          []string             `json:"relay_addrs,omitempty"`
+	Proxy               string               `json:"proxy"`
+	RDPUser             string               `json:"rdp_user,omitempty"`
+	Destinations        []destinationProfile `json:"destinations,omitempty"`
+	SelectedDestination string               `json:"selected_destination,omitempty"`
+}
+
+type destinationProfile struct {
+	Name       string   `json:"name"`
+	RelayAddrs []string `json:"relay_addrs"`
 }
 
 type relayURLFlag []string
@@ -62,17 +69,22 @@ type clientApp struct {
 	mw *walk.MainWindow
 	ni *walk.NotifyIcon
 
-	relayList   *walk.ListBox
-	relayEdit   *walk.LineEdit
-	relayAdd    *walk.PushButton
-	relayUpdate *walk.PushButton
-	relayDelete *walk.PushButton
-	relayUp     *walk.PushButton
-	relayDown   *walk.PushButton
-	listenAddr  *walk.LineEdit
-	proxy       *walk.LineEdit
-	rdpUser     *walk.LineEdit
-	rdpPass     *walk.LineEdit
+	relayList         *walk.ListBox
+	relayEdit         *walk.LineEdit
+	relayAdd          *walk.PushButton
+	relayUpdate       *walk.PushButton
+	relayDelete       *walk.PushButton
+	relayUp           *walk.PushButton
+	relayDown         *walk.PushButton
+	destinationList   *walk.ComboBox
+	destinationEdit   *walk.LineEdit
+	destinationAdd    *walk.PushButton
+	destinationRename *walk.PushButton
+	destinationDelete *walk.PushButton
+	listenAddr        *walk.LineEdit
+	proxy             *walk.LineEdit
+	rdpUser           *walk.LineEdit
+	rdpPass           *walk.LineEdit
 
 	tunnelStatus *walk.Label
 	workStatus   *walk.Label
@@ -89,17 +101,20 @@ type clientApp struct {
 	trayStop    *walk.Action
 	trayRDP     *walk.Action
 
-	mu              sync.Mutex
-	cfg             config
-	relayURLs       []string
-	relayDragIndex  int
-	relayDragStartY int
-	relayDragging   bool
-	cancel          context.CancelFunc
-	listener        net.Listener
-	activeLocal     int
-	statusCancel    context.CancelFunc
-	exiting         bool
+	mu                  sync.Mutex
+	cfg                 config
+	relayURLs           []string
+	destinations        []destinationProfile
+	selectedDestination int
+	changingDestination bool
+	relayDragIndex      int
+	relayDragStartY     int
+	relayDragging       bool
+	cancel              context.CancelFunc
+	listener            net.Listener
+	activeLocal         int
+	statusCancel        context.CancelFunc
+	exiting             bool
 }
 
 type relaySnapshot struct {
@@ -216,6 +231,21 @@ func (a *clientApp) run(smokeTest bool) error {
 				Title:  "Connection",
 				Layout: Grid{Columns: 4, Spacing: 7},
 				Children: []Widget{
+					Label{Text: "Destination"},
+					ComboBox{
+						AssignTo:              &a.destinationList,
+						Model:                 destinationNames(a.cfg.Destinations),
+						OnCurrentIndexChanged: a.destinationSelectionChanged,
+					},
+					LineEdit{AssignTo: &a.destinationEdit, CueBanner: "Work destination name"},
+					Composite{
+						Layout: Flow{Spacing: 5},
+						Children: []Widget{
+							PushButton{AssignTo: &a.destinationAdd, Text: "Add", OnClicked: a.addDestination},
+							PushButton{AssignTo: &a.destinationRename, Text: "Rename", OnClicked: a.renameDestination},
+							PushButton{AssignTo: &a.destinationDelete, Text: "Delete", OnClicked: a.deleteDestination},
+						},
+					},
 					Label{Text: "Relay URLs"},
 					Composite{
 						ColumnSpan: 3,
@@ -291,6 +321,7 @@ func (a *clientApp) run(smokeTest bool) error {
 	if err := window.Create(); err != nil {
 		return err
 	}
+	a.setDestinations(a.cfg.Destinations, a.cfg.SelectedDestination)
 	a.setRelayURLList(a.cfg.relayAddresses(), 0)
 	if err := a.setupNotifyIcon(); err != nil {
 		return err
@@ -345,6 +376,179 @@ func statusTile(title string, assignTo **walk.Label, initial string, width int) 
 
 func (a *clientApp) relayURLListValues() []string {
 	return append([]string(nil), a.relayURLs...)
+}
+
+func destinationNames(values []destinationProfile) []string {
+	names := make([]string, 0, len(values))
+	for _, value := range values {
+		names = append(names, value.Name)
+	}
+	return names
+}
+
+func cloneDestinations(values []destinationProfile) []destinationProfile {
+	out := make([]destinationProfile, len(values))
+	for i, value := range values {
+		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...)}
+	}
+	return out
+}
+
+func (a *clientApp) setDestinations(values []destinationProfile, selectedName string) {
+	a.destinations = cloneDestinations(values)
+	a.selectedDestination = 0
+	for i, value := range a.destinations {
+		if strings.EqualFold(value.Name, selectedName) {
+			a.selectedDestination = i
+			break
+		}
+	}
+	a.changingDestination = true
+	if a.destinationList != nil {
+		_ = a.destinationList.SetModel(destinationNames(a.destinations))
+		_ = a.destinationList.SetCurrentIndex(a.selectedDestination)
+	}
+	a.changingDestination = false
+	a.updateDestinationEditor()
+	a.updateDestinationButtons()
+}
+
+func (a *clientApp) updateDestinationEditor() {
+	if a.destinationEdit == nil {
+		return
+	}
+	if a.selectedDestination >= 0 && a.selectedDestination < len(a.destinations) {
+		_ = a.destinationEdit.SetText(a.destinations[a.selectedDestination].Name)
+	}
+}
+
+func (a *clientApp) updateDestinationButtons() {
+	valid := a.selectedDestination >= 0 && a.selectedDestination < len(a.destinations)
+	if a.destinationRename != nil {
+		a.destinationRename.SetEnabled(valid)
+	}
+	if a.destinationDelete != nil {
+		a.destinationDelete.SetEnabled(valid && len(a.destinations) > 1)
+	}
+}
+
+func (a *clientApp) commitDestinationRelayURLs() {
+	if a.selectedDestination >= 0 && a.selectedDestination < len(a.destinations) {
+		a.destinations[a.selectedDestination].RelayAddrs = a.relayURLListValues()
+	}
+}
+
+func (a *clientApp) destinationSelectionChanged() {
+	if a.changingDestination || a.destinationList == nil {
+		return
+	}
+	index := a.destinationList.CurrentIndex()
+	if index < 0 || index >= len(a.destinations) || index == a.selectedDestination {
+		return
+	}
+	if a.isTunnelRunning() {
+		a.changingDestination = true
+		_ = a.destinationList.SetCurrentIndex(a.selectedDestination)
+		a.changingDestination = false
+		return
+	}
+	a.commitDestinationRelayURLs()
+	a.selectedDestination = index
+	a.setRelayURLList(a.destinations[index].RelayAddrs, 0)
+	a.updateDestinationEditor()
+	a.persistDestinationSelection()
+}
+
+func (a *clientApp) destinationNameFromEditor() (string, error) {
+	name := strings.TrimSpace(a.destinationEdit.Text())
+	if name == "" {
+		return "", errors.New("destination name is required")
+	}
+	return name, nil
+}
+
+func (a *clientApp) uniqueDestinationName(requested string, ignored int) string {
+	base := strings.TrimSpace(requested)
+	candidate := base
+	for suffix := 2; ; suffix++ {
+		found := false
+		for i, value := range a.destinations {
+			if i != ignored && strings.EqualFold(value.Name, candidate) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s %d", base, suffix)
+	}
+}
+
+func (a *clientApp) addDestination() {
+	name, err := a.destinationNameFromEditor()
+	if err != nil {
+		a.showError(err)
+		return
+	}
+	a.commitDestinationRelayURLs()
+	a.destinations = append(a.destinations, destinationProfile{
+		Name: a.uniqueDestinationName(name, -1), RelayAddrs: []string{defaultRelayURL},
+	})
+	a.selectedDestination = len(a.destinations) - 1
+	a.setDestinations(a.destinations, a.destinations[a.selectedDestination].Name)
+	a.setRelayURLList(a.destinations[a.selectedDestination].RelayAddrs, 0)
+	a.persistDestinationSelection()
+}
+
+func (a *clientApp) renameDestination() {
+	if a.selectedDestination < 0 || a.selectedDestination >= len(a.destinations) {
+		return
+	}
+	name, err := a.destinationNameFromEditor()
+	if err != nil {
+		a.showError(err)
+		return
+	}
+	a.destinations[a.selectedDestination].Name = a.uniqueDestinationName(name, a.selectedDestination)
+	selected := a.destinations[a.selectedDestination].Name
+	a.setDestinations(a.destinations, selected)
+	a.persistDestinationSelection()
+}
+
+func (a *clientApp) deleteDestination() {
+	if len(a.destinations) <= 1 || a.selectedDestination < 0 || a.selectedDestination >= len(a.destinations) {
+		return
+	}
+	index := a.selectedDestination
+	a.destinations = append(a.destinations[:index], a.destinations[index+1:]...)
+	if index >= len(a.destinations) {
+		index = len(a.destinations) - 1
+	}
+	selected := a.destinations[index].Name
+	a.setDestinations(a.destinations, selected)
+	a.setRelayURLList(a.destinations[a.selectedDestination].RelayAddrs, 0)
+	a.persistDestinationSelection()
+}
+
+func (a *clientApp) persistDestinationSelection() {
+	if len(a.destinations) == 0 || a.selectedDestination < 0 || a.selectedDestination >= len(a.destinations) {
+		return
+	}
+	a.commitDestinationRelayURLs()
+	cfg := a.currentConfig()
+	cfg.Destinations = cloneDestinations(a.destinations)
+	cfg.SelectedDestination = a.destinations[a.selectedDestination].Name
+	cfg.setRelayAddresses(a.destinations[a.selectedDestination].RelayAddrs)
+	a.mu.Lock()
+	a.cfg = cfg
+	a.mu.Unlock()
+	if err := saveSettingsConfig(cfg); err != nil {
+		a.showError(err)
+		return
+	}
+	a.restartHomePresence()
+	a.refreshRelayStatusAsync()
 }
 
 func (a *clientApp) setRelayURLList(values []string, selectIndex int) {
@@ -677,11 +881,16 @@ func (a *clientApp) saveFromUI(showMessage bool) error {
 
 func (a *clientApp) configFromUI() (config, error) {
 	relayURLs := a.relayURLListValues()
+	a.commitDestinationRelayURLs()
 	cfg := config{
-		RelayAddrs: relayURLs,
-		ListenAddr: strings.TrimSpace(a.listenAddr.Text()),
-		Proxy:      strings.TrimSpace(a.proxy.Text()),
-		RDPUser:    strings.TrimSpace(a.rdpUser.Text()),
+		RelayAddrs:   relayURLs,
+		ListenAddr:   strings.TrimSpace(a.listenAddr.Text()),
+		Proxy:        strings.TrimSpace(a.proxy.Text()),
+		RDPUser:      strings.TrimSpace(a.rdpUser.Text()),
+		Destinations: cloneDestinations(a.destinations),
+	}
+	if a.selectedDestination >= 0 && a.selectedDestination < len(a.destinations) {
+		cfg.SelectedDestination = a.destinations[a.selectedDestination].Name
 	}
 	if len(relayURLs) > 0 {
 		cfg.RelayAddr = relayURLs[0]
@@ -706,6 +915,7 @@ func (a *clientApp) setConfig(cfg config) {
 	a.cfg = cfg
 	a.mu.Unlock()
 	a.onUI(func() {
+		a.setDestinations(cfg.Destinations, cfg.SelectedDestination)
 		a.setRelayURLList(cfg.relayAddresses(), 0)
 		_ = a.listenAddr.SetText(cfg.ListenAddr)
 		_ = a.proxy.SetText(cfg.Proxy)
@@ -820,6 +1030,18 @@ func (a *clientApp) refreshLocalState() {
 	a.mu.Unlock()
 
 	a.onUI(func() {
+		if a.destinationList != nil {
+			a.destinationList.SetEnabled(!running)
+		}
+		if a.destinationAdd != nil {
+			a.destinationAdd.SetEnabled(!running)
+		}
+		if a.destinationRename != nil {
+			a.destinationRename.SetEnabled(!running)
+		}
+		if a.destinationDelete != nil {
+			a.destinationDelete.SetEnabled(!running && len(a.destinations) > 1)
+		}
 		if running {
 			_ = a.tunnelStatus.SetText("Running")
 			_ = a.connectButton.SetText("Stop Tunnel")
@@ -1066,15 +1288,20 @@ func loadConfig(relayURL, listenAddr, proxyFlag string) (config, error) {
 		return config{}, err
 	}
 	cfg.setRelayAddresses(normalized)
+	if err := cfg.ensureDestinations(); err != nil {
+		return config{}, err
+	}
 	return cfg, cfg.validate()
 }
 
 func defaultConfig() config {
 	return config{
-		ListenAddr: defaultListenAddr,
-		RelayAddr:  defaultRelayURL,
-		RelayAddrs: []string{defaultRelayURL},
-		Proxy:      "env",
+		ListenAddr:          defaultListenAddr,
+		RelayAddr:           defaultRelayURL,
+		RelayAddrs:          []string{defaultRelayURL},
+		Proxy:               "env",
+		Destinations:        []destinationProfile{{Name: "Work", RelayAddrs: []string{defaultRelayURL}}},
+		SelectedDestination: "Work",
 	}
 }
 
@@ -1106,11 +1333,13 @@ func saveSettingsConfig(cfg config) error {
 		return fmt.Errorf("create settings directory: %w", err)
 	}
 	data, err := json.MarshalIndent(config{
-		ListenAddr: cfg.ListenAddr,
-		RelayAddr:  cfg.primaryRelayAddress(),
-		RelayAddrs: cfg.relayAddresses(),
-		Proxy:      cfg.Proxy,
-		RDPUser:    cfg.RDPUser,
+		ListenAddr:          cfg.ListenAddr,
+		RelayAddr:           cfg.primaryRelayAddress(),
+		RelayAddrs:          cfg.relayAddresses(),
+		Proxy:               cfg.Proxy,
+		RDPUser:             cfg.RDPUser,
+		Destinations:        cloneDestinations(cfg.Destinations),
+		SelectedDestination: cfg.SelectedDestination,
 	}, "", "  ")
 	if err != nil {
 		return err
@@ -1146,6 +1375,50 @@ func (c *config) merge(other config) {
 	if strings.TrimSpace(other.RDPUser) != "" {
 		c.RDPUser = other.RDPUser
 	}
+	if len(other.Destinations) > 0 {
+		c.Destinations = cloneDestinations(other.Destinations)
+	}
+	if strings.TrimSpace(other.SelectedDestination) != "" {
+		c.SelectedDestination = other.SelectedDestination
+	}
+}
+
+func (c *config) ensureDestinations() error {
+	current := c.relayAddresses()
+	if len(c.Destinations) == 0 {
+		c.Destinations = []destinationProfile{{Name: "Work", RelayAddrs: current}}
+		c.SelectedDestination = "Work"
+		return nil
+	}
+	normalized := make([]destinationProfile, 0, len(c.Destinations))
+	seen := map[string]bool{}
+	for _, destination := range c.Destinations {
+		name := strings.TrimSpace(destination.Name)
+		if name == "" {
+			name = "Work"
+		}
+		base := name
+		for suffix := 2; seen[strings.ToLower(name)]; suffix++ {
+			name = fmt.Sprintf("%s %d", base, suffix)
+		}
+		seen[strings.ToLower(name)] = true
+		relays, err := normalizeRelayURLs("", destination.RelayAddrs)
+		if err != nil {
+			return fmt.Errorf("destination %q: %w", name, err)
+		}
+		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays})
+	}
+	selected := 0
+	for i, destination := range normalized {
+		if strings.EqualFold(destination.Name, c.SelectedDestination) {
+			selected = i
+			break
+		}
+	}
+	normalized[selected].RelayAddrs = append([]string(nil), current...)
+	c.Destinations = normalized
+	c.SelectedDestination = normalized[selected].Name
+	return nil
 }
 
 func (c *config) applyDefaults() {
