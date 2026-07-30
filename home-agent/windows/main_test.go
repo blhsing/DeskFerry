@@ -3,9 +3,37 @@
 package main
 
 import (
+	"fmt"
+	"os"
 	"reflect"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
+
+func TestAcquireNamedInstanceMutexRejectsSecondInstance(t *testing.T) {
+	name := fmt.Sprintf(`Global\DeskFerryHomeAgentTest-%d`, os.Getpid())
+	first, alreadyRunning, err := acquireNamedInstanceMutex(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alreadyRunning {
+		t.Fatal("first mutex acquisition reported an existing instance")
+	}
+	defer windows.CloseHandle(first)
+
+	second, alreadyRunning, err := acquireNamedInstanceMutex(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != 0 {
+		windows.CloseHandle(second)
+		t.Fatal("second mutex acquisition returned an owned handle")
+	}
+	if !alreadyRunning {
+		t.Fatal("second mutex acquisition did not report the existing instance")
+	}
+}
 
 func TestEnsureDestinationsMigratesLegacyRelayList(t *testing.T) {
 	cfg := config{

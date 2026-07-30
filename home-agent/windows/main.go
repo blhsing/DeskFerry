@@ -34,6 +34,7 @@ import (
 const (
 	defaultRelayURL    = "https://test-officialwebsite.azurewebsites.net/relay/workdesk"
 	defaultListenAddr  = "127.0.0.1:3390"
+	singleInstanceName = `Global\DeskFerryHomeAgent`
 	appIconResourceID  = 2
 	statusTileWidth    = 150
 	rdpStatusTileWidth = 230
@@ -167,6 +168,20 @@ func main() {
 	flag.BoolVar(&smokeTest, "ui-smoke-test", false, "start and close the GUI")
 	flag.Parse()
 
+	if !smokeTest {
+		instance, alreadyRunning, err := acquireNamedInstanceMutex(singleInstanceName)
+		if err != nil {
+			windowsMessageBox(appTitle(), "Check for an existing DeskFerry Home instance: "+err.Error(), windows.MB_OK|windows.MB_ICONERROR)
+			os.Exit(1)
+		}
+		if alreadyRunning {
+			activateExistingHomeWindow()
+			log.Print("DeskFerry Home is already running")
+			return
+		}
+		defer windows.CloseHandle(instance)
+	}
+
 	cfg, err := loadConfig(relayURLs.String(), listenAddr, proxyFlag)
 	if err != nil {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
@@ -190,6 +205,45 @@ func main() {
 
 func appTitle() string {
 	return "DeskFerry Home"
+}
+
+func acquireNamedInstanceMutex(name string) (windows.Handle, bool, error) {
+	namePtr, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return 0, false, err
+	}
+	handle, err := windows.CreateMutex(nil, false, namePtr)
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		if handle != 0 {
+			_ = windows.CloseHandle(handle)
+		}
+		return 0, true, nil
+	}
+	// A mutex created by another Windows account can exist without granting this
+	// account MUTEX_ALL_ACCESS. Treat access denied as an existing instance.
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		return 0, true, nil
+	}
+	if err != nil {
+		if handle != 0 {
+			_ = windows.CloseHandle(handle)
+		}
+		return 0, false, err
+	}
+	return handle, false, nil
+}
+
+func activateExistingHomeWindow() {
+	title, err := windows.UTF16PtrFromString(appTitle())
+	if err != nil {
+		return
+	}
+	window := win.FindWindow(nil, title)
+	if window == 0 {
+		return
+	}
+	win.ShowWindow(window, win.SW_RESTORE)
+	win.SetForegroundWindow(window)
 }
 
 func (a *clientApp) run(smokeTest bool) error {

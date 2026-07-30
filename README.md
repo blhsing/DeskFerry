@@ -187,6 +187,8 @@ Start the Windows home app, choose or create a named destination, and manage tha
 
 The app opens a friendly control panel and a notification-area icon. Click `Connect` to start the local RDP listener and open Remote Desktop. The default local listener is `127.0.0.1:3390`, avoiding Windows' normal local RDP port `3389`, and the app opens one outbound WebSocket to the first reachable relay for each local RDP session.
 
+Only one Windows home-app instance runs on the machine. Launching it again restores and focuses the existing control panel when it is in the same interactive session, instead of creating another tray icon, relay presence connection, or local listener.
+
 The home app stores its room URL list, local RDP address, and proxy mode in `%APPDATA%\DeskFerry\home-client.json`. Console debug mode is still available:
 
 ```powershell
