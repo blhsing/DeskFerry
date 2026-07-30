@@ -71,13 +71,21 @@ func TestHomeAgentStatusPresence(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	home := dialRole(t, ctx, server.URL, "/relay/unit-home/ws", "home-agent")
-	status := getStatus(t, server.URL, "unit-home")
+	deadline := time.Now().Add(3 * time.Second)
+	var status StatusSnapshot
+	for time.Now().Before(deadline) {
+		status = getStatus(t, server.URL, "unit-home")
+		if len(status.Rooms) == 1 && status.Rooms[0].HomeAgentConnected {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if len(status.Rooms) != 1 || !status.Rooms[0].HomeAgentConnected {
-		t.Fatalf("home presence not reflected: %+v", status.Rooms)
+		t.Fatalf("home presence was not reflected before timeout: %+v", status.Rooms)
 	}
 	_ = home.Close(websocket.StatusNormalClosure, "")
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		status = getStatus(t, server.URL, "unit-home")
 		if len(status.Rooms) == 1 && !status.Rooms[0].HomeAgentConnected {
