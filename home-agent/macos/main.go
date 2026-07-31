@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"deskferry/internal/diaglog"
 	"deskferry/internal/tunnel"
 	"nhooyr.io/websocket"
 )
@@ -88,14 +89,21 @@ func main() {
 	var relayURLs relayURLFlag
 	var listenAddr string
 	var proxyFlag string
+	var logRetentionDays int
 	var openRDP bool
 	var statusOnly bool
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.StringVar(&listenAddr, "listen", "", "local RDP listen address")
 	flag.StringVar(&proxyFlag, "proxy", "", "proxy: env, direct, or http(s)://host:port")
+	flag.IntVar(&logRetentionDays, "log-retention-days", diaglog.DefaultRetentionDays, "number of calendar days of diagnostic logs to retain")
 	flag.BoolVar(&openRDP, "open-rdp", false, "open the local RDP profile after the tunnel starts")
 	flag.BoolVar(&statusOnly, "status", false, "print relay room status and exit")
 	flag.Parse()
+	if path, err := diaglog.Enable("home-agent", false, logRetentionDays); err != nil {
+		log.Printf("persistent diagnostic logging unavailable: %v", err)
+	} else {
+		log.Printf("diagnostic log file: %s retention_days=%d", path, logRetentionDays)
+	}
 
 	cfg, err := loadConfig(relayURLs.String(), listenAddr, proxyFlag)
 	if err != nil {
@@ -201,19 +209,21 @@ func run(ctx context.Context, cfg config, openRDP bool) error {
 }
 
 func handleLocalConn(ctx context.Context, cfg config, localConn net.Conn, remote string) {
-	defer localConn.Close()
+	started := time.Now()
 	relayConn, relayAddr, err := dialRelay(ctx, cfg)
 	if err != nil {
-		log.Printf("relay dial failed for %s: %v", remote, err)
+		log.Printf("RDP session remote=%s relay dial failed after %s: %v", remote, time.Since(started).Round(time.Millisecond), err)
+		_ = localConn.Close()
 		return
 	}
-	log.Printf("bridging local RDP connection from %s through %s", remote, relayAddr)
-	tunnel.Pipe(localConn, relayConn)
-	log.Printf("closed local RDP connection from %s", remote)
+	log.Printf("RDP session remote=%s connected relay=%s local=%s relay_stream=%s dial_duration=%s", remote, relayAddr, localConn.LocalAddr(), relayConn.RemoteAddr(), time.Since(started).Round(time.Millisecond))
+	result := tunnel.PipeWithResult(localConn, relayConn)
+	log.Printf("RDP session remote=%s relay=%s ended duration=%s local_to_relay_bytes=%d local_to_relay_error=%v local_to_relay_half_close_error=%v relay_to_local_bytes=%d relay_to_local_error=%v relay_to_local_half_close_error=%v local_close_error=%v relay_close_error=%v", remote, relayAddr, result.Duration.Round(time.Millisecond), result.AToB.Bytes, result.AToB.CopyErr, result.AToB.CloseWriteErr, result.BToA.Bytes, result.BToA.CopyErr, result.BToA.CloseWriteErr, result.ACloseErr, result.BCloseErr)
 }
 
 func homePresenceLoop(ctx context.Context, cfg config) {
 	for {
+		started := time.Now()
 		conn, relayAddr, err := dialWebSocketFallback(ctx, cfg, tunnel.RoleHomeAgent)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -221,14 +231,14 @@ func homePresenceLoop(ctx context.Context, cfg config) {
 			}
 			log.Printf("home status connection failed: %v", err)
 		} else {
-			log.Printf("home status connected to %s", relayAddr)
+			log.Printf("home status connected to %s after %s", relayAddr, time.Since(started).Round(time.Millisecond))
 			_, _, err = conn.Read(ctx)
 			tunnel.CloseWebSocket(conn)
 			if ctx.Err() != nil {
 				return
 			}
 			if err != nil {
-				log.Printf("home status disconnected: %v", err)
+				log.Printf("home status disconnected relay=%s duration=%s error=%v close_status=%d context_error=%v", relayAddr, time.Since(started).Round(time.Millisecond), err, websocket.CloseStatus(err), ctx.Err())
 			}
 		}
 		select {
@@ -242,6 +252,7 @@ func homePresenceLoop(ctx context.Context, cfg config) {
 func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
 	var errs []string
 	for _, relayAddr := range cfg.relayAddresses() {
+		attemptStarted := time.Now()
 		attemptCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		ws, err := tunnel.DialWebSocket(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "")
 		if err == nil {
@@ -249,11 +260,12 @@ func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
 		}
 		if err == nil {
 			cancel()
+			log.Printf("relay client paired relay=%s via=%s duration=%s", relayAddr, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
 			return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil
 		}
 		cancel()
 		tunnel.CloseWebSocket(ws)
-		errs = append(errs, fmt.Sprintf("%s: %v", relayAddr, err))
+		errs = append(errs, fmt.Sprintf("%s after %s: %v", relayAddr, time.Since(attemptStarted).Round(time.Millisecond), err))
 		if ctx.Err() != nil {
 			break
 		}

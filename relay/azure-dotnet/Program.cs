@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net.WebSockets;
 using System.Text;
 
@@ -47,6 +48,8 @@ async Task RelayWebSocketHandler(HttpContext context, RelayHub hub)
 
     using var socket = await context.WebSockets.AcceptWebSocketAsync();
     var remote = RemoteAddress(context);
+    var roomForLog = ReadRoom(context) ?? (role == "dashboard" ? "overview" : "header-token");
+    app.Logger.LogInformation("websocket connected role={Role} room={Room} remote={Remote} user_agent={UserAgent}", role, roomForLog, remote, context.Request.Headers.UserAgent.ToString());
     switch (role)
     {
         case "dashboard":
@@ -626,12 +629,14 @@ sealed class RelayHub
     public async Task ServeHomeAgentAsync(string token, WebSocket socket, string remote, CancellationToken abort)
     {
         var room = RoomFor(token);
+        var stopwatch = Stopwatch.StartNew();
         room.HomeAgentConnected(remote);
         _log.LogInformation("home app connected room={Room} remote={Remote}", room.Id, remote);
         NotifyDashboards();
         try
         {
-            await DrainUntilCloseAsync(socket, abort);
+            var end = await DrainUntilCloseAsync(socket, abort);
+            _log.LogInformation("home app receive ended room={Room} remote={Remote} duration_ms={DurationMs} end={End} close_status={CloseStatus} close_reason={CloseReason} error={Error} socket_state={SocketState} request_aborted={RequestAborted}", room.Id, remote, stopwatch.ElapsedMilliseconds, end.End, end.CloseStatus, end.CloseReason, end.Error, socket.State, abort.IsCancellationRequested);
         }
         finally
         {
@@ -649,7 +654,7 @@ sealed class RelayHub
         try
         {
             await SendDashboardAsync(client, abort);
-            await DrainUntilCloseAsync(socket, abort);
+            _ = await DrainUntilCloseAsync(socket, abort);
         }
         finally
         {
@@ -737,7 +742,7 @@ sealed class RelayHub
         }
     }
 
-    private static async Task DrainUntilCloseAsync(WebSocket socket, CancellationToken cancellationToken)
+    private static async Task<SocketEnd> DrainUntilCloseAsync(WebSocket socket, CancellationToken cancellationToken)
     {
         var buffer = ArrayPool<byte>.Shared.Rent(1024);
         try
@@ -748,12 +753,15 @@ sealed class RelayHub
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
                     await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None);
-                    return;
+                    return new SocketEnd("close-frame", result.CloseStatus, result.CloseStatusDescription, null);
                 }
             }
+
+            return new SocketEnd(cancellationToken.IsCancellationRequested ? "canceled" : $"socket-{socket.State}", socket.CloseStatus, socket.CloseStatusDescription, null);
         }
-        catch (OperationCanceledException)
+        catch (Exception ex)
         {
+            return new SocketEnd(ex is OperationCanceledException ? "canceled" : "receive-error", socket.CloseStatus, socket.CloseStatusDescription, ex.ToString());
         }
         finally
         {
@@ -935,10 +943,13 @@ sealed class RelayRoom
 
     public async Task BridgeAsync(WebSocket agent, WebSocket client, string agentRemote, string clientRemote, TaskCompletionSource clientDone, Action stateChanged, CancellationToken abort)
     {
+        long pairId;
+        var stopwatch = Stopwatch.StartNew();
         lock (_gate)
         {
             _activePairs++;
             _totalPairs++;
+            pairId = _totalPairs;
             _lastClientRemote = clientRemote;
             _lastClientConnectedAt = DateTimeOffset.UtcNow;
             _lastClientDisconnectedAt = null;
@@ -947,11 +958,13 @@ sealed class RelayRoom
         try
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(abort);
-            var left = PumpAsync(agent, client, cts.Token);
-            var right = PumpAsync(client, agent, cts.Token);
-            await Task.WhenAny(left, right);
+            var left = PumpAsync(agent, client, "agent_to_client", cts.Token);
+            var right = PumpAsync(client, agent, "client_to_agent", cts.Token);
+            var firstTask = await Task.WhenAny(left, right);
+            var first = await firstTask;
             cts.Cancel();
-            await Task.WhenAll(SwallowAsync(left), SwallowAsync(right));
+            var second = await (ReferenceEquals(firstTask, left) ? right : left);
+            _log.LogInformation("bridge pumps ended room={Room} pair={PairId} duration_ms={DurationMs} trigger_direction={TriggerDirection} trigger_bytes={TriggerBytes} trigger_messages={TriggerMessages} trigger_end={TriggerEnd} trigger_close_status={TriggerCloseStatus} trigger_close_reason={TriggerCloseReason} trigger_error={TriggerError} other_direction={OtherDirection} other_bytes={OtherBytes} other_messages={OtherMessages} other_end={OtherEnd} other_close_status={OtherCloseStatus} other_close_reason={OtherCloseReason} other_error={OtherError} agent_state={AgentState} client_state={ClientState} request_aborted={RequestAborted}", Id, pairId, stopwatch.ElapsedMilliseconds, first.Direction, first.Bytes, first.Messages, first.End, first.CloseStatus, first.CloseReason, first.Error, second.Direction, second.Bytes, second.Messages, second.End, second.CloseStatus, second.CloseReason, second.Error, agent.State, client.State, abort.IsCancellationRequested);
         }
         finally
         {
@@ -968,7 +981,7 @@ sealed class RelayRoom
             await CloseQuietlyAsync(client);
             clientDone.TrySetResult();
             stateChanged();
-            _log.LogInformation("bridge closed room={Room} agent={AgentRemote} client={ClientRemote}", Id, agentRemote, clientRemote);
+            _log.LogInformation("bridge closed room={Room} pair={PairId} agent={AgentRemote} client={ClientRemote} duration_ms={DurationMs}", Id, pairId, agentRemote, clientRemote, stopwatch.ElapsedMilliseconds);
         }
     }
 
@@ -1010,9 +1023,11 @@ sealed class RelayRoom
         }
     }
 
-    private static async Task PumpAsync(WebSocket source, WebSocket destination, CancellationToken cancellationToken)
+    private static async Task<PumpResult> PumpAsync(WebSocket source, WebSocket destination, string direction, CancellationToken cancellationToken)
     {
         var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        long bytes = 0;
+        long messages = 0;
         try
         {
             while (source.State == WebSocketState.Open && destination.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
@@ -1020,29 +1035,26 @@ sealed class RelayRoom
                 var result = await source.ReceiveAsync(buffer, cancellationToken);
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
-                    return;
+                    return new PumpResult(direction, bytes, messages, "close-frame", result.CloseStatus, result.CloseStatusDescription, null);
                 }
                 if (result.MessageType != WebSocketMessageType.Binary)
                 {
                     continue;
                 }
                 await destination.SendAsync(new ArraySegment<byte>(buffer, 0, result.Count), WebSocketMessageType.Binary, result.EndOfMessage, cancellationToken);
+                bytes += result.Count;
+                messages++;
             }
+
+            return new PumpResult(direction, bytes, messages, cancellationToken.IsCancellationRequested ? "canceled" : $"socket-state source={source.State} destination={destination.State}", source.CloseStatus, source.CloseStatusDescription, null);
+        }
+        catch (Exception ex)
+        {
+            return new PumpResult(direction, bytes, messages, ex is OperationCanceledException ? "canceled" : "error", source.CloseStatus, source.CloseStatusDescription, ex.ToString());
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
-        }
-    }
-
-    private static async Task SwallowAsync(Task task)
-    {
-        try
-        {
-            await task;
-        }
-        catch
-        {
         }
     }
 
@@ -1060,6 +1072,10 @@ sealed class RelayRoom
         }
     }
 }
+
+sealed record SocketEnd(string End, WebSocketCloseStatus? CloseStatus, string? CloseReason, string? Error);
+
+sealed record PumpResult(string Direction, long Bytes, long Messages, string End, WebSocketCloseStatus? CloseStatus, string? CloseReason, string? Error);
 
 sealed class WaitingAgent
 {

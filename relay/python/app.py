@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -130,24 +131,60 @@ async def close_quietly(websocket: WebSocket, code: int = 1000, reason: str = ""
         pass
 
 
-async def drain_until_close(websocket: WebSocket) -> None:
+async def drain_until_close(websocket: WebSocket) -> tuple[str, Any, str | None]:
     try:
         while websocket_is_connected(websocket):
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
-                return
-    except WebSocketDisconnect:
-        return
+                return "close-frame", message.get("code"), message.get("reason")
+        return "socket-state", None, None
+    except WebSocketDisconnect as exc:
+        return "disconnect", getattr(exc, "code", None), getattr(exc, "reason", None)
+    except asyncio.CancelledError:
+        return "canceled", None, None
+    except Exception as exc:
+        return f"error: {exc!r}", None, None
 
 
-async def pump_binary(source: WebSocket, destination: WebSocket) -> None:
-    while websocket_is_connected(source) and websocket_is_connected(destination):
-        message = await source.receive()
-        if message["type"] == "websocket.disconnect":
-            return
-        payload = message.get("bytes")
-        if payload is not None:
-            await destination.send_bytes(payload)
+@dataclass
+class PumpResult:
+    direction: str
+    byte_count: int = 0
+    messages: int = 0
+    end: str = "socket-state"
+    close_code: Any = None
+    close_reason: str | None = None
+    error: str | None = None
+
+
+async def pump_binary(source: WebSocket, destination: WebSocket, direction: str) -> PumpResult:
+    result = PumpResult(direction)
+    try:
+        while websocket_is_connected(source) and websocket_is_connected(destination):
+            message = await source.receive()
+            if message["type"] == "websocket.disconnect":
+                result.end = "close-frame"
+                result.close_code = message.get("code")
+                result.close_reason = message.get("reason")
+                return result
+            payload = message.get("bytes")
+            if payload is not None:
+                await destination.send_bytes(payload)
+                result.byte_count += len(payload)
+                result.messages += 1
+        return result
+    except asyncio.CancelledError:
+        result.end = "canceled"
+        return result
+    except WebSocketDisconnect as exc:
+        result.end = "disconnect"
+        result.close_code = getattr(exc, "code", None)
+        result.close_reason = getattr(exc, "reason", None)
+        return result
+    except Exception as exc:
+        result.end = "error"
+        result.error = repr(exc)
+        return result
 
 
 async def send_start(websocket: WebSocket, side: str, room: str, remote: str) -> bool:
@@ -280,21 +317,30 @@ class RelayRoom:
         client_done: asyncio.Future[None],
         state_changed: Any,
     ) -> None:
+        started = time.monotonic()
         async with self._lock:
             self._active_pairs += 1
             self._total_pairs += 1
+            pair_id = self._total_pairs
             self._last_client_remote = client_remote
             self._last_client_connected_at = utc_now()
             self._last_client_disconnected_at = None
         state_changed()
 
-        left = asyncio.create_task(pump_binary(agent, client))
-        right = asyncio.create_task(pump_binary(client, agent))
+        left = asyncio.create_task(pump_binary(agent, client, "agent_to_client"))
+        right = asyncio.create_task(pump_binary(client, agent, "client_to_agent"))
         try:
             done, pending = await asyncio.wait({left, right}, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*done, *pending, return_exceptions=True)
+            first_task = next(iter(done))
+            first = await first_task
+            second_task = right if first_task is left else left
+            if not second_task.done():
+                second_task.cancel()
+            second = await second_task
+            logger.info(
+                "bridge pumps ended room=%s pair=%s duration_ms=%d trigger_direction=%s trigger_bytes=%d trigger_messages=%d trigger_end=%s trigger_close_code=%s trigger_close_reason=%r trigger_error=%r other_direction=%s other_bytes=%d other_messages=%d other_end=%s other_close_code=%s other_close_reason=%r other_error=%r",
+                self.id, pair_id, round((time.monotonic() - started) * 1000), first.direction, first.byte_count, first.messages, first.end, first.close_code, first.close_reason, first.error, second.direction, second.byte_count, second.messages, second.end, second.close_code, second.close_reason, second.error,
+            )
         finally:
             async with self._lock:
                 self._active_pairs = max(0, self._active_pairs - 1)
@@ -305,7 +351,7 @@ class RelayRoom:
             if not client_done.done():
                 client_done.set_result(None)
             state_changed()
-            logger.info("bridge closed room=%s agent=%s client=%s", self.id, agent_remote, client_remote)
+            logger.info("bridge closed room=%s pair=%s agent=%s client=%s duration_ms=%d", self.id, pair_id, agent_remote, client_remote, round((time.monotonic() - started) * 1000))
 
     async def snapshot(self) -> dict[str, Any]:
         async with self._lock:
@@ -417,11 +463,13 @@ class RelayHub:
 
     async def serve_home_agent(self, token: str, websocket: WebSocket, remote: str) -> None:
         room = await self._room_for(token)
+        started_at = time.monotonic()
         await room.home_agent_connected(remote)
         logger.info("home app connected room=%s remote=%s", room.id, remote)
         self.notify_dashboards()
         try:
-            await drain_until_close(websocket)
+            end, close_code, close_reason = await drain_until_close(websocket)
+            logger.info("home app receive ended room=%s remote=%s duration_ms=%d end=%s close_code=%s close_reason=%r client_state=%s application_state=%s", room.id, remote, round((time.monotonic() - started_at) * 1000), end, close_code, close_reason, websocket.client_state, websocket.application_state)
         finally:
             await room.home_agent_disconnected(remote)
             self.notify_dashboards()
@@ -535,6 +583,7 @@ async def relay_websocket(websocket: WebSocket, room: str | None) -> None:
     await websocket.accept()
     await asyncio.sleep(0)
     remote = websocket_remote(websocket)
+    logger.info("websocket connected role=%s room=%s remote=%s user_agent=%r", role, room_id(token), remote, websocket.headers.get("user-agent", ""))
     if role == DASHBOARD_ROLE:
         await hub.serve_dashboard(websocket, remote, room)
     elif role == "agent":

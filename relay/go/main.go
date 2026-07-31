@@ -165,6 +165,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hub *RelayHub, room
 
 	remote := remoteAddr(r)
 	ctx := r.Context()
+	log.Printf("websocket connected role=%s room=%s remote=%s user_agent=%q", role, roomID(token), remote, r.UserAgent())
 	switch role {
 	case dashboardRole:
 		hub.ServeDashboard(ctx, c, remote, room)
@@ -379,16 +380,18 @@ func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.C
 
 func (h *RelayHub) ServeHomeAgent(ctx context.Context, token string, c *websocket.Conn, remote string) {
 	room := h.roomFor(token)
+	started := time.Now()
 	room.HomeAgentConnected(remote)
 	log.Printf("home app connected room=%s remote=%s", room.ID, remote)
 	h.NotifyDashboards()
 	defer func() {
 		room.HomeAgentDisconnected(remote)
 		h.NotifyDashboards()
-		log.Printf("home app disconnected room=%s remote=%s", room.ID, remote)
+		log.Printf("home app disconnected room=%s remote=%s duration=%s", room.ID, remote, time.Since(started).Round(time.Millisecond))
 		closeQuietly(c, websocket.StatusNormalClosure, "")
 	}()
-	drainUntilClose(ctx, c)
+	err := drainUntilClose(ctx, c)
+	log.Printf("home app receive ended room=%s remote=%s error=%v close_status=%d context_error=%v", room.ID, remote, err, websocket.CloseStatus(err), ctx.Err())
 }
 
 func (h *RelayHub) ServeDashboard(ctx context.Context, c *websocket.Conn, remote, room string) {
@@ -579,10 +582,12 @@ func (r *RelayRoom) HomeAgentDisconnected(remote string) {
 
 func (r *RelayRoom) Bridge(ctx context.Context, agent, client *websocket.Conn, agentRemote, clientRemote string, clientDone chan struct{}, stateChanged func()) {
 	now := time.Now().UTC()
+	started := time.Now()
 	clientRemoteCopy := clientRemote
 	r.mu.Lock()
 	r.activePairs++
 	r.totalPairs++
+	pairID := r.totalPairs
 	r.lastClientRemote = &clientRemoteCopy
 	r.lastClientConnectedAt = &now
 	r.lastClientDisconnectedAt = nil
@@ -590,12 +595,12 @@ func (r *RelayRoom) Bridge(ctx context.Context, agent, client *websocket.Conn, a
 	stateChanged()
 
 	bridgeCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{}, 2)
-	go pumpBinary(bridgeCtx, agent, client, done)
-	go pumpBinary(bridgeCtx, client, agent, done)
-	<-done
+	done := make(chan pumpResult, 2)
+	go pumpBinary(bridgeCtx, agent, client, "agent_to_client", done)
+	go pumpBinary(bridgeCtx, client, agent, "client_to_agent", done)
+	first := <-done
 	cancel()
-	<-done
+	second := <-done
 
 	now = time.Now().UTC()
 	r.mu.Lock()
@@ -609,7 +614,7 @@ func (r *RelayRoom) Bridge(ctx context.Context, agent, client *websocket.Conn, a
 	closeQuietly(client, websocket.StatusNormalClosure, "")
 	closeOnce(clientDone)
 	stateChanged()
-	log.Printf("bridge closed room=%s agent=%s client=%s", r.ID, agentRemote, clientRemote)
+	log.Printf("bridge closed room=%s pair=%d agent=%s client=%s duration=%s trigger_direction=%s trigger_bytes=%d trigger_messages=%d trigger_error=%v trigger_close_status=%d other_direction=%s other_bytes=%d other_messages=%d other_error=%v other_close_status=%d context_error=%v", r.ID, pairID, agentRemote, clientRemote, time.Since(started).Round(time.Millisecond), first.Direction, first.Bytes, first.Messages, first.Err, websocket.CloseStatus(first.Err), second.Direction, second.Bytes, second.Messages, second.Err, websocket.CloseStatus(second.Err), ctx.Err())
 }
 
 func (r *RelayRoom) Snapshot() RoomSnapshot {
@@ -790,26 +795,38 @@ func sendStart(c *websocket.Conn, room, remote, side string) bool {
 	return true
 }
 
-func pumpBinary(ctx context.Context, source, destination *websocket.Conn, done chan<- struct{}) {
-	defer func() { done <- struct{}{} }()
+type pumpResult struct {
+	Direction string
+	Bytes     int64
+	Messages  int64
+	Err       error
+}
+
+func pumpBinary(ctx context.Context, source, destination *websocket.Conn, direction string, done chan<- pumpResult) {
+	result := pumpResult{Direction: direction}
+	defer func() { done <- result }()
 	for {
 		typ, payload, err := source.Read(ctx)
 		if err != nil {
+			result.Err = fmt.Errorf("read: %w", err)
 			return
 		}
 		if typ != websocket.MessageBinary {
 			continue
 		}
 		if err := destination.Write(ctx, websocket.MessageBinary, payload); err != nil {
+			result.Err = fmt.Errorf("write: %w", err)
 			return
 		}
+		result.Bytes += int64(len(payload))
+		result.Messages++
 	}
 }
 
-func drainUntilClose(ctx context.Context, c *websocket.Conn) {
+func drainUntilClose(ctx context.Context, c *websocket.Conn) error {
 	for {
 		if _, _, err := c.Read(ctx); err != nil {
-			return
+			return err
 		}
 	}
 }

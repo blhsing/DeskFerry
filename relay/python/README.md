@@ -85,3 +85,9 @@ curl -fsS 'http://127.0.0.1/relay/status?room=b'
 ```
 
 The OCI network and guest firewall must allow inbound TCP `80`. SSH access from this workstation used HTTP CONNECT through `192.9.200.25:3128`.
+
+## Diagnostics And Retention
+
+The relay logs WebSocket roles, room and pairing lifecycle, bridge direction, bytes and message counts, duration, close details, socket state, cancellation state, and errors through standard Python/ASGI logging. Tunnel payload contents and credentials are not intentionally logged.
+
+Log retention belongs to the hosting process supervisor or platform. A systemd deployment can use persistent journald with a `MaxRetentionSec=7day` drop-in and a disk-usage cap; an App Service deployment should use the equivalent App Service diagnostic settings.

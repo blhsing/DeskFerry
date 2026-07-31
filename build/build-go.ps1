@@ -87,7 +87,9 @@ try {
     $targets = @(
         @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-agent-windows-amd64.exe'; Package = './work-agent/windows/service' },
         @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-agent-configurator-windows-amd64.exe'; Package = './work-agent/windows/configurator'; Ldflags = '-s -w -H windowsgui' },
-        @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-home-windows-amd64.exe'; Package = './home-agent/windows'; Ldflags = '-s -w -H windowsgui' },
+        # Keep symbols in the Windows home GUI. The stripped PE has repeatedly
+        # triggered endpoint-protection false positives on deployment hosts.
+        @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-home-windows-amd64.exe'; Package = './home-agent/windows'; Ldflags = '-H windowsgui' },
         @{ GOOS = 'darwin'; GOARCH = 'arm64'; Name = 'deskferry-home-macos-arm64'; Package = './home-agent/macos' },
         @{ GOOS = 'darwin'; GOARCH = 'amd64'; Name = 'deskferry-home-macos-amd64'; Package = './home-agent/macos' },
         @{ GOOS = 'linux'; GOARCH = 'amd64'; Name = 'deskferry-relay-linux-amd64'; Package = './relay/go' }

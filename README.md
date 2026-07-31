@@ -40,6 +40,7 @@ The Android app is a home-agent client like the Windows and macOS home agents. I
 - [Build Commands](#build-commands)
 - [URL Configuration](#url-configuration)
 - [Troubleshooting](#troubleshooting)
+  - [Diagnostic Logs](#diagnostic-logs)
   - [Agent Self-Test Fails Through Proxy](#agent-self-test-fails-through-proxy)
   - [Home App Connects But RDP Fails](#home-app-connects-but-rdp-fails)
   - [OCI Relay Becomes Unresponsive](#oci-relay-becomes-unresponsive)
@@ -176,6 +177,8 @@ Useful checks:
 
 WebSocket mode uses standard proxy environment variables by default, such as `HTTP_PROXY` and `HTTPS_PROXY`. Use `-proxy http://proxy.example:8080` or `-proxy https://proxy.example:8443` to force a proxy, or `-proxy direct` to bypass proxy discovery. For plain `http://` relay URLs behind a corporate proxy, DeskFerry opens a `CONNECT` tunnel first so the WebSocket upgrade reaches the relay unchanged.
 
+The work agent writes persistent daily diagnostic logs under `%ProgramData%\DeskFerry`. Seven calendar days are retained by default. Use `-log-retention-days <days>` in the service command line to configure a value from 1 through 3650.
+
 ### 5. Run Windows Home App
 
 Start the Windows home app, choose or create a named destination, and manage that destination's relay room URLs in priority order. The first URL is primary; later URLs are fallbacks. Stop the tunnel before changing destinations:
@@ -195,6 +198,8 @@ The home app stores its room URL list, local RDP address, and proxy mode in `%AP
 .\deskferry-home-windows-amd64.exe -console -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk
 ```
 
+Persistent diagnostic logs are written under `%APPDATA%\DeskFerry`. Their default retention is seven calendar days; use `-log-retention-days <days>` to configure a value from 1 through 3650.
+
 ### 6. Run macOS Home Agent
 
 Choose the binary for your Mac:
@@ -211,6 +216,8 @@ Use `deskferry-home-macos-amd64` on Intel Macs. The macOS home agent runs in the
 127.0.0.1:3389
 ```
 
+The macOS agent has the same persistent daily diagnostics and `-log-retention-days <days>` option as the Windows home agent. Logs are stored in the user's DeskFerry configuration directory, normally `~/Library/Application Support/DeskFerry`.
+
 ### 7. Run Android Home App
 
 Install the debug-signed APK:
@@ -226,6 +233,8 @@ Open DeskFerry Home, keep the local RDP port at `3389`, and choose or create a n
 ```
 
 The Android app keeps the tunnel alive through a foreground service while you switch to the RDP client. It maintains the same `home-agent` presence socket used by the relay dashboard and a `dashboard` WebSocket for live relay status updates. Its Proxy field accepts `system`, `direct`, `http://host:port`, or `https://host:port`; optional Basic credentials can be included in the proxy URL.
+
+Android writes the same daily diagnostics to the app-specific external-files `logs` directory, falling back to internal app storage when necessary. Set **Diagnostic log retention days** in the control panel; the default is 7 and the accepted range is 1 through 3650. The activity log prints the resolved diagnostic-log path when the foreground service starts.
 
 ## Deliverables
 
@@ -476,6 +485,31 @@ Rules:
 - No generated pairing files are required for the normal Azure WebSocket path.
 
 ## Troubleshooting
+
+### Diagnostic Logs
+
+DeskFerry records connection lifecycle details intended to make intermittent disconnects traceable across the home agent, work agent, and relay. Entries include relay selection and dialing, proxy use, WebSocket connection and close information, pairing identifiers, stream direction, byte and message counts, elapsed time, socket state, cancellation state, and errors. Credentials, proxy passwords, and RDP payload contents are not intentionally logged.
+
+Go-based Windows and macOS agents use daily files named `home-agent-YYYY-MM-DD.log` or `work-agent-YYYY-MM-DD.log`. Android uses `home-agent-YYYY-MM-DD.log`. A daily file rotates to `.old` when it reaches 8 MiB. Expired daily and legacy log files are pruned at startup and on date rollover. The configured retention includes the current calendar day, so the default of 7 keeps today plus the previous six days.
+
+Default locations:
+
+```text
+Windows home:  %APPDATA%\DeskFerry\home-agent-YYYY-MM-DD.log
+Windows work:  %ProgramData%\DeskFerry\work-agent-YYYY-MM-DD.log
+macOS home:    ~/Library/Application Support/DeskFerry/home-agent-YYYY-MM-DD.log
+Android home:  <app-specific files>/logs/home-agent-YYYY-MM-DD.log
+```
+
+Windows and macOS accept `-log-retention-days <days>`. Android exposes the equivalent setting in its control panel. All three home implementations default to seven days, as does the Windows work agent.
+
+Relay diagnostics are written to standard output and retained by the hosting platform:
+
+- Azure App Service application logging should be enabled at `Information` level. The production service uses seven-day filesystem HTTP-log retention plus filesystem application-log size and file-count limits. Exact application-log retention by days requires Azure Blob Storage or another Azure Monitor destination because App Service filesystem application logs do not expose a day-retention property.
+- The OCI systemd host stores Go relay output in persistent journald. Its deployed journal policy uses `MaxRetentionSec=7day` together with a disk-usage cap. Inspect it with `journalctl -u deskferry-relay.service --since '7 days ago'`.
+- Python relay deployments also log connection, pairing, bridge, and disconnect lifecycle events through their ASGI server output; configure retention in the process supervisor or hosting platform.
+
+When investigating a disconnect, collect the home-agent and work-agent entries covering the same timestamp, then correlate them with Azure App Service logs or `journalctl` on the relay that was selected. Pair identifiers and close details distinguish a relay-side termination from a home-to-relay, work-to-relay, or local-RDP failure.
 
 ### Agent Self-Test Fails Through Proxy
 

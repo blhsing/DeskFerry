@@ -28,6 +28,7 @@ import (
 	"golang.org/x/sys/windows"
 	"nhooyr.io/websocket"
 
+	"deskferry/internal/diaglog"
 	"deskferry/internal/tunnel"
 )
 
@@ -159,14 +160,21 @@ func main() {
 	var relayURLs relayURLFlag
 	var listenAddr string
 	var proxyFlag string
+	var logRetentionDays int
 	var consoleMode bool
 	var smokeTest bool
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.StringVar(&listenAddr, "listen", "", "local RDP listen address")
 	flag.StringVar(&proxyFlag, "proxy", "", "proxy: env, direct, or http(s)://host:port")
+	flag.IntVar(&logRetentionDays, "log-retention-days", diaglog.DefaultRetentionDays, "number of calendar days of diagnostic logs to retain")
 	flag.BoolVar(&consoleMode, "console", false, "run in the foreground instead of the control panel")
 	flag.BoolVar(&smokeTest, "ui-smoke-test", false, "start and close the GUI")
 	flag.Parse()
+	if path, err := diaglog.Enable("home-agent", false, logRetentionDays); err != nil {
+		log.Printf("persistent diagnostic logging unavailable: %v", err)
+	} else {
+		log.Printf("diagnostic log file: %s retention_days=%d", path, logRetentionDays)
+	}
 
 	if !smokeTest {
 		instance, alreadyRunning, err := acquireNamedInstanceMutex(singleInstanceName)
@@ -1541,20 +1549,22 @@ func serveListener(ctx context.Context, cfg config, listener net.Listener, start
 
 func handleLocalConn(ctx context.Context, cfg config, localConn net.Conn, remote string, done func(string), logf func(string, ...any)) {
 	defer done(remote)
-	relayConn, err := dialRelay(ctx, cfg)
+	started := time.Now()
+	relayConn, relayAddr, err := dialRelay(ctx, cfg)
 	if err != nil {
-		logf("Relay dial failed for %s: %v", remote, err)
+		logf("RDP session remote=%s relay dial failed after %s: %v", remote, time.Since(started).Round(time.Millisecond), err)
 		_ = localConn.Close()
 		return
 	}
-	logf("Bridging local RDP connection from %s.", remote)
-	tunnel.Pipe(localConn, relayConn)
-	logf("Closed local RDP connection from %s.", remote)
+	logf("RDP session remote=%s connected relay=%s local=%s relay_stream=%s dial_duration=%s", remote, relayAddr, localConn.LocalAddr(), relayConn.RemoteAddr(), time.Since(started).Round(time.Millisecond))
+	result := tunnel.PipeWithResult(localConn, relayConn)
+	logf("RDP session remote=%s relay=%s ended duration=%s local_to_relay_bytes=%d local_to_relay_error=%v local_to_relay_half_close_error=%v relay_to_local_bytes=%d relay_to_local_error=%v relay_to_local_half_close_error=%v local_close_error=%v relay_close_error=%v", remote, relayAddr, result.Duration.Round(time.Millisecond), result.AToB.Bytes, result.AToB.CopyErr, result.AToB.CloseWriteErr, result.BToA.Bytes, result.BToA.CopyErr, result.BToA.CloseWriteErr, result.ACloseErr, result.BCloseErr)
 }
 
-func dialRelay(ctx context.Context, cfg config) (net.Conn, error) {
+func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
 	var errs []string
 	for _, relayAddr := range cfg.relayAddresses() {
+		attemptStarted := time.Now()
 		attemptCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		ws, err := tunnel.DialWebSocket(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "")
 		if err == nil {
@@ -1562,16 +1572,17 @@ func dialRelay(ctx context.Context, cfg config) (net.Conn, error) {
 		}
 		if err == nil {
 			cancel()
-			return tunnel.WebSocketNetConn(ctx, ws), nil
+			log.Printf("relay client paired relay=%s via=%s duration=%s", relayAddr, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
+			return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil
 		}
 		cancel()
 		tunnel.CloseWebSocket(ws)
-		errs = append(errs, fmt.Sprintf("%s: %v", relayAddr, err))
+		errs = append(errs, fmt.Sprintf("%s after %s: %v", relayAddr, time.Since(attemptStarted).Round(time.Millisecond), err))
 		if ctx.Err() != nil {
 			break
 		}
 	}
-	return nil, fmt.Errorf("all relay URLs failed: %s", strings.Join(errs, "; "))
+	return nil, "", fmt.Errorf("all relay URLs failed: %s", strings.Join(errs, "; "))
 }
 
 func queryRelaySummary(ctx context.Context, cfg config) (relaySummary, error) {

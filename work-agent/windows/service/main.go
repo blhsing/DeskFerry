@@ -26,6 +26,7 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
 
+	"deskferry/internal/diaglog"
 	"deskferry/internal/tunnel"
 )
 
@@ -59,6 +60,7 @@ func main() {
 	var relayURLs relayURLFlag
 	var proxyFlag string
 	var rdpFlag string
+	var logRetentionDays int
 	var consoleMode bool
 	var serviceMode bool
 	var installMode bool
@@ -68,6 +70,7 @@ func main() {
 	flag.Var(&relayURLs, "relay-url", "relay service URL; repeat to add more relay URLs")
 	flag.StringVar(&proxyFlag, "proxy", "", "HTTP proxy for Azure relay WebSocket, or direct/env/auto")
 	flag.StringVar(&rdpFlag, "rdp", "", "local RDP target")
+	flag.IntVar(&logRetentionDays, "log-retention-days", diaglog.DefaultRetentionDays, "number of calendar days of diagnostic logs to retain")
 	flag.BoolVar(&consoleMode, "console", false, "run in the foreground for debugging")
 	flag.BoolVar(&serviceMode, "service", false, "run under the Windows service control manager")
 	flag.BoolVar(&installMode, "install", false, "install and start the Windows service")
@@ -75,6 +78,11 @@ func main() {
 	flag.BoolVar(&statusMode, "status", false, "print Windows service status")
 	flag.BoolVar(&selfTestMode, "self-test", false, "test local RDP and relay WebSocket connectivity")
 	flag.Parse()
+	if path, err := diaglog.Enable("work-agent", true, logRetentionDays); err != nil {
+		log.Printf("persistent diagnostic logging unavailable: %v", err)
+	} else {
+		log.Printf("diagnostic log file: %s retention_days=%d", path, logRetentionDays)
+	}
 
 	relayURL := relayURLs.String()
 	if relayURL == "" {
@@ -468,6 +476,7 @@ func runWebSocketSlot(ctx context.Context, cfg config, slot int, agentID string)
 }
 
 func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string) error {
+	connectedAt := time.Now()
 	headers := http.Header{}
 	if agentID != "" {
 		headers.Set(agentIDHeader, agentID)
@@ -475,18 +484,19 @@ func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string)
 	}
 	ws, err := tunnel.DialWebSocketWithHeaders(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgent, "", headers)
 	if err != nil {
-		return err
+		return fmt.Errorf("dial after %s: %w", time.Since(connectedAt).Round(time.Millisecond), err)
 	}
 	defer tunnel.CloseWebSocket(ws)
 
 	log.Printf("websocket agent slot %d connected to relay %s via %s", slot, cfg.RelayAddr, tunnel.ProxySpecForLog(cfg.Proxy))
 	if err := tunnel.AwaitWebSocketStart(ctx, ws); err != nil {
-		return err
+		return fmt.Errorf("wait for pairing after %s: %w", time.Since(connectedAt).Round(time.Millisecond), err)
 	}
-	log.Printf("websocket agent slot %d paired on relay %s; forwarding to %s", slot, cfg.RelayAddr, cfg.RDPAddr)
+	pairedAt := time.Now()
+	log.Printf("websocket agent slot %d paired on relay %s after idle=%s; forwarding to %s", slot, cfg.RelayAddr, pairedAt.Sub(connectedAt).Round(time.Millisecond), cfg.RDPAddr)
 	stream := tunnel.WebSocketNetConn(ctx, ws)
-	handleStream(ctx, stream, cfg.RDPAddr)
-	return nil
+	handleStream(ctx, stream, cfg.RDPAddr, cfg.RelayAddr, slot)
+	return fmt.Errorf("paired stream completed after %s", time.Since(pairedAt).Round(time.Millisecond))
 }
 
 func loadOrCreateAgentID() (string, error) {
@@ -632,17 +642,18 @@ func relayPortForHint(addr string) string {
 	return port
 }
 
-func handleStream(ctx context.Context, stream net.Conn, rdpAddr string) {
+func handleStream(ctx context.Context, stream net.Conn, rdpAddr, relayAddr string, slot int) {
+	started := time.Now()
 	var d net.Dialer
 	rdpConn, err := d.DialContext(ctx, "tcp", rdpAddr)
 	if err != nil {
-		log.Printf("RDP dial %s failed: %v", rdpAddr, err)
+		log.Printf("RDP stream slot=%d relay=%s target=%s dial failed after %s: %v", slot, relayAddr, rdpAddr, time.Since(started).Round(time.Millisecond), err)
 		_ = stream.Close()
 		return
 	}
-	log.Printf("opened RDP stream to %s", rdpAddr)
-	tunnel.Pipe(stream, rdpConn)
-	log.Printf("closed RDP stream to %s", rdpAddr)
+	log.Printf("RDP stream slot=%d relay=%s target=%s opened local=%s remote=%s dial_duration=%s", slot, relayAddr, rdpAddr, rdpConn.LocalAddr(), rdpConn.RemoteAddr(), time.Since(started).Round(time.Millisecond))
+	result := tunnel.PipeWithResult(stream, rdpConn)
+	log.Printf("RDP stream slot=%d relay=%s target=%s ended duration=%s relay_to_rdp_bytes=%d relay_to_rdp_error=%v relay_to_rdp_half_close_error=%v rdp_to_relay_bytes=%d rdp_to_relay_error=%v rdp_to_relay_half_close_error=%v relay_close_error=%v rdp_close_error=%v", slot, relayAddr, rdpAddr, result.Duration.Round(time.Millisecond), result.AToB.Bytes, result.AToB.CopyErr, result.AToB.CloseWriteErr, result.BToA.Bytes, result.BToA.CopyErr, result.BToA.CloseWriteErr, result.ACloseErr, result.BCloseErr)
 }
 
 func installScheduledTask(relayURL, proxyFlag, rdpFlag string) error {

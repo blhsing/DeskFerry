@@ -60,6 +60,7 @@ public class MainActivity extends Activity {
     private Button relayAddButton;
     private EditText localPortField;
     private EditText proxyField;
+    private EditText logRetentionDaysField;
     private TextView tunnelStatus;
     private TextView workStatus;
     private TextView homeStatus;
@@ -199,6 +200,10 @@ public class MainActivity extends Activity {
         proxyField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         configCard.addView(proxyField, matchWrap());
 
+        logRetentionDaysField = field("Diagnostic log retention days");
+        logRetentionDaysField.setInputType(InputType.TYPE_CLASS_NUMBER);
+        configCard.addView(logRetentionDaysField, matchWrap());
+
         rdpAddress = label(RelayUrls.rdpAddress(HomePrefs.DEFAULT_LOCAL_PORT), 20, "#1F2933", true);
         rdpAddress.setPadding(0, dp(10), 0, 0);
         configCard.addView(rdpAddress);
@@ -276,13 +281,15 @@ public class MainActivity extends Activity {
         setRelayUrls(relayUrls);
         localPortField.setText(String.valueOf(HomePrefs.loadLocalPort(this)));
         proxyField.setText(HomePrefs.loadProxy(this));
+        logRetentionDaysField.setText(String.valueOf(HomePrefs.loadLogRetentionDays(this)));
     }
 
     private void savePreferences(String relayUrl, int port, String proxy) {
         if (!destinations.isEmpty()) {
             destinations.get(selectedDestination).relayUrl = relayUrl;
         }
-        HomePrefs.saveDestinations(this, destinations, selectedDestination, port, proxy);
+        HomePrefs.saveDestinations(this, destinations, selectedDestination, port, proxy,
+                parseLogRetentionDays(logRetentionDaysField.getText().toString()));
     }
 
     private void refreshDestinationSpinner() {
@@ -421,11 +428,13 @@ public class MainActivity extends Activity {
         String relayUrl;
         int port;
         String proxy;
+        int logRetentionDays;
         try {
             List<String> normalizedRelayUrls = normalizedRelayUrlsFromRows();
             relayUrl = RelayUrls.joinRelayUrls(normalizedRelayUrls);
             port = parsePort(localPortField.getText().toString());
             proxy = ProxySettings.normalize(proxyField.getText().toString());
+            logRetentionDays = parseLogRetentionDays(logRetentionDaysField.getText().toString());
         } catch (Exception ex) {
             Toast.makeText(this, ex.getMessage(), Toast.LENGTH_LONG).show();
             return;
@@ -439,13 +448,15 @@ public class MainActivity extends Activity {
         setRelayUrls(relayUrls);
         localPortField.setText(String.valueOf(port));
         proxyField.setText(proxy);
+        logRetentionDaysField.setText(String.valueOf(logRetentionDays));
         savePreferences(relayUrl, port, proxy);
 
         Intent intent = new Intent(this, TunnelService.class)
                 .setAction(TunnelService.ACTION_START)
                 .putExtra(TunnelService.EXTRA_RELAY_URL, relayUrl)
                 .putExtra(TunnelService.EXTRA_LOCAL_PORT, port)
-                .putExtra(TunnelService.EXTRA_PROXY, proxy);
+                .putExtra(TunnelService.EXTRA_PROXY, proxy)
+                .putExtra(TunnelService.EXTRA_LOG_RETENTION_DAYS, logRetentionDays);
         if (Build.VERSION.SDK_INT >= 26) {
             startForegroundService(intent);
         } else {
@@ -459,6 +470,14 @@ public class MainActivity extends Activity {
             throw new IllegalArgumentException("Local RDP port must be 1-65535.");
         }
         return port;
+    }
+
+    private int parseLogRetentionDays(String value) {
+        int days = Integer.parseInt(value.trim());
+        if (days < 1 || days > 3650) {
+            throw new IllegalArgumentException("Log retention days must be 1-3650.");
+        }
+        return days;
     }
 
     private void renderState(TunnelService.State state) {
@@ -478,6 +497,7 @@ public class MainActivity extends Activity {
         destinationDeleteButton.setEnabled(!state.running && destinations.size() > 1);
         localPortField.setEnabled(!state.running);
         proxyField.setEnabled(!state.running);
+        logRetentionDaysField.setEnabled(!state.running);
     }
 
     private void copyRdpTarget() {

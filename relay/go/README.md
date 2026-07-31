@@ -62,3 +62,15 @@ ps -o pid,rss,comm,args -p "$(systemctl show -p MainPID --value deskferry-relay.
 curl -fsS http://127.0.0.1/relay/health
 curl -fsS 'http://127.0.0.1/relay/status?room=b'
 ```
+
+## Diagnostics And Retention
+
+The relay writes structured connection lifecycle messages to standard output, including roles, room names, pairing identifiers, bridge byte/message totals, duration, close status and reason, socket state, cancellation state, and errors. It does not intentionally log tunnel payload contents or credentials.
+
+Under systemd, inspect these messages with:
+
+```sh
+journalctl -u deskferry-relay.service --since '7 days ago'
+```
+
+The production OCI host uses persistent journald with `MaxRetentionSec=7day` and `SystemMaxUse=128M`. These are host-owned policies rather than relay flags; adjust them in a `journald.conf.d` drop-in when deploying to another systemd host.

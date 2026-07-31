@@ -9,7 +9,11 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.SystemClock;
+import android.util.Log;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -18,8 +22,10 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.Calendar;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -28,6 +34,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import okhttp3.OkHttpClient;
@@ -47,10 +54,16 @@ public class TunnelService extends Service {
     static final String EXTRA_RELAY_URL = "relay_url";
     static final String EXTRA_LOCAL_PORT = "local_port";
     static final String EXTRA_PROXY = "proxy";
+    static final String EXTRA_LOG_RETENTION_DAYS = "log_retention_days";
 
     private static final String CHANNEL_ID = "deskferry_home";
     private static final int NOTIFICATION_ID = 7310;
+    private static final String LOG_TAG = "DeskFerryHome";
+    private static final long MAX_DIAGNOSTIC_LOG_BYTES = 8L * 1024L * 1024L;
     private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss", Locale.ROOT);
+    private static final SimpleDateFormat DIAGNOSTIC_TIME_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.ROOT);
+    private static final SimpleDateFormat DIAGNOSTIC_DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT);
+    private static final Object DIAGNOSTIC_LOG_LOCK = new Object();
     private static final Object STATE_LOCK = new Object();
     private static State currentState = State.initial();
 
@@ -67,6 +80,8 @@ public class TunnelService extends Service {
     private volatile String relayUrl = RelayUrls.DEFAULT_RELAY_URL;
     private volatile List<String> relayUrls = Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL);
     private volatile int localPort = HomePrefs.DEFAULT_LOCAL_PORT;
+    private volatile int logRetentionDays = HomePrefs.DEFAULT_LOG_RETENTION_DAYS;
+    private volatile String lastPrunedLogDate = "";
     private volatile int activeConnections;
     private volatile int totalConnections;
 
@@ -101,8 +116,11 @@ public class TunnelService extends Service {
         String requestedProxy = intent != null && intent.hasExtra(EXTRA_PROXY)
                 ? intent.getStringExtra(EXTRA_PROXY)
                 : HomePrefs.loadProxy(this);
+        int requestedLogRetentionDays = intent != null && intent.hasExtra(EXTRA_LOG_RETENTION_DAYS)
+                ? intent.getIntExtra(EXTRA_LOG_RETENTION_DAYS, HomePrefs.DEFAULT_LOG_RETENTION_DAYS)
+                : HomePrefs.loadLogRetentionDays(this);
         startForeground(NOTIFICATION_ID, buildNotification());
-        startTunnel(requestedRelay, requestedPort, requestedProxy);
+        startTunnel(requestedRelay, requestedPort, requestedProxy, requestedLogRetentionDays);
         return START_STICKY;
     }
 
@@ -120,13 +138,14 @@ public class TunnelService extends Service {
         return null;
     }
 
-    private void startTunnel(String requestedRelay, int requestedPort, String requestedProxy) {
+    private void startTunnel(String requestedRelay, int requestedPort, String requestedProxy, int requestedLogRetentionDays) {
         synchronized (lock) {
             stopTunnelLocked();
             try {
                 relayUrls = RelayUrls.normalizeRelayUrls(requestedRelay);
                 relayUrl = RelayUrls.joinRelayUrls(relayUrls);
                 localPort = sanitizePort(requestedPort);
+                logRetentionDays = HomePrefs.sanitizeLogRetentionDays(requestedLogRetentionDays);
                 OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
                         .pingInterval(25, TimeUnit.SECONDS)
                         .retryOnConnectionFailure(true);
@@ -140,6 +159,7 @@ public class TunnelService extends Service {
                 totalConnections = 0;
                 updateState("Running", "Connecting", "Checking", null);
                 append("Listening on " + RelayUrls.rdpAddress(localPort) + ".");
+                append("Diagnostic log file: " + diagnosticLogFile().getAbsolutePath() + " retention_days=" + logRetentionDays + ".");
                 append("Relay primary: " + relayUrls.get(0) + (relayUrls.size() > 1 ? " (" + (relayUrls.size() - 1) + " fallback)" : "") + ".");
                 append("Proxy: " + ProxySettings.forLog(requestedProxy) + ".");
                 startAcceptLoop();
@@ -207,6 +227,7 @@ public class TunnelService extends Service {
                     CountDownLatch closed = new CountDownLatch(1);
                     AtomicBoolean openedCandidate = new AtomicBoolean(false);
                     AtomicReference<String> failure = new AtomicReference<>("");
+                    long attemptStarted = SystemClock.elapsedRealtime();
                     try {
                         Request request = webSocketRequest(candidate, "home-agent");
                         WebSocket socket = httpClient.newWebSocket(request, new WebSocketListener() {
@@ -220,12 +241,16 @@ public class TunnelService extends Service {
 
                             @Override
                             public void onClosed(WebSocket webSocket, int code, String reason) {
+                                if (openedCandidate.get()) {
+                                    append("Home status disconnected relay=" + candidate + " duration_ms=" + elapsedMillis(attemptStarted) + " close_code=" + code + " close_reason=" + quoted(reason) + ".");
+                                }
                                 closed.countDown();
                             }
 
                             @Override
                             public void onFailure(WebSocket webSocket, Throwable t, Response response) {
                                 failure.set(t.getMessage());
+                                append("Home status failure relay=" + candidate + " duration_ms=" + elapsedMillis(attemptStarted) + " error=" + throwableText(t) + " http_status=" + responseStatus(response) + ".");
                                 if (running && openedCandidate.get()) {
                                     updateState(null, "Reconnecting", null, "Home status: " + t.getMessage());
                                 }
@@ -266,6 +291,7 @@ public class TunnelService extends Service {
                     CountDownLatch closed = new CountDownLatch(1);
                     AtomicBoolean openedCandidate = new AtomicBoolean(false);
                     AtomicReference<String> failure = new AtomicReference<>("");
+                    long attemptStarted = SystemClock.elapsedRealtime();
                     try {
                         Request request = webSocketRequest(candidate, "dashboard");
                         WebSocket socket = httpClient.newWebSocket(request, new WebSocketListener() {
@@ -283,12 +309,16 @@ public class TunnelService extends Service {
 
                             @Override
                             public void onClosed(WebSocket webSocket, int code, String reason) {
+                                if (openedCandidate.get()) {
+                                    append("Relay status stream disconnected relay=" + candidate + " duration_ms=" + elapsedMillis(attemptStarted) + " close_code=" + code + " close_reason=" + quoted(reason) + ".");
+                                }
                                 closed.countDown();
                             }
 
                             @Override
                             public void onFailure(WebSocket webSocket, Throwable t, Response response) {
                                 failure.set(t.getMessage());
+                                append("Relay status stream failure relay=" + candidate + " duration_ms=" + elapsedMillis(attemptStarted) + " error=" + throwableText(t) + " http_status=" + responseStatus(response) + ".");
                                 if (running && openedCandidate.get()) {
                                     updateState(null, null, "Check relay", "Relay status stream: " + t.getMessage());
                                 }
@@ -384,6 +414,9 @@ public class TunnelService extends Service {
     }
 
     private void append(String message) {
+        String diagnosticLine = diagnosticNow() + " " + message;
+        Log.i(LOG_TAG, message);
+        writeDiagnosticLog(diagnosticLine + System.lineSeparator());
         synchronized (STATE_LOCK) {
             State next = currentState.copy();
             next.lastMessage = message;
@@ -471,6 +504,96 @@ public class TunnelService extends Service {
         }
     }
 
+    private static String diagnosticNow() {
+        synchronized (DIAGNOSTIC_TIME_FORMAT) {
+            return DIAGNOSTIC_TIME_FORMAT.format(new Date());
+        }
+    }
+
+    private File diagnosticLogFile() {
+        File base = getExternalFilesDir(null);
+        if (base == null) {
+            base = getFilesDir();
+        }
+        return new File(new File(base, "logs"), "home-agent-" + diagnosticDate() + ".log");
+    }
+
+    private void writeDiagnosticLog(String line) {
+        synchronized (DIAGNOSTIC_LOG_LOCK) {
+            File file = diagnosticLogFile();
+            File directory = file.getParentFile();
+            if (directory == null || (!directory.isDirectory() && !directory.mkdirs())) {
+                Log.e(LOG_TAG, "Could not create diagnostic log directory");
+                return;
+            }
+            String today = diagnosticDate();
+            if (!today.equals(lastPrunedLogDate)) {
+                pruneDiagnosticLogs(directory);
+                lastPrunedLogDate = today;
+            }
+            byte[] data = line.getBytes(StandardCharsets.UTF_8);
+            if (file.length() > 0 && file.length() + data.length > MAX_DIAGNOSTIC_LOG_BYTES) {
+                File old = new File(file.getPath() + ".old");
+                if (old.exists() && !old.delete()) {
+                    Log.w(LOG_TAG, "Could not remove previous diagnostic log");
+                }
+                if (!file.renameTo(old)) {
+                    Log.w(LOG_TAG, "Could not rotate diagnostic log");
+                }
+            }
+            try (FileOutputStream output = new FileOutputStream(file, true)) {
+                output.write(data);
+            } catch (IOException ex) {
+                Log.e(LOG_TAG, "Could not write diagnostic log", ex);
+            }
+        }
+    }
+
+    private void pruneDiagnosticLogs(File directory) {
+        Calendar cutoff = Calendar.getInstance();
+        cutoff.set(Calendar.HOUR_OF_DAY, 0);
+        cutoff.set(Calendar.MINUTE, 0);
+        cutoff.set(Calendar.SECOND, 0);
+        cutoff.set(Calendar.MILLISECOND, 0);
+        cutoff.add(Calendar.DAY_OF_YEAR, -(logRetentionDays - 1));
+        File[] files = directory.listFiles((dir, name) ->
+                name.equals("home-agent.log") || name.equals("home-agent.log.old") ||
+                        (name.startsWith("home-agent-") && (name.endsWith(".log") || name.endsWith(".log.old"))));
+        if (files == null) {
+            return;
+        }
+        for (File candidate : files) {
+            if (candidate.lastModified() < cutoff.getTimeInMillis() && !candidate.delete()) {
+                Log.w(LOG_TAG, "Could not remove expired diagnostic log " + candidate.getName());
+            }
+        }
+    }
+
+    private static String diagnosticDate() {
+        synchronized (DIAGNOSTIC_DATE_FORMAT) {
+            return DIAGNOSTIC_DATE_FORMAT.format(new Date());
+        }
+    }
+
+    private static long elapsedMillis(long started) {
+        return Math.max(0, SystemClock.elapsedRealtime() - started);
+    }
+
+    private static String throwableText(Throwable throwable) {
+        if (throwable == null) {
+            return "none";
+        }
+        return throwable.getClass().getSimpleName() + ": " + emptyAs(throwable.getMessage(), "no message");
+    }
+
+    private static String responseStatus(Response response) {
+        return response == null ? "none" : response.code() + " " + response.message();
+    }
+
+    private static String quoted(String value) {
+        return "\"" + emptyAs(value, "").replace("\r", " ").replace("\n", " ") + "\"";
+    }
+
     private static void sleepQuietly(long millis) {
         try {
             Thread.sleep(millis);
@@ -545,7 +668,14 @@ public class TunnelService extends Service {
     private final class BridgeSession implements Runnable {
         private final Socket localSocket;
         private final AtomicBoolean closed = new AtomicBoolean(false);
+        private final AtomicLong localToRelayBytes = new AtomicLong();
+        private final AtomicLong localToRelayMessages = new AtomicLong();
+        private final AtomicLong relayToLocalBytes = new AtomicLong();
+        private final AtomicLong relayToLocalMessages = new AtomicLong();
+        private final AtomicReference<String> termination = new AtomicReference<>("running");
+        private final long startedAt = SystemClock.elapsedRealtime();
         private volatile WebSocket webSocket;
+        private volatile String selectedRelay = "none";
 
         BridgeSession(Socket localSocket) {
             this.localSocket = localSocket;
@@ -566,7 +696,10 @@ public class TunnelService extends Service {
                         break;
                     }
                     try {
+                        long dialStarted = SystemClock.elapsedRealtime();
                         connectRelay(candidate);
+                        selectedRelay = candidate;
+                        append("RDP session remote=" + remote + " connected relay=" + candidate + " dial_duration_ms=" + elapsedMillis(dialStarted) + ".");
                     } catch (Exception ex) {
                         lastError = candidate + ": " + ex.getMessage();
                         closeWebSocketOnly();
@@ -581,15 +714,17 @@ public class TunnelService extends Service {
                     break;
                 }
                 if (!connected && !closed.get()) {
+                    recordTermination("all_relay_urls_failed error=" + emptyAs(lastError, "unknown"));
                     append("RDP bridge failed: " + emptyAs(lastError, "all relay URLs failed"));
                 }
             } catch (Exception ex) {
+                recordTermination("bridge_error=" + throwableText(ex));
                 if (!closed.get()) {
                     append("RDP bridge failed: " + ex.getMessage());
                 }
             } finally {
                 close();
-                append("RDP connection closed from " + remote + ".");
+                append("RDP session remote=" + remote + " relay=" + selectedRelay + " ended duration_ms=" + elapsedMillis(startedAt) + " termination=" + termination.get() + " local_to_relay_bytes=" + localToRelayBytes.get() + " local_to_relay_messages=" + localToRelayMessages.get() + " relay_to_local_bytes=" + relayToLocalBytes.get() + " relay_to_local_messages=" + relayToLocalMessages.get() + ".");
             }
         }
 
@@ -609,19 +744,26 @@ public class TunnelService extends Service {
                 @Override
                 public void onMessage(WebSocket webSocket, ByteString bytes) {
                     try {
+                        byte[] payload = bytes.toByteArray();
                         OutputStream output = localSocket.getOutputStream();
                         synchronized (output) {
-                            output.write(bytes.toByteArray());
+                            output.write(payload);
                             output.flush();
                         }
+                        relayToLocalBytes.addAndGet(payload.length);
+                        relayToLocalMessages.incrementAndGet();
                     } catch (IOException ex) {
                         failure.set(ex);
+                        recordTermination("relay_to_local_write_error=" + throwableText(ex));
                         close();
                     }
                 }
 
                 @Override
                 public void onClosed(WebSocket webSocket, int code, String reason) {
+                    if (started.get()) {
+                        recordTermination("websocket_closed code=" + code + " reason=" + quoted(reason));
+                    }
                     paired.countDown();
                     if (started.get()) {
                         close();
@@ -631,6 +773,9 @@ public class TunnelService extends Service {
                 @Override
                 public void onFailure(WebSocket webSocket, Throwable t, Response response) {
                     failure.set(t);
+                    if (started.get()) {
+                        recordTermination("websocket_failure error=" + throwableText(t) + " http_status=" + responseStatus(response));
+                    }
                     paired.countDown();
                     if (started.get()) {
                         close();
@@ -651,6 +796,7 @@ public class TunnelService extends Service {
         }
 
         void close() {
+            recordTermination("closed_by_app");
             if (!closed.compareAndSet(false, true)) {
                 return;
             }
@@ -679,12 +825,22 @@ public class TunnelService extends Service {
             while (!closed.get() && (read = input.read(buffer)) >= 0) {
                 WebSocket socket = webSocket;
                 if (socket == null || !socket.send(ByteString.of(buffer, 0, read))) {
+                    recordTermination("local_to_relay_send_failed");
                     throw new IOException("relay WebSocket send failed");
                 }
+                localToRelayBytes.addAndGet(read);
+                localToRelayMessages.incrementAndGet();
                 while (!closed.get() && socket.queueSize() > 4L * 1024L * 1024L) {
                     sleepQuietly(10);
                 }
             }
+            if (!closed.get()) {
+                recordTermination("local_tcp_eof");
+            }
+        }
+
+        private void recordTermination(String cause) {
+            termination.compareAndSet("running", cause);
         }
     }
 }

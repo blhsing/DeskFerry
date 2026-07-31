@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 type closeWriter interface {
@@ -14,25 +15,51 @@ type closeReader interface {
 	CloseRead() error
 }
 
-func Pipe(a, b net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go copyHalf(&wg, a, b)
-	go copyHalf(&wg, b, a)
-	wg.Wait()
-	_ = a.Close()
-	_ = b.Close()
+type CopyResult struct {
+	Bytes         int64
+	CopyErr       error
+	CloseWriteErr error
+	CloseReadErr  error
 }
 
-func copyHalf(wg *sync.WaitGroup, dst, src net.Conn) {
+type PipeResult struct {
+	AToB      CopyResult
+	BToA      CopyResult
+	ACloseErr error
+	BCloseErr error
+	Duration  time.Duration
+}
+
+func Pipe(a, b net.Conn) {
+	_ = PipeWithResult(a, b)
+}
+
+// PipeWithResult copies both directions until each side ends and returns the
+// errors and byte counts that explain why the stream stopped. AToB describes
+// bytes read from a and written to b; BToA describes the reverse direction.
+func PipeWithResult(a, b net.Conn) PipeResult {
+	started := time.Now()
+	var result PipeResult
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go copyHalf(&wg, b, a, &result.AToB)
+	go copyHalf(&wg, a, b, &result.BToA)
+	wg.Wait()
+	result.ACloseErr = a.Close()
+	result.BCloseErr = b.Close()
+	result.Duration = time.Since(started)
+	return result
+}
+
+func copyHalf(wg *sync.WaitGroup, dst, src net.Conn, result *CopyResult) {
 	defer wg.Done()
-	_, _ = io.Copy(dst, src)
+	result.Bytes, result.CopyErr = io.Copy(dst, src)
 	if cw, ok := dst.(closeWriter); ok {
-		_ = cw.CloseWrite()
+		result.CloseWriteErr = cw.CloseWrite()
 	} else {
-		_ = dst.Close()
+		result.CloseWriteErr = dst.Close()
 	}
 	if cr, ok := src.(closeReader); ok {
-		_ = cr.CloseRead()
+		result.CloseReadErr = cr.CloseRead()
 	}
 }
