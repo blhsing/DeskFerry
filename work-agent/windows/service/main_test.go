@@ -3,6 +3,7 @@ package main
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestSplitRelayURLs(t *testing.T) {
@@ -94,5 +95,30 @@ func TestCleanAgentIdentity(t *testing.T) {
 	got := cleanAgentIdentity(" unit/agent:slot!* ")
 	if got != "unitagentslot" {
 		t.Fatalf("cleanAgentIdentity() = %q", got)
+	}
+}
+
+func TestReconnectDelayBacksOffDialFailures(t *testing.T) {
+	minBackoff := time.Second
+	maxBackoff := time.Minute
+
+	delay, next := reconnectDelay(minBackoff, minBackoff, maxBackoff, false)
+	if delay != time.Second || next != 2*time.Second {
+		t.Fatalf("first failure delay, next = %s, %s; want 1s, 2s", delay, next)
+	}
+
+	delay, next = reconnectDelay(maxBackoff, minBackoff, maxBackoff, false)
+	if delay != time.Minute || next != time.Minute {
+		t.Fatalf("capped failure delay, next = %s, %s; want 1m, 1m", delay, next)
+	}
+}
+
+func TestReconnectDelayResetsAfterConnection(t *testing.T) {
+	minBackoff := time.Second
+	maxBackoff := time.Minute
+
+	delay, next := reconnectDelay(maxBackoff, minBackoff, maxBackoff, true)
+	if delay != time.Second || next != time.Second {
+		t.Fatalf("connected delay, next = %s, %s; want 1s, 1s", delay, next)
 	}
 }

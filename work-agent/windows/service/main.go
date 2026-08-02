@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -67,6 +68,7 @@ func main() {
 	var uninstallMode bool
 	var statusMode bool
 	var selfTestMode bool
+	var updateServiceTarget string
 	flag.Var(&relayURLs, "relay-url", "relay service URL; repeat to add more relay URLs")
 	flag.StringVar(&proxyFlag, "proxy", "", "HTTP proxy for Azure relay WebSocket, or direct/env/auto")
 	flag.StringVar(&rdpFlag, "rdp", "", "local RDP target")
@@ -77,6 +79,7 @@ func main() {
 	flag.BoolVar(&uninstallMode, "uninstall", false, "stop and remove the Windows service")
 	flag.BoolVar(&statusMode, "status", false, "print Windows service status")
 	flag.BoolVar(&selfTestMode, "self-test", false, "test local RDP and relay WebSocket connectivity")
+	flag.StringVar(&updateServiceTarget, "update-service", "", "replace the installed service executable and restart it")
 	flag.Parse()
 	if path, err := diaglog.Enable("work-agent", true, logRetentionDays); err != nil {
 		log.Printf("persistent diagnostic logging unavailable: %v", err)
@@ -98,6 +101,12 @@ func main() {
 	}
 	if runningAsService {
 		if err := runService(relayURL, proxyFlag, rdpFlag); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if updateServiceTarget != "" {
+		if err := updateServiceBinary(updateServiceTarget); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -140,6 +149,122 @@ func main() {
 	defer stop()
 	if err := run(ctx, cfg); err != nil && ctx.Err() == nil {
 		log.Fatal(err)
+	}
+}
+
+func updateServiceBinary(target string) error {
+	source, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	source, err = filepath.Abs(source)
+	if err != nil {
+		return err
+	}
+	target, err = filepath.Abs(strings.TrimSpace(target))
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(source, target) {
+		return fmt.Errorf("update source and installed service path are the same: %s", target)
+	}
+	if !isElevated() {
+		verb, _ := windows.UTF16PtrFromString("runas")
+		exe, _ := windows.UTF16PtrFromString(source)
+		params, _ := windows.UTF16PtrFromString(joinWindowsArgs([]string{"-update-service", target}))
+		if err := windows.ShellExecute(0, verb, exe, params, nil, windows.SW_NORMAL); err != nil {
+			return fmt.Errorf("request elevation: %w", err)
+		}
+		fmt.Println("Elevation requested for DeskFerry Agent service update")
+		return nil
+	}
+
+	m, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("connect to service manager: %w", err)
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return fmt.Errorf("open service: %w", err)
+	}
+	defer s.Close()
+
+	staged := target + ".update"
+	previous := target + ".previous"
+	if err := copyExecutable(source, staged); err != nil {
+		return fmt.Errorf("stage service executable: %w", err)
+	}
+	defer os.Remove(staged)
+
+	status, err := s.Query()
+	if err != nil {
+		return fmt.Errorf("query service: %w", err)
+	}
+	if status.State != svc.Stopped {
+		if _, err := s.Control(svc.Stop); err != nil {
+			return fmt.Errorf("stop service: %w", err)
+		}
+		if err := waitForServiceState(s, svc.Stopped, 20*time.Second); err != nil {
+			return err
+		}
+	}
+
+	_ = os.Remove(previous)
+	if err := os.Rename(target, previous); err != nil {
+		_ = s.Start()
+		return fmt.Errorf("preserve previous service executable: %w", err)
+	}
+	if err := os.Rename(staged, target); err != nil {
+		_ = os.Rename(previous, target)
+		_ = s.Start()
+		return fmt.Errorf("install service executable: %w", err)
+	}
+	if err := s.Start(); err != nil {
+		_ = os.Remove(target)
+		_ = os.Rename(previous, target)
+		_ = s.Start()
+		return fmt.Errorf("start updated service (previous executable restored): %w", err)
+	}
+	if err := waitForServiceState(s, svc.Running, 20*time.Second); err != nil {
+		return err
+	}
+	fmt.Printf("Updated and started DeskFerry Agent service at %s\n", target)
+	return nil
+}
+
+func copyExecutable(source, target string) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0755)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func waitForServiceState(s *mgr.Service, want svc.State, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		status, err := s.Query()
+		if err != nil {
+			return err
+		}
+		if status.State == want {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for service state %s, current state is %s", serviceState(want), serviceState(status.State))
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 }
 
@@ -456,26 +581,35 @@ func runWebSocketSlot(ctx context.Context, cfg config, slot int, agentID string)
 	maxBackoff, _ := time.ParseDuration(cfg.MaxBackoff)
 	backoff := minBackoff
 	for ctx.Err() == nil {
-		err := runWebSocketOnce(ctx, cfg, slot, agentID)
+		connected, err := runWebSocketOnce(ctx, cfg, slot, agentID)
 		if ctx.Err() != nil {
 			return
 		}
-		log.Printf("websocket agent slot %d for relay %s disconnected: %v; reconnecting in %s", slot, cfg.RelayAddr, err, backoff)
-		timer := time.NewTimer(backoff)
+		delay, nextBackoff := reconnectDelay(backoff, minBackoff, maxBackoff, connected)
+		backoff = nextBackoff
+		log.Printf("websocket agent slot %d for relay %s disconnected: %v; reconnecting in %s", slot, cfg.RelayAddr, err, delay)
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return
 		case <-timer.C:
 		}
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
 	}
 }
 
-func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string) error {
+func reconnectDelay(backoff, minBackoff, maxBackoff time.Duration, connected bool) (time.Duration, time.Duration) {
+	if connected {
+		return minBackoff, minBackoff
+	}
+	nextBackoff := backoff * 2
+	if nextBackoff > maxBackoff {
+		nextBackoff = maxBackoff
+	}
+	return backoff, nextBackoff
+}
+
+func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string) (bool, error) {
 	connectedAt := time.Now()
 	headers := http.Header{}
 	if agentID != "" {
@@ -484,19 +618,19 @@ func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string)
 	}
 	ws, err := tunnel.DialWebSocketWithHeaders(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgent, "", headers)
 	if err != nil {
-		return fmt.Errorf("dial after %s: %w", time.Since(connectedAt).Round(time.Millisecond), err)
+		return false, fmt.Errorf("dial after %s: %w", time.Since(connectedAt).Round(time.Millisecond), err)
 	}
 	defer tunnel.CloseWebSocket(ws)
 
 	log.Printf("websocket agent slot %d connected to relay %s via %s", slot, cfg.RelayAddr, tunnel.ProxySpecForLog(cfg.Proxy))
 	if err := tunnel.AwaitWebSocketStart(ctx, ws); err != nil {
-		return fmt.Errorf("wait for pairing after %s: %w", time.Since(connectedAt).Round(time.Millisecond), err)
+		return true, fmt.Errorf("wait for pairing after %s: %w", time.Since(connectedAt).Round(time.Millisecond), err)
 	}
 	pairedAt := time.Now()
 	log.Printf("websocket agent slot %d paired on relay %s after idle=%s; forwarding to %s", slot, cfg.RelayAddr, pairedAt.Sub(connectedAt).Round(time.Millisecond), cfg.RDPAddr)
 	stream := tunnel.WebSocketNetConn(ctx, ws)
 	handleStream(ctx, stream, cfg.RDPAddr, cfg.RelayAddr, slot)
-	return fmt.Errorf("paired stream completed after %s", time.Since(pairedAt).Round(time.Millisecond))
+	return true, fmt.Errorf("paired stream completed after %s", time.Since(pairedAt).Round(time.Millisecond))
 }
 
 func loadOrCreateAgentID() (string, error) {

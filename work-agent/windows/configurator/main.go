@@ -72,6 +72,13 @@ func main() {
 		return
 	}
 	if hasElevatedAction(os.Args[1:]) {
+		if !isElevated() {
+			if err := relaunchCurrentArgsElevated(os.Args[1:]); err != nil {
+				windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
+				os.Exit(1)
+			}
+			return
+		}
 		runElevatedAction(os.Args[1:])
 		return
 	}
@@ -914,6 +921,14 @@ func relaunchElevatedAction(action string, opts actionOptions) error {
 	}
 	if opts.RelayURL != "" {
 		args = append(args, "-relay-url", opts.RelayURL)
+	}
+	return shellExecute("runas", exePath, joinWindowsArgs(args), "")
+}
+
+func relaunchCurrentArgsElevated(args []string) error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
 	}
 	return shellExecute("runas", exePath, joinWindowsArgs(args), "")
 }
