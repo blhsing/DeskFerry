@@ -41,6 +41,7 @@ The Android app is a home-agent client like the Windows and macOS home agents. I
 - [URL Configuration](#url-configuration)
 - [Troubleshooting](#troubleshooting)
   - [Diagnostic Logs](#diagnostic-logs)
+  - [Repeated RDP Disconnects After A Network Drop](#repeated-rdp-disconnects-after-a-network-drop)
   - [Agent Self-Test Fails Through Proxy](#agent-self-test-fails-through-proxy)
   - [Endpoint Protection Flags Windows Binaries](#endpoint-protection-flags-windows-binaries)
   - [Home App Connects But RDP Fails](#home-app-connects-but-rdp-fails)
@@ -94,7 +95,7 @@ Build the deployable zip:
 .\build\build-azure-relay.ps1
 ```
 
-Deploy `dist\azure-relay\deskferry-azure-relay.zip` to the Azure App Service. Confirm WebSockets are enabled in App Service configuration.
+Deploy `dist\azure-relay\deskferry-azure-relay.zip` to the Azure App Service. Confirm WebSockets are enabled in App Service configuration. The package enables ASP.NET Core stdout logging at `%HOME%\LogFiles\Application\deskferry-stdout`; do not disable that setting when replacing `web.config`.
 
 Dashboard and health endpoints:
 
@@ -129,10 +130,11 @@ Artifact:
 dist\bin\deskferry-relay-linux-amd64
 ```
 
-Deploy by copying the binary to `/opt/deskferry/go-relay/deskferry-relay` and running:
+Deploy through a temporary upload, replace the installed binary, restart the service, and remove the upload so old or staging binaries are not retained:
 
-```text
-/opt/deskferry/go-relay/deskferry-relay -listen 0.0.0.0:80
+```sh
+scp dist/bin/deskferry-relay-linux-amd64 opc@217.142.228.117:/tmp/deskferry-relay-linux-amd64
+ssh opc@217.142.228.117 'sudo install -m 0755 /tmp/deskferry-relay-linux-amd64 /opt/deskferry/go-relay/deskferry-relay && sudo systemctl restart deskferry-relay.service && sudo rm -f /tmp/deskferry-relay-linux-amd64'
 ```
 
 The current OCI host is hardened for a small Always Free VM: it uses a 2 GiB swap file, persistent journald, a 60-second systemd runtime watchdog through `softdog`, kernel panic recovery for hung tasks, and a local health timer named `deskferry-relay-healthcheck.timer`. The timer checks `http://127.0.0.1/relay/health` every minute, restarts `deskferry-relay.service` when the relay process stops responding, and reboots the VM after three consecutive failed post-restart checks.
@@ -529,11 +531,27 @@ Windows and macOS accept `-log-retention-days <days>`. Android exposes the equiv
 
 Relay diagnostics are written to standard output and retained by the hosting platform:
 
-- Azure App Service application logging should be enabled at `Information` level. The production service uses seven-day filesystem HTTP-log retention plus filesystem application-log size and file-count limits. Exact application-log retention by days requires Azure Blob Storage or another Azure Monitor destination because App Service filesystem application logs do not expose a day-retention property.
+- The Azure relay installs a UTC, single-line console logger and its `web.config` writes ASP.NET Core stdout to `%HOME%\LogFiles\Application\deskferry-stdout`. App Service application logging should also remain enabled at `Information` level. The production service uses seven-day filesystem HTTP-log retention plus filesystem application-log size and file-count limits. Exact application-log retention by days requires Azure Blob Storage or another Azure Monitor destination because App Service filesystem application logs do not expose a day-retention property.
 - The OCI systemd host stores Go relay output in persistent journald. Its deployed journal policy uses `MaxRetentionSec=7day` together with a disk-usage cap. Inspect it with `journalctl -u deskferry-relay.service --since '7 days ago'`.
 - Python relay deployments also log connection, pairing, bridge, and disconnect lifecycle events through their ASGI server output; configure retention in the process supervisor or hosting platform.
 
 When investigating a disconnect, collect the home-agent and work-agent entries covering the same timestamp, then correlate them with Azure App Service logs or `journalctl` on the relay that was selected. Pair identifiers and close details distinguish a relay-side termination from a home-to-relay, work-to-relay, or local-RDP failure.
+
+### Repeated RDP Disconnects After A Network Drop
+
+Some corporate proxies expire outbound WebSockets on a fixed interval even while the local RDP session remains active. A reconnect or `replaced waiting agent` message roughly every 15 minutes points to that network path rather than an RDP authentication failure.
+
+For resumable pairs, the relay must release the interrupted bridge before it waits for replacement `resume` sockets. Current Azure and Go relays abort obsolete transports immediately and bound graceful WebSocket closes so a missing close handshake cannot hold the resume path for several minutes. Relay logs include `resume rejected`, `resume attachment waiting`, and `resume attachment released` events for correlation with the agent logs.
+
+After a relay change, verify the deployed resume behavior with:
+
+```powershell
+$env:DESKFERRY_COMPAT_RELAY_URL='https://test-officialwebsite.azurewebsites.net'
+$env:DESKFERRY_COMPAT_PROXY='direct'
+go test .\internal\tunnel -run TestExternalRelayResumption -count=1 -v -timeout 60s
+```
+
+The test deliberately drops the relay transport and succeeds only if both sides reattach and continue the same logical stream. Deploying or restarting a relay still interrupts active sessions because resumable state is in memory.
 
 ### Agent Self-Test Fails Through Proxy
 
@@ -563,10 +581,9 @@ DeskFerry's locally built Windows executables are unsigned. Some heuristic endpo
 3. Submit the artifact to the security vendor as a false positive.
 4. Build the unoptimized diagnostic binaries described under [Build Commands](#build-commands) to determine whether the verdict is specific to compiler layout.
 
-Stop the Windows home app before replacing its executable. Preserve the previous file so the installation can be restored if the security product alters the replacement. The work agent's `-update-service` command performs a transactional service update and retains `agent.exe.previous` automatically:
+Stop the Windows home app before replacing its executable and verify the new artifact hash before installation. Do not retain renamed copies of old executables after a successful upgrade. The work agent's `-update-service` command uses `agent.exe.previous` only as a transactional rollback file and removes it after the upgraded service reaches the running state:
 
 ```powershell
-Copy-Item "$env:LOCALAPPDATA\Programs\DeskFerry\DeskFerryHome.exe" "$env:LOCALAPPDATA\Programs\DeskFerry\DeskFerryHome.previous.exe" -Force
 Copy-Item ".\dist\bin\deskferry-home-windows-amd64-debug.exe" "$env:LOCALAPPDATA\Programs\DeskFerry\DeskFerryHome.exe" -Force
 .\dist\bin\deskferry-agent-windows-amd64-debug.exe -update-service D:\DeskFerry\Agent\agent.exe
 ```

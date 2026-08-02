@@ -6,6 +6,13 @@ using System.Text;
 using System.Threading.Channels;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Logging.ClearProviders();
+builder.Logging.AddSimpleConsole(options =>
+{
+    options.SingleLine = true;
+    options.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ ";
+    options.UseUtcTimestamp = true;
+});
 builder.Services.AddSingleton<RelayHub>();
 
 var app = builder.Build();
@@ -661,13 +668,18 @@ sealed class RelayHub
     {
         sessionId = CleanSessionValue(sessionId);
         side = side?.Trim().ToLowerInvariant();
-        var key = $"{RoomId(token)}/{sessionId}";
+        var roomId = RoomId(token);
+        var key = $"{roomId}/{sessionId}";
         if (sessionId.Length == 0 || side is not ("agent" or "client") || !_sessions.TryGetValue(key, out var session))
         {
+            _log.LogInformation("resume rejected room={Room} session={Session} side={Side} remote={Remote}", roomId, sessionId, side, remote);
             await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "unknown resumable session");
             return;
         }
-        if (!await session.AttachAsync(side, socket, remote, abort))
+        _log.LogInformation("resume attachment waiting room={Room} session={Session} side={Side} remote={Remote}", roomId, sessionId, side, remote);
+        var attached = await session.AttachAsync(side, socket, remote, abort);
+        _log.LogInformation("resume attachment released room={Room} session={Session} side={Side} remote={Remote} attached={Attached}", roomId, sessionId, side, remote, attached);
+        if (!attached)
         {
             await CloseQuietlyAsync(socket, WebSocketCloseStatus.EndpointUnavailable, "resumable session unavailable");
         }
@@ -889,11 +901,13 @@ sealed class RelayHub
         {
             if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
             {
-                await socket.CloseAsync(status, reason, CancellationToken.None);
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await socket.CloseAsync(status, reason, timeout.Token);
             }
         }
         catch
         {
+            socket.Abort();
         }
     }
 }
@@ -1146,11 +1160,13 @@ sealed class RelayRoom
         {
             if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
             {
-                await socket.CloseAsync(status, reason, CancellationToken.None);
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await socket.CloseAsync(status, reason, timeout.Token);
             }
         }
         catch
         {
+            socket.Abort();
         }
     }
 }
@@ -1218,16 +1234,18 @@ sealed class ResumeSession
                 var (first, second) = await BridgeOnceAsync(agent, client);
                 if (first.CloseStatus == WebSocketCloseStatus.NormalClosure)
                 {
-                    await RelayRoom.CloseQuietlyAsync(agent, WebSocketCloseStatus.NormalClosure, "session closed");
-                    await RelayRoom.CloseQuietlyAsync(client, WebSocketCloseStatus.NormalClosure, "session closed");
+                    await Task.WhenAll(
+                        RelayRoom.CloseQuietlyAsync(agent, WebSocketCloseStatus.NormalClosure, "session closed"),
+                        RelayRoom.CloseQuietlyAsync(client, WebSocketCloseStatus.NormalClosure, "session closed"));
                     agentAttachment?.Done.TrySetResult();
                     clientAttachment?.Done.TrySetResult();
                     return;
                 }
 
                 _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} trigger_direction={TriggerDirection} trigger_error={TriggerError} other_direction={OtherDirection} other_error={OtherError}", Room.Id, pairId, Id, first.Direction, first.Error, second.Direction, second.Error);
-                await RelayRoom.CloseQuietlyAsync(agent, ResumeCloseStatus, "resume session");
-                await RelayRoom.CloseQuietlyAsync(client, ResumeCloseStatus, "resume session");
+                await Task.WhenAll(
+                    RelayRoom.CloseQuietlyAsync(agent, ResumeCloseStatus, "resume session"),
+                    RelayRoom.CloseQuietlyAsync(client, ResumeCloseStatus, "resume session"));
                 agentAttachment?.Done.TrySetResult();
                 clientAttachment?.Done.TrySetResult();
 
@@ -1246,8 +1264,9 @@ sealed class ResumeSession
                 client = clientAttachment.Socket;
                 if (!await TrySendControlAsync(agent, $"resume {Id}") || !await TrySendControlAsync(client, $"resume {Id}"))
                 {
-                    await RelayRoom.CloseQuietlyAsync(agent, ResumeCloseStatus, "retry resume");
-                    await RelayRoom.CloseQuietlyAsync(client, ResumeCloseStatus, "retry resume");
+                    await Task.WhenAll(
+                        RelayRoom.CloseQuietlyAsync(agent, ResumeCloseStatus, "retry resume"),
+                        RelayRoom.CloseQuietlyAsync(client, ResumeCloseStatus, "retry resume"));
                     agentAttachment.Done.TrySetResult();
                     clientAttachment.Done.TrySetResult();
                     continue;

@@ -227,7 +227,15 @@ func updateServiceBinary(target string) error {
 		return fmt.Errorf("start updated service (previous executable restored): %w", err)
 	}
 	if err := waitForServiceState(s, svc.Running, 20*time.Second); err != nil {
-		return err
+		_, _ = s.Control(svc.Stop)
+		_ = waitForServiceState(s, svc.Stopped, 20*time.Second)
+		_ = os.Remove(target)
+		_ = os.Rename(previous, target)
+		_ = s.Start()
+		return fmt.Errorf("updated service did not reach running state (previous executable restored): %w", err)
+	}
+	if err := os.Remove(previous); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove previous service executable: %w", err)
 	}
 	fmt.Printf("Updated and started DeskFerry Agent service at %s\n", target)
 	return nil

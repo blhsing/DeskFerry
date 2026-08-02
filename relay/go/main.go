@@ -408,15 +408,21 @@ func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.C
 }
 
 func (h *RelayHub) ServeResume(ctx context.Context, token string, c *websocket.Conn, remote, sessionID, side string) {
-	key := roomID(token) + "/" + cleanSessionValue(sessionID)
+	room := roomID(token)
+	sessionID = cleanSessionValue(sessionID)
+	key := room + "/" + sessionID
 	h.mu.Lock()
 	session := h.sessions[key]
 	h.mu.Unlock()
 	if session == nil || (side != "agent" && side != "client") {
+		log.Printf("resume rejected room=%s session=%s side=%s remote=%s", room, sessionID, side, remote)
 		closeQuietly(c, websocket.StatusPolicyViolation, "unknown resumable session")
 		return
 	}
-	if !session.Attach(ctx, side, c, remote) {
+	log.Printf("resume attachment waiting room=%s session=%s side=%s remote=%s", room, sessionID, side, remote)
+	attached := session.Attach(ctx, side, c, remote)
+	log.Printf("resume attachment released room=%s session=%s side=%s remote=%s attached=%t", room, sessionID, side, remote, attached)
+	if !attached {
 		closeQuietly(c, websocket.StatusTryAgainLater, "resumable session unavailable")
 	}
 }
@@ -901,8 +907,8 @@ func (s *ResumeSession) Run(agent, client *websocket.Conn, clientDone chan struc
 			return
 		}
 		log.Printf("resumable bridge interrupted room=%s pair=%d session=%s trigger_direction=%s trigger_error=%v other_direction=%s other_error=%v", s.Room.ID, pairID, s.ID, first.Direction, first.Err, second.Direction, second.Err)
-		closeQuietly(agent, websocket.StatusServiceRestart, "resume session")
-		closeQuietly(client, websocket.StatusServiceRestart, "resume session")
+		abortQuietly(agent)
+		abortQuietly(client)
 		if agentAttachment != nil {
 			closeOnce(agentAttachment.Done)
 		}
@@ -1083,6 +1089,16 @@ func closeQuietly(c *websocket.Conn, status websocket.StatusCode, reason string)
 		return
 	}
 	_ = c.Close(status, reason)
+}
+
+// Resume peers must not wait for a close handshake from a transport that may
+// already have vanished behind a proxy. Replacement sockets carry the
+// protocol-level continuation, so discard the obsolete transport immediately.
+func abortQuietly(c *websocket.Conn) {
+	if c == nil {
+		return
+	}
+	_ = c.CloseNow()
 }
 
 func closeOnce(ch chan struct{}) {

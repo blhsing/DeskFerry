@@ -45,6 +45,8 @@ Service layout:
 /etc/systemd/system/deskferry-relay.service
 ```
 
+Deploy through `/tmp`, replace the installed binary, restart the service, and delete the temporary upload. Do not retain old relay binaries alongside the active executable.
+
 The systemd service uses:
 
 ```text
@@ -65,7 +67,7 @@ curl -fsS 'http://127.0.0.1/relay/status?room=b'
 
 ## Diagnostics And Retention
 
-The relay writes structured connection lifecycle messages to standard output, including roles, room names, pairing identifiers, bridge byte/message totals, duration, close status and reason, socket state, cancellation state, and errors. It does not intentionally log tunnel payload contents or credentials.
+The relay writes structured connection lifecycle messages to standard output, including roles, room names, pairing identifiers, bridge byte/message totals, duration, close status and reason, socket state, cancellation state, errors, and `resume rejected`, `resume attachment waiting`, and `resume attachment released` events. It does not intentionally log tunnel payload contents or credentials.
 
 Under systemd, inspect these messages with:
 
