@@ -1,6 +1,9 @@
 package tunnel
 
 import (
+	"context"
+	"errors"
+	"net"
 	"net/http"
 	"testing"
 )
@@ -65,13 +68,47 @@ func TestHTTPSRelayThroughProxyUsesStandardProxyTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("transport = %T, want *http.Transport", client.Transport)
 	}
-	if transport.DialContext != nil {
-		t.Fatal("DialContext is set, want standard HTTPS proxy transport")
+	if transport.DialContext == nil {
+		t.Fatal("DialContext is nil, want DNS-resilient standard proxy transport")
 	}
 	if transport.Proxy == nil {
 		t.Fatal("Proxy is nil, want standard HTTPS proxy transport")
 	}
 }
+
+func TestDNSFallbackDialerUsesCachedAddressWhenLookupFails(t *testing.T) {
+	lookupCalls := 0
+	dialed := make([]string, 0, 2)
+	d := &dnsFallbackDialer{
+		cache: make(map[string][]net.IPAddr),
+		lookup: func(context.Context, string) ([]net.IPAddr, error) {
+			lookupCalls++
+			if lookupCalls == 1 {
+				return []net.IPAddr{{IP: net.ParseIP("192.0.2.10")}}, nil
+			}
+			return nil, errors.New("temporary DNS failure")
+		},
+		dial: func(_ context.Context, _, address string) (net.Conn, error) {
+			dialed = append(dialed, address)
+			return &stubConn{}, nil
+		},
+	}
+
+	for range 2 {
+		conn, err := d.DialContext(context.Background(), "tcp", "relay.example:443")
+		if err != nil {
+			t.Fatalf("DialContext: %v", err)
+		}
+		_ = conn.Close()
+	}
+	if len(dialed) != 2 || dialed[0] != "192.0.2.10:443" || dialed[1] != "192.0.2.10:443" {
+		t.Fatalf("dialed = %v, want cached relay address twice", dialed)
+	}
+}
+
+type stubConn struct{ net.Conn }
+
+func (*stubConn) Close() error { return nil }
 
 func TestHTTPSProxyURLIsAccepted(t *testing.T) {
 	proxyURL, err := resolveProxyURL("relay.example:443", "https://proxy.example:8443")

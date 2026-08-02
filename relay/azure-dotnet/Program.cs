@@ -13,6 +13,21 @@ builder.Logging.AddSimpleConsole(options =>
     options.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ ";
     options.UseUtcTimestamp = true;
 });
+if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("WEBSITE_INSTANCE_ID")) &&
+    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("HOME")))
+{
+    try
+    {
+        builder.Logging.AddProvider(new RelayFileLoggerProvider(Path.Combine(
+            Environment.GetEnvironmentVariable("HOME")!,
+            "LogFiles",
+            "Application")));
+    }
+    catch (Exception exception)
+    {
+        Console.Error.WriteLine($"DeskFerry direct file logger unavailable: {exception.Message}");
+    }
+}
 builder.Services.AddSingleton<RelayHub>();
 
 var app = builder.Build();

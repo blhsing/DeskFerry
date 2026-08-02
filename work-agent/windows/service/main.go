@@ -805,7 +805,7 @@ func handleStream(ctx context.Context, stream net.Conn, rdpAddr, relayAddr strin
 	}
 	log.Printf("RDP stream slot=%d relay=%s target=%s opened local=%s remote=%s dial_duration=%s", slot, relayAddr, rdpAddr, rdpConn.LocalAddr(), rdpConn.RemoteAddr(), time.Since(started).Round(time.Millisecond))
 	result := tunnel.PipeWithResult(stream, rdpConn)
-	log.Printf("RDP stream slot=%d relay=%s target=%s ended duration=%s relay_to_rdp_bytes=%d relay_to_rdp_error=%v relay_to_rdp_half_close_error=%v rdp_to_relay_bytes=%d rdp_to_relay_error=%v rdp_to_relay_half_close_error=%v relay_close_error=%v rdp_close_error=%v", slot, relayAddr, rdpAddr, result.Duration.Round(time.Millisecond), result.AToB.Bytes, result.AToB.CopyErr, result.AToB.CloseWriteErr, result.BToA.Bytes, result.BToA.CopyErr, result.BToA.CloseWriteErr, result.ACloseErr, result.BCloseErr)
+	log.Printf("RDP stream slot=%d relay=%s target=%s ended duration=%s end_initiator=%s relay_to_rdp_bytes=%d relay_to_rdp_error=%v relay_to_rdp_half_close_error=%v rdp_to_relay_bytes=%d rdp_to_relay_error=%v rdp_to_relay_half_close_error=%v relay_close_error=%v rdp_close_error=%v", slot, relayAddr, rdpAddr, result.Duration.Round(time.Millisecond), result.EndInitiator("relay", "local_rdp"), result.AToB.Bytes, result.AToB.CopyErr, result.AToB.CloseWriteErr, result.BToA.Bytes, result.BToA.CopyErr, result.BToA.CloseWriteErr, result.ACloseErr, result.BCloseErr)
 }
 
 func installScheduledTask(relayURL, proxyFlag, rdpFlag string) error {

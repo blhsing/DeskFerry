@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -35,6 +36,26 @@ func TestPipeWithResultReportsBothDirections(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("PipeWithResult did not finish")
+	}
+}
+
+func TestPipeEndInitiator(t *testing.T) {
+	tests := []struct {
+		name   string
+		result PipeResult
+		want   string
+	}{
+		{name: "local", result: PipeResult{AToB: CopyResult{CopyErr: errors.New("local closed")}}, want: "local_rdp"},
+		{name: "relay", result: PipeResult{BToA: CopyResult{CopyErr: errors.New("relay closed")}}, want: "relay"},
+		{name: "both", result: PipeResult{AToB: CopyResult{CopyErr: errors.New("a")}, BToA: CopyResult{CopyErr: errors.New("b")}}, want: "both"},
+		{name: "clean", result: PipeResult{}, want: "clean_or_unknown"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.result.EndInitiator("local_rdp", "relay"); got != test.want {
+				t.Fatalf("EndInitiator = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

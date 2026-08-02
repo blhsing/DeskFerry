@@ -95,7 +95,13 @@ Build the deployable zip:
 .\build\build-azure-relay.ps1
 ```
 
-Deploy `dist\azure-relay\deskferry-azure-relay.zip` to the Azure App Service. Confirm WebSockets are enabled in App Service configuration. The package enables ASP.NET Core stdout logging at `%HOME%\LogFiles\Application\deskferry-stdout`; do not disable that setting when replacing `web.config`.
+Deploy `dist\azure-relay\deskferry-azure-relay.zip` to the Azure App Service with Azure CLI:
+
+```powershell
+az webapp deploy --resource-group OfficialWebsite --name test-officialWebSite --src-path .\dist\azure-relay\deskferry-azure-relay.zip --type zip --clean true --restart true --track-status true
+```
+
+The authenticated Kudu Zip Deploy page is the fallback when Azure CLI is unavailable. Confirm WebSockets are enabled in App Service configuration. On App Service, the relay writes directly to `%HOME%\LogFiles\Application\deskferry-relay-<instance>-<pid>.log`; this avoids depending on ANCM stdout capture.
 
 Dashboard and health endpoints:
 
@@ -137,7 +143,7 @@ scp dist/bin/deskferry-relay-linux-amd64 opc@217.142.228.117:/tmp/deskferry-rela
 ssh opc@217.142.228.117 'sudo install -m 0755 /tmp/deskferry-relay-linux-amd64 /opt/deskferry/go-relay/deskferry-relay && sudo systemctl restart deskferry-relay.service && sudo rm -f /tmp/deskferry-relay-linux-amd64'
 ```
 
-The current OCI host is hardened for a small Always Free VM: it uses a 2 GiB swap file, persistent journald, a 60-second systemd runtime watchdog through `softdog`, kernel panic recovery for hung tasks, and a local health timer named `deskferry-relay-healthcheck.timer`. The timer checks `http://127.0.0.1/relay/health` every minute, restarts `deskferry-relay.service` when the relay process stops responding, and reboots the VM after three consecutive failed post-restart checks.
+The current OCI host is hardened for a small Always Free VM: it uses a 2 GiB swap file, persistent journald, a five-minute systemd runtime watchdog through `softdog`, kernel panic recovery for hung tasks, and a local health timer named `deskferry-relay-healthcheck.timer`. The longer watchdog window avoids resetting a resource-constrained VM during short hypervisor stalls while still recovering sustained hangs. The timer checks `http://127.0.0.1/relay/health` every minute, restarts `deskferry-relay.service` when the relay process stops responding, and reboots the VM after three consecutive failed post-restart checks.
 
 ### 3. Choose A Room URL
 
@@ -531,7 +537,7 @@ Windows and macOS accept `-log-retention-days <days>`. Android exposes the equiv
 
 Relay diagnostics are written to standard output and retained by the hosting platform:
 
-- The Azure relay installs a UTC, single-line console logger and its `web.config` writes ASP.NET Core stdout to `%HOME%\LogFiles\Application\deskferry-stdout`. App Service application logging should also remain enabled at `Information` level. The production service uses seven-day filesystem HTTP-log retention plus filesystem application-log size and file-count limits. Exact application-log retention by days requires Azure Blob Storage or another Azure Monitor destination because App Service filesystem application logs do not expose a day-retention property.
+- The Azure relay installs UTC, single-line console logging and also writes directly to `%HOME%\LogFiles\Application\deskferry-relay-<instance>-<pid>.log`. Direct file logging remains available when the App Service ANCM stdout capture file is empty. App Service application logging should remain enabled at `Information` level. The production service uses seven-day filesystem HTTP-log retention plus filesystem application-log size and file-count limits. Exact application-log retention by days requires Azure Blob Storage or another Azure Monitor destination because App Service filesystem application logs do not expose a day-retention property.
 - The OCI systemd host stores Go relay output in persistent journald. Its deployed journal policy uses `MaxRetentionSec=7day` together with a disk-usage cap. Inspect it with `journalctl -u deskferry-relay.service --since '7 days ago'`.
 - Python relay deployments also log connection, pairing, bridge, and disconnect lifecycle events through their ASGI server output; configure retention in the process supervisor or hosting platform.
 
@@ -552,6 +558,8 @@ go test .\internal\tunnel -run TestExternalRelayResumption -count=1 -v -timeout 
 ```
 
 The test deliberately drops the relay transport and succeeds only if both sides reattach and continue the same logical stream. Deploying or restarting a relay still interrupts active sessions because resumable state is in memory.
+
+Agents cache successful relay DNS answers for the lifetime of the process. If a later DNS lookup fails transiently, reconnect attempts try the cached addresses while preserving the relay hostname for TLS validation. Session-end log entries include `end_initiator=local_rdp`, `end_initiator=relay`, or `end_initiator=both` to distinguish a local RDP socket close from a relay-side interruption.
 
 ### Agent Self-Test Fails Through Proxy
 
@@ -604,7 +612,7 @@ Check:
 
 ### OCI Relay Becomes Unresponsive
 
-The OCI Go relay is supervised by `deskferry-relay.service`, a local health timer, and systemd's runtime watchdog:
+The OCI Go relay is supervised by `deskferry-relay.service`, a local health timer, and systemd's five-minute runtime watchdog:
 
 ```bash
 systemctl status deskferry-relay.service

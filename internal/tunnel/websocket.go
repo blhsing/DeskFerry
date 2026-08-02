@@ -10,9 +10,74 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"nhooyr.io/websocket"
 )
+
+type dnsFallbackDialer struct {
+	mu     sync.RWMutex
+	cache  map[string][]net.IPAddr
+	lookup func(context.Context, string) ([]net.IPAddr, error)
+	dial   func(context.Context, string, string) (net.Conn, error)
+}
+
+var resilientDNSDialer = newDNSFallbackDialer()
+
+func newDNSFallbackDialer() *dnsFallbackDialer {
+	var dialer net.Dialer
+	return &dnsFallbackDialer{
+		cache:  make(map[string][]net.IPAddr),
+		lookup: net.DefaultResolver.LookupIPAddr,
+		dial:   dialer.DialContext,
+	}
+}
+
+func (d *dnsFallbackDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || net.ParseIP(host) != nil {
+		return d.dial(ctx, network, address)
+	}
+
+	addresses, lookupErr := d.lookup(ctx, host)
+	if lookupErr == nil && len(addresses) == 0 {
+		lookupErr = fmt.Errorf("resolver returned no addresses")
+	}
+	if lookupErr == nil && len(addresses) > 0 {
+		d.mu.Lock()
+		d.cache[host] = append([]net.IPAddr(nil), addresses...)
+		d.mu.Unlock()
+	} else {
+		d.mu.RLock()
+		addresses = append([]net.IPAddr(nil), d.cache[host]...)
+		d.mu.RUnlock()
+		if len(addresses) == 0 {
+			return nil, fmt.Errorf("resolve %s: %w", host, lookupErr)
+		}
+	}
+
+	var dialErr error
+	for _, candidate := range addresses {
+		if network == "tcp4" && candidate.IP.To4() == nil {
+			continue
+		}
+		if network == "tcp6" && candidate.IP.To4() != nil {
+			continue
+		}
+		conn, err := d.dial(ctx, network, net.JoinHostPort(candidate.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		dialErr = err
+	}
+	if dialErr == nil {
+		dialErr = fmt.Errorf("no %s address available", network)
+	}
+	if lookupErr != nil {
+		return nil, fmt.Errorf("dial %s using cached DNS after %v: %w", address, lookupErr, dialErr)
+	}
+	return nil, fmt.Errorf("dial %s: %w", address, dialErr)
+}
 
 const (
 	RoleProbe     = "probe"
@@ -218,6 +283,7 @@ func webSocketHTTPClient(relayAddr, proxySpec string) *http.Client {
 			MinVersion: tls.VersionTLS12,
 			ServerName: HostFromRelayAddress(relayAddr),
 		},
+		DialContext: resilientDNSDialer.DialContext,
 	}
 	if endpoint, err := WebSocketEndpoint(relayAddr); err == nil {
 		if endpointURL, err := url.Parse(endpoint); err == nil && endpointURL.Scheme == "ws" {
@@ -245,8 +311,7 @@ func webSocketProxyURL(targetAddr, proxySpec string) (*url.URL, error) {
 
 func proxyConnectDialContext(proxyURL *url.URL) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		var dialer net.Dialer
-		conn, err := dialer.DialContext(ctx, network, canonicalProxyAddr(proxyURL))
+		conn, err := resilientDNSDialer.DialContext(ctx, network, canonicalProxyAddr(proxyURL))
 		if err != nil {
 			return nil, err
 		}

@@ -30,6 +30,22 @@ type PipeResult struct {
 	Duration  time.Duration
 }
 
+// EndInitiator identifies which source side reported the copy error that
+// ended a bidirectional stream. It makes a local RDP socket closure visibly
+// different from a relay transport failure in agent diagnostics.
+func (result PipeResult) EndInitiator(aName, bName string) string {
+	switch {
+	case result.AToB.CopyErr != nil && result.BToA.CopyErr == nil:
+		return aName
+	case result.BToA.CopyErr != nil && result.AToB.CopyErr == nil:
+		return bName
+	case result.AToB.CopyErr != nil && result.BToA.CopyErr != nil:
+		return "both"
+	default:
+		return "clean_or_unknown"
+	}
+}
+
 func Pipe(a, b net.Conn) {
 	_ = PipeWithResult(a, b)
 }
