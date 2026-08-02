@@ -42,6 +42,7 @@ The Android app is a home-agent client like the Windows and macOS home agents. I
 - [Troubleshooting](#troubleshooting)
   - [Diagnostic Logs](#diagnostic-logs)
   - [Agent Self-Test Fails Through Proxy](#agent-self-test-fails-through-proxy)
+  - [Endpoint Protection Flags Windows Binaries](#endpoint-protection-flags-windows-binaries)
   - [Home App Connects But RDP Fails](#home-app-connects-but-rdp-fails)
   - [OCI Relay Becomes Unresponsive](#oci-relay-becomes-unresponsive)
   - [Saved RDP Login](#saved-rdp-login)
@@ -74,6 +75,10 @@ agent.exe Windows service
 ```
 
 The relay groups sockets by room name. A waiting work-agent socket is paired with one home-client socket from the same room, then the relay copies binary WebSocket frames in both directions. The relay does not store credentials or generated client files.
+
+Current agents negotiate resumable RDP streams with the relay. If an HTTP proxy or network path drops an active WebSocket, both endpoints keep their local RDP sockets open, reconnect to the same relay session for up to five minutes, and replay only data that the peer has not acknowledged. Each endpoint buffers at most 8 MiB of unacknowledged data so an extended outage applies backpressure instead of consuming unbounded memory. Older agents and relays continue to use the original non-resumable stream protocol.
+
+Resumption is enabled only when both paired endpoints send `X-DeskFerry-Resumable: 1`. The relay then returns a random session ID in `start <session-id>`. Following an abnormal transport close, each endpoint reconnects with the `resume` role, the session ID, and its `agent` or `client` side; the relay reattaches both sockets to the existing logical pair. A normal WebSocket close still ends the RDP session immediately. Relay restarts cannot preserve sessions because resume state is intentionally in memory.
 
 The home app also keeps a lightweight `home-agent` presence WebSocket open while it is running. That presence socket lets the relay dashboard and home control panels show whether the home side is online; RDP data still flows only when a home agent starts a local listener and an RDP client connects to it.
 
@@ -438,6 +443,18 @@ Build Go binaries:
 .\build\build-go.ps1
 ```
 
+To produce separate unoptimized Windows diagnostic builds, first run `build-go.ps1` so the Windows manifest resources are generated, then run:
+
+```powershell
+$env:GOOS = 'windows'
+$env:GOARCH = 'amd64'
+$env:CGO_ENABLED = '0'
+go build -gcflags 'all=-N -l' -o dist\bin\deskferry-home-windows-amd64-debug.exe ./home-agent/windows
+go build -gcflags 'all=-N -l' -o dist\bin\deskferry-agent-windows-amd64-debug.exe ./work-agent/windows/service
+```
+
+These debug binaries are larger and slower and remain unsigned. They are useful for diagnostics or for testing an endpoint-protection false positive, but code signing and an administrator-approved allowlist are preferred for normal deployment.
+
 Build Android home APK:
 
 ```powershell
@@ -457,6 +474,13 @@ dist\bin\deskferry-home-windows-amd64.exe
 dist\bin\deskferry-home-macos-arm64
 dist\bin\deskferry-home-macos-amd64
 dist\android\deskferry-home-android-debug.apk
+```
+
+The optional unoptimized commands above additionally produce:
+
+```text
+dist\bin\deskferry-home-windows-amd64-debug.exe
+dist\bin\deskferry-agent-windows-amd64-debug.exe
 ```
 
 ## URL Configuration
@@ -529,6 +553,25 @@ Common causes:
 - Azure App Service WebSockets are disabled.
 - The Azure relay has not been deployed or is not running.
 - Local RDP is disabled or not listening on `127.0.0.1:3389`.
+
+### Endpoint Protection Flags Windows Binaries
+
+DeskFerry's locally built Windows executables are unsigned. Some heuristic endpoint-protection products may quarantine a newly built executable or replace it with a zero-byte hidden file. Do not disable or bypass endpoint protection. Prefer these remedies in order:
+
+1. Sign release binaries with an organization-approved code-signing certificate.
+2. Have an administrator allowlist the reviewed artifact hash or installation path.
+3. Submit the artifact to the security vendor as a false positive.
+4. Build the unoptimized diagnostic binaries described under [Build Commands](#build-commands) to determine whether the verdict is specific to compiler layout.
+
+Stop the Windows home app before replacing its executable. Preserve the previous file so the installation can be restored if the security product alters the replacement. The work agent's `-update-service` command performs a transactional service update and retains `agent.exe.previous` automatically:
+
+```powershell
+Copy-Item "$env:LOCALAPPDATA\Programs\DeskFerry\DeskFerryHome.exe" "$env:LOCALAPPDATA\Programs\DeskFerry\DeskFerryHome.previous.exe" -Force
+Copy-Item ".\dist\bin\deskferry-home-windows-amd64-debug.exe" "$env:LOCALAPPDATA\Programs\DeskFerry\DeskFerryHome.exe" -Force
+.\dist\bin\deskferry-agent-windows-amd64-debug.exe -update-service D:\DeskFerry\Agent\agent.exe
+```
+
+Verify the installed files with `Get-FileHash` after the endpoint-protection scan completes. A work-service update briefly interrupts active sessions; subsequent sessions use resumption only when the home agent, work agent, and selected relay all support it.
 
 ### Home App Connects But RDP Fails
 

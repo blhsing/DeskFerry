@@ -24,7 +24,9 @@ import (
 const (
 	serviceName       = "DeskFerry.Relay"
 	dashboardRole     = "dashboard"
+	resumeRole        = "resume"
 	startMessage      = "start"
+	resumeMessage     = "resume"
 	started           = "started"
 	agentUnavailable  = "agent-unavailable"
 	clientUnavailable = "client-unavailable"
@@ -35,6 +37,7 @@ var validRoles = map[string]bool{
 	"client":      true,
 	"home-agent":  true,
 	"probe":       true,
+	resumeRole:    true,
 	dashboardRole: true,
 }
 
@@ -170,9 +173,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hub *RelayHub, room
 	case dashboardRole:
 		hub.ServeDashboard(ctx, c, remote, room)
 	case "agent":
-		hub.ServeAgent(ctx, token, c, remote, readAgentIdentity(r))
+		hub.ServeAgent(ctx, token, c, remote, readAgentIdentity(r), readResumable(r))
 	case "client":
-		hub.ServeClient(ctx, token, c, remote)
+		hub.ServeClient(ctx, token, c, remote, readResumable(r))
+	case resumeRole:
+		hub.ServeResume(ctx, token, c, remote, r.Header.Get("X-DeskFerry-Session"), r.Header.Get("X-DeskFerry-Session-Side"))
 	case "home-agent":
 		hub.ServeHomeAgent(ctx, token, c, remote)
 	case "probe":
@@ -241,6 +246,11 @@ func readAgentIdentity(r *http.Request) AgentIdentity {
 	}
 }
 
+func readResumable(r *http.Request) bool {
+	value := strings.TrimSpace(r.Header.Get("X-DeskFerry-Resumable"))
+	return value == "1" || strings.EqualFold(value, "true")
+}
+
 func cleanAgentIdentity(value string) string {
 	value = strings.TrimSpace(value)
 	var b strings.Builder
@@ -290,18 +300,20 @@ type RelayHub struct {
 	mu         sync.Mutex
 	rooms      map[string]*RelayRoom
 	dashboards map[string]*DashboardClient
+	sessions   map[string]*ResumeSession
 }
 
 func newRelayHub() *RelayHub {
 	return &RelayHub{
 		rooms:      make(map[string]*RelayRoom),
 		dashboards: make(map[string]*DashboardClient),
+		sessions:   make(map[string]*ResumeSession),
 	}
 }
 
-func (h *RelayHub) ServeAgent(ctx context.Context, token string, c *websocket.Conn, remote string, identity AgentIdentity) {
+func (h *RelayHub) ServeAgent(ctx context.Context, token string, c *websocket.Conn, remote string, identity AgentIdentity, resumable bool) {
 	room := h.roomFor(token)
-	waiting, replaced := room.EnqueueAgent(c, remote, identity)
+	waiting, replaced := room.EnqueueAgent(c, remote, identity, resumable)
 	log.Printf("agent waiting room=%s remote=%s key=%s replaced=%d", room.ID, remote, identity.LogString(), replaced)
 	h.NotifyDashboards()
 
@@ -330,6 +342,23 @@ func (h *RelayHub) ServeAgent(ctx context.Context, token string, c *websocket.Co
 
 paired:
 	log.Printf("pairing room=%s agent=%s client=%s", room.ID, remote, peer.Remote)
+	if waiting.Resumable && peer.Resumable {
+		session := h.newResumeSession(room, remote, peer.Remote)
+		if !sendControl(c, room.ID, remote, "agent", startMessage+" "+session.ID) {
+			peer.SetStarted(agentUnavailable)
+			session.Finish()
+			return
+		}
+		if !sendControl(peer.Conn, room.ID, peer.Remote, "client", startMessage+" "+session.ID) {
+			peer.SetStarted(clientUnavailable)
+			peer.SetDone()
+			session.Finish()
+			return
+		}
+		peer.SetStarted(started)
+		session.Run(c, peer.Conn, peer.Done, h.NotifyDashboards)
+		return
+	}
 	if !sendStart(c, room.ID, remote, "agent") {
 		peer.SetStarted(agentUnavailable)
 		return
@@ -343,7 +372,7 @@ paired:
 	room.Bridge(ctx, c, peer.Conn, remote, peer.Remote, peer.Done, h.NotifyDashboards)
 }
 
-func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.Conn, remote string) {
+func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.Conn, remote string, resumable bool) {
 	room := h.roomFor(token)
 	for {
 		waiting := room.TryTakeAgent()
@@ -353,7 +382,7 @@ func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.C
 			return
 		}
 
-		peer := NewHomePeer(c, remote)
+		peer := NewHomePeer(c, remote, resumable)
 		if !waiting.TryPair(peer) {
 			peer.SetDone()
 			continue
@@ -376,6 +405,32 @@ func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.C
 			return
 		}
 	}
+}
+
+func (h *RelayHub) ServeResume(ctx context.Context, token string, c *websocket.Conn, remote, sessionID, side string) {
+	key := roomID(token) + "/" + cleanSessionValue(sessionID)
+	h.mu.Lock()
+	session := h.sessions[key]
+	h.mu.Unlock()
+	if session == nil || (side != "agent" && side != "client") {
+		closeQuietly(c, websocket.StatusPolicyViolation, "unknown resumable session")
+		return
+	}
+	if !session.Attach(ctx, side, c, remote) {
+		closeQuietly(c, websocket.StatusTryAgainLater, "resumable session unavailable")
+	}
+}
+
+func (h *RelayHub) newResumeSession(room *RelayRoom, agentRemote, clientRemote string) *ResumeSession {
+	session := NewResumeSession(randomID(), room, agentRemote, clientRemote, func(s *ResumeSession) {
+		h.mu.Lock()
+		delete(h.sessions, room.ID+"/"+s.ID)
+		h.mu.Unlock()
+	})
+	h.mu.Lock()
+	h.sessions[room.ID+"/"+session.ID] = session
+	h.mu.Unlock()
+	return session
 }
 
 func (h *RelayHub) ServeHomeAgent(ctx context.Context, token string, c *websocket.Conn, remote string) {
@@ -515,8 +570,8 @@ func NewRelayRoom(id string) *RelayRoom {
 	return &RelayRoom{ID: id}
 }
 
-func (r *RelayRoom) EnqueueAgent(c *websocket.Conn, remote string, identity AgentIdentity) (*WaitingAgent, int) {
-	waiting := NewWaitingAgent(c, remote, identity)
+func (r *RelayRoom) EnqueueAgent(c *websocket.Conn, remote string, identity AgentIdentity, resumable bool) (*WaitingAgent, int) {
+	waiting := NewWaitingAgent(c, remote, identity, resumable)
 	now := time.Now().UTC()
 	remoteCopy := remote
 	r.mu.Lock()
@@ -581,17 +636,8 @@ func (r *RelayRoom) HomeAgentDisconnected(remote string) {
 }
 
 func (r *RelayRoom) Bridge(ctx context.Context, agent, client *websocket.Conn, agentRemote, clientRemote string, clientDone chan struct{}, stateChanged func()) {
-	now := time.Now().UTC()
 	started := time.Now()
-	clientRemoteCopy := clientRemote
-	r.mu.Lock()
-	r.activePairs++
-	r.totalPairs++
-	pairID := r.totalPairs
-	r.lastClientRemote = &clientRemoteCopy
-	r.lastClientConnectedAt = &now
-	r.lastClientDisconnectedAt = nil
-	r.mu.Unlock()
+	pairID := r.PairStarted(clientRemote)
 	stateChanged()
 
 	bridgeCtx, cancel := context.WithCancel(ctx)
@@ -602,7 +648,29 @@ func (r *RelayRoom) Bridge(ctx context.Context, agent, client *websocket.Conn, a
 	cancel()
 	second := <-done
 
-	now = time.Now().UTC()
+	r.PairEnded()
+	closeQuietly(agent, websocket.StatusNormalClosure, "")
+	closeQuietly(client, websocket.StatusNormalClosure, "")
+	closeOnce(clientDone)
+	stateChanged()
+	log.Printf("bridge closed room=%s pair=%d agent=%s client=%s duration=%s trigger_direction=%s trigger_bytes=%d trigger_messages=%d trigger_error=%v trigger_close_status=%d other_direction=%s other_bytes=%d other_messages=%d other_error=%v other_close_status=%d context_error=%v", r.ID, pairID, agentRemote, clientRemote, time.Since(started).Round(time.Millisecond), first.Direction, first.Bytes, first.Messages, first.Err, websocket.CloseStatus(first.Err), second.Direction, second.Bytes, second.Messages, second.Err, websocket.CloseStatus(second.Err), ctx.Err())
+}
+
+func (r *RelayRoom) PairStarted(clientRemote string) int64 {
+	now := time.Now().UTC()
+	clientRemoteCopy := clientRemote
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.activePairs++
+	r.totalPairs++
+	r.lastClientRemote = &clientRemoteCopy
+	r.lastClientConnectedAt = &now
+	r.lastClientDisconnectedAt = nil
+	return r.totalPairs
+}
+
+func (r *RelayRoom) PairEnded() {
+	now := time.Now().UTC()
 	r.mu.Lock()
 	if r.activePairs > 0 {
 		r.activePairs--
@@ -610,11 +678,6 @@ func (r *RelayRoom) Bridge(ctx context.Context, agent, client *websocket.Conn, a
 	r.lastAgentDisconnectedAt = &now
 	r.lastClientDisconnectedAt = &now
 	r.mu.Unlock()
-	closeQuietly(agent, websocket.StatusNormalClosure, "")
-	closeQuietly(client, websocket.StatusNormalClosure, "")
-	closeOnce(clientDone)
-	stateChanged()
-	log.Printf("bridge closed room=%s pair=%d agent=%s client=%s duration=%s trigger_direction=%s trigger_bytes=%d trigger_messages=%d trigger_error=%v trigger_close_status=%d other_direction=%s other_bytes=%d other_messages=%d other_error=%v other_close_status=%d context_error=%v", r.ID, pairID, agentRemote, clientRemote, time.Since(started).Round(time.Millisecond), first.Direction, first.Bytes, first.Messages, first.Err, websocket.CloseStatus(first.Err), second.Direction, second.Bytes, second.Messages, second.Err, websocket.CloseStatus(second.Err), ctx.Err())
 }
 
 func (r *RelayRoom) Snapshot() RoomSnapshot {
@@ -688,24 +751,26 @@ func (i AgentIdentity) LogString() string {
 }
 
 type WaitingAgent struct {
-	Conn     *websocket.Conn
-	Remote   string
-	Identity AgentIdentity
-	Paired   chan *HomePeer
-	Done     chan struct{}
+	Conn      *websocket.Conn
+	Remote    string
+	Identity  AgentIdentity
+	Resumable bool
+	Paired    chan *HomePeer
+	Done      chan struct{}
 
 	closed atomic.Bool
 	paired atomic.Bool
 	once   sync.Once
 }
 
-func NewWaitingAgent(c *websocket.Conn, remote string, identity AgentIdentity) *WaitingAgent {
+func NewWaitingAgent(c *websocket.Conn, remote string, identity AgentIdentity, resumable bool) *WaitingAgent {
 	return &WaitingAgent{
-		Conn:     c,
-		Remote:   remote,
-		Identity: identity,
-		Paired:   make(chan *HomePeer, 1),
-		Done:     make(chan struct{}),
+		Conn:      c,
+		Remote:    remote,
+		Identity:  identity,
+		Resumable: resumable,
+		Paired:    make(chan *HomePeer, 1),
+		Done:      make(chan struct{}),
 	}
 }
 
@@ -728,21 +793,23 @@ func (w *WaitingAgent) Cancel() {
 }
 
 type HomePeer struct {
-	Conn    *websocket.Conn
-	Remote  string
-	Done    chan struct{}
-	Started chan string
+	Conn      *websocket.Conn
+	Remote    string
+	Resumable bool
+	Done      chan struct{}
+	Started   chan string
 
 	doneOnce    sync.Once
 	startedOnce sync.Once
 }
 
-func NewHomePeer(c *websocket.Conn, remote string) *HomePeer {
+func NewHomePeer(c *websocket.Conn, remote string, resumable bool) *HomePeer {
 	return &HomePeer{
-		Conn:    c,
-		Remote:  remote,
-		Done:    make(chan struct{}),
-		Started: make(chan string, 1),
+		Conn:      c,
+		Remote:    remote,
+		Resumable: resumable,
+		Done:      make(chan struct{}),
+		Started:   make(chan string, 1),
 	}
 }
 
@@ -752,6 +819,169 @@ func (p *HomePeer) SetDone() {
 
 func (p *HomePeer) SetStarted(value string) {
 	p.startedOnce.Do(func() { p.Started <- value })
+}
+
+type ResumeAttachment struct {
+	Conn   *websocket.Conn
+	Remote string
+	Done   chan struct{}
+}
+
+type ResumeSession struct {
+	ID           string
+	Room         *RelayRoom
+	AgentRemote  string
+	ClientRemote string
+
+	agent    chan *ResumeAttachment
+	client   chan *ResumeAttachment
+	done     chan struct{}
+	onFinish func(*ResumeSession)
+	once     sync.Once
+}
+
+func NewResumeSession(id string, room *RelayRoom, agentRemote, clientRemote string, onFinish func(*ResumeSession)) *ResumeSession {
+	return &ResumeSession{
+		ID:           id,
+		Room:         room,
+		AgentRemote:  agentRemote,
+		ClientRemote: clientRemote,
+		agent:        make(chan *ResumeAttachment, 2),
+		client:       make(chan *ResumeAttachment, 2),
+		done:         make(chan struct{}),
+		onFinish:     onFinish,
+	}
+}
+
+func (s *ResumeSession) Attach(ctx context.Context, side string, conn *websocket.Conn, remote string) bool {
+	attachment := &ResumeAttachment{Conn: conn, Remote: remote, Done: make(chan struct{})}
+	queue := s.client
+	if side == "agent" {
+		queue = s.agent
+	}
+	select {
+	case queue <- attachment:
+	case <-s.done:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+	select {
+	case <-attachment.Done:
+		return true
+	case <-s.done:
+		return true
+	}
+}
+
+func (s *ResumeSession) Run(agent, client *websocket.Conn, clientDone chan struct{}, stateChanged func()) {
+	startedAt := time.Now()
+	pairID := s.Room.PairStarted(s.ClientRemote)
+	stateChanged()
+	defer func() {
+		s.Room.PairEnded()
+		closeOnce(clientDone)
+		s.Finish()
+		stateChanged()
+		log.Printf("resumable bridge closed room=%s pair=%d session=%s agent=%s client=%s duration=%s", s.Room.ID, pairID, s.ID, s.AgentRemote, s.ClientRemote, time.Since(startedAt).Round(time.Millisecond))
+	}()
+
+	var agentAttachment, clientAttachment *ResumeAttachment
+	for {
+		first, second := bridgeSockets(agent, client)
+		if websocket.CloseStatus(first.Err) == websocket.StatusNormalClosure {
+			closeQuietly(agent, websocket.StatusNormalClosure, "session closed")
+			closeQuietly(client, websocket.StatusNormalClosure, "session closed")
+			if agentAttachment != nil {
+				closeOnce(agentAttachment.Done)
+			}
+			if clientAttachment != nil {
+				closeOnce(clientAttachment.Done)
+			}
+			return
+		}
+		log.Printf("resumable bridge interrupted room=%s pair=%d session=%s trigger_direction=%s trigger_error=%v other_direction=%s other_error=%v", s.Room.ID, pairID, s.ID, first.Direction, first.Err, second.Direction, second.Err)
+		closeQuietly(agent, websocket.StatusServiceRestart, "resume session")
+		closeQuietly(client, websocket.StatusServiceRestart, "resume session")
+		if agentAttachment != nil {
+			closeOnce(agentAttachment.Done)
+		}
+		if clientAttachment != nil {
+			closeOnce(clientAttachment.Done)
+		}
+
+		var ok bool
+		agentAttachment, clientAttachment, ok = s.waitForAttachments()
+		if !ok {
+			return
+		}
+		agent = agentAttachment.Conn
+		client = clientAttachment.Conn
+		if !sendControl(agent, s.Room.ID, agentAttachment.Remote, "agent", resumeMessage+" "+s.ID) ||
+			!sendControl(client, s.Room.ID, clientAttachment.Remote, "client", resumeMessage+" "+s.ID) {
+			closeQuietly(agent, websocket.StatusServiceRestart, "retry resume")
+			closeQuietly(client, websocket.StatusServiceRestart, "retry resume")
+			closeOnce(agentAttachment.Done)
+			closeOnce(clientAttachment.Done)
+			continue
+		}
+		log.Printf("resumable bridge resumed room=%s pair=%d session=%s agent=%s client=%s", s.Room.ID, pairID, s.ID, agentAttachment.Remote, clientAttachment.Remote)
+	}
+}
+
+func (s *ResumeSession) waitForAttachments() (*ResumeAttachment, *ResumeAttachment, bool) {
+	timer := time.NewTimer(5 * time.Minute)
+	defer timer.Stop()
+	var agent, client *ResumeAttachment
+	for agent == nil || client == nil {
+		select {
+		case next := <-s.agent:
+			if agent != nil {
+				closeQuietly(agent.Conn, websocket.StatusNormalClosure, "replaced resume socket")
+				closeOnce(agent.Done)
+			}
+			agent = next
+		case next := <-s.client:
+			if client != nil {
+				closeQuietly(client.Conn, websocket.StatusNormalClosure, "replaced resume socket")
+				closeOnce(client.Done)
+			}
+			client = next
+		case <-timer.C:
+			if agent != nil {
+				closeQuietly(agent.Conn, websocket.StatusGoingAway, "resume window expired")
+				closeOnce(agent.Done)
+			}
+			if client != nil {
+				closeQuietly(client.Conn, websocket.StatusGoingAway, "resume window expired")
+				closeOnce(client.Done)
+			}
+			return nil, nil, false
+		case <-s.done:
+			return nil, nil, false
+		}
+	}
+	return agent, client, true
+}
+
+func (s *ResumeSession) Finish() {
+	s.once.Do(func() {
+		close(s.done)
+		if s.onFinish != nil {
+			s.onFinish(s)
+		}
+	})
+}
+
+func bridgeSockets(agent, client *websocket.Conn) (pumpResult, pumpResult) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan pumpResult, 2)
+	go pumpBinary(ctx, agent, client, "agent_to_client", done)
+	go pumpBinary(ctx, client, agent, "client_to_agent", done)
+	first := <-done
+	cancel()
+	second := <-done
+	return first, second
 }
 
 type DashboardClient struct {
@@ -785,14 +1015,31 @@ type RoomSnapshot struct {
 }
 
 func sendStart(c *websocket.Conn, room, remote, side string) bool {
+	return sendControl(c, room, remote, side, startMessage)
+}
+
+func sendControl(c *websocket.Conn, room, remote, side, message string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Write(ctx, websocket.MessageText, []byte(startMessage)); err != nil {
-		log.Printf("start frame failed room=%s side=%s remote=%s: %v", room, side, remote, err)
+	if err := c.Write(ctx, websocket.MessageText, []byte(message)); err != nil {
+		log.Printf("control frame failed room=%s side=%s remote=%s message=%q: %v", room, side, remote, message, err)
 		closeQuietly(c, websocket.StatusNormalClosure, "")
 		return false
 	}
 	return true
+}
+
+func cleanSessionValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) != 32 {
+		return ""
+	}
+	for _, r := range value {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return ""
+		}
+	}
+	return strings.ToLower(value)
 }
 
 type pumpResult struct {

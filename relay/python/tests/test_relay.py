@@ -13,6 +13,7 @@ class FakeWebSocket:
         self.application_state = WebSocketState.CONNECTED
         self.fail_text = fail_text
         self.text_messages = []
+        self.byte_messages = []
         self.closed = False
         self._received = asyncio.Queue()
 
@@ -22,7 +23,7 @@ class FakeWebSocket:
         self.text_messages.append(text)
 
     async def send_bytes(self, payload):
-        pass
+        self.byte_messages.append(payload)
 
     async def receive(self):
         return await self._received.get()
@@ -103,6 +104,55 @@ def test_agent_client_pair_and_bridge_bytes():
             status = client.get("/relay/status?room=unit-bridge").json()
             assert status["rooms"][0]["active_pairs"] == 1
             assert status["rooms"][0]["total_pairs"] == 1
+
+
+def test_resumable_pair_reattaches_after_websocket_drop():
+    from app import RelayRoom, ResumeSession
+
+    async def scenario():
+        room = RelayRoom("unit-resume")
+        removed = []
+        session = ResumeSession("0" * 32, room, "work", "home", removed.append)
+        agent = FakeWebSocket()
+        home = FakeWebSocket()
+        client_done = asyncio.Future()
+        session_task = asyncio.create_task(session.run(agent, home, client_done, lambda: None))
+
+        await home._received.put({"type": "websocket.receive", "bytes": b"before-drop"})
+        for _ in range(50):
+            if agent.byte_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert agent.byte_messages == [b"before-drop"]
+
+        await home._received.put({"type": "websocket.disconnect", "code": 1012, "reason": "test drop"})
+        resumed_agent = FakeWebSocket()
+        resumed_home = FakeWebSocket()
+        agent_attach = asyncio.create_task(session.attach("agent", resumed_agent, "work-2"))
+        home_attach = asyncio.create_task(session.attach("client", resumed_home, "home-2"))
+        for _ in range(50):
+            if resumed_agent.text_messages and resumed_home.text_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert resumed_agent.text_messages == ["resume " + session.id]
+        assert resumed_home.text_messages == ["resume " + session.id]
+
+        await resumed_agent._received.put({"type": "websocket.receive", "bytes": b"after-resume"})
+        for _ in range(50):
+            if resumed_home.byte_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert resumed_home.byte_messages == [b"after-resume"]
+
+        await resumed_home._received.put({"type": "websocket.disconnect", "code": 1000, "reason": "closed"})
+        await asyncio.wait_for(session_task, timeout=2)
+        await asyncio.gather(agent_attach, home_attach)
+        status = await room.snapshot()
+        assert status["active_pairs"] == 0
+        assert status["total_pairs"] == 1
+        assert removed == [session]
+
+    asyncio.run(scenario())
 
 
 def test_dashboard_websocket_receives_snapshot():

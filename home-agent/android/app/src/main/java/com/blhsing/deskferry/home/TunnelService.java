@@ -22,10 +22,12 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URISyntaxException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Calendar;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -60,6 +62,9 @@ public class TunnelService extends Service {
     private static final int NOTIFICATION_ID = 7310;
     private static final String LOG_TAG = "DeskFerryHome";
     private static final long MAX_DIAGNOSTIC_LOG_BYTES = 8L * 1024L * 1024L;
+    private static final int RESUMABLE_MAX_BUFFER = 8 * 1024 * 1024;
+    private static final int RESUMABLE_CHUNK_SIZE = 64 * 1024;
+    private static final long RESUMABLE_WINDOW_MS = 5L * 60L * 1000L;
     private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss", Locale.ROOT);
     private static final SimpleDateFormat DIAGNOSTIC_TIME_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.ROOT);
     private static final SimpleDateFormat DIAGNOSTIC_DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT);
@@ -376,7 +381,7 @@ public class TunnelService extends Service {
                 .header("Authorization", "Bearer " + token)
                 .header("X-DeskFerry-Role", role)
                 .header("X-TunnelDesktop-Role", role)
-                .header("User-Agent", "DeskFerry-Android/0.5.5")
+                .header("User-Agent", "DeskFerry-Android/0.5.6")
                 .build();
     }
 
@@ -673,9 +678,17 @@ public class TunnelService extends Service {
         private final AtomicLong relayToLocalBytes = new AtomicLong();
         private final AtomicLong relayToLocalMessages = new AtomicLong();
         private final AtomicReference<String> termination = new AtomicReference<>("running");
+        private final AtomicBoolean reconnecting = new AtomicBoolean(false);
+        private final Object resumeLock = new Object();
         private final long startedAt = SystemClock.elapsedRealtime();
         private volatile WebSocket webSocket;
+        private volatile WebSocket pendingResumeSocket;
         private volatile String selectedRelay = "none";
+        private volatile String sessionId = "";
+        private byte[] sendBuffer = new byte[0];
+        private long sendBase;
+        private long sendEnd;
+        private long receiveOffset;
 
         BridgeSession(Socket localSocket) {
             this.localSocket = localSocket;
@@ -691,27 +704,37 @@ public class TunnelService extends Service {
             try {
                 boolean connected = false;
                 String lastError = "";
-                for (String candidate : relayUrlsSnapshot()) {
-                    if (closed.get()) {
+                long retryDeadline = SystemClock.elapsedRealtime() + RESUMABLE_WINDOW_MS;
+                long retryBackoff = 250;
+                while (!closed.get() && !connected && SystemClock.elapsedRealtime() < retryDeadline) {
+                    for (String candidate : relayUrlsSnapshot()) {
+                        if (closed.get()) {
+                            break;
+                        }
+                        try {
+                            long dialStarted = SystemClock.elapsedRealtime();
+                            connectRelay(candidate);
+                            selectedRelay = candidate;
+                            append("RDP session remote=" + remote + " connected relay=" + candidate + " dial_duration_ms=" + elapsedMillis(dialStarted) + ".");
+                        } catch (Exception ex) {
+                            lastError = candidate + ": " + ex.getMessage();
+                            closeWebSocketOnly();
+                            if (!closed.get()) {
+                                append("RDP bridge via " + candidate + " failed; retrying: " + ex.getMessage());
+                            }
+                            continue;
+                        }
+                        append("Bridging local RDP connection from " + remote + " through " + candidate + ".");
+                        connected = true;
                         break;
                     }
-                    try {
-                        long dialStarted = SystemClock.elapsedRealtime();
-                        connectRelay(candidate);
-                        selectedRelay = candidate;
-                        append("RDP session remote=" + remote + " connected relay=" + candidate + " dial_duration_ms=" + elapsedMillis(dialStarted) + ".");
-                    } catch (Exception ex) {
-                        lastError = candidate + ": " + ex.getMessage();
-                        closeWebSocketOnly();
-                        if (!closed.get()) {
-                            append("RDP bridge via " + candidate + " failed: " + ex.getMessage());
-                        }
-                        continue;
+                    if (!connected && !closed.get()) {
+                        sleepQuietly(retryBackoff);
+                        retryBackoff = Math.min(5000, retryBackoff * 2);
                     }
-                    append("Bridging local RDP connection from " + remote + " through " + candidate + ".");
-                    connected = true;
+                }
+                if (connected) {
                     pipeLocalToRelay();
-                    break;
                 }
                 if (!connected && !closed.get()) {
                     recordTermination("all_relay_urls_failed error=" + emptyAs(lastError, "unknown"));
@@ -732,56 +755,10 @@ public class TunnelService extends Service {
             CountDownLatch paired = new CountDownLatch(1);
             AtomicBoolean started = new AtomicBoolean(false);
             AtomicReference<Throwable> failure = new AtomicReference<>();
-            WebSocket socket = httpClient.newWebSocket(webSocketRequest(candidate, "client"), new WebSocketListener() {
-                @Override
-                public void onMessage(WebSocket webSocket, String text) {
-                    if ("start".equals(text.trim())) {
-                        started.set(true);
-                        paired.countDown();
-                    }
-                }
-
-                @Override
-                public void onMessage(WebSocket webSocket, ByteString bytes) {
-                    try {
-                        byte[] payload = bytes.toByteArray();
-                        OutputStream output = localSocket.getOutputStream();
-                        synchronized (output) {
-                            output.write(payload);
-                            output.flush();
-                        }
-                        relayToLocalBytes.addAndGet(payload.length);
-                        relayToLocalMessages.incrementAndGet();
-                    } catch (IOException ex) {
-                        failure.set(ex);
-                        recordTermination("relay_to_local_write_error=" + throwableText(ex));
-                        close();
-                    }
-                }
-
-                @Override
-                public void onClosed(WebSocket webSocket, int code, String reason) {
-                    if (started.get()) {
-                        recordTermination("websocket_closed code=" + code + " reason=" + quoted(reason));
-                    }
-                    paired.countDown();
-                    if (started.get()) {
-                        close();
-                    }
-                }
-
-                @Override
-                public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-                    failure.set(t);
-                    if (started.get()) {
-                        recordTermination("websocket_failure error=" + throwableText(t) + " http_status=" + responseStatus(response));
-                    }
-                    paired.countDown();
-                    if (started.get()) {
-                        close();
-                    }
-                }
-            });
+            Request request = webSocketRequest(candidate, "client").newBuilder()
+                    .header("X-DeskFerry-Resumable", "1")
+                    .build();
+            WebSocket socket = httpClient.newWebSocket(request, bridgeListener(paired, started, failure, true));
             webSocket = socket;
             if (!paired.await(30, TimeUnit.SECONDS)) {
                 throw new IOException("relay did not pair with a work agent");
@@ -795,14 +772,263 @@ public class TunnelService extends Service {
             }
         }
 
+        private WebSocketListener bridgeListener(CountDownLatch ready, AtomicBoolean started, AtomicReference<Throwable> failure, boolean initial) {
+            return new WebSocketListener() {
+                @Override
+                public void onMessage(WebSocket socket, String text) {
+                    String value = text.trim();
+                    if (initial && ("start".equals(value) || value.startsWith("start "))) {
+                        if (value.startsWith("start ")) {
+                            sessionId = value.substring("start ".length()).trim();
+                            if (!attachTransport(socket)) {
+                                failure.set(new IOException("failed to initialize resumable relay stream"));
+                            }
+                        }
+                        started.set(true);
+                        ready.countDown();
+                    } else if (!initial && value.equals("resume " + sessionId)) {
+                        if (!attachTransport(socket)) {
+                            failure.set(new IOException("failed to replay resumable relay stream"));
+                        }
+                        started.set(true);
+                        ready.countDown();
+                    }
+                }
+
+                @Override
+                public void onMessage(WebSocket socket, ByteString bytes) {
+                    try {
+                        handleRelayPayload(socket, bytes.toByteArray());
+                    } catch (IOException ex) {
+                        failure.set(ex);
+                        recordTermination("relay_to_local_write_error=" + throwableText(ex));
+                        close();
+                    }
+                }
+
+                @Override
+                public void onClosed(WebSocket socket, int code, String reason) {
+                    ready.countDown();
+                    if (!started.get()) {
+                        return;
+                    }
+                    if (!sessionId.isEmpty() && code != 1000 && !closed.get()) {
+                        markTransportLost(socket, "websocket_closed code=" + code + " reason=" + quoted(reason));
+                    } else {
+                        recordTermination("websocket_closed code=" + code + " reason=" + quoted(reason));
+                        close();
+                    }
+                }
+
+                @Override
+                public void onFailure(WebSocket socket, Throwable t, Response response) {
+                    failure.set(t);
+                    ready.countDown();
+                    if (!started.get()) {
+                        return;
+                    }
+                    if (!sessionId.isEmpty() && !closed.get()) {
+                        markTransportLost(socket, "websocket_failure error=" + throwableText(t) + " http_status=" + responseStatus(response));
+                    } else {
+                        recordTermination("websocket_failure error=" + throwableText(t) + " http_status=" + responseStatus(response));
+                        close();
+                    }
+                }
+            };
+        }
+
+        private boolean attachTransport(WebSocket socket) {
+            synchronized (resumeLock) {
+                if (closed.get()) {
+                    return false;
+                }
+                webSocket = socket;
+                if (!socket.send(frame((byte) 2, receiveOffset, null))) {
+                    webSocket = null;
+                    return false;
+                }
+                int position = 0;
+                long offset = sendBase;
+                while (position < sendBuffer.length) {
+                    int size = Math.min(RESUMABLE_CHUNK_SIZE, sendBuffer.length - position);
+                    byte[] payload = Arrays.copyOfRange(sendBuffer, position, position + size);
+                    if (!socket.send(frame((byte) 1, offset, payload))) {
+                        webSocket = null;
+                        return false;
+                    }
+                    position += size;
+                    offset += size;
+                }
+                resumeLock.notifyAll();
+                return true;
+            }
+        }
+
+        private void markTransportLost(WebSocket socket, String reason) {
+            synchronized (resumeLock) {
+                if (webSocket != socket || closed.get()) {
+                    return;
+                }
+                webSocket = null;
+                resumeLock.notifyAll();
+            }
+            append("RDP relay stream interrupted; retrying transparently: " + reason);
+            startReconnectLoop();
+        }
+
+        private void startReconnectLoop() {
+            if (!reconnecting.compareAndSet(false, true)) {
+                return;
+            }
+            new Thread(() -> {
+                long deadline = SystemClock.elapsedRealtime() + RESUMABLE_WINDOW_MS;
+                long backoff = 250;
+                try {
+                    while (!closed.get() && SystemClock.elapsedRealtime() < deadline) {
+                        CountDownLatch ready = new CountDownLatch(1);
+                        AtomicBoolean started = new AtomicBoolean(false);
+                        AtomicReference<Throwable> failure = new AtomicReference<>();
+                        try {
+                            Request request = webSocketRequest(selectedRelay, "resume").newBuilder()
+                                    .header("X-DeskFerry-Session", sessionId)
+                                    .header("X-DeskFerry-Session-Side", "client")
+                                    .build();
+                            WebSocket candidate = httpClient.newWebSocket(request, bridgeListener(ready, started, failure, false));
+                            pendingResumeSocket = candidate;
+                            long remaining = Math.max(1, deadline - SystemClock.elapsedRealtime());
+                            if (ready.await(remaining, TimeUnit.MILLISECONDS) && started.get() && failure.get() == null) {
+                                pendingResumeSocket = null;
+                                append("RDP relay stream resumed through " + selectedRelay + ".");
+                                return;
+                            }
+                            pendingResumeSocket = null;
+                            candidate.cancel();
+                        } catch (Exception ignored) {
+                            WebSocket candidate = pendingResumeSocket;
+                            pendingResumeSocket = null;
+                            if (candidate != null) {
+                                candidate.cancel();
+                            }
+                        }
+                        sleepQuietly(backoff);
+                        backoff = Math.min(5000, backoff * 2);
+                    }
+                    if (!closed.get()) {
+                        recordTermination("resume_window_expired");
+                        close();
+                    }
+                } finally {
+                    reconnecting.set(false);
+                    synchronized (resumeLock) {
+                        resumeLock.notifyAll();
+                    }
+                }
+            }, "DeskFerry-RDP-Resume").start();
+        }
+
+        private void handleRelayPayload(WebSocket socket, byte[] payload) throws IOException {
+            if (sessionId.isEmpty()) {
+                writeLocal(payload);
+                return;
+            }
+            if (payload.length < 9 || payload.length > 9 + RESUMABLE_CHUNK_SIZE) {
+                markTransportLost(socket, "invalid resumable frame");
+                return;
+            }
+            ByteBuffer frame = ByteBuffer.wrap(payload);
+            byte type = frame.get();
+            long offset = frame.getLong();
+            if (offset < 0) {
+                markTransportLost(socket, "invalid resumable offset");
+                return;
+            }
+            if (type == 2) {
+                if (frame.hasRemaining()) {
+                    markTransportLost(socket, "invalid resumable acknowledgement");
+                    return;
+                }
+                applyAcknowledgement(offset);
+                return;
+            }
+            if (type != 1) {
+                markTransportLost(socket, "unknown resumable frame");
+                return;
+            }
+            byte[] data = new byte[frame.remaining()];
+            frame.get(data);
+            synchronized (resumeLock) {
+                long end = offset + data.length;
+                if (offset > receiveOffset) {
+                    markTransportLost(socket, "resumable sequence gap");
+                    return;
+                }
+                if (end > receiveOffset) {
+                    int trim = (int) (receiveOffset - offset);
+                    byte[] fresh = Arrays.copyOfRange(data, trim, data.length);
+                    writeLocal(fresh);
+                    receiveOffset += fresh.length;
+                }
+                WebSocket current = webSocket;
+                if (current != null && !current.send(frame((byte) 2, receiveOffset, null))) {
+                    markTransportLost(current, "acknowledgement send failed");
+                }
+            }
+        }
+
+        private void writeLocal(byte[] payload) throws IOException {
+            OutputStream output = localSocket.getOutputStream();
+            synchronized (output) {
+                output.write(payload);
+                output.flush();
+            }
+            relayToLocalBytes.addAndGet(payload.length);
+            relayToLocalMessages.incrementAndGet();
+        }
+
+        private void applyAcknowledgement(long offset) {
+            synchronized (resumeLock) {
+                if (offset < sendBase || offset > sendEnd) {
+                    WebSocket current = webSocket;
+                    if (current != null) {
+                        markTransportLost(current, "invalid resumable acknowledgement");
+                    }
+                    return;
+                }
+                int drop = (int) (offset - sendBase);
+                sendBuffer = Arrays.copyOfRange(sendBuffer, drop, sendBuffer.length);
+                sendBase = offset;
+                resumeLock.notifyAll();
+            }
+        }
+
+        private ByteString frame(byte type, long offset, byte[] payload) {
+            int length = payload == null ? 0 : payload.length;
+            ByteBuffer buffer = ByteBuffer.allocate(9 + length);
+            buffer.put(type);
+            buffer.putLong(offset);
+            if (payload != null) {
+                buffer.put(payload);
+            }
+            return ByteString.of(buffer.array());
+        }
+
         void close() {
             recordTermination("closed_by_app");
             if (!closed.compareAndSet(false, true)) {
                 return;
             }
             WebSocket socket = webSocket;
+            WebSocket pending = pendingResumeSocket;
+            pendingResumeSocket = null;
             if (socket != null) {
                 socket.close(1000, "closed");
+            }
+            if (pending != null && pending != socket) {
+                pending.cancel();
+            }
+            synchronized (resumeLock) {
+                webSocket = null;
+                resumeLock.notifyAll();
             }
             closeQuietly(localSocket);
             sessions.remove(this);
@@ -823,20 +1049,68 @@ public class TunnelService extends Service {
             byte[] buffer = new byte[16 * 1024];
             int read;
             while (!closed.get() && (read = input.read(buffer)) >= 0) {
-                WebSocket socket = webSocket;
-                if (socket == null || !socket.send(ByteString.of(buffer, 0, read))) {
-                    recordTermination("local_to_relay_send_failed");
-                    throw new IOException("relay WebSocket send failed");
+                if (sessionId.isEmpty()) {
+                    WebSocket socket = webSocket;
+                    if (socket == null || !socket.send(ByteString.of(buffer, 0, read))) {
+                        recordTermination("local_to_relay_send_failed");
+                        throw new IOException("relay WebSocket send failed");
+                    }
+                    while (!closed.get() && socket.queueSize() > 4L * 1024L * 1024L) {
+                        sleepQuietly(10);
+                    }
+                } else {
+                    sendReliable(Arrays.copyOf(buffer, read));
                 }
                 localToRelayBytes.addAndGet(read);
                 localToRelayMessages.incrementAndGet();
-                while (!closed.get() && socket.queueSize() > 4L * 1024L * 1024L) {
-                    sleepQuietly(10);
-                }
             }
             if (!closed.get()) {
                 recordTermination("local_tcp_eof");
             }
+        }
+
+        private void sendReliable(byte[] payload) throws IOException {
+            long offset;
+            synchronized (resumeLock) {
+                while (!closed.get() && sendBuffer.length + payload.length > RESUMABLE_MAX_BUFFER) {
+                    try {
+                        resumeLock.wait(1000);
+                    } catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("interrupted while waiting for relay acknowledgement", ex);
+                    }
+                }
+                if (closed.get()) {
+                    throw new IOException("RDP bridge closed");
+                }
+                offset = sendEnd;
+                byte[] combined = Arrays.copyOf(sendBuffer, sendBuffer.length + payload.length);
+                System.arraycopy(payload, 0, combined, sendBuffer.length, payload.length);
+                sendBuffer = combined;
+                sendEnd += payload.length;
+            }
+            ByteString framed = frame((byte) 1, offset, payload);
+            while (!closed.get()) {
+                WebSocket socket;
+                synchronized (resumeLock) {
+                    while (!closed.get() && webSocket == null) {
+                        try {
+                            resumeLock.wait(1000);
+                        } catch (InterruptedException ex) {
+                            Thread.currentThread().interrupt();
+                            throw new IOException("interrupted while resuming relay", ex);
+                        }
+                    }
+                    socket = webSocket;
+                }
+                if (socket != null && socket.send(framed)) {
+                    return;
+                }
+                if (socket != null) {
+                    markTransportLost(socket, "data send failed");
+                }
+            }
+            throw new IOException("RDP bridge closed");
         }
 
         private void recordTermination(String cause) {

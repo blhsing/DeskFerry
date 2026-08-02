@@ -17,8 +17,14 @@ import (
 const (
 	RoleProbe     = "probe"
 	RoleHomeAgent = "home-agent"
+	RoleResume    = "resume"
 
-	webSocketStartMessage = "start"
+	webSocketStartMessage  = "start"
+	webSocketResumeMessage = "resume"
+
+	HeaderResumable   = "X-DeskFerry-Resumable"
+	HeaderSessionID   = "X-DeskFerry-Session"
+	HeaderSessionSide = "X-DeskFerry-Session-Side"
 )
 
 func IsWebSocketRelay(relayAddr string) bool {
@@ -157,15 +163,44 @@ func DialWebSocketWithHeaders(ctx context.Context, relayAddr, proxySpec, role, t
 }
 
 func AwaitWebSocketStart(ctx context.Context, c *websocket.Conn) error {
+	_, err := AwaitWebSocketStartSession(ctx, c)
+	return err
+}
+
+// AwaitWebSocketStartSession waits for relay pairing and returns the optional
+// resumable session identifier negotiated by upgraded peers.
+func AwaitWebSocketStartSession(ctx context.Context, c *websocket.Conn) (string, error) {
+	return awaitWebSocketControl(ctx, c, webSocketStartMessage)
+}
+
+func AwaitWebSocketResume(ctx context.Context, c *websocket.Conn, sessionID string) error {
+	got, err := awaitWebSocketControl(ctx, c, webSocketResumeMessage)
+	if err != nil {
+		return err
+	}
+	if got != sessionID {
+		return fmt.Errorf("relay resumed unexpected session %q", got)
+	}
+	return nil
+}
+
+func awaitWebSocketControl(ctx context.Context, c *websocket.Conn, command string) (string, error) {
 	readCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	for {
 		typ, data, err := c.Read(readCtx)
 		if err != nil {
-			return fmt.Errorf("wait for relay pairing: %w", err)
+			return "", fmt.Errorf("wait for relay %s: %w", command, err)
 		}
-		if typ == websocket.MessageText && strings.TrimSpace(string(data)) == webSocketStartMessage {
-			return nil
+		if typ != websocket.MessageText {
+			continue
+		}
+		fields := strings.Fields(string(data))
+		if len(fields) > 0 && fields[0] == command {
+			if len(fields) > 1 {
+				return fields[1], nil
+			}
+			return "", nil
 		}
 	}
 }
@@ -295,7 +330,7 @@ func proxyFunc(relayAddr, proxySpec string) func(*http.Request) (*url.URL, error
 
 func validateWebSocketRole(role string) error {
 	switch role {
-	case RoleAgent, RoleClient, RoleProbe, RoleHomeAgent:
+	case RoleAgent, RoleClient, RoleProbe, RoleHomeAgent, RoleResume:
 		return nil
 	default:
 		return fmt.Errorf("invalid websocket role %q", role)

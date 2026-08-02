@@ -616,6 +616,7 @@ func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string)
 		headers.Set(agentIDHeader, agentID)
 		headers.Set(agentSlotHeader, strconv.Itoa(slot))
 	}
+	headers.Set(tunnel.HeaderResumable, "1")
 	ws, err := tunnel.DialWebSocketWithHeaders(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgent, "", headers)
 	if err != nil {
 		return false, fmt.Errorf("dial after %s: %w", time.Since(connectedAt).Round(time.Millisecond), err)
@@ -623,12 +624,21 @@ func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string)
 	defer tunnel.CloseWebSocket(ws)
 
 	log.Printf("websocket agent slot %d connected to relay %s via %s", slot, cfg.RelayAddr, tunnel.ProxySpecForLog(cfg.Proxy))
-	if err := tunnel.AwaitWebSocketStart(ctx, ws); err != nil {
+	sessionID, err := tunnel.AwaitWebSocketStartSession(ctx, ws)
+	if err != nil {
 		return true, fmt.Errorf("wait for pairing after %s: %w", time.Since(connectedAt).Round(time.Millisecond), err)
 	}
 	pairedAt := time.Now()
 	log.Printf("websocket agent slot %d paired on relay %s after idle=%s; forwarding to %s", slot, cfg.RelayAddr, pairedAt.Sub(connectedAt).Round(time.Millisecond), cfg.RDPAddr)
-	stream := tunnel.WebSocketNetConn(ctx, ws)
+	stream := net.Conn(tunnel.WebSocketNetConn(ctx, ws))
+	if sessionID != "" {
+		stream = tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{
+			RelayAddr: cfg.RelayAddr,
+			Proxy:     cfg.Proxy,
+			SessionID: sessionID,
+			Side:      "agent",
+		})
+	}
 	handleStream(ctx, stream, cfg.RDPAddr, cfg.RelayAddr, slot)
 	return true, fmt.Errorf("paired stream completed after %s", time.Since(pairedAt).Round(time.Millisecond))
 }

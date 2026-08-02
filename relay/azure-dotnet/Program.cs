@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.WebSockets;
 using System.Text;
+using System.Threading.Channels;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<RelayHub>();
@@ -56,10 +57,13 @@ async Task RelayWebSocketHandler(HttpContext context, RelayHub hub)
             await hub.ServeDashboardAsync(socket, remote, ReadRoom(context), context.RequestAborted);
             break;
         case "agent":
-            await hub.ServeAgentAsync(token, socket, remote, ReadAgentIdentity(context.Request), context.RequestAborted);
+            await hub.ServeAgentAsync(token, socket, remote, ReadAgentIdentity(context.Request), ReadResumable(context.Request), context.RequestAborted);
             break;
         case "client":
-            await hub.ServeClientAsync(token, socket, remote, context.RequestAborted);
+            await hub.ServeClientAsync(token, socket, remote, ReadResumable(context.Request), context.RequestAborted);
+            break;
+        case "resume":
+            await hub.ServeResumeAsync(token, socket, remote, context.Request.Headers["X-DeskFerry-Session"].FirstOrDefault(), context.Request.Headers["X-DeskFerry-Session-Side"].FirstOrDefault(), context.RequestAborted);
             break;
         case "home-agent":
             await hub.ServeHomeAgentAsync(token, socket, remote, context.RequestAborted);
@@ -81,7 +85,13 @@ static string? ReadRole(HttpRequest request)
         ?? request.Headers["X-TunnelDesktop-Role"].FirstOrDefault()
         ?? request.Query["role"].FirstOrDefault();
     role = role?.Trim().ToLowerInvariant();
-    return role is "agent" or "client" or "home-agent" or "probe" or "dashboard" ? role : null;
+    return role is "agent" or "client" or "home-agent" or "probe" or "dashboard" or "resume" ? role : null;
+}
+
+static bool ReadResumable(HttpRequest request)
+{
+    var value = request.Headers["X-DeskFerry-Resumable"].FirstOrDefault()?.Trim();
+    return value == "1" || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
 }
 
 static string? ReadToken(HttpRequest request)
@@ -519,6 +529,7 @@ sealed class RelayHub
 
     private readonly ConcurrentDictionary<string, RelayRoom> _rooms = new();
     private readonly ConcurrentDictionary<Guid, DashboardClient> _dashboards = new();
+    private readonly ConcurrentDictionary<string, ResumeSession> _sessions = new();
     private readonly ILogger<RelayHub> _log;
 
     public RelayHub(ILogger<RelayHub> log)
@@ -526,10 +537,10 @@ sealed class RelayHub
         _log = log;
     }
 
-    public async Task ServeAgentAsync(string token, WebSocket socket, string remote, AgentIdentity identity, CancellationToken abort)
+    public async Task ServeAgentAsync(string token, WebSocket socket, string remote, AgentIdentity identity, bool resumable, CancellationToken abort)
     {
         var room = RoomFor(token);
-        var (waiting, replaced) = room.EnqueueAgent(socket, remote, identity);
+        var (waiting, replaced) = room.EnqueueAgent(socket, remote, identity, resumable);
         _log.LogInformation("agent waiting room={Room} remote={Remote} key={AgentKey} replaced={Replaced}", room.Id, remote, identity.LogString, replaced);
         NotifyDashboards();
 
@@ -539,6 +550,26 @@ sealed class RelayHub
         {
             peer = await waiting.WaitAsync();
             _log.LogInformation("pairing room={Room} agent={AgentRemote} client={ClientRemote}", room.Id, remote, peer.Remote);
+            if (waiting.Resumable && peer.Resumable)
+            {
+                var session = NewResumeSession(room, remote, peer.Remote);
+                if (!await TrySendControlAsync(socket, room.Id, remote, "agent", $"start {session.Id}", CancellationToken.None))
+                {
+                    peer.Started.TrySetResult(AgentUnavailable);
+                    session.Finish();
+                    return;
+                }
+                if (!await TrySendControlAsync(peer.Socket, room.Id, peer.Remote, "client", $"start {session.Id}", CancellationToken.None))
+                {
+                    peer.Started.TrySetResult(ClientUnavailable);
+                    peer.Done.TrySetResult();
+                    session.Finish();
+                    return;
+                }
+                peer.Started.TrySetResult(Started);
+                await session.RunAsync(socket, peer.Socket, peer.Done, NotifyDashboards);
+                return;
+            }
             if (!await TrySendStartAsync(socket, room.Id, remote, "agent", abort))
             {
                 peer.Started.TrySetResult(AgentUnavailable);
@@ -575,7 +606,7 @@ sealed class RelayHub
         }
     }
 
-    public async Task ServeClientAsync(string token, WebSocket socket, string remote, CancellationToken abort)
+    public async Task ServeClientAsync(string token, WebSocket socket, string remote, bool resumable, CancellationToken abort)
     {
         var room = RoomFor(token);
         while (socket.State == WebSocketState.Open && !abort.IsCancellationRequested)
@@ -590,7 +621,7 @@ sealed class RelayHub
 
             var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var started = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-            if (!peer.TryPair(new HomePeer(socket, remote, done, started)))
+            if (!peer.TryPair(new HomePeer(socket, remote, done, started, resumable)))
             {
                 done.TrySetResult();
                 continue;
@@ -624,6 +655,32 @@ sealed class RelayHub
         }
 
         await CloseQuietlyAsync(socket);
+    }
+
+    public async Task ServeResumeAsync(string token, WebSocket socket, string remote, string? sessionId, string? side, CancellationToken abort)
+    {
+        sessionId = CleanSessionValue(sessionId);
+        side = side?.Trim().ToLowerInvariant();
+        var key = $"{RoomId(token)}/{sessionId}";
+        if (sessionId.Length == 0 || side is not ("agent" or "client") || !_sessions.TryGetValue(key, out var session))
+        {
+            await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "unknown resumable session");
+            return;
+        }
+        if (!await session.AttachAsync(side, socket, remote, abort))
+        {
+            await CloseQuietlyAsync(socket, WebSocketCloseStatus.EndpointUnavailable, "resumable session unavailable");
+        }
+    }
+
+    private ResumeSession NewResumeSession(RelayRoom room, string agentRemote, string clientRemote)
+    {
+        var session = new ResumeSession(Guid.NewGuid().ToString("N"), room, agentRemote, clientRemote, _log, completed =>
+        {
+            _sessions.TryRemove($"{room.Id}/{completed.Id}", out _);
+        });
+        _sessions[$"{room.Id}/{session.Id}"] = session;
+        return session;
     }
 
     public async Task ServeHomeAgentAsync(string token, WebSocket socket, string remote, CancellationToken abort)
@@ -719,15 +776,25 @@ sealed class RelayHub
 
     private static async Task SendStartAsync(WebSocket socket, CancellationToken cancellationToken)
     {
-        var payload = Encoding.UTF8.GetBytes("start");
+        await SendControlAsync(socket, "start", cancellationToken);
+    }
+
+    private static async Task SendControlAsync(WebSocket socket, string message, CancellationToken cancellationToken)
+    {
+        var payload = Encoding.UTF8.GetBytes(message);
         await socket.SendAsync(payload, WebSocketMessageType.Text, true, cancellationToken);
     }
 
     private async Task<bool> TrySendStartAsync(WebSocket socket, string room, string remote, string side, CancellationToken cancellationToken)
     {
+        return await TrySendControlAsync(socket, room, remote, side, "start", cancellationToken);
+    }
+
+    private async Task<bool> TrySendControlAsync(WebSocket socket, string room, string remote, string side, string message, CancellationToken cancellationToken)
+    {
         try
         {
-            await SendStartAsync(socket, cancellationToken);
+            await SendControlAsync(socket, message, cancellationToken);
             return true;
         }
         catch (OperationCanceledException)
@@ -736,10 +803,16 @@ sealed class RelayHub
         }
         catch (Exception ex)
         {
-            _log.LogInformation(ex, "start frame failed room={Room} side={Side} remote={Remote}", room, side, remote);
+            _log.LogInformation(ex, "control frame failed room={Room} side={Side} remote={Remote} message={Message}", room, side, remote, message);
             await CloseQuietlyAsync(socket);
             return false;
         }
+    }
+
+    private static string CleanSessionValue(string? value)
+    {
+        value = value?.Trim();
+        return value is { Length: 32 } && value.All(Uri.IsHexDigit) ? value.ToLowerInvariant() : "";
     }
 
     private static async Task<SocketEnd> DrainUntilCloseAsync(WebSocket socket, CancellationToken cancellationToken)
@@ -810,13 +883,13 @@ sealed class RelayHub
         }
     }
 
-    private static async Task CloseQuietlyAsync(WebSocket socket)
+    private static async Task CloseQuietlyAsync(WebSocket socket, WebSocketCloseStatus status = WebSocketCloseStatus.NormalClosure, string reason = "")
     {
         try
         {
             if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
             {
-                await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None);
+                await socket.CloseAsync(status, reason, CancellationToken.None);
             }
         }
         catch
@@ -850,9 +923,9 @@ sealed class RelayRoom
 
     public string Id { get; }
 
-    public (WaitingAgent Agent, int Replaced) EnqueueAgent(WebSocket socket, string remote, AgentIdentity identity)
+    public (WaitingAgent Agent, int Replaced) EnqueueAgent(WebSocket socket, string remote, AgentIdentity identity, bool resumable)
     {
-        var agent = new WaitingAgent(socket, remote, identity);
+        var agent = new WaitingAgent(socket, remote, identity, resumable);
         List<WaitingAgent> replaced = [];
         lock (_gate)
         {
@@ -943,17 +1016,8 @@ sealed class RelayRoom
 
     public async Task BridgeAsync(WebSocket agent, WebSocket client, string agentRemote, string clientRemote, TaskCompletionSource clientDone, Action stateChanged, CancellationToken abort)
     {
-        long pairId;
         var stopwatch = Stopwatch.StartNew();
-        lock (_gate)
-        {
-            _activePairs++;
-            _totalPairs++;
-            pairId = _totalPairs;
-            _lastClientRemote = clientRemote;
-            _lastClientConnectedAt = DateTimeOffset.UtcNow;
-            _lastClientDisconnectedAt = null;
-        }
+        var pairId = PairStarted(clientRemote);
         stateChanged();
         try
         {
@@ -968,20 +1032,38 @@ sealed class RelayRoom
         }
         finally
         {
-            lock (_gate)
-            {
-                if (_activePairs > 0)
-                {
-                    _activePairs--;
-                }
-                _lastAgentDisconnectedAt = DateTimeOffset.UtcNow;
-                _lastClientDisconnectedAt = DateTimeOffset.UtcNow;
-            }
+            PairEnded();
             await CloseQuietlyAsync(agent);
             await CloseQuietlyAsync(client);
             clientDone.TrySetResult();
             stateChanged();
             _log.LogInformation("bridge closed room={Room} pair={PairId} agent={AgentRemote} client={ClientRemote} duration_ms={DurationMs}", Id, pairId, agentRemote, clientRemote, stopwatch.ElapsedMilliseconds);
+        }
+    }
+
+    public long PairStarted(string clientRemote)
+    {
+        lock (_gate)
+        {
+            _activePairs++;
+            _totalPairs++;
+            _lastClientRemote = clientRemote;
+            _lastClientConnectedAt = DateTimeOffset.UtcNow;
+            _lastClientDisconnectedAt = null;
+            return _totalPairs;
+        }
+    }
+
+    public void PairEnded()
+    {
+        lock (_gate)
+        {
+            if (_activePairs > 0)
+            {
+                _activePairs--;
+            }
+            _lastAgentDisconnectedAt = DateTimeOffset.UtcNow;
+            _lastClientDisconnectedAt = DateTimeOffset.UtcNow;
         }
     }
 
@@ -1023,7 +1105,7 @@ sealed class RelayRoom
         }
     }
 
-    private static async Task<PumpResult> PumpAsync(WebSocket source, WebSocket destination, string direction, CancellationToken cancellationToken)
+    internal static async Task<PumpResult> PumpAsync(WebSocket source, WebSocket destination, string direction, CancellationToken cancellationToken)
     {
         var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
         long bytes = 0;
@@ -1058,13 +1140,13 @@ sealed class RelayRoom
         }
     }
 
-    private static async Task CloseQuietlyAsync(WebSocket socket)
+    internal static async Task CloseQuietlyAsync(WebSocket socket, WebSocketCloseStatus status = WebSocketCloseStatus.NormalClosure, string reason = "")
     {
         try
         {
             if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
             {
-                await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None);
+                await socket.CloseAsync(status, reason, CancellationToken.None);
             }
         }
         catch
@@ -1077,20 +1159,169 @@ sealed record SocketEnd(string End, WebSocketCloseStatus? CloseStatus, string? C
 
 sealed record PumpResult(string Direction, long Bytes, long Messages, string End, WebSocketCloseStatus? CloseStatus, string? CloseReason, string? Error);
 
+sealed record ResumeAttachment(WebSocket Socket, string Remote, TaskCompletionSource Done);
+
+sealed class ResumeSession
+{
+    private static readonly WebSocketCloseStatus ResumeCloseStatus = (WebSocketCloseStatus)1012;
+    private readonly Channel<ResumeAttachment> _agent = Channel.CreateUnbounded<ResumeAttachment>();
+    private readonly Channel<ResumeAttachment> _client = Channel.CreateUnbounded<ResumeAttachment>();
+    private readonly CancellationTokenSource _finished = new();
+    private readonly ILogger _log;
+    private readonly Action<ResumeSession> _onFinish;
+    private int _finishStarted;
+
+    public ResumeSession(string id, RelayRoom room, string agentRemote, string clientRemote, ILogger log, Action<ResumeSession> onFinish)
+    {
+        Id = id;
+        Room = room;
+        AgentRemote = agentRemote;
+        ClientRemote = clientRemote;
+        _log = log;
+        _onFinish = onFinish;
+    }
+
+    public string Id { get; }
+    public RelayRoom Room { get; }
+    public string AgentRemote { get; }
+    public string ClientRemote { get; }
+
+    public async Task<bool> AttachAsync(string side, WebSocket socket, string remote, CancellationToken abort)
+    {
+        var attachment = new ResumeAttachment(socket, remote, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+        var writer = side == "agent" ? _agent.Writer : _client.Writer;
+        try
+        {
+            await writer.WriteAsync(attachment, abort);
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+        await Task.WhenAny(attachment.Done.Task, Task.Delay(Timeout.InfiniteTimeSpan, _finished.Token));
+        return true;
+    }
+
+    public async Task RunAsync(WebSocket initialAgent, WebSocket initialClient, TaskCompletionSource clientDone, Action stateChanged)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var pairId = Room.PairStarted(ClientRemote);
+        stateChanged();
+        WebSocket agent = initialAgent;
+        WebSocket client = initialClient;
+        ResumeAttachment? agentAttachment = null;
+        ResumeAttachment? clientAttachment = null;
+        try
+        {
+            while (true)
+            {
+                var (first, second) = await BridgeOnceAsync(agent, client);
+                if (first.CloseStatus == WebSocketCloseStatus.NormalClosure)
+                {
+                    await RelayRoom.CloseQuietlyAsync(agent, WebSocketCloseStatus.NormalClosure, "session closed");
+                    await RelayRoom.CloseQuietlyAsync(client, WebSocketCloseStatus.NormalClosure, "session closed");
+                    agentAttachment?.Done.TrySetResult();
+                    clientAttachment?.Done.TrySetResult();
+                    return;
+                }
+
+                _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} trigger_direction={TriggerDirection} trigger_error={TriggerError} other_direction={OtherDirection} other_error={OtherError}", Room.Id, pairId, Id, first.Direction, first.Error, second.Direction, second.Error);
+                await RelayRoom.CloseQuietlyAsync(agent, ResumeCloseStatus, "resume session");
+                await RelayRoom.CloseQuietlyAsync(client, ResumeCloseStatus, "resume session");
+                agentAttachment?.Done.TrySetResult();
+                clientAttachment?.Done.TrySetResult();
+
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_finished.Token);
+                timeout.CancelAfter(TimeSpan.FromMinutes(5));
+                try
+                {
+                    agentAttachment = await _agent.Reader.ReadAsync(timeout.Token);
+                    clientAttachment = await _client.Reader.ReadAsync(timeout.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                agent = agentAttachment.Socket;
+                client = clientAttachment.Socket;
+                if (!await TrySendControlAsync(agent, $"resume {Id}") || !await TrySendControlAsync(client, $"resume {Id}"))
+                {
+                    await RelayRoom.CloseQuietlyAsync(agent, ResumeCloseStatus, "retry resume");
+                    await RelayRoom.CloseQuietlyAsync(client, ResumeCloseStatus, "retry resume");
+                    agentAttachment.Done.TrySetResult();
+                    clientAttachment.Done.TrySetResult();
+                    continue;
+                }
+                _log.LogInformation("resumable bridge resumed room={Room} pair={PairId} session={Session} agent={AgentRemote} client={ClientRemote}", Room.Id, pairId, Id, agentAttachment.Remote, clientAttachment.Remote);
+            }
+        }
+        finally
+        {
+            agentAttachment?.Done.TrySetResult();
+            clientAttachment?.Done.TrySetResult();
+            Room.PairEnded();
+            clientDone.TrySetResult();
+            Finish();
+            stateChanged();
+            _log.LogInformation("resumable bridge closed room={Room} pair={PairId} session={Session} agent={AgentRemote} client={ClientRemote} duration_ms={DurationMs}", Room.Id, pairId, Id, AgentRemote, ClientRemote, stopwatch.ElapsedMilliseconds);
+        }
+    }
+
+    public void Finish()
+    {
+        if (Interlocked.Exchange(ref _finishStarted, 1) != 0)
+        {
+            return;
+        }
+        _finished.Cancel();
+        _agent.Writer.TryComplete();
+        _client.Writer.TryComplete();
+        _onFinish(this);
+    }
+
+    private static async Task<(PumpResult First, PumpResult Second)> BridgeOnceAsync(WebSocket agent, WebSocket client)
+    {
+        using var cts = new CancellationTokenSource();
+        var left = RelayRoom.PumpAsync(agent, client, "agent_to_client", cts.Token);
+        var right = RelayRoom.PumpAsync(client, agent, "client_to_agent", cts.Token);
+        var firstTask = await Task.WhenAny(left, right);
+        var first = await firstTask;
+        cts.Cancel();
+        var second = await (ReferenceEquals(firstTask, left) ? right : left);
+        return (first, second);
+    }
+
+    private static async Task<bool> TrySendControlAsync(WebSocket socket, string message)
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await socket.SendAsync(Encoding.UTF8.GetBytes(message), WebSocketMessageType.Text, true, timeout.Token);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+}
+
 sealed class WaitingAgent
 {
     private readonly TaskCompletionSource<HomePeer> _paired = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    public WaitingAgent(WebSocket socket, string remote, AgentIdentity identity)
+    public WaitingAgent(WebSocket socket, string remote, AgentIdentity identity, bool resumable)
     {
         Socket = socket;
         Remote = remote;
         Identity = identity;
+        Resumable = resumable;
     }
 
     public WebSocket Socket { get; }
     public string Remote { get; }
     public AgentIdentity Identity { get; }
+    public bool Resumable { get; }
     public bool IsOpen => Socket.State == WebSocketState.Open && !_paired.Task.IsCompleted;
 
     public Task<HomePeer> WaitAsync() => _paired.Task;
@@ -1104,7 +1335,7 @@ sealed record AgentIdentity(string Instance, string Slot)
     public string LogString => IsValid ? $"{Instance}/{Slot}" : "legacy";
 }
 
-sealed record HomePeer(WebSocket Socket, string Remote, TaskCompletionSource Done, TaskCompletionSource<string> Started);
+sealed record HomePeer(WebSocket Socket, string Remote, TaskCompletionSource Done, TaskCompletionSource<string> Started, bool Resumable);
 
 sealed record DashboardClient(Guid Id, WebSocket Socket, string? RoomId)
 {

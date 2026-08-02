@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"deskferry/internal/tunnel"
 	"nhooyr.io/websocket"
 )
 
@@ -126,6 +128,111 @@ func TestAgentClientPairAndBridgeBytes(t *testing.T) {
 	}
 }
 
+func TestResumablePairReattachesAfterWebSocketDrop(t *testing.T) {
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	capability := http.Header{"X-DeskFerry-Resumable": []string{"1"}}
+	agent := dialRoleHeaders(t, ctx, server.URL, "/relay/unit-resume/ws", "agent", capability)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status := getStatus(t, server.URL, "unit-resume")
+		if len(status.Rooms) == 1 && status.Rooms[0].WaitingAgents == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	home := dialRoleHeaders(t, ctx, server.URL, "/relay/unit-resume/ws", "client", capability)
+
+	agentStart := expectTextPrefix(t, ctx, agent, startMessage+" ")
+	homeStart := expectTextPrefix(t, ctx, home, startMessage+" ")
+	if agentStart != homeStart {
+		t.Fatalf("session starts differ: agent=%q home=%q", agentStart, homeStart)
+	}
+	sessionID := strings.TrimPrefix(agentStart, startMessage+" ")
+
+	if err := home.Write(ctx, websocket.MessageBinary, []byte("before-drop")); err != nil {
+		t.Fatal(err)
+	}
+	expectBinary(t, ctx, agent, "before-drop")
+	_ = home.CloseNow()
+	if _, _, err := agent.Read(ctx); err == nil {
+		t.Fatal("agent socket remained open after paired client drop")
+	}
+
+	agentHeaders := http.Header{
+		"X-DeskFerry-Session":      []string{sessionID},
+		"X-DeskFerry-Session-Side": []string{"agent"},
+	}
+	clientHeaders := http.Header{
+		"X-DeskFerry-Session":      []string{sessionID},
+		"X-DeskFerry-Session-Side": []string{"client"},
+	}
+	agent = dialRoleHeaders(t, ctx, server.URL, "/relay/unit-resume/ws", resumeRole, agentHeaders)
+	home = dialRoleHeaders(t, ctx, server.URL, "/relay/unit-resume/ws", resumeRole, clientHeaders)
+	defer agent.Close(websocket.StatusNormalClosure, "session closed")
+	defer home.Close(websocket.StatusNormalClosure, "session closed")
+	expectText(t, ctx, agent, resumeMessage+" "+sessionID)
+	expectText(t, ctx, home, resumeMessage+" "+sessionID)
+
+	if err := agent.Write(ctx, websocket.MessageBinary, []byte("after-resume")); err != nil {
+		t.Fatal(err)
+	}
+	expectBinary(t, ctx, home, "after-resume")
+	status := getStatus(t, server.URL, "unit-resume")
+	if len(status.Rooms) != 1 || status.Rooms[0].ActivePairs != 1 || status.Rooms[0].TotalPairs != 1 {
+		t.Fatalf("resumed bridge changed pair counts: %+v", status.Rooms)
+	}
+}
+
+func TestResumableStreamsSurviveForcedRelayTransportLoss(t *testing.T) {
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	relayAddr := server.URL + "/relay/unit-resume-stream"
+	headers := http.Header{}
+	headers.Set(tunnel.HeaderResumable, "1")
+	agentWS, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleAgent, "", headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status := getStatus(t, server.URL, "unit-resume-stream")
+		if len(status.Rooms) == 1 && status.Rooms[0].WaitingAgents == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	clientWS, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleClient, "", headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentSession, err := tunnel.AwaitWebSocketStartSession(ctx, agentWS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientSession, err := tunnel.AwaitWebSocketStartSession(ctx, clientWS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agentSession == "" || agentSession != clientSession {
+		t.Fatalf("negotiated sessions agent=%q client=%q", agentSession, clientSession)
+	}
+	agentConn := tunnel.NewResumableWebSocketConn(ctx, agentWS, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: "direct", SessionID: agentSession, Side: "agent"})
+	clientConn := tunnel.NewResumableWebSocketConn(ctx, clientWS, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: "direct", SessionID: clientSession, Side: "client"})
+	defer agentConn.Close()
+	defer clientConn.Close()
+
+	assertStreamTransfer(t, ctx, clientConn, agentConn, []byte("before-drop"))
+	_ = clientWS.CloseNow()
+	assertStreamTransfer(t, ctx, agentConn, clientConn, []byte("after-resume"))
+}
+
 func TestAgentIdentityReplacesExistingWaitingSocket(t *testing.T) {
 	server := httptest.NewServer(newServer())
 	defer server.Close()
@@ -232,6 +339,18 @@ func expectText(t *testing.T, ctx context.Context, c *websocket.Conn, want strin
 	}
 }
 
+func expectTextPrefix(t *testing.T, ctx context.Context, c *websocket.Conn, prefix string) string {
+	t.Helper()
+	typ, payload, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ != websocket.MessageText || !strings.HasPrefix(string(payload), prefix) {
+		t.Fatalf("message = (%v, %q), want text prefix %q", typ, payload, prefix)
+	}
+	return string(payload)
+}
+
 func expectBinary(t *testing.T, ctx context.Context, c *websocket.Conn, want string) {
 	t.Helper()
 	typ, payload, err := c.Read(ctx)
@@ -240,5 +359,32 @@ func expectBinary(t *testing.T, ctx context.Context, c *websocket.Conn, want str
 	}
 	if typ != websocket.MessageBinary || string(payload) != want {
 		t.Fatalf("message = (%v, %q), want binary %q", typ, payload, want)
+	}
+}
+
+func assertStreamTransfer(t *testing.T, ctx context.Context, source, destination io.ReadWriter, payload []byte) {
+	t.Helper()
+	errCh := make(chan error, 2)
+	go func() {
+		_, err := source.Write(payload)
+		errCh <- err
+	}()
+	got := make([]byte, len(payload))
+	go func() {
+		_, err := io.ReadFull(destination, got)
+		errCh <- err
+	}()
+	for range 2 {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("stream received %q, want %q", got, payload)
 	}
 }

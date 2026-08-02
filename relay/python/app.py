@@ -16,10 +16,11 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
 DASHBOARD_ROLE = "dashboard"
+RESUME_ROLE = "resume"
 STARTED = "started"
 AGENT_UNAVAILABLE = "agent-unavailable"
 CLIENT_UNAVAILABLE = "client-unavailable"
-VALID_ROLES = {"agent", "client", "home-agent", "probe", DASHBOARD_ROLE}
+VALID_ROLES = {"agent", "client", "home-agent", "probe", RESUME_ROLE, DASHBOARD_ROLE}
 
 logger = logging.getLogger("deskferry.relay")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -123,6 +124,15 @@ def read_agent_identity(websocket: WebSocket) -> AgentIdentity:
     )
 
 
+def read_resumable(websocket: WebSocket) -> bool:
+    return websocket.headers.get("x-deskferry-resumable", "").strip().lower() in {"1", "true"}
+
+
+def clean_session_value(value: str | None) -> str:
+    value = (value or "").strip().lower()
+    return value if len(value) == 32 and all(ch in "0123456789abcdef" for ch in value) else ""
+
+
 async def close_quietly(websocket: WebSocket, code: int = 1000, reason: str = "") -> None:
     try:
         if websocket.application_state == WebSocketState.CONNECTED:
@@ -188,13 +198,17 @@ async def pump_binary(source: WebSocket, destination: WebSocket, direction: str)
 
 
 async def send_start(websocket: WebSocket, side: str, room: str, remote: str) -> bool:
+    return await send_control(websocket, "start", side, room, remote)
+
+
+async def send_control(websocket: WebSocket, message: str, side: str, room: str, remote: str) -> bool:
     try:
-        await websocket.send_text("start")
+        await websocket.send_text(message)
         return True
     except asyncio.CancelledError:
         raise
     except Exception:
-        logger.info("start frame failed room=%s side=%s remote=%s", room, side, remote, exc_info=True)
+        logger.info("control frame failed room=%s side=%s remote=%s message=%r", room, side, remote, message, exc_info=True)
         await close_quietly(websocket)
         return False
 
@@ -219,6 +233,7 @@ class HomePeer:
     remote: str
     done: asyncio.Future[None]
     started: asyncio.Future[str]
+    resumable: bool = False
 
 
 @dataclass
@@ -226,6 +241,7 @@ class WaitingAgent:
     websocket: WebSocket
     remote: str
     identity: AgentIdentity = field(default_factory=AgentIdentity)
+    resumable: bool = False
     paired: asyncio.Future[HomePeer] = field(default_factory=asyncio.Future)
 
     @property
@@ -260,8 +276,8 @@ class RelayRoom:
         self._last_client_connected_at: datetime | None = None
         self._last_client_disconnected_at: datetime | None = None
 
-    async def enqueue_agent(self, websocket: WebSocket, remote: str, identity: AgentIdentity) -> tuple[WaitingAgent, int]:
-        waiting = WaitingAgent(websocket, remote, identity)
+    async def enqueue_agent(self, websocket: WebSocket, remote: str, identity: AgentIdentity, resumable: bool = False) -> tuple[WaitingAgent, int]:
+        waiting = WaitingAgent(websocket, remote, identity, resumable)
         replaced: list[WaitingAgent] = []
         async with self._lock:
             self._prune_closed_agents_locked()
@@ -318,13 +334,7 @@ class RelayRoom:
         state_changed: Any,
     ) -> None:
         started = time.monotonic()
-        async with self._lock:
-            self._active_pairs += 1
-            self._total_pairs += 1
-            pair_id = self._total_pairs
-            self._last_client_remote = client_remote
-            self._last_client_connected_at = utc_now()
-            self._last_client_disconnected_at = None
+        pair_id = await self.pair_started(client_remote)
         state_changed()
 
         left = asyncio.create_task(pump_binary(agent, client, "agent_to_client"))
@@ -342,16 +352,28 @@ class RelayRoom:
                 self.id, pair_id, round((time.monotonic() - started) * 1000), first.direction, first.byte_count, first.messages, first.end, first.close_code, first.close_reason, first.error, second.direction, second.byte_count, second.messages, second.end, second.close_code, second.close_reason, second.error,
             )
         finally:
-            async with self._lock:
-                self._active_pairs = max(0, self._active_pairs - 1)
-                self._last_agent_disconnected_at = utc_now()
-                self._last_client_disconnected_at = utc_now()
+            await self.pair_ended()
             await close_quietly(agent)
             await close_quietly(client)
             if not client_done.done():
                 client_done.set_result(None)
             state_changed()
             logger.info("bridge closed room=%s pair=%s agent=%s client=%s duration_ms=%d", self.id, pair_id, agent_remote, client_remote, round((time.monotonic() - started) * 1000))
+
+    async def pair_started(self, client_remote: str) -> int:
+        async with self._lock:
+            self._active_pairs += 1
+            self._total_pairs += 1
+            self._last_client_remote = client_remote
+            self._last_client_connected_at = utc_now()
+            self._last_client_disconnected_at = None
+            return self._total_pairs
+
+    async def pair_ended(self) -> None:
+        async with self._lock:
+            self._active_pairs = max(0, self._active_pairs - 1)
+            self._last_agent_disconnected_at = utc_now()
+            self._last_client_disconnected_at = utc_now()
 
     async def snapshot(self) -> dict[str, Any]:
         async with self._lock:
@@ -378,6 +400,123 @@ class RelayRoom:
 
 
 @dataclass
+class ResumeAttachment:
+    websocket: WebSocket
+    remote: str
+    done: asyncio.Future[None]
+
+
+class ResumeSession:
+    def __init__(
+        self,
+        session_id: str,
+        room: RelayRoom,
+        agent_remote: str,
+        client_remote: str,
+        on_finish: Any,
+    ) -> None:
+        self.id = session_id
+        self.room = room
+        self.agent_remote = agent_remote
+        self.client_remote = client_remote
+        self._agent: asyncio.Queue[ResumeAttachment] = asyncio.Queue(maxsize=2)
+        self._client: asyncio.Queue[ResumeAttachment] = asyncio.Queue(maxsize=2)
+        self._done = asyncio.Event()
+        self._on_finish = on_finish
+
+    async def attach(self, side: str, websocket: WebSocket, remote: str) -> bool:
+        attachment = ResumeAttachment(websocket, remote, asyncio.Future())
+        queue = self._agent if side == "agent" else self._client
+        try:
+            await queue.put(attachment)
+            done_task = asyncio.create_task(self._done.wait())
+            await asyncio.wait({attachment.done, done_task}, return_when=asyncio.FIRST_COMPLETED)
+            done_task.cancel()
+            return True
+        except asyncio.CancelledError:
+            return False
+
+    async def run(
+        self,
+        agent: WebSocket,
+        client: WebSocket,
+        client_done: asyncio.Future[None],
+        state_changed: Any,
+    ) -> None:
+        started_at = time.monotonic()
+        pair_id = await self.room.pair_started(self.client_remote)
+        state_changed()
+        agent_attachment: ResumeAttachment | None = None
+        client_attachment: ResumeAttachment | None = None
+        try:
+            while True:
+                first, second = await bridge_once(agent, client)
+                if first.close_code == 1000:
+                    await close_quietly(agent, 1000, "session closed")
+                    await close_quietly(client, 1000, "session closed")
+                    if agent_attachment is not None:
+                        try_set_result(agent_attachment.done, None)
+                    if client_attachment is not None:
+                        try_set_result(client_attachment.done, None)
+                    return
+
+                logger.info(
+                    "resumable bridge interrupted room=%s pair=%s session=%s trigger_direction=%s trigger_error=%r other_direction=%s other_error=%r",
+                    self.room.id, pair_id, self.id, first.direction, first.error, second.direction, second.error,
+                )
+                await close_quietly(agent, 1012, "resume session")
+                await close_quietly(client, 1012, "resume session")
+                if agent_attachment is not None:
+                    try_set_result(agent_attachment.done, None)
+                if client_attachment is not None:
+                    try_set_result(client_attachment.done, None)
+                try:
+                    agent_attachment, client_attachment = await asyncio.wait_for(
+                        asyncio.gather(self._agent.get(), self._client.get()), timeout=300
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    return
+                agent = agent_attachment.websocket
+                client = client_attachment.websocket
+                if not await send_control(agent, f"resume {self.id}", "agent", self.room.id, agent_attachment.remote) or not await send_control(client, f"resume {self.id}", "client", self.room.id, client_attachment.remote):
+                    await close_quietly(agent, 1012, "retry resume")
+                    await close_quietly(client, 1012, "retry resume")
+                    try_set_result(agent_attachment.done, None)
+                    try_set_result(client_attachment.done, None)
+                    continue
+                logger.info("resumable bridge resumed room=%s pair=%s session=%s agent=%s client=%s", self.room.id, pair_id, self.id, agent_attachment.remote, client_attachment.remote)
+        finally:
+            if agent_attachment is not None:
+                try_set_result(agent_attachment.done, None)
+            if client_attachment is not None:
+                try_set_result(client_attachment.done, None)
+            await self.room.pair_ended()
+            try_set_result(client_done, None)
+            self.finish()
+            state_changed()
+            logger.info("resumable bridge closed room=%s pair=%s session=%s agent=%s client=%s duration_ms=%d", self.room.id, pair_id, self.id, self.agent_remote, self.client_remote, round((time.monotonic() - started_at) * 1000))
+
+    def finish(self) -> None:
+        if self._done.is_set():
+            return
+        self._done.set()
+        self._on_finish(self)
+
+
+async def bridge_once(agent: WebSocket, client: WebSocket) -> tuple[PumpResult, PumpResult]:
+    left = asyncio.create_task(pump_binary(agent, client, "agent_to_client"))
+    right = asyncio.create_task(pump_binary(client, agent, "client_to_agent"))
+    done, _ = await asyncio.wait({left, right}, return_when=asyncio.FIRST_COMPLETED)
+    first_task = next(iter(done))
+    first = await first_task
+    second_task = right if first_task is left else left
+    if not second_task.done():
+        second_task.cancel()
+    second = await second_task
+    return first, second
+
+
+@dataclass
 class DashboardClient:
     id: str
     websocket: WebSocket
@@ -390,6 +529,7 @@ class RelayHub:
         self._lock = asyncio.Lock()
         self._rooms: dict[str, RelayRoom] = {}
         self._dashboards: dict[str, DashboardClient] = {}
+        self._sessions: dict[str, ResumeSession] = {}
 
     async def serve_agent(
         self,
@@ -397,10 +537,11 @@ class RelayHub:
         websocket: WebSocket,
         remote: str,
         identity: AgentIdentity | None = None,
+        resumable: bool = False,
     ) -> None:
         room = await self._room_for(token)
         identity = identity or AgentIdentity()
-        waiting, replaced = await room.enqueue_agent(websocket, remote, identity)
+        waiting, replaced = await room.enqueue_agent(websocket, remote, identity, resumable)
         logger.info("agent waiting room=%s remote=%s key=%s replaced=%s", room.id, remote, identity.log_string, replaced)
         self.notify_dashboards()
 
@@ -408,6 +549,20 @@ class RelayHub:
         try:
             peer = await waiting.paired
             logger.info("pairing room=%s agent=%s client=%s", room.id, remote, peer.remote)
+            if waiting.resumable and peer.resumable:
+                session = self._new_resume_session(room, remote, peer.remote)
+                if not await send_control(websocket, f"start {session.id}", "agent", room.id, remote):
+                    try_set_result(peer.started, AGENT_UNAVAILABLE)
+                    session.finish()
+                    return
+                if not await send_control(peer.websocket, f"start {session.id}", "client", room.id, peer.remote):
+                    try_set_result(peer.started, CLIENT_UNAVAILABLE)
+                    try_set_result(peer.done, None)
+                    session.finish()
+                    return
+                try_set_result(peer.started, STARTED)
+                await session.run(websocket, peer.websocket, peer.done, self.notify_dashboards)
+                return
             if not await send_start(websocket, "agent", room.id, remote):
                 try_set_result(peer.started, AGENT_UNAVAILABLE)
                 return
@@ -432,7 +587,7 @@ class RelayHub:
             await room.remove_waiting(waiting)
             self.notify_dashboards()
 
-    async def serve_client(self, token: str, websocket: WebSocket, remote: str) -> None:
+    async def serve_client(self, token: str, websocket: WebSocket, remote: str, resumable: bool = False) -> None:
         room = await self._room_for(token)
         while websocket_is_connected(websocket):
             waiting = await room.try_take_agent()
@@ -443,7 +598,7 @@ class RelayHub:
 
             done: asyncio.Future[None] = asyncio.Future()
             started: asyncio.Future[str] = asyncio.Future()
-            if not waiting.try_pair(HomePeer(websocket, remote, done, started)):
+            if not waiting.try_pair(HomePeer(websocket, remote, done, started, resumable)):
                 continue
             self.notify_dashboards()
 
@@ -460,6 +615,24 @@ class RelayHub:
                 return
 
         await close_quietly(websocket)
+
+    async def serve_resume(self, token: str, websocket: WebSocket, remote: str, session_id: str | None, side: str | None) -> None:
+        session_id = clean_session_value(session_id)
+        side = (side or "").strip().lower()
+        session = self._sessions.get(f"{room_id(token)}/{session_id}")
+        if not session_id or side not in {"agent", "client"} or session is None:
+            await close_quietly(websocket, 1008, "unknown resumable session")
+            return
+        if not await session.attach(side, websocket, remote):
+            await close_quietly(websocket, 1013, "resumable session unavailable")
+
+    def _new_resume_session(self, room: RelayRoom, agent_remote: str, client_remote: str) -> ResumeSession:
+        def remove(session: ResumeSession) -> None:
+            self._sessions.pop(f"{room.id}/{session.id}", None)
+
+        session = ResumeSession(uuid.uuid4().hex, room, agent_remote, client_remote, remove)
+        self._sessions[f"{room.id}/{session.id}"] = session
+        return session
 
     async def serve_home_agent(self, token: str, websocket: WebSocket, remote: str) -> None:
         room = await self._room_for(token)
@@ -587,9 +760,11 @@ async def relay_websocket(websocket: WebSocket, room: str | None) -> None:
     if role == DASHBOARD_ROLE:
         await hub.serve_dashboard(websocket, remote, room)
     elif role == "agent":
-        await hub.serve_agent(token, websocket, remote, read_agent_identity(websocket))
+        await hub.serve_agent(token, websocket, remote, read_agent_identity(websocket), read_resumable(websocket))
     elif role == "client":
-        await hub.serve_client(token, websocket, remote)
+        await hub.serve_client(token, websocket, remote, read_resumable(websocket))
+    elif role == RESUME_ROLE:
+        await hub.serve_resume(token, websocket, remote, websocket.headers.get("x-deskferry-session"), websocket.headers.get("x-deskferry-session-side"))
     elif role == "home-agent":
         await hub.serve_home_agent(token, websocket, remote)
     elif role == "probe":

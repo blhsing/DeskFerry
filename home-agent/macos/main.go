@@ -250,27 +250,58 @@ func homePresenceLoop(ctx context.Context, cfg config) {
 }
 
 func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
+	deadline := time.Now().Add(5 * time.Minute)
+	backoff := 250 * time.Millisecond
 	var errs []string
-	for _, relayAddr := range cfg.relayAddresses() {
-		attemptStarted := time.Now()
-		attemptCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		ws, err := tunnel.DialWebSocket(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "")
-		if err == nil {
-			err = tunnel.AwaitWebSocketStart(attemptCtx, ws)
-		}
-		if err == nil {
+	for ctx.Err() == nil && time.Now().Before(deadline) {
+		errs = errs[:0]
+		for _, relayAddr := range cfg.relayAddresses() {
+			attemptStarted := time.Now()
+			attemptCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			headers := http.Header{}
+			headers.Set(tunnel.HeaderResumable, "1")
+			ws, err := tunnel.DialWebSocketWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
+			sessionID := ""
+			if err == nil {
+				sessionID, err = tunnel.AwaitWebSocketStartSession(attemptCtx, ws)
+			}
+			if err == nil {
+				cancel()
+				log.Printf("relay client paired relay=%s via=%s duration=%s", relayAddr, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
+				if sessionID != "" {
+					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{
+						RelayAddr: relayAddr,
+						Proxy:     cfg.Proxy,
+						SessionID: sessionID,
+						Side:      "client",
+					}), relayAddr, nil
+				}
+				return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil
+			}
 			cancel()
-			log.Printf("relay client paired relay=%s via=%s duration=%s", relayAddr, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
-			return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil
+			tunnel.CloseWebSocket(ws)
+			errs = append(errs, fmt.Sprintf("%s after %s: %v", relayAddr, time.Since(attemptStarted).Round(time.Millisecond), err))
+			if ctx.Err() != nil {
+				break
+			}
 		}
-		cancel()
-		tunnel.CloseWebSocket(ws)
-		errs = append(errs, fmt.Sprintf("%s after %s: %v", relayAddr, time.Since(attemptStarted).Round(time.Millisecond), err))
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || time.Now().After(deadline) {
 			break
 		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+		}
+		if backoff < 5*time.Second {
+			backoff *= 2
+			if backoff > 5*time.Second {
+				backoff = 5 * time.Second
+			}
+		}
 	}
-	return nil, "", fmt.Errorf("all relay URLs failed: %s", strings.Join(errs, "; "))
+	return nil, "", fmt.Errorf("relay retry window ended: %s", strings.Join(errs, "; "))
 }
 
 func launchRDP(cfg config) error {
