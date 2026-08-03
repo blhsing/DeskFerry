@@ -402,6 +402,11 @@ func (a *clientApp) run(smokeTest bool) error {
 	a.restartHomePresence()
 	a.refreshRelayStatusAsync()
 	a.startStatusPoller()
+	if !smokeTest {
+		if err := a.startTunnel(false); err != nil {
+			a.appendLog("Could not restore local RDP listener: %v", err)
+		}
+	}
 
 	if smokeTest {
 		time.AfterFunc(350*time.Millisecond, func() {
@@ -1529,6 +1534,8 @@ func run(ctx context.Context, cfg config, openMSTSC bool) error {
 }
 
 func serveListener(ctx context.Context, cfg config, listener net.Listener, started func(string), done func(string), logf func(string, ...any)) error {
+	var localSessions tunnel.LatestConnGroup
+	defer localSessions.Close()
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
@@ -1543,7 +1550,14 @@ func serveListener(ctx context.Context, cfg config, listener net.Listener, start
 		}
 		remote := conn.RemoteAddr().String()
 		started(remote)
-		go handleLocalConn(ctx, cfg, conn, remote, done, logf)
+		connCtx, release, replaced := localSessions.Begin(ctx, conn)
+		if replaced {
+			logf("RDP connection remote=%s superseded previous local retry", remote)
+		}
+		go func() {
+			defer release()
+			handleLocalConn(connCtx, cfg, conn, remote, done, logf)
+		}()
 	}
 }
 

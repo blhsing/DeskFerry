@@ -90,6 +90,10 @@ const (
 	HeaderResumable   = "X-DeskFerry-Resumable"
 	HeaderSessionID   = "X-DeskFerry-Session"
 	HeaderSessionSide = "X-DeskFerry-Session-Side"
+
+	// Resumable data messages contain a 64 KiB payload plus framing. Keep a
+	// bounded amount of headroom above that protocol maximum.
+	webSocketReadLimit = 1 << 20
 )
 
 func IsWebSocketRelay(relayAddr string) bool {
@@ -224,6 +228,7 @@ func DialWebSocketWithHeaders(ctx context.Context, relayAddr, proxySpec, role, t
 		}
 		return nil, fmt.Errorf("websocket dial failed: %w", err)
 	}
+	c.SetReadLimit(webSocketReadLimit)
 	return c, nil
 }
 

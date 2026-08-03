@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -54,7 +55,7 @@ func TestExternalRelayResumption(t *testing.T) {
 	clientConn := NewResumableWebSocketConn(ctx, clientWS, ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: proxySpec, SessionID: clientSession, Side: "client"})
 	defer agentConn.Close()
 	defer clientConn.Close()
-	compatTransfer(t, ctx, clientConn, agentConn, []byte("before-drop"))
+	compatTransfer(t, ctx, clientConn, agentConn, bytes.Repeat([]byte{0xa5}, resumableChunkSize+resumableHeaderLen))
 	_ = clientWS.CloseNow()
 	compatTransfer(t, ctx, agentConn, clientConn, []byte("after-resume"))
 }

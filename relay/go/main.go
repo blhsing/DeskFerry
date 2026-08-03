@@ -30,6 +30,9 @@ const (
 	started           = "started"
 	agentUnavailable  = "agent-unavailable"
 	clientUnavailable = "client-unavailable"
+	// Resumable tunnel data messages contain a 64 KiB payload plus framing.
+	// Keep a bounded amount of headroom above that protocol maximum.
+	relayWebSocketReadLimit = 1 << 20
 )
 
 var validRoles = map[string]bool{
@@ -188,9 +191,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hub *RelayHub, room
 }
 
 func acceptWebSocket(w http.ResponseWriter, r *http.Request) (*websocket.Conn, error) {
-	return websocket.Accept(w, r, &websocket.AcceptOptions{
+	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		CompressionMode: websocket.CompressionDisabled,
 	})
+	if err != nil {
+		return nil, err
+	}
+	c.SetReadLimit(relayWebSocketReadLimit)
+	return c, nil
 }
 
 func readRole(r *http.Request) string {

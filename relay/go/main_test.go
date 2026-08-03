@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -111,6 +112,7 @@ func TestAgentClientPairAndBridgeBytes(t *testing.T) {
 
 	expectText(t, ctx, agent, startMessage)
 	expectText(t, ctx, home, startMessage)
+	agent.SetReadLimit(relayWebSocketReadLimit)
 
 	if err := home.Write(ctx, websocket.MessageBinary, []byte("from-home")); err != nil {
 		t.Fatal(err)
@@ -121,6 +123,20 @@ func TestAgentClientPairAndBridgeBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	expectBinary(t, ctx, home, "from-agent")
+
+	// A full resumable frame is 64 KiB of data plus a 9-byte header. This
+	// exceeds nhooyr's 32 KiB default and must pass through the relay intact.
+	largeFrame := bytes.Repeat([]byte{0xa5}, 64*1024+9)
+	if err := home.Write(ctx, websocket.MessageBinary, largeFrame); err != nil {
+		t.Fatal(err)
+	}
+	typ, payload, err := agent.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ != websocket.MessageBinary || !bytes.Equal(payload, largeFrame) {
+		t.Fatalf("large frame = (%v, %d bytes), want binary %d bytes", typ, len(payload), len(largeFrame))
+	}
 
 	status := getStatus(t, server.URL, "unit-bridge")
 	if len(status.Rooms) != 1 || status.Rooms[0].ActivePairs != 1 || status.Rooms[0].TotalPairs != 1 {
@@ -228,7 +244,7 @@ func TestResumableStreamsSurviveForcedRelayTransportLoss(t *testing.T) {
 	defer agentConn.Close()
 	defer clientConn.Close()
 
-	assertStreamTransfer(t, ctx, clientConn, agentConn, []byte("before-drop"))
+	assertStreamTransfer(t, ctx, clientConn, agentConn, bytes.Repeat([]byte{0xa5}, 64*1024+9))
 	_ = clientWS.CloseNow()
 	assertStreamTransfer(t, ctx, agentConn, clientConn, []byte("after-resume"))
 }
