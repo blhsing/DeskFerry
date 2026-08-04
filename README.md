@@ -260,6 +260,8 @@ Read-Host "Room password" -MaskInput | .\DeskFerryHomeSetup.exe `
 
 The CLI actions are `install`, `configure`, `uninstall`, and `status`. Use `-enable-network=false` for an app-only configuration, `-room-password-blob <path>` to read an existing machine-scope DPAPI room-password blob, and `-cli-help` for all options. From a non-elevated shell, Setup requests UAC elevation and returns after launching the elevated action.
 
+The virtual adapter has its own single work-destination configuration. It does not automatically follow the destination currently selected in the Home RDP app. Configure Home Setup with the relay URLs and room password for the exact work computer whose shares should appear under `\\deskferry-work`; changing the selected RDP destination alone does not retarget SMB. The matching work agent must use that room, the same password, and an SMB target such as `127.0.0.1:445`. Do not point the Home adapter at a room served by a work agent on the Home PC itself: that creates a valid tunnel back to the Home PC's SMB server, so a path such as `\\deskferry-work\c$` displays the Home PC's local `C:` drive.
+
 After both sides are configured, open an existing work share in Explorer:
 
 ```text
@@ -723,12 +725,16 @@ Check:
 
 Check:
 
+- Home Setup's relay room is the intended file-server work computer. This setting is independent of the destination selected in the Home RDP app.
 - The work configurator has SMB target `127.0.0.1:445`, the alias used by Home setup, and a room password.
 - Home setup used the same room name and password and its file-access checkbox was selected.
+- The relay dashboard reports that room as protected and shows waiting work-agent capacity for SMB. A room exposing only RDP capacity cannot serve file access.
 - The `DeskFerryHomeNetwork` service is running and the `DeskFerry` adapter has address `198.18.0.1`.
 - `Test-NetConnection deskferry-work -Port 445` reaches `198.18.0.2` on the Home PC.
 - The named Windows share exists and the supplied Windows account has both share and NTFS permission.
 - The work PC was restarted once after adding or changing the SMB server alias.
+
+If `\\deskferry-work\c$` opens the Home PC's own system drive, the adapter is targeting a room whose work agent runs on the Home PC. Reconfigure Home Setup with the remote work computer's room; also enable a password and SMB on that remote work agent before retrying.
 
 If Windows reports that the target account name is incorrect in a domain, the alias lacks a matching Kerberos SPN. Register the alias through the domain's normal computer-alias/SPN administration, use the actual work hostname as the configured alias, or permit the organization's approved NTLM fallback. Microsoft documents the alias/SPN behavior in [SMB file server share access through an alias](https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/dns-cname-alias-cannot-access-smb-file-server-share).
 
