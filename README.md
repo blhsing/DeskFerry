@@ -199,7 +199,24 @@ To enable remote command execution, set the WinRM target to `127.0.0.1:5985`. Wi
 
 To enable Windows file sharing, set the SMB target to `127.0.0.1:445`, leave the SMB server alias at `deskferry-work`, and use a non-empty room password. The configurator registers that specific alias with the Windows Server service; restart the work PC once if the alias is not accepted immediately. Create and permission shares with the normal Windows **Advanced Sharing** controls. DeskFerry does not create shares or weaken their NTFS/share permissions.
 
-Command-line install is also supported:
+The configurator also exposes every setup field and service action through its CLI. Run it from an elevated PowerShell session when the caller must wait for completion; otherwise it requests UAC elevation and returns after launching the elevated action. Supply passwords over standard input so they do not appear in the process command line:
+
+```powershell
+Read-Host "Room password" -MaskInput | .\deskferry-agent-configurator-windows-amd64.exe `
+  -cli-action install `
+  -install-dir 'C:\Program Files\DeskFerry\Agent' `
+  -agent .\deskferry-agent-windows-amd64.exe `
+  -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk `
+  -relay-url http://217.142.228.117/relay/workdesk `
+  -room-password-stdin `
+  -winrm 127.0.0.1:5985 `
+  -smb 127.0.0.1:445 `
+  -smb-alias deskferry-work
+```
+
+Omit all password flags during an update to preserve the installed DPAPI-protected credential. Use `-clear-room-password` to remove it, or `-room-password-blob <path>` to install and consume an existing machine-scope DPAPI blob. The available `-cli-action` values are `install`, `start`, `stop`, `restart`, `uninstall`, and `status`; run the configurator with `-cli-help` for the complete option summary.
+
+The work agent's narrower command-line installer is also supported:
 
 ```powershell
 .\deskferry-agent-windows-amd64.exe -install -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk
@@ -227,6 +244,21 @@ dist\windows-home-installer\DeskFerryHomeSetup.exe
 ```
 
 **Enable `\\deskferry-work\...` file access with the DeskFerry virtual network adapter** is selected by default and can be cleared for an app-only installation. When selected, enter the same relay room URL list and room password as the work agent. Setup installs the Home GUI, Start menu and Apps & Features entries, the automatic restricted network service, signed Wintun, and tun2socks. When it is cleared during an update, setup removes the network service, adapter helpers, and managed hostname while leaving the Home GUI installed.
+
+Setup doubles as the installed Home configurator. When reopened, its UI and CLI load the installed location plus the current relay list, proxy, alias, and adapter state. Setup preserves the protected derived room proof during an elevated same-room update, so the password is not required again; changing rooms or enabling file access without an existing proof does require it. A complete non-interactive install or reconfiguration can be run from an elevated PowerShell session:
+
+```powershell
+Read-Host "Room password" -MaskInput | .\DeskFerryHomeSetup.exe `
+  -cli-action configure `
+  -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk `
+  -relay-url http://217.142.228.117/relay/workdesk `
+  -proxy direct `
+  -alias deskferry-work `
+  -enable-network=true `
+  -room-password-stdin
+```
+
+The CLI actions are `install`, `configure`, `uninstall`, and `status`. Use `-enable-network=false` for an app-only configuration, `-room-password-blob <path>` to read an existing machine-scope DPAPI room-password blob, and `-cli-help` for all options. From a non-elevated shell, Setup requests UAC elevation and returns after launching the elevated action.
 
 After both sides are configured, open an existing work share in Explorer:
 
@@ -429,7 +461,7 @@ It:
 
 The Windows package also includes:
 
-- `DeskFerryHomeSetup.exe`, a self-contained GUI installer with file access selected by default.
+- `DeskFerryHomeSetup.exe`, a self-contained GUI/CLI installer and configurator with file access selected by default.
 - `DeskFerryHomeNetwork.exe`, an automatic LocalSystem service that owns the virtual adapter and the TCP/445-only relay bridge.
 - Wintun 0.14.1 and tun2socks 2.6.0, downloaded by the build with pinned SHA-256 hashes and distributed with their licenses.
 
@@ -766,10 +798,10 @@ relay/python/            Python/FastAPI WebSocket relay
 work-agent/windows/service
                          Windows service work-side agent
 work-agent/windows/configurator
-                         Windows service setup/configurator GUI
+                         Windows service setup/configurator GUI and CLI
 home-agent/windows       Windows control-panel/tray home app
 home-agent/windows/installer
-                         Self-contained Windows Home setup GUI
+                         Self-contained Windows Home setup/configurator GUI and CLI
 home-agent/windows/network-service
                          Restricted Wintun/tun2socks SMB network service
 home-agent/macos         macOS foreground CLI home agent

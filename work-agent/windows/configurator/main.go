@@ -87,6 +87,13 @@ func main() {
 		}
 		return
 	}
+	if hasArg(os.Args[1:], "-cli-action") || hasArg(os.Args[1:], "-cli-help") {
+		if err := runCLI(os.Args[1:], os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if hasElevatedAction(os.Args[1:]) {
 		if !isElevated() {
 			if err := relaunchCurrentArgsElevated(os.Args[1:]); err != nil {
@@ -167,9 +174,9 @@ func (a *app) run(smokeTest bool) error {
 					Label{Text: "Password options"},
 					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM and SMB)", ColumnSpan: 2},
 					Label{Text: "WinRM target"},
-					LineEdit{AssignTo: &a.winrmAddr, CueBanner: "127.0.0.1:5985; blank disables WinRM", ColumnSpan: 2},
+					LineEdit{AssignTo: &a.winrmAddr, Text: "127.0.0.1:5985", CueBanner: "blank disables WinRM", ColumnSpan: 2},
 					Label{Text: "SMB target"},
-					LineEdit{AssignTo: &a.smbAddr, CueBanner: "127.0.0.1:445; blank disables SMB", ColumnSpan: 2},
+					LineEdit{AssignTo: &a.smbAddr, Text: "127.0.0.1:445", CueBanner: "blank disables SMB", ColumnSpan: 2},
 					Label{Text: "SMB server alias"},
 					LineEdit{AssignTo: &a.smbAlias, Text: defaultSMBAlias, CueBanner: defaultSMBAlias, ColumnSpan: 2},
 				},
@@ -471,7 +478,7 @@ func (a *app) runAction(action string) {
 	}
 	go func() {
 		if !isElevated() {
-			if err := relaunchElevatedAction(action, opts); err != nil {
+			if err := relaunchElevatedAction(action, opts, false); err != nil {
 				a.appendLog("Elevation failed: %v", err)
 				return
 			}
@@ -676,8 +683,9 @@ func runElevatedAction(args []string) {
 	winrmAddr := fs.String("winrm", "", "WinRM target")
 	smbAddr := fs.String("smb", "", "SMB target")
 	smbAlias := fs.String("smb-alias", defaultSMBAlias, "SMB server alias")
+	noDialog := fs.Bool("no-dialog", false, "write the result to the console instead of displaying a dialog")
 	if err := fs.Parse(args); err != nil {
-		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
+		reportElevatedResult(*noDialog, "", err)
 		os.Exit(2)
 	}
 	message, err := performAction(*action, actionOptions{
@@ -691,10 +699,170 @@ func runElevatedAction(args []string) {
 		SMBAlias:          *smbAlias,
 	})
 	if err != nil {
-		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
+		reportElevatedResult(*noDialog, "", err)
 		os.Exit(1)
 	}
+	reportElevatedResult(*noDialog, message, nil)
+}
+
+func reportElevatedResult(noDialog bool, message string, err error) {
+	if noDialog {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+		} else {
+			fmt.Fprintln(os.Stdout, message)
+		}
+		return
+	}
+	if err != nil {
+		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
+		return
+	}
 	windowsMessageBox(appTitle(), message, windows.MB_OK|windows.MB_ICONINFORMATION)
+}
+
+type relayURLFlags []string
+
+func (values *relayURLFlags) String() string {
+	return joinRelayURLs(*values)
+}
+
+func (values *relayURLFlags) Set(value string) error {
+	urls := splitRelayURLs(value)
+	if len(urls) == 0 {
+		return errors.New("relay URL cannot be empty")
+	}
+	*values = append(*values, urls...)
+	return nil
+}
+
+func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error) {
+	var opts actionOptions
+	var relayURLs relayURLFlags
+	fs := flag.NewFlagSet("deskferry-agent-configurator", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	action := fs.String("cli-action", "", "install, start, stop, restart, uninstall, or status")
+	fs.StringVar(&opts.InstallDir, "install-dir", defaultInstallDir(), "agent installation directory")
+	fs.StringVar(&opts.AgentPath, "agent", defaultAgentPath(), "work agent executable")
+	fs.Var(&relayURLs, "relay-url", "relay room URL; repeat to configure multiple relays in priority order")
+	passwordStdin := fs.Bool("room-password-stdin", false, "read the room password from standard input")
+	fs.StringVar(&opts.RoomPasswordBlob, "room-password-blob", "", "machine-scope DPAPI password blob to consume")
+	fs.BoolVar(&opts.ClearRoomPassword, "clear-room-password", false, "remove the stored room password")
+	fs.StringVar(&opts.WinRMAddr, "winrm", "", "WinRM target in host:port form")
+	fs.StringVar(&opts.SMBAddr, "smb", "", "SMB target in host:port form")
+	fs.StringVar(&opts.SMBAlias, "smb-alias", defaultSMBAlias, "SMB server alias")
+	if err := fs.Parse(args); err != nil {
+		return "", opts, err
+	}
+	if fs.NArg() != 0 {
+		return "", opts, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	if *action == "" {
+		return "", opts, errors.New("-cli-action is required")
+	}
+	switch *action {
+	case "install", "start", "stop", "restart", "uninstall", "status":
+	default:
+		return "", opts, fmt.Errorf("unknown CLI action %q", *action)
+	}
+	if *action != "install" {
+		installOnly := map[string]bool{
+			"agent": true, "relay-url": true, "room-password-stdin": true,
+			"room-password-blob": true, "clear-room-password": true,
+			"winrm": true, "smb": true, "smb-alias": true,
+		}
+		if *action != "uninstall" {
+			installOnly["install-dir"] = true
+		}
+		var invalid string
+		fs.Visit(func(option *flag.Flag) {
+			if invalid == "" && installOnly[option.Name] {
+				invalid = option.Name
+			}
+		})
+		if invalid != "" {
+			return "", opts, fmt.Errorf("-%s is only valid with -cli-action install", invalid)
+		}
+	}
+	if *passwordStdin && opts.RoomPasswordBlob != "" {
+		return "", opts, errors.New("-room-password-stdin and -room-password-blob cannot be used together")
+	}
+	if opts.ClearRoomPassword && (*passwordStdin || opts.RoomPasswordBlob != "") {
+		return "", opts, errors.New("-clear-room-password cannot be combined with a password input")
+	}
+	if *passwordStdin {
+		value, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", opts, fmt.Errorf("read room password: %w", err)
+		}
+		opts.RoomPassword = strings.TrimSuffix(strings.TrimSuffix(string(value), "\n"), "\r")
+		if opts.RoomPassword == "" {
+			return "", opts, errors.New("room password from standard input is empty")
+		}
+	}
+	opts.RelayURL = joinRelayURLs(relayURLs)
+	if *action == "install" {
+		if err := validateInstallInputs(opts); err != nil {
+			return "", opts, err
+		}
+	}
+	return *action, opts, nil
+}
+
+func runCLI(args []string, stdin io.Reader, stdout io.Writer) error {
+	if hasArg(args, "-cli-help") {
+		printCLIUsage(stdout)
+		return nil
+	}
+	action, opts, err := parseCLIArgs(args, stdin)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printCLIUsage(stdout)
+			return nil
+		}
+		return err
+	}
+	if action == "status" {
+		info, err := queryServiceInfo()
+		if err != nil {
+			return err
+		}
+		if !info.Installed {
+			fmt.Fprintln(stdout, "DeskFerry Agent is not installed.")
+			return nil
+		}
+		fmt.Fprintf(stdout, "DeskFerry Agent is installed: state=%s pid=%d\n", serviceStateText(info.State), info.ProcessID)
+		return nil
+	}
+	if !isElevated() {
+		if err := relaunchElevatedAction(action, opts, true); err != nil {
+			return fmt.Errorf("request elevation: %w", err)
+		}
+		fmt.Fprintf(stdout, "Elevation requested for %s.\n", action)
+		return nil
+	}
+	message, err := performAction(action, opts)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, message)
+	return nil
+}
+
+func printCLIUsage(output io.Writer) {
+	fmt.Fprintln(output, "Usage: deskferry-agent-configurator-windows-amd64.exe -cli-action ACTION [options]")
+	fmt.Fprintln(output, "Actions: install, start, stop, restart, uninstall, status")
+	fmt.Fprintln(output, "Install options:")
+	fmt.Fprintln(output, "  -install-dir PATH          Agent installation directory")
+	fmt.Fprintln(output, "  -agent PATH                Work agent executable")
+	fmt.Fprintln(output, "  -relay-url URL             Relay room URL; repeat for multiple relays")
+	fmt.Fprintln(output, "  -room-password-stdin       Read a new room password from standard input")
+	fmt.Fprintln(output, "  -room-password-blob PATH   Consume a machine-scope DPAPI password blob")
+	fmt.Fprintln(output, "  -clear-room-password       Remove the stored room password")
+	fmt.Fprintln(output, "  -winrm HOST:PORT           WinRM target")
+	fmt.Fprintln(output, "  -smb HOST:PORT             SMB target")
+	fmt.Fprintln(output, "  -smb-alias NAME            SMB server alias (default deskferry-work)")
+	fmt.Fprintln(output, "Omitting all password flags preserves the installed credential.")
 }
 
 func performAction(action string, opts actionOptions) (string, error) {
@@ -1005,12 +1173,15 @@ func queryServiceInfo() (serviceInfo, error) {
 	return info, nil
 }
 
-func relaunchElevatedAction(action string, opts actionOptions) error {
+func relaunchElevatedAction(action string, opts actionOptions, noDialog bool) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
 	}
 	args := []string{"-elevated-action", action}
+	if noDialog {
+		args = append(args, "-no-dialog")
+	}
 	if opts.InstallDir != "" {
 		args = append(args, "-install-dir", opts.InstallDir)
 	}
@@ -1029,6 +1200,7 @@ func relaunchElevatedAction(action string, opts actionOptions) error {
 	if opts.SMBAlias != "" {
 		args = append(args, "-smb-alias", opts.SMBAlias)
 	}
+	temporaryPasswordBlob := ""
 	if opts.ClearRoomPassword {
 		args = append(args, "-clear-room-password")
 	} else if opts.RoomPassword != "" {
@@ -1051,8 +1223,17 @@ func relaunchElevatedAction(action string, opts actionOptions) error {
 			return err
 		}
 		args = append(args, "-room-password-blob", path)
+		temporaryPasswordBlob = path
+	} else if opts.RoomPasswordBlob != "" {
+		args = append(args, "-room-password-blob", opts.RoomPasswordBlob)
 	}
-	return shellExecute("runas", exePath, joinWindowsArgs(args), "")
+	if err := shellExecute("runas", exePath, joinWindowsArgs(args), ""); err != nil {
+		if temporaryPasswordBlob != "" {
+			_ = os.Remove(temporaryPasswordBlob)
+		}
+		return err
+	}
+	return nil
 }
 
 func relaunchCurrentArgsElevated(args []string) error {

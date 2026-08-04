@@ -57,6 +57,7 @@ type setupOptions struct {
 	RelayAddrs    []string `json:"relay_addrs"`
 	Proxy         string   `json:"proxy"`
 	RoomPassword  string   `json:"room_password"`
+	RoomProof     string   `json:"room_proof,omitempty"`
 	Alias         string   `json:"alias"`
 	EnableNetwork bool     `json:"enable_network"`
 }
@@ -81,17 +82,27 @@ type setupApp struct {
 	relayDragIndex  int
 	relayDragStartY int
 	relayDragging   bool
+	roomProof       string
+	roomProofRoom   string
 }
 
 func main() {
+	if hasArg(os.Args[1:], "-cli-action") || hasArg(os.Args[1:], "-cli-help") {
+		if err := runCLI(os.Args[1:], os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	requestFile := flag.String("elevated-request", "", "DPAPI-protected setup request")
 	uninstall := flag.Bool("elevated-uninstall", false, "uninstall DeskFerry Home")
 	smokeTest := flag.Bool("ui-smoke-test", false, "open and close the setup UI")
+	noDialog := flag.Bool("no-dialog", false, "write the result to the console instead of displaying a dialog")
 	flag.Parse()
 	if *requestFile != "" || *uninstall {
 		if !isElevated() {
 			if err := relaunchElevated(os.Args[1:]); err != nil {
-				windowsMessageBox(productName+" Setup", err.Error(), windows.MB_OK|windows.MB_ICONERROR)
+				reportResult(*noDialog, "", err)
 			}
 			return
 		}
@@ -103,10 +114,10 @@ func main() {
 			message, err = installFromRequest(*requestFile)
 		}
 		if err != nil {
-			windowsMessageBox(productName+" Setup", err.Error(), windows.MB_OK|windows.MB_ICONERROR)
+			reportResult(*noDialog, "", err)
 			os.Exit(1)
 		}
-		windowsMessageBox(productName+" Setup", message, windows.MB_OK|windows.MB_ICONINFORMATION)
+		reportResult(*noDialog, message, nil)
 		return
 	}
 	app := &setupApp{relayDragIndex: -1}
@@ -206,7 +217,14 @@ func (a *setupApp) run(smokeTest bool) error {
 	if err := window.Create(); err != nil {
 		return err
 	}
-	a.setRelayURLList([]string{defaultRelayURL}, 0)
+	initial := existingSetupOptions(filepath.Dir(mustExecutable()))
+	_ = a.installDir.SetText(initial.InstallDir)
+	a.enableNetwork.SetChecked(initial.EnableNetwork)
+	_ = a.proxy.SetText(initial.Proxy)
+	_ = a.alias.SetText(initial.Alias)
+	a.roomProof = initial.RoomProof
+	a.roomProofRoom = relayRoom(initial.RelayAddrs)
+	a.setRelayURLList(initial.RelayAddrs, 0)
 	a.updateNetworkControls()
 	a.refreshStatus()
 	if smokeTest {
@@ -249,7 +267,7 @@ func (a *setupApp) updateUNCPreview() {
 
 func (a *setupApp) options() setupOptions {
 	exe, _ := os.Executable()
-	return setupOptions{
+	opts := setupOptions{
 		InstallDir:    strings.TrimSpace(a.installDir.Text()),
 		SourceDir:     filepath.Dir(exe),
 		RelayAddrs:    append([]string(nil), a.relayURLs...),
@@ -258,37 +276,20 @@ func (a *setupApp) options() setupOptions {
 		Alias:         strings.TrimSpace(a.alias.Text()),
 		EnableNetwork: a.enableNetwork.Checked(),
 	}
+	if opts.RoomPassword == "" && relayRoom(opts.RelayAddrs) == a.roomProofRoom {
+		opts.RoomProof = a.roomProof
+	}
+	return opts
 }
 
 func (a *setupApp) install() {
 	opts := a.options()
-	if err := validateOptions(opts); err != nil {
+	if err := validateRequestOptions(opts); err != nil {
 		a.showError(err)
 		return
 	}
-	data, err := json.Marshal(opts)
+	path, err := writeSetupRequest(opts)
 	if err != nil {
-		a.showError(err)
-		return
-	}
-	protected, err := winsecret.ProtectMachine(string(data))
-	if err != nil {
-		a.showError(err)
-		return
-	}
-	file, err := os.CreateTemp("", "deskferry-home-setup-*.dpapi")
-	if err != nil {
-		a.showError(err)
-		return
-	}
-	path := file.Name()
-	if _, err = file.Write(protected); err == nil {
-		err = file.Close()
-	} else {
-		_ = file.Close()
-	}
-	if err != nil {
-		_ = os.Remove(path)
 		a.showError(err)
 		return
 	}
@@ -508,6 +509,335 @@ func installFromRequest(path string) (string, error) {
 	return installProduct(opts)
 }
 
+func writeSetupRequest(opts setupOptions) (string, error) {
+	data, err := json.Marshal(opts)
+	if err != nil {
+		return "", err
+	}
+	protected, err := winsecret.ProtectMachine(string(data))
+	if err != nil {
+		return "", err
+	}
+	file, err := os.CreateTemp("", "deskferry-home-setup-*.dpapi")
+	if err != nil {
+		return "", err
+	}
+	path := file.Name()
+	if _, err = file.Write(protected); err == nil {
+		err = file.Close()
+	} else {
+		_ = file.Close()
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
+type relayURLFlags []string
+
+func (values *relayURLFlags) String() string { return strings.Join(*values, ";") }
+
+func (values *relayURLFlags) Set(value string) error {
+	items := strings.FieldsFunc(value, func(r rune) bool { return r == ';' || r == ',' || r == '\r' || r == '\n' })
+	if len(items) == 0 {
+		return errors.New("relay URL cannot be empty")
+	}
+	*values = append(*values, items...)
+	return nil
+}
+
+func parseCLIArgs(args []string, stdin io.Reader) (string, setupOptions, error) {
+	exe := mustExecutable()
+	initial := existingSetupOptions(filepath.Dir(exe))
+	opts := initial
+	var relayURLs relayURLFlags
+	fs := flag.NewFlagSet("DeskFerryHomeSetup", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	action := fs.String("cli-action", "", "install, configure, uninstall, or status")
+	fs.StringVar(&opts.InstallDir, "install-dir", initial.InstallDir, "installation directory")
+	fs.StringVar(&opts.SourceDir, "source-dir", initial.SourceDir, "setup payload directory")
+	fs.Var(&relayURLs, "relay-url", "relay room URL; repeat for multiple relays")
+	fs.StringVar(&opts.Proxy, "proxy", initial.Proxy, "env, direct, or an HTTP(S) proxy URL")
+	fs.StringVar(&opts.Alias, "alias", initial.Alias, "work computer alias")
+	fs.BoolVar(&opts.EnableNetwork, "enable-network", initial.EnableNetwork, "install the virtual network adapter and SMB bridge")
+	passwordStdin := fs.Bool("room-password-stdin", false, "read the room password from standard input")
+	passwordBlob := fs.String("room-password-blob", "", "read a machine-scope DPAPI room password blob")
+	if err := fs.Parse(args); err != nil {
+		return "", opts, err
+	}
+	if fs.NArg() != 0 {
+		return "", opts, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	if *action == "" {
+		return "", opts, errors.New("-cli-action is required")
+	}
+	switch *action {
+	case "install", "configure", "uninstall", "status":
+	default:
+		return "", opts, fmt.Errorf("unknown CLI action %q", *action)
+	}
+	if *action != "install" && *action != "configure" {
+		var invalid string
+		fs.Visit(func(option *flag.Flag) {
+			if invalid == "" && option.Name != "cli-action" {
+				invalid = option.Name
+			}
+		})
+		if invalid != "" {
+			return "", opts, fmt.Errorf("-%s is only valid with install or configure", invalid)
+		}
+		return *action, opts, nil
+	}
+	if *passwordStdin && *passwordBlob != "" {
+		return "", opts, errors.New("-room-password-stdin and -room-password-blob cannot be used together")
+	}
+	if len(relayURLs) > 0 {
+		opts.RelayAddrs = uniqueRelayURLs(relayURLs)
+	}
+	if relayRoom(opts.RelayAddrs) != relayRoom(initial.RelayAddrs) {
+		opts.RoomProof = ""
+	}
+	if *passwordStdin {
+		value, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", opts, fmt.Errorf("read room password: %w", err)
+		}
+		opts.RoomPassword = strings.TrimSuffix(strings.TrimSuffix(string(value), "\n"), "\r")
+		if opts.RoomPassword == "" {
+			return "", opts, errors.New("room password from standard input is empty")
+		}
+	} else if *passwordBlob != "" {
+		data, err := os.ReadFile(*passwordBlob)
+		if err != nil {
+			return "", opts, fmt.Errorf("read room password blob: %w", err)
+		}
+		opts.RoomPassword, err = winsecret.Unprotect(data)
+		if err != nil {
+			return "", opts, fmt.Errorf("decrypt room password blob: %w", err)
+		}
+	}
+	if err := validateRequestOptions(opts); err != nil {
+		return "", opts, err
+	}
+	return *action, opts, nil
+}
+
+func runCLI(args []string, stdin io.Reader, stdout io.Writer) error {
+	if hasArg(args, "-cli-help") {
+		printCLIUsage(stdout)
+		return nil
+	}
+	action, opts, err := parseCLIArgs(args, stdin)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printCLIUsage(stdout)
+			return nil
+		}
+		return err
+	}
+	if action == "status" {
+		state, err := queryServiceState()
+		if err != nil {
+			return err
+		}
+		installed := filepath.Join(installedLocation(), "DeskFerryHome.exe")
+		if _, err := os.Stat(installed); err != nil {
+			fmt.Fprintln(stdout, "DeskFerry Home is not installed; virtual network adapter is not installed.")
+			return nil
+		}
+		if state == 0 {
+			fmt.Fprintf(stdout, "DeskFerry Home is installed at %s; virtual network adapter is not installed.\n", installedLocation())
+		} else {
+			fmt.Fprintf(stdout, "DeskFerry Home is installed at %s; virtual network adapter service is %s.\n", installedLocation(), serviceStateText(state))
+		}
+		return nil
+	}
+	if !isElevated() {
+		args := []string{"-no-dialog"}
+		requestPath := ""
+		if action == "uninstall" {
+			args = append(args, "-elevated-uninstall")
+		} else {
+			requestPath, err = writeSetupRequest(opts)
+			if err != nil {
+				return err
+			}
+			args = append(args, "-elevated-request", requestPath)
+		}
+		if err := relaunchElevated(args); err != nil {
+			if requestPath != "" {
+				_ = os.Remove(requestPath)
+			}
+			return fmt.Errorf("request elevation: %w", err)
+		}
+		fmt.Fprintf(stdout, "Elevation requested for %s.\n", action)
+		return nil
+	}
+	var message string
+	if action == "uninstall" {
+		message, err = uninstallProduct()
+	} else {
+		message, err = installProduct(opts)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, message)
+	return nil
+}
+
+func printCLIUsage(output io.Writer) {
+	fmt.Fprintln(output, "Usage: DeskFerryHomeSetup.exe -cli-action ACTION [options]")
+	fmt.Fprintln(output, "Actions: install, configure, uninstall, status")
+	fmt.Fprintln(output, "  -install-dir PATH          Installation directory")
+	fmt.Fprintln(output, "  -source-dir PATH           Setup payload directory")
+	fmt.Fprintln(output, "  -relay-url URL             Relay room URL; repeat for multiple relays")
+	fmt.Fprintln(output, "  -proxy VALUE               env, direct, or an HTTP(S) proxy URL")
+	fmt.Fprintln(output, "  -alias NAME                Work computer alias")
+	fmt.Fprintln(output, "  -enable-network=BOOL       Install the virtual adapter and SMB bridge")
+	fmt.Fprintln(output, "  -room-password-stdin       Read the room password from standard input")
+	fmt.Fprintln(output, "  -room-password-blob PATH   Read a machine-scope DPAPI password blob")
+	fmt.Fprintln(output, "Installed settings are defaults; the room proof is preserved when the room is unchanged.")
+}
+
+type homeClientSettings struct {
+	RelayAddrs          []string                `json:"relay_addrs"`
+	Proxy               string                  `json:"proxy"`
+	RoomProof           string                  `json:"room_proof"`
+	Destinations        []homeClientDestination `json:"destinations"`
+	SelectedDestination string                  `json:"selected_destination"`
+}
+
+type homeClientDestination struct {
+	Name       string   `json:"name"`
+	RelayAddrs []string `json:"relay_addrs"`
+	RoomProof  string   `json:"room_proof"`
+}
+
+type installMetadata struct {
+	InstallDir    string   `json:"install_dir"`
+	RelayAddrs    []string `json:"relay_addrs,omitempty"`
+	Proxy         string   `json:"proxy,omitempty"`
+	Alias         string   `json:"alias,omitempty"`
+	EnableNetwork bool     `json:"enable_network"`
+}
+
+func existingSetupOptions(sourceDir string) setupOptions {
+	opts := setupOptions{
+		InstallDir:    defaultInstallDir(),
+		SourceDir:     sourceDir,
+		RelayAddrs:    []string{defaultRelayURL},
+		Proxy:         "env",
+		Alias:         homenetwork.DefaultAlias,
+		EnableNetwork: true,
+	}
+	installedDir := installedLocation()
+	if _, err := os.Stat(filepath.Join(installedDir, "DeskFerryHome.exe")); err == nil {
+		opts.InstallDir = installedDir
+		opts.EnableNetwork = false
+	}
+	metadataLoaded := false
+	if metadata, ok := readInstallMetadata(); ok {
+		if relays := uniqueRelayURLs(metadata.RelayAddrs); len(relays) > 0 {
+			metadataLoaded = true
+			opts.RelayAddrs = relays
+		}
+		opts.Proxy = strings.TrimSpace(metadata.Proxy)
+		if strings.TrimSpace(metadata.Alias) != "" {
+			opts.Alias = strings.TrimSpace(metadata.Alias)
+		}
+		opts.EnableNetwork = metadata.EnableNetwork
+	}
+	var cfg homenetwork.Config
+	if data, err := os.ReadFile(configPath()); err == nil && json.Unmarshal(data, &cfg) == nil {
+		cfg = cfg.WithDefaults(opts.InstallDir)
+		opts.RelayAddrs = cfg.RelayAddrs
+		opts.Proxy = cfg.Proxy
+		opts.RoomProof = cfg.RoomProof
+		opts.Alias = cfg.Alias
+		opts.EnableNetwork = true
+		return opts
+	}
+	if metadataLoaded {
+		return opts
+	}
+	settingsPath := filepath.Join(strings.TrimSpace(os.Getenv("APPDATA")), "DeskFerry", "home-client.json")
+	var settings homeClientSettings
+	if data, err := os.ReadFile(settingsPath); err == nil && json.Unmarshal(data, &settings) == nil {
+		relays, proof := settings.RelayAddrs, settings.RoomProof
+		for _, destination := range settings.Destinations {
+			if destination.Name == settings.SelectedDestination {
+				relays, proof = destination.RelayAddrs, destination.RoomProof
+				break
+			}
+		}
+		if values := uniqueRelayURLs(relays); len(values) > 0 {
+			opts.RelayAddrs = values
+			opts.RoomProof = strings.TrimSpace(proof)
+		}
+		if strings.TrimSpace(settings.Proxy) != "" {
+			opts.Proxy = strings.TrimSpace(settings.Proxy)
+		}
+	}
+	return opts
+}
+
+func relayRoom(relays []string) string {
+	if len(relays) == 0 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(tunnel.RelayRoomToken(relays[0], "")))
+}
+
+func mustExecutable() string {
+	path, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return path
+}
+
+func hasArg(args []string, name string) bool {
+	for _, arg := range args {
+		if arg == name || strings.HasPrefix(arg, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func reportResult(noDialog bool, message string, err error) {
+	if noDialog {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+		} else {
+			fmt.Fprintln(os.Stdout, message)
+		}
+		return
+	}
+	if err != nil {
+		windowsMessageBox(productName+" Setup", err.Error(), windows.MB_OK|windows.MB_ICONERROR)
+		return
+	}
+	windowsMessageBox(productName+" Setup", message, windows.MB_OK|windows.MB_ICONINFORMATION)
+}
+
+func preserveInstalledRoomProof(opts *setupOptions) {
+	if opts == nil || opts.RoomPassword != "" || opts.RoomProof != "" || !opts.EnableNetwork {
+		return
+	}
+	var cfg homenetwork.Config
+	data, err := os.ReadFile(configPath())
+	if err != nil || json.Unmarshal(data, &cfg) != nil {
+		return
+	}
+	if relayRoom(opts.RelayAddrs) == relayRoom(cfg.RelayAddrs) {
+		opts.RoomProof = strings.TrimSpace(cfg.RoomProof)
+	}
+}
+
 func validateOptions(opts setupOptions) error {
 	if strings.TrimSpace(opts.InstallDir) == "" {
 		return errors.New("install location is required")
@@ -534,16 +864,25 @@ func validateOptions(opts setupOptions) error {
 	if !opts.EnableNetwork {
 		return nil
 	}
-	if strings.TrimSpace(opts.RoomPassword) == "" {
+	if strings.TrimSpace(opts.RoomPassword) == "" && strings.TrimSpace(opts.RoomProof) == "" {
 		return errors.New("enter the same room password configured on the work agent")
 	}
 	cfg := networkConfig(opts)
 	return cfg.Validate()
 }
 
+func validateRequestOptions(opts setupOptions) error {
+	if opts.EnableNetwork && opts.RoomPassword == "" && opts.RoomProof == "" {
+		if _, err := os.Stat(configPath()); err == nil {
+			opts.RoomProof = "preserve-installed-proof-after-elevation"
+		}
+	}
+	return validateOptions(opts)
+}
+
 func networkConfig(opts setupOptions) homenetwork.Config {
-	proof := ""
-	if len(opts.RelayAddrs) > 0 {
+	proof := strings.TrimSpace(opts.RoomProof)
+	if len(opts.RelayAddrs) > 0 && opts.RoomPassword != "" {
 		proof = tunnel.RoomPasswordProof(opts.RelayAddrs[0], "", opts.RoomPassword)
 	}
 	return (homenetwork.Config{
@@ -556,6 +895,7 @@ func networkConfig(opts setupOptions) homenetwork.Config {
 }
 
 func installProduct(opts setupOptions) (string, error) {
+	preserveInstalledRoomProof(&opts)
 	if err := validateOptions(opts); err != nil {
 		return "", err
 	}
@@ -584,9 +924,6 @@ func installProduct(opts setupOptions) (string, error) {
 	if err := createShortcuts(installDir); err != nil {
 		return "", err
 	}
-	if err := writeInstallMetadata(installDir); err != nil {
-		return "", err
-	}
 	if err := registerUninstaller(installDir); err != nil {
 		return "", err
 	}
@@ -597,6 +934,9 @@ func installProduct(opts setupOptions) (string, error) {
 		_ = os.Remove(configPath())
 		for _, name := range []string{"DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
 			_ = os.Remove(filepath.Join(installDir, name))
+		}
+		if err := writeInstallMetadata(opts); err != nil {
+			return "", err
 		}
 		return "DeskFerry Home was installed without the optional virtual network adapter.", nil
 	}
@@ -623,6 +963,9 @@ func installProduct(opts setupOptions) (string, error) {
 		return "", err
 	}
 	if err := createAndStartNetworkService(filepath.Join(installDir, "DeskFerryHomeNetwork.exe"), configPath()); err != nil {
+		return "", err
+	}
+	if err := writeInstallMetadata(opts); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("DeskFerry Home and file access were installed. Open \\\\%s\\sharename after the work agent enables SMB.", cfg.Alias), nil
@@ -737,10 +1080,14 @@ func materializePayload(sourceDir string, networkEnabled bool) (string, func(), 
 	return tempDir, cleanup, nil
 }
 
-func writeInstallMetadata(installDir string) error {
-	data, err := json.Marshal(struct {
-		InstallDir string `json:"install_dir"`
-	}{InstallDir: installDir})
+func writeInstallMetadata(opts setupOptions) error {
+	data, err := json.Marshal(installMetadata{
+		InstallDir:    opts.InstallDir,
+		RelayAddrs:    uniqueRelayURLs(opts.RelayAddrs),
+		Proxy:         strings.TrimSpace(opts.Proxy),
+		Alias:         strings.TrimSpace(opts.Alias),
+		EnableNetwork: opts.EnableNetwork,
+	})
 	if err != nil {
 		return err
 	}
@@ -750,15 +1097,18 @@ func writeInstallMetadata(installDir string) error {
 	return os.WriteFile(installMetadataPath(), data, 0644)
 }
 
-func installedLocation() string {
+func readInstallMetadata() (installMetadata, bool) {
+	var metadata installMetadata
 	data, err := os.ReadFile(installMetadataPath())
-	if err == nil {
-		var metadata struct {
-			InstallDir string `json:"install_dir"`
-		}
-		if json.Unmarshal(data, &metadata) == nil && strings.TrimSpace(metadata.InstallDir) != "" {
-			return metadata.InstallDir
-		}
+	if err != nil || json.Unmarshal(data, &metadata) != nil {
+		return metadata, false
+	}
+	return metadata, true
+}
+
+func installedLocation() string {
+	if metadata, ok := readInstallMetadata(); ok && strings.TrimSpace(metadata.InstallDir) != "" {
+		return metadata.InstallDir
 	}
 	return defaultInstallDir()
 }
@@ -862,21 +1212,28 @@ func waitForServiceState(s *mgr.Service, wanted svc.State, timeout time.Duration
 }
 
 func queryServiceState() (uint32, error) {
-	m, err := mgr.Connect()
+	scm, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
 	if err != nil {
 		return 0, err
 	}
-	defer m.Disconnect()
-	s, err := m.OpenService(networkServiceName)
+	defer windows.CloseServiceHandle(scm)
+	name, err := windows.UTF16PtrFromString(networkServiceName)
+	if err != nil {
+		return 0, err
+	}
+	handle, err := windows.OpenService(scm, name, windows.SERVICE_QUERY_STATUS)
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
-	defer s.Close()
-	status, err := s.Query()
-	return uint32(status.State), err
+	defer windows.CloseServiceHandle(handle)
+	var status windows.SERVICE_STATUS
+	if err := windows.QueryServiceStatus(handle, &status); err != nil {
+		return 0, err
+	}
+	return status.CurrentState, nil
 }
 
 func updateHostsAlias(alias, address string) error {

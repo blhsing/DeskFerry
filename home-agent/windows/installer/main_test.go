@@ -3,8 +3,13 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"deskferry/internal/homenetwork"
 )
 
 func TestRemoveManagedHostsBlock(t *testing.T) {
@@ -25,5 +30,85 @@ func TestNetworkConfigUsesRoomScopedProof(t *testing.T) {
 	cfg := networkConfig(opts)
 	if cfg.RoomProof == "" || strings.Contains(cfg.RoomProof, opts.RoomPassword) {
 		t.Fatalf("unexpected room proof %q", cfg.RoomProof)
+	}
+}
+
+func TestNetworkConfigPreservesExistingProof(t *testing.T) {
+	opts := setupOptions{
+		InstallDir: `C:\Program Files\DeskFerry Home`,
+		RelayAddrs: []string{"https://relay.example/relay/office"},
+		RoomProof:  "existing-proof",
+		Alias:      "deskferry-work",
+	}
+	if got := networkConfig(opts).RoomProof; got != opts.RoomProof {
+		t.Fatalf("RoomProof = %q", got)
+	}
+}
+
+func TestParseCLIInstall(t *testing.T) {
+	sourceDir := t.TempDir()
+	for _, name := range []string{"DeskFerryHomeSetup.exe", "DeskFerryHome.exe", "DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
+		if err := os.WriteFile(filepath.Join(sourceDir, name), []byte(name), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	action, opts, err := parseCLIArgs([]string{
+		"-cli-action", "configure",
+		"-install-dir", filepath.Join(t.TempDir(), "Home"),
+		"-source-dir", sourceDir,
+		"-relay-url", "https://relay.example/relay/h",
+		"-relay-url", "http://relay-backup.example/relay/h",
+		"-proxy", "direct",
+		"-alias", "deskferry-work",
+		"-enable-network=true",
+		"-room-password-stdin",
+	}, strings.NewReader("secret\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "configure" || opts.RoomPassword != "secret" || len(opts.RelayAddrs) != 2 || opts.Proxy != "direct" || !opts.EnableNetwork {
+		t.Fatalf("action=%q options=%#v", action, opts)
+	}
+}
+
+func TestParseCLIRejectsInstallOptionsForStatus(t *testing.T) {
+	_, _, err := parseCLIArgs([]string{"-cli-action", "status", "-enable-network=true"}, strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "only valid with install or configure") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestExistingSetupOptionsLoadsInstalledNetworkConfig(t *testing.T) {
+	programData := t.TempDir()
+	appData := t.TempDir()
+	t.Setenv("ProgramData", programData)
+	t.Setenv("APPDATA", appData)
+	installDir := filepath.Join(t.TempDir(), "DeskFerry Home")
+	if err := os.MkdirAll(installDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(installDir, "DeskFerryHome.exe"), []byte("home"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(installMetadataPath()), 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata, _ := json.Marshal(map[string]string{"install_dir": installDir})
+	if err := os.WriteFile(installMetadataPath(), metadata, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := (homenetwork.Config{
+		RelayAddrs: []string{"https://relay.example/relay/h"},
+		Proxy:      "direct",
+		RoomProof:  "saved-proof",
+		Alias:      "deskferry-work",
+	}).WithDefaults(installDir)
+	data, _ := json.Marshal(cfg)
+	if err := os.WriteFile(configPath(), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	opts := existingSetupOptions(t.TempDir())
+	if opts.InstallDir != installDir || !opts.EnableNetwork || opts.RoomProof != "saved-proof" || opts.Proxy != "direct" {
+		t.Fatalf("options = %#v", opts)
 	}
 }
