@@ -135,7 +135,8 @@ def read_room_proof(websocket: WebSocket) -> str:
 
 
 def read_service(websocket: WebSocket) -> str:
-    return "winrm" if websocket.headers.get("x-deskferry-service", "").strip().lower() == "winrm" else "rdp"
+    service = websocket.headers.get("x-deskferry-service", "").strip().lower()
+    return service if service in {"winrm", "smb"} else "rdp"
 
 
 def clean_session_value(value: str | None) -> str:

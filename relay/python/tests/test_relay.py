@@ -279,3 +279,34 @@ def test_service_channels_do_not_cross_pair():
         await asyncio.gather(agent_task, client_task, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+def test_smb_service_channel_pairs_only_smb():
+    async def scenario():
+        hub = RelayHub()
+        agent = FakeWebSocket()
+        winrm_home = FakeWebSocket()
+        smb_home = FakeWebSocket()
+
+        agent_task = asyncio.create_task(
+            hub.serve_agent("unit-smb", agent, "work", proof="proof", service="smb")
+        )
+        await asyncio.sleep(0)
+        await hub.serve_client("unit-smb", winrm_home, "winrm-home", proof="proof", service="winrm")
+        assert winrm_home.close_code == 1013
+
+        client_task = asyncio.create_task(
+            hub.serve_client("unit-smb", smb_home, "smb-home", proof="proof", service="smb")
+        )
+        for _ in range(50):
+            if smb_home.text_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert agent.text_messages == ["start"]
+        assert smb_home.text_messages == ["start"]
+
+        for task in (agent_task, client_task):
+            task.cancel()
+        await asyncio.gather(agent_task, client_task, return_exceptions=True)
+
+    asyncio.run(scenario())

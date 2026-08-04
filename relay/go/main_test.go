@@ -53,6 +53,10 @@ func TestRoomSelectsWaitingAgentByService(t *testing.T) {
 	room := NewRelayRoom("services")
 	rdp, _ := room.EnqueueAgent(nil, "rdp", AgentIdentity{}, false, serviceRDP)
 	winrm, _ := room.EnqueueAgent(nil, "winrm", AgentIdentity{}, false, serviceWinRM)
+	smb, _ := room.EnqueueAgent(nil, "smb", AgentIdentity{}, false, serviceSMB)
+	if got := room.TryTakeAgent(serviceSMB); got != smb {
+		t.Fatalf("SMB selection = %p, want %p", got, smb)
+	}
 	if got := room.TryTakeAgent(serviceWinRM); got != winrm {
 		t.Fatalf("WinRM selection = %p, want %p", got, winrm)
 	}

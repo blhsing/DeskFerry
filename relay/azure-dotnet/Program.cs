@@ -123,7 +123,7 @@ static string ReadRoomProof(HttpRequest request) =>
 static string ReadService(HttpRequest request)
 {
     var service = (request.Headers["X-DeskFerry-Service"].FirstOrDefault() ?? "").Trim().ToLowerInvariant();
-    return service == "winrm" ? "winrm" : "rdp";
+    return service is "winrm" or "smb" ? service : "rdp";
 }
 
 static string? ReadToken(HttpRequest request)

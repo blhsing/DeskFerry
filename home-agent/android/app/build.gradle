@@ -8,8 +8,8 @@ android {
         applicationId "com.blhsing.deskferry.home"
         minSdk 23
         targetSdk 35
-        versionCode 60
-        versionName "0.6.0"
+        versionCode 70
+        versionName "0.7.0"
     }
 
     compileOptions {

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-DeskFerry is a Go + .NET + Python + Android project for an outbound-only RDP rendezvous tunnel. The normal relay is the Azure App Service at `https://test-officialwebsite.azurewebsites.net/relay/`, implemented by `relay/azure-dotnet/`. The OCI Always Free fallback relay is reachable under `http://217.142.228.117/relay/<room>` and is implemented by `relay/go/`. A protocol-compatible Python/FastAPI relay lives in `relay/python/` for alternate hosts and local testing. The work-side Windows service may connect to one or more relay room URLs at the same time, while the Windows, macOS, and Android home agents connect to ordered primary/fallback relay URL lists such as `https://test-officialwebsite.azurewebsites.net/relay/workdesk` and `http://217.142.228.117/relay/workdesk`.
+DeskFerry is a Go + .NET + Python + Android project for outbound-only RDP, WinRM, and SMB/UNC rendezvous tunnels. The normal relay is the Azure App Service at `https://test-officialwebsite.azurewebsites.net/relay/`, implemented by `relay/azure-dotnet/`. The OCI Always Free fallback relay is reachable under `http://217.142.228.117/relay/<room>` and is implemented by `relay/go/`. A protocol-compatible Python/FastAPI relay lives in `relay/python/` for alternate hosts and local testing. The work-side Windows service may connect to one or more relay room URLs at the same time, while the Windows, macOS, and Android home agents connect to ordered primary/fallback relay URL lists such as `https://test-officialwebsite.azurewebsites.net/relay/workdesk` and `http://217.142.228.117/relay/workdesk`.
 
 ## Architecture Rules
 
@@ -23,6 +23,9 @@ DeskFerry is a Go + .NET + Python + Android project for an outbound-only RDP ren
 - Android relay status should use the relay `dashboard` WebSocket stream, not HTTP polling.
 - The Windows home app should remain control-panel/tray-first. Console mode is debug-only.
 - The Windows home app should listen on loopback by default, normally `127.0.0.1:3390`.
+- SMB is a separate relay service and must use the same room password as RDP and WinRM.
+- The optional Windows Home network component uses the synthetic `198.18.0.0/30` network and permits only TCP port 445 to the configured work-host alias. It must not become a general-purpose VPN.
+- The Windows Home installer should offer the virtual network adapter as an optional component selected by default.
 - `work-agent/windows/service` must remain Windows-service-first. Console mode is debug-only.
 - `work-agent/windows/configurator` owns the native Windows setup/configurator GUI for the work agent service.
 - Do not add stealth, anti-monitoring, or obfuscation behavior.
@@ -60,13 +63,19 @@ Build Windows/macOS/relay Go artifacts:
 .\build\build-go.ps1
 ```
 
+Build the self-contained Windows Home installer (including the optional network component):
+
+```powershell
+.\build\build-windows-home-installer.ps1
+```
+
 Build Android home APK:
 
 ```powershell
 .\build\build-android-home.ps1
 ```
 
-When `work-agent/windows/service`, `work-agent/windows/configurator`, `home-agent/windows`, `home-agent/macos`, `relay/go`, `internal/tunnel`, or shared relay behavior changes, run `go test ./...` and `.\build\build-go.ps1`. When `relay/azure-dotnet/` changes, run `.\build\build-azure-relay.ps1`. When `relay/python/` changes, run `.\build\build-python-relay.ps1`. When `home-agent/android/` changes, run `.\build\build-android-home.ps1`.
+When `work-agent/windows/service`, `work-agent/windows/configurator`, `home-agent/windows`, `home-agent/macos`, `relay/go`, `internal/tunnel`, or shared relay behavior changes, run `go test ./...` and `.\build\build-go.ps1`. When `home-agent/windows/network-service`, `home-agent/windows/installer`, `internal/homenetwork`, or the installer build script changes, also run `.\build\build-windows-home-installer.ps1`. When `relay/azure-dotnet/` changes, run `.\build\build-azure-relay.ps1`. When `relay/python/` changes, run `.\build\build-python-relay.ps1`. When `home-agent/android/` changes, run `.\build\build-android-home.ps1`.
 
 ## Tooling Notes
 
@@ -92,11 +101,13 @@ Deployable artifacts:
 - `dist/bin/deskferry-agent-windows-amd64.exe`
 - `dist/bin/deskferry-agent-configurator-windows-amd64.exe`
 - `dist/bin/deskferry-home-windows-amd64.exe`
+- `dist/bin/deskferry-home-network-windows-amd64.exe`
+- `dist/windows-home-installer/DeskFerryHomeSetup.exe`
 - `dist/bin/deskferry-home-macos-arm64`
 - `dist/bin/deskferry-home-macos-amd64`
 - `dist/android/deskferry-home-android-debug.apk`
 
-After code changes, build the relevant artifacts. The user prefers deployment after code changes. Prefer authenticated `az webapp deploy` for the Azure App Service; use the authenticated browser/Kudu path as the fallback. For the OCI Go relay, upload `dist/bin/deskferry-relay-linux-amd64` to `/tmp/deskferry-relay-linux-amd64`, install it as `/opt/deskferry/go-relay/deskferry-relay`, restart `deskferry-relay.service`, and delete the temporary upload. Do not retain old or backup relay binaries. The OCI host also has `deskferry-relay-healthcheck.timer`, which checks local `/relay/health` every minute, restarts `deskferry-relay.service` when the app stops responding, and reboots after three consecutive failed post-restart checks. The host is also configured with a 2 GiB swap file, persistent journald, `softdog`, systemd `RuntimeWatchdogSec=5min`, and kernel panic recovery for hung tasks.
+After code changes, build the relevant artifacts. The user prefers deployment after code changes. Prefer authenticated `az webapp deploy` for the Azure App Service; use the authenticated browser/Kudu path as the fallback. For the OCI Go relay, SSH and SCP from the work network must use HTTP `CONNECT` through `192.9.200.25:3128`; direct port 22 is expected to time out. Use the private key at `$env:USERPROFILE\Downloads\ssh-key-2026-06-27.key` and OpenSSH option `-o "ProxyCommand=ncat --proxy 192.9.200.25:3128 --proxy-type http %h %p"` on every OCI `ssh` and `scp` command. Upload `dist/bin/deskferry-relay-linux-amd64` to `/tmp/deskferry-relay-linux-amd64`, install it as `/opt/deskferry/go-relay/deskferry-relay`, restart `deskferry-relay.service`, and delete the temporary upload. Do not retain old or backup relay binaries. The OCI host also has `deskferry-relay-healthcheck.timer`, which checks local `/relay/health` every minute, restarts `deskferry-relay.service` when the app stops responding, and reboots after three consecutive failed post-restart checks. The host is also configured with a 2 GiB swap file, persistent journald, `softdog`, systemd `RuntimeWatchdogSec=5min`, and kernel panic recovery for hung tasks.
 
 ## Verification Expectations
 

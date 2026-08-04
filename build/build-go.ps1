@@ -65,7 +65,8 @@ function Build-WindowsResources {
     if (-not $?) { throw 'client icon generation failed' }
     $resources = @(
         @{ Manifest = 'work-agent/windows/configurator/app.manifest'; Output = 'work-agent/windows/configurator/rsrc_windows_amd64.syso'; Name = 'agent configurator' },
-        @{ Manifest = 'home-agent/windows/app.manifest'; Output = 'home-agent/windows/rsrc_windows_amd64.syso'; Name = 'home app'; Icon = 'home-agent/windows/app.ico' }
+        @{ Manifest = 'home-agent/windows/app.manifest'; Output = 'home-agent/windows/rsrc_windows_amd64.syso'; Name = 'home app'; Icon = 'home-agent/windows/app.ico' },
+        @{ Manifest = 'home-agent/windows/installer/app.manifest'; Output = 'home-agent/windows/installer/rsrc_windows_amd64.syso'; Name = 'home installer'; Icon = 'home-agent/windows/app.ico' }
     )
     foreach ($resource in $resources) {
         $manifest = Join-Path $root $resource.Manifest
@@ -94,6 +95,8 @@ try {
         # triggered endpoint-protection false positives on deployment hosts.
         @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-agent-configurator-windows-amd64.exe'; Package = './work-agent/windows/configurator'; Ldflags = '-H windowsgui' },
         @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-home-windows-amd64.exe'; Package = './home-agent/windows'; Ldflags = '-H windowsgui' },
+        @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-home-network-windows-amd64.exe'; Package = './home-agent/windows/network-service' },
+        @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-home-setup-windows-amd64.exe'; Package = './home-agent/windows/installer'; Ldflags = '-H windowsgui' },
         @{ GOOS = 'darwin'; GOARCH = 'arm64'; Name = 'deskferry-home-macos-arm64'; Package = './home-agent/macos' },
         @{ GOOS = 'darwin'; GOARCH = 'amd64'; Name = 'deskferry-home-macos-amd64'; Package = './home-agent/macos' },
         @{ GOOS = 'linux'; GOARCH = 'amd64'; Name = 'deskferry-relay-linux-amd64'; Package = './relay/go' }

@@ -38,6 +38,14 @@ func TestRoomAndServiceHeaders(t *testing.T) {
 	}
 }
 
+func TestSMBServiceHeader(t *testing.T) {
+	headers := http.Header{}
+	AddServiceHeader(headers, ServiceSMB)
+	if got := headers.Get(HeaderService); got != "smb" {
+		t.Fatalf("service = %q", got)
+	}
+}
+
 func TestWebSocketEndpointUsesRelayPath(t *testing.T) {
 	endpoint, err := WebSocketEndpoint("https://test-officialwebsite.azurewebsites.net/relay/")
 	if err != nil {

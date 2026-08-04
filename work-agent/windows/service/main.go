@@ -43,6 +43,7 @@ type config struct {
 	Proxy            string   `json:"proxy"`
 	RDPAddr          string   `json:"rdp_addr"`
 	WinRMAddr        string   `json:"winrm_addr,omitempty"`
+	SMBAddr          string   `json:"smb_addr,omitempty"`
 	RoomPasswordFile string   `json:"room_password_file,omitempty"`
 	RoomPassword     string   `json:"-"`
 	MinBackoff       string   `json:"min_backoff"`
@@ -66,6 +67,7 @@ func main() {
 	var proxyFlag string
 	var rdpFlag string
 	var winrmFlag string
+	var smbFlag string
 	var roomPasswordFile string
 	var logRetentionDays int
 	var consoleMode bool
@@ -79,6 +81,7 @@ func main() {
 	flag.StringVar(&proxyFlag, "proxy", "", "HTTP proxy for Azure relay WebSocket, or direct/env/auto")
 	flag.StringVar(&rdpFlag, "rdp", "", "local RDP target")
 	flag.StringVar(&winrmFlag, "winrm", "", "local WinRM target; blank disables WinRM")
+	flag.StringVar(&smbFlag, "smb", "", "local SMB target; blank disables SMB")
 	flag.StringVar(&roomPasswordFile, "room-password-file", "", "DPAPI-protected room password file")
 	flag.IntVar(&logRetentionDays, "log-retention-days", diaglog.DefaultRetentionDays, "number of calendar days of diagnostic logs to retain")
 	flag.BoolVar(&consoleMode, "console", false, "run in the foreground for debugging")
@@ -108,7 +111,7 @@ func main() {
 		}
 	}
 	if runningAsService {
-		if err := runService(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile); err != nil {
+		if err := runService(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -132,7 +135,7 @@ func main() {
 		return
 	}
 	if selfTestMode {
-		cfg, err := loadConfig(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile)
+		cfg, err := loadConfig(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -143,13 +146,13 @@ func main() {
 		return
 	}
 	if installMode || !consoleMode {
-		if err := installService(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile); err != nil {
+		if err := installService(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
 
-	cfg, err := loadConfig(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile)
+	cfg, err := loadConfig(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -285,18 +288,22 @@ func waitForServiceState(s *mgr.Service, want svc.State, timeout time.Duration) 
 }
 
 func loadConfig(relayURL, proxyOverride, rdpOverride string, extras ...string) (config, error) {
-	winrmOverride, passwordFile := "", ""
+	winrmOverride, smbOverride, passwordFile := "", "", ""
 	if len(extras) > 0 {
 		winrmOverride = extras[0]
 	}
 	if len(extras) > 1 {
-		passwordFile = extras[1]
+		smbOverride = extras[1]
+	}
+	if len(extras) > 2 {
+		passwordFile = extras[2]
 	}
 	cfg := config{
 		RelayAddrs:       splitRelayURLs(relayURL),
 		Proxy:            strings.TrimSpace(proxyOverride),
 		RDPAddr:          strings.TrimSpace(rdpOverride),
 		WinRMAddr:        strings.TrimSpace(winrmOverride),
+		SMBAddr:          strings.TrimSpace(smbOverride),
 		RoomPasswordFile: strings.TrimSpace(passwordFile),
 	}
 	if cfg.RoomPasswordFile != "" {
@@ -336,6 +343,14 @@ func (c *config) applyDefaults() {
 func (c config) validate() error {
 	if c.WinRMAddr != "" && c.RoomPassword == "" {
 		return fmt.Errorf("winrm requires a non-empty room password")
+	}
+	if c.SMBAddr != "" && c.RoomPassword == "" {
+		return fmt.Errorf("smb requires a non-empty room password")
+	}
+	if c.SMBAddr != "" {
+		if _, _, err := net.SplitHostPort(c.SMBAddr); err != nil {
+			return fmt.Errorf("smb target must be host:port: %w", err)
+		}
 	}
 	if c.WinRMAddr != "" {
 		if _, _, err := net.SplitHostPort(c.WinRMAddr); err != nil {
@@ -433,12 +448,12 @@ func joinRelayURLs(values []string) string {
 	return strings.Join(uniqueRelayURLs(values), ";")
 }
 
-func installService(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile string) error {
+func installService(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile string) error {
 	if strings.TrimSpace(relayURL) == "" {
 		relayURL = defaultRelayURL
 	}
 	if !isElevated() {
-		return relaunchElevated(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile)
+		return relaunchElevated(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile)
 	}
 	exePath, err := os.Executable()
 	if err != nil {
@@ -450,7 +465,7 @@ func installService(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile st
 	}
 	defer m.Disconnect()
 
-	args := serviceArgs(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile)
+	args := serviceArgs(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile)
 	serviceConfig := serviceInstallConfig(exePath, args)
 	s, err := m.CreateService(serviceName, exePath, serviceConfig, args...)
 	if err != nil {
@@ -464,7 +479,7 @@ func installService(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile st
 				return fmt.Errorf("update existing service: %w", err)
 			}
 		} else if isAccessDenied(err) {
-			return installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile)
+			return installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile)
 		} else {
 			return fmt.Errorf("create service: %w", err)
 		}
@@ -478,7 +493,7 @@ func installService(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile st
 	return nil
 }
 
-func serviceArgs(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile string) []string {
+func serviceArgs(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile string) []string {
 	args := []string{"-service"}
 	if relayURL != "" {
 		args = append(args, "-relay-url", relayURL)
@@ -491,6 +506,9 @@ func serviceArgs(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile strin
 	}
 	if winrmFlag != "" {
 		args = append(args, "-winrm", winrmFlag)
+	}
+	if smbFlag != "" {
+		args = append(args, "-smb", smbFlag)
 	}
 	if roomPasswordFile != "" {
 		args = append(args, "-room-password-file", roomPasswordFile)
@@ -505,7 +523,7 @@ func serviceInstallConfig(exePath string, args []string) mgr.Config {
 		ErrorControl:   mgr.ErrorNormal,
 		BinaryPathName: serviceBinaryPath(exePath, args),
 		DisplayName:    "DeskFerry Agent",
-		Description:    "Work-side RDP backend for DeskFerry.",
+		Description:    "Work-side RDP, WinRM, and SMB backend for DeskFerry.",
 	}
 }
 
@@ -557,8 +575,8 @@ func printStatus() error {
 	return nil
 }
 
-func runService(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile string) error {
-	return svc.Run(serviceName, &agentService{relayURL: relayURL, proxyFlag: proxyFlag, rdpFlag: rdpFlag, winrmFlag: winrmFlag, roomPasswordFile: roomPasswordFile})
+func runService(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile string) error {
+	return svc.Run(serviceName, &agentService{relayURL: relayURL, proxyFlag: proxyFlag, rdpFlag: rdpFlag, winrmFlag: winrmFlag, smbFlag: smbFlag, roomPasswordFile: roomPasswordFile})
 }
 
 type agentService struct {
@@ -566,13 +584,14 @@ type agentService struct {
 	proxyFlag        string
 	rdpFlag          string
 	winrmFlag        string
+	smbFlag          string
 	roomPasswordFile string
 }
 
 func (s *agentService) Execute(_ []string, requests <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
 	const accepts = svc.AcceptStop | svc.AcceptShutdown
 	changes <- svc.Status{State: svc.StartPending}
-	cfg, err := loadConfig(s.relayURL, s.proxyFlag, s.rdpFlag, s.winrmFlag, s.roomPasswordFile)
+	cfg, err := loadConfig(s.relayURL, s.proxyFlag, s.rdpFlag, s.winrmFlag, s.smbFlag, s.roomPasswordFile)
 	if err != nil {
 		logEvent(eventlog.Error, "load config failed: %v", err)
 		return false, 1
@@ -615,6 +634,9 @@ func runWebSocketPools(ctx context.Context, cfg config) error {
 	targets := []serviceTarget{{Service: tunnel.ServiceRDP, Address: cfg.RDPAddr}}
 	if cfg.WinRMAddr != "" {
 		targets = append(targets, serviceTarget{Service: tunnel.ServiceWinRM, Address: cfg.WinRMAddr})
+	}
+	if cfg.SMBAddr != "" {
+		targets = append(targets, serviceTarget{Service: tunnel.ServiceSMB, Address: cfg.SMBAddr})
 	}
 	var wg sync.WaitGroup
 	relayAddrs := cfg.relayAddresses()
@@ -806,6 +828,14 @@ func selfTest(parent context.Context, cfg config) error {
 		}
 		_ = winrmConn.Close()
 	}
+	if cfg.SMBAddr != "" {
+		log.Printf("self-test local SMB target: %s", cfg.SMBAddr)
+		smbConn, err := d.DialContext(ctx, "tcp", cfg.SMBAddr)
+		if err != nil {
+			return fmt.Errorf("local SMB target %s is not reachable: %w", cfg.SMBAddr, err)
+		}
+		_ = smbConn.Close()
+	}
 
 	var failures []error
 	for _, relayAddr := range cfg.relayAddresses() {
@@ -883,7 +913,7 @@ func handleStream(ctx context.Context, stream net.Conn, target serviceTarget, re
 	log.Printf("%s stream slot=%d relay=%s target=%s ended duration=%s end_initiator=%s relay_to_local_bytes=%d relay_to_local_error=%v local_to_relay_bytes=%d local_to_relay_error=%v", strings.ToUpper(target.Service), slot, relayAddr, target.Address, result.Duration.Round(time.Millisecond), result.EndInitiator("relay", "local_"+target.Service), result.AToB.Bytes, result.AToB.CopyErr, result.BToA.Bytes, result.BToA.CopyErr)
 }
 
-func installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile string) error {
+func installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile string) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
@@ -901,6 +931,9 @@ func installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordF
 	if winrmFlag != "" {
 		args = append(args, "-winrm", strconv.Quote(winrmFlag))
 	}
+	if smbFlag != "" {
+		args = append(args, "-smb", strconv.Quote(smbFlag))
+	}
 	if roomPasswordFile != "" {
 		args = append(args, "-room-password-file", strconv.Quote(roomPasswordFile))
 	}
@@ -912,7 +945,7 @@ func installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordF
 	return nil
 }
 
-func relaunchElevated(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile string) error {
+func relaunchElevated(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile string) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
@@ -930,6 +963,9 @@ func relaunchElevated(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile 
 	if winrmFlag != "" {
 		args = append(args, "-winrm", winrmFlag)
 	}
+	if smbFlag != "" {
+		args = append(args, "-smb", smbFlag)
+	}
 	if roomPasswordFile != "" {
 		args = append(args, "-room-password-file", roomPasswordFile)
 	}
@@ -938,7 +974,7 @@ func relaunchElevated(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile 
 	params, _ := windows.UTF16PtrFromString(joinWindowsArgs(args))
 	if err := windows.ShellExecute(0, verb, exe, params, nil, windows.SW_NORMAL); err != nil {
 		if isAccessDenied(err) {
-			return installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile)
+			return installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile)
 		}
 		return err
 	}

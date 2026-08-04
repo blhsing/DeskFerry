@@ -2,7 +2,7 @@
 
 # DeskFerry
 
-DeskFerry is an outbound-only RDP and WinRM rendezvous tunnel for a work PC that cannot accept inbound connections. The current architecture uses an Azure App Service relay at `https://test-officialwebsite.azurewebsites.net/relay/` and an OCI Always Free fallback relay at `http://217.142.228.117/relay/`. The Azure relay implementation is .NET, the OCI relay implementation is a lightweight Go service, and a protocol-compatible Python/FastAPI relay is also available under `relay/python/`. The work-side Windows service and the Windows, macOS, and Android home agents connect out to relay web services over WebSockets.
+DeskFerry is an outbound-only RDP, WinRM, and SMB rendezvous tunnel for a work PC that cannot accept inbound connections. The current architecture uses an Azure App Service relay at `https://test-officialwebsite.azurewebsites.net/relay/` and an OCI Always Free fallback relay at `http://217.142.228.117/relay/`. The Azure relay implementation is .NET, the OCI relay implementation is a lightweight Go service, and a protocol-compatible Python/FastAPI relay is also available under `relay/python/`. The work-side Windows service and the Windows, macOS, and Android home agents connect out to relay web services over WebSockets.
 
 Home apps accept one or more relay room URLs in priority order. The first URL is the primary relay; later URLs are fallbacks used when the primary cannot connect or cannot pair an RDP stream. The Windows and Android home apps organize those same-room URL lists into named work-destination profiles, so a user can choose among multiple work PCs without mixing different rooms into one fallback list. Existing single-list settings migrate automatically to a `Work` destination. The Windows, Android, and work-agent configurator UIs manage relay URLs as ordered lists with add, edit, delete, and reorder controls. The work agent can connect to one or more relay room URLs at the same time, as long as they use the same room name. For example:
 
@@ -17,6 +17,7 @@ The Android app is a home-agent client like the Windows and macOS home agents. I
 
 ## Table Of Contents
 
+- [Release Notes](CHANGELOG.md)
 - [How It Works](#how-it-works)
 - [Installation](#installation)
   - [1. Deploy Azure Relay](#1-deploy-azure-relay)
@@ -45,6 +46,7 @@ The Android app is a home-agent client like the Windows and macOS home agents. I
   - [Agent Self-Test Fails Through Proxy](#agent-self-test-fails-through-proxy)
   - [Endpoint Protection Flags Windows Binaries](#endpoint-protection-flags-windows-binaries)
   - [Home App Connects But RDP Fails](#home-app-connects-but-rdp-fails)
+  - [Work File Access Fails](#work-file-access-fails)
   - [OCI Relay Becomes Unresponsive](#oci-relay-becomes-unresponsive)
   - [Saved Windows Login](#saved-windows-login)
   - [Azure Relay Status](#azure-relay-status)
@@ -74,9 +76,12 @@ agent.exe Windows service
   outbound WebSockets to one or more relay services, optionally through an HTTP or HTTPS proxy
   RDP sockets   -> 127.0.0.1:3389
   WinRM sockets -> 127.0.0.1:5985 (when enabled)
+  SMB sockets   -> 127.0.0.1:445 (when enabled)
 ```
 
-The relay groups sockets by room name and service type. A waiting work-agent socket is paired with one authenticated home-client socket for RDP or WinRM in the same room, then the relay copies binary WebSocket frames in both directions. The relay stores only an in-memory room-scoped password proof, never the room password or Windows login credentials.
+The relay groups sockets by room name and service type. A waiting work-agent socket is paired with one authenticated home-client socket for RDP, WinRM, or SMB in the same room, then the relay copies binary WebSocket frames in both directions. The relay stores only an in-memory room-scoped password proof, never the room password or Windows login credentials.
+
+On Windows Home PCs, the optional `DeskFerryHomeNetwork` service creates a Wintun Layer-3 adapter for the synthetic `198.18.0.0/30` network. The installer maps `deskferry-work` to `198.18.0.2`; tun2socks sends that adapter's TCP stream to a DeskFerry-owned loopback SOCKS endpoint, which accepts only the synthetic address on TCP port 445. The work agent then connects to the work PC's existing loopback SMB server. Normal Internet and LAN routes are not changed.
 
 Current agents negotiate resumable RDP streams with the relay. If an HTTP proxy or network path drops an active WebSocket, both endpoints keep their local RDP sockets open, reconnect to the same relay session for up to five minutes, and replay only data that the peer has not acknowledged. Each endpoint buffers at most 8 MiB of unacknowledged data so an extended outage applies backpressure instead of consuming unbounded memory. Older agents and relays continue to use the original non-resumable stream protocol.
 
@@ -143,12 +148,22 @@ Artifact:
 dist\bin\deskferry-relay-linux-amd64
 ```
 
+SSH egress from the work network must go through the HTTPS proxy. Direct `ssh` and `scp` to OCI are expected to time out. Use Ncat as OpenSSH's HTTP `CONNECT` transport:
+
+```powershell
+$ociKeyPath = "$env:USERPROFILE\Downloads\ssh-key-2026-06-27.key"
+$ociProxyCommand = 'ncat --proxy 192.9.200.25:3128 --proxy-type http %h %p'
+ssh -i $ociKeyPath -o IdentitiesOnly=yes -o "ProxyCommand=$ociProxyCommand" opc@217.142.228.117 'hostname'
+```
+
 Deploy through a temporary upload, replace the installed binary, restart the service, and remove the upload so old or staging binaries are not retained:
 
-```sh
-scp dist/bin/deskferry-relay-linux-amd64 opc@217.142.228.117:/tmp/deskferry-relay-linux-amd64
-ssh opc@217.142.228.117 'sudo install -m 0755 /tmp/deskferry-relay-linux-amd64 /opt/deskferry/go-relay/deskferry-relay && sudo systemctl restart deskferry-relay.service && sudo rm -f /tmp/deskferry-relay-linux-amd64'
+```powershell
+scp -i $ociKeyPath -o IdentitiesOnly=yes -o "ProxyCommand=$ociProxyCommand" dist/bin/deskferry-relay-linux-amd64 opc@217.142.228.117:/tmp/deskferry-relay-linux-amd64
+ssh -i $ociKeyPath -o IdentitiesOnly=yes -o "ProxyCommand=$ociProxyCommand" opc@217.142.228.117 'sudo install -m 0755 /tmp/deskferry-relay-linux-amd64 /opt/deskferry/go-relay/deskferry-relay && sudo systemctl restart deskferry-relay.service && sudo rm -f /tmp/deskferry-relay-linux-amd64'
 ```
+
+Keep the proxy command on every OCI SSH/SCP operation from this network; the proxied health check alone does not imply that direct SSH is available.
 
 The current OCI host is hardened for a small Always Free VM: it uses a 2 GiB swap file, persistent journald, a five-minute systemd runtime watchdog through `softdog`, kernel panic recovery for hung tasks, and a local health timer named `deskferry-relay-healthcheck.timer`. The longer watchdog window avoids resetting a resource-constrained VM during short hypervisor stalls while still recovering sustained hangs. The timer checks `http://127.0.0.1/relay/health` every minute, restarts `deskferry-relay.service` when the relay process stops responding, and reboots the VM after three consecutive failed post-restart checks.
 
@@ -182,6 +197,8 @@ It defaults to `D:\DeskFerry\Agent` when `D:` exists. Select `deskferry-agent-wi
 
 To enable remote command execution, set the WinRM target to `127.0.0.1:5985`. WinRM requires a non-empty room password. The target can be changed for an existing local WinRM configuration, but it must remain a `host:port` reachable by the work service.
 
+To enable Windows file sharing, set the SMB target to `127.0.0.1:445`, leave the SMB server alias at `deskferry-work`, and use a non-empty room password. The configurator registers that specific alias with the Windows Server service; restart the work PC once if the alias is not accepted immediately. Create and permission shares with the normal Windows **Advanced Sharing** controls. DeskFerry does not create shares or weaken their NTFS/share permissions.
+
 Command-line install is also supported:
 
 ```powershell
@@ -202,6 +219,24 @@ WebSocket mode uses standard proxy environment variables by default, such as `HT
 The work agent writes persistent daily diagnostic logs under `%ProgramData%\DeskFerry`. Seven calendar days are retained by default. Use `-log-retention-days <days>` in the service command line to configure a value from 1 through 3650.
 
 ### 5. Run Windows Home App
+
+The preferred installation is the self-contained setup application:
+
+```text
+dist\windows-home-installer\DeskFerryHomeSetup.exe
+```
+
+**Enable `\\deskferry-work\...` file access with the DeskFerry virtual network adapter** is selected by default and can be cleared for an app-only installation. When selected, enter the same relay room URL list and room password as the work agent. Setup installs the Home GUI, Start menu and Apps & Features entries, the automatic restricted network service, signed Wintun, and tun2socks. When it is cleared during an update, setup removes the network service, adapter helpers, and managed hostname while leaving the Home GUI installed.
+
+After both sides are configured, open an existing work share in Explorer:
+
+```text
+\\deskferry-work\sharename
+```
+
+Use the Windows account that has permission to that share. A domain environment may fall back to NTLM for the friendly alias; organizations that require Kerberos-only SMB should register the alias and `cifs/<alias>` SPN through their domain administrators or configure the actual work hostname as the alias.
+
+The standalone Home binary remains available for portable/manual use:
 
 Start the Windows home app, choose or create a named destination, and manage that destination's relay room URLs in priority order. The first URL is primary; later URLs are fallbacks. Stop the tunnel before changing destinations:
 
@@ -373,6 +408,7 @@ It:
 - Copies the selected agent binary to `agent.exe`.
 - Installs or updates the automatic `DeskFerryAgent` Windows service with the configured ordered relay URL list.
 - Protects every configured room with one optional DPAPI-encrypted password and enables an optional WinRM target when a password is present.
+- Enables an optional loopback SMB target, registers the selected Windows SMB server alias, and preserves unrelated server aliases.
 - Provides add, update, delete, button reorder, and drag reorder controls for relay URLs.
 - Configures SCM restart recovery.
 - Starts, stops, restarts, uninstalls, refreshes status, opens the install folder, and runs `agent.exe -self-test`.
@@ -390,6 +426,12 @@ It:
 - A loopback RDP listener, normally `127.0.0.1:3390`.
 - A loopback WinRM listener, normally `127.0.0.1:3391`, plus an integrated PowerShell command panel.
 - Automatic Remote Desktop launch when the user clicks `Connect`.
+
+The Windows package also includes:
+
+- `DeskFerryHomeSetup.exe`, a self-contained GUI installer with file access selected by default.
+- `DeskFerryHomeNetwork.exe`, an automatic LocalSystem service that owns the virtual adapter and the TCP/445-only relay bridge.
+- Wintun 0.14.1 and tun2socks 2.6.0, downloaded by the build with pinned SHA-256 hashes and distributed with their licenses.
 
 ### macOS Home Agent
 
@@ -426,8 +468,10 @@ Good free Android RDP client options include Microsoft's Remote Desktop/Windows 
 - Room passwords are not placed in URLs, service command lines, relay logs, or relay status. The work configurator stores the password as a machine-scope DPAPI blob; home profiles store only the derived proof.
 - A room proof is a bearer credential. Use a strong, unique room password and prefer `https://` relays. The plain-HTTP OCI fallback cannot protect a captured proof from interception and replay.
 - The relay never dials the work PC or home PC.
-- The work agent only dials its configured RDP or WinRM loopback target after a relay has paired an authenticated, same-room, same-service home connection.
+- The work agent only dials its configured RDP, WinRM, or SMB loopback target after a relay has paired an authenticated, same-room, same-service home connection.
 - WinRM is disabled unless the work configurator has both a room password and a WinRM target. Windows login credentials are supplied by the home user for each command and are not handled by the relay.
+- SMB is disabled unless the work configurator has both a room password and an SMB target. The Home SOCKS bridge rejects every destination except the configured synthetic work address on TCP port 445; it is not a general-purpose VPN or proxy.
+- SMB authentication and authorization remain Windows responsibilities. DeskFerry neither stores file-share passwords nor bypasses share or NTFS permissions.
 - Home apps listen on loopback by default, so other LAN devices cannot connect to local RDP or WinRM listeners unless the user intentionally changes a listen address.
 
 Choose room names that are not obvious. For meaningful access control, also configure a strong room password and use TLS.
@@ -444,6 +488,8 @@ Required:
 - JDK 17+ plus Android SDK platform 35 and build-tools 35.0.0 for the Android home app.
 - Gradle 9.x, or a compatible Gradle installation on `PATH`, for the Android home app.
 - `rsrc` for Windows GUI manifest resources; `build\build-go.ps1` installs it under `D:\Go\bin` when missing.
+
+The Windows Home installer build downloads [Wintun 0.14.1](https://www.wintun.net/) and [tun2socks 2.6.0](https://github.com/xjasonlyu/tun2socks/releases/tag/v2.6.0). Both archives and the tun2socks license are verified against pinned SHA-256 values before packaging.
 
 This repo has been built with Go installed under `D:\Scoop` and .NET SDK 9.x publishing the relay as `net8.0`.
 
@@ -465,6 +511,18 @@ Build Go binaries:
 
 ```powershell
 .\build\build-go.ps1
+```
+
+Build the self-contained Windows Home setup (this also builds Go artifacts unless `-SkipGoBuild` is used):
+
+```powershell
+.\build\build-windows-home-installer.ps1
+```
+
+On development PCs where SEP flags optimized unsigned Go PE files, retain symbols and disable optimization for the Windows artifacts:
+
+```powershell
+.\build\build-windows-home-installer.ps1 -DebugWindows
 ```
 
 To produce separate unoptimized Windows diagnostic builds, first run `build-go.ps1` so the Windows manifest resources are generated, then run:
@@ -495,6 +553,9 @@ dist\bin\deskferry-relay-linux-amd64
 dist\bin\deskferry-agent-windows-amd64.exe
 dist\bin\deskferry-agent-configurator-windows-amd64.exe
 dist\bin\deskferry-home-windows-amd64.exe
+dist\bin\deskferry-home-network-windows-amd64.exe
+dist\bin\deskferry-home-setup-windows-amd64.exe
+dist\windows-home-installer\DeskFerryHomeSetup.exe
 dist\bin\deskferry-home-macos-arm64
 dist\bin\deskferry-home-macos-amd64
 dist\android\deskferry-home-android-debug.apk
@@ -626,6 +687,19 @@ Check:
 - The configured Windows account is allowed to log in remotely.
 - The home app local listen port is not already in use. If `127.0.0.1:3389` fails on the home PC, use `127.0.0.1:3390`.
 
+### Work File Access Fails
+
+Check:
+
+- The work configurator has SMB target `127.0.0.1:445`, the alias used by Home setup, and a room password.
+- Home setup used the same room name and password and its file-access checkbox was selected.
+- The `DeskFerryHomeNetwork` service is running and the `DeskFerry` adapter has address `198.18.0.1`.
+- `Test-NetConnection deskferry-work -Port 445` reaches `198.18.0.2` on the Home PC.
+- The named Windows share exists and the supplied Windows account has both share and NTFS permission.
+- The work PC was restarted once after adding or changing the SMB server alias.
+
+If Windows reports that the target account name is incorrect in a domain, the alias lacks a matching Kerberos SPN. Register the alias through the domain's normal computer-alias/SPN administration, use the actual work hostname as the configured alias, or permit the organization's approved NTLM fallback. Microsoft documents the alias/SPN behavior in [SMB file server share access through an alias](https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/dns-cname-alias-cannot-access-smb-file-server-share).
+
 ### OCI Relay Becomes Unresponsive
 
 The OCI Go relay is supervised by `deskferry-relay.service`, a local health timer, and systemd's five-minute runtime watchdog:
@@ -694,6 +768,10 @@ work-agent/windows/service
 work-agent/windows/configurator
                          Windows service setup/configurator GUI
 home-agent/windows       Windows control-panel/tray home app
+home-agent/windows/installer
+                         Self-contained Windows Home setup GUI
+home-agent/windows/network-service
+                         Restricted Wintun/tun2socks SMB network service
 home-agent/macos         macOS foreground CLI home agent
 home-agent/android       Android foreground-service home app
 internal/tunnel          WebSocket, proxy, pipe, and role helpers
@@ -712,9 +790,10 @@ This repo currently contains:
 - Windows work agent implemented as a Windows service deliverable.
 - Windows configurator GUI for installing and managing the work agent service.
 - Windows home app implemented as a friendly control-panel and tray deliverable.
+- Optional Windows Home virtual network adapter and self-contained installer for `\\deskferry-work\<share>` access.
 - macOS home agent implemented as a foreground CLI tunnel endpoint.
 - Android home app implemented as a foreground-service loopback tunnel endpoint.
-- Build scripts for Go binaries, relay packages, and the Android APK.
+- Build scripts for Go binaries, the Windows Home installer, relay packages, and the Android APK.
 
 ## Current Limitations
 
@@ -722,5 +801,6 @@ This repo currently contains:
 - Multiple App Service instances are not supported unless sticky routing or shared broker state is added.
 - The Go work and home agents support direct, environment, HTTP proxy, and HTTPS proxy modes. Proxy URLs may contain Basic credentials; NTLM proxy authentication is not implemented.
 - The Windows home app is an RDP launcher and tunnel endpoint, not a full RDP client.
+- Windows UNC access currently transports SMB only. It does not carry arbitrary IP traffic, SMB discovery, or printer discovery; users open a known `\\alias\share` path.
 - The macOS home agent is a tunnel endpoint and `.rdp` launcher, not a full RDP client; use Microsoft Remote Desktop/Windows App or another macOS RDP client against `127.0.0.1:3389`.
 - The Android home app is also a tunnel endpoint, not a full RDP client; use a separate Android RDP client against `127.0.0.1:3389`.

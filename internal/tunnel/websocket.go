@@ -96,6 +96,7 @@ const (
 
 	ServiceRDP   = "rdp"
 	ServiceWinRM = "winrm"
+	ServiceSMB   = "smb"
 
 	// Resumable data messages contain a 64 KiB payload plus framing. Keep a
 	// bounded amount of headroom above that protocol maximum.

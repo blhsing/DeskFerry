@@ -22,6 +22,7 @@ import (
 	. "github.com/lxn/walk/declarative"
 	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -34,6 +35,7 @@ const (
 	serviceDisplayName = "DeskFerry Agent"
 	installedAgentName = "agent.exe"
 	defaultRelayURL    = "https://test-officialwebsite.azurewebsites.net/relay/"
+	defaultSMBAlias    = "deskferry-work"
 )
 
 type app struct {
@@ -50,6 +52,8 @@ type app struct {
 	roomPassword    *walk.LineEdit
 	clearPassword   *walk.CheckBox
 	winrmAddr       *walk.LineEdit
+	smbAddr         *walk.LineEdit
+	smbAlias        *walk.LineEdit
 	status          *walk.Label
 	log             *walk.TextEdit
 	relayURLs       []string
@@ -66,6 +70,8 @@ type actionOptions struct {
 	RoomPasswordBlob  string
 	ClearRoomPassword bool
 	WinRMAddr         string
+	SMBAddr           string
+	SMBAlias          string
 }
 
 type serviceInfo struct {
@@ -159,9 +165,13 @@ func (a *app) run(smokeTest bool) error {
 					Label{Text: "Room password"},
 					LineEdit{AssignTo: &a.roomPassword, PasswordMode: true, CueBanner: "blank keeps the current password", ColumnSpan: 2},
 					Label{Text: "Password options"},
-					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM)", ColumnSpan: 2},
+					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM and SMB)", ColumnSpan: 2},
 					Label{Text: "WinRM target"},
 					LineEdit{AssignTo: &a.winrmAddr, CueBanner: "127.0.0.1:5985; blank disables WinRM", ColumnSpan: 2},
+					Label{Text: "SMB target"},
+					LineEdit{AssignTo: &a.smbAddr, CueBanner: "127.0.0.1:445; blank disables SMB", ColumnSpan: 2},
+					Label{Text: "SMB server alias"},
+					LineEdit{AssignTo: &a.smbAlias, Text: defaultSMBAlias, CueBanner: defaultSMBAlias, ColumnSpan: 2},
 				},
 			},
 			GroupBox{
@@ -504,6 +514,9 @@ func (a *app) runSelfTest() {
 		if opts.WinRMAddr != "" {
 			args = append(args, "-winrm", opts.WinRMAddr)
 		}
+		if opts.SMBAddr != "" {
+			args = append(args, "-smb", opts.SMBAddr)
+		}
 		cmd := exec.Command(exePath, args...)
 		var output bytes.Buffer
 		cmd.Stdout = &output
@@ -616,6 +629,8 @@ func (a *app) options() actionOptions {
 		RoomPassword:      a.roomPassword.Text(),
 		ClearRoomPassword: a.clearPassword.Checked(),
 		WinRMAddr:         strings.TrimSpace(a.winrmAddr.Text()),
+		SMBAddr:           strings.TrimSpace(a.smbAddr.Text()),
+		SMBAlias:          strings.TrimSpace(a.smbAlias.Text()),
 	}
 }
 
@@ -659,6 +674,8 @@ func runElevatedAction(args []string) {
 	roomPasswordBlob := fs.String("room-password-blob", "", "DPAPI room password blob")
 	clearRoomPassword := fs.Bool("clear-room-password", false, "clear room password")
 	winrmAddr := fs.String("winrm", "", "WinRM target")
+	smbAddr := fs.String("smb", "", "SMB target")
+	smbAlias := fs.String("smb-alias", defaultSMBAlias, "SMB server alias")
 	if err := fs.Parse(args); err != nil {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(2)
@@ -670,6 +687,8 @@ func runElevatedAction(args []string) {
 		RoomPasswordBlob:  *roomPasswordBlob,
 		ClearRoomPassword: *clearRoomPassword,
 		WinRMAddr:         *winrmAddr,
+		SMBAddr:           *smbAddr,
+		SMBAlias:          *smbAlias,
 	})
 	if err != nil {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
@@ -692,7 +711,7 @@ func performAction(action string, opts actionOptions) (string, error) {
 		}
 		return startService()
 	case "uninstall":
-		return uninstallService()
+		return uninstallService(opts.InstallDir)
 	default:
 		return "", fmt.Errorf("unknown action %q", action)
 	}
@@ -741,8 +760,8 @@ func installOrUpdate(opts actionOptions) (string, error) {
 	} else if opts.ClearRoomPassword {
 		_ = os.Remove(passwordDest)
 	}
-	if opts.WinRMAddr != "" && !fileExists(passwordDest) {
-		return "", errors.New("WinRM requires a room password")
+	if (opts.WinRMAddr != "" || opts.SMBAddr != "") && !fileExists(passwordDest) {
+		return "", errors.New("WinRM and SMB require a room password")
 	}
 	args := []string{"-service", "-relay-url", opts.RelayURL}
 	if fileExists(passwordDest) {
@@ -750,6 +769,12 @@ func installOrUpdate(opts actionOptions) (string, error) {
 	}
 	if opts.WinRMAddr != "" {
 		args = append(args, "-winrm", opts.WinRMAddr)
+	}
+	if opts.SMBAddr != "" {
+		args = append(args, "-smb", opts.SMBAddr)
+	}
+	if err := configureSMBAlias(installDir, opts.SMBAlias, opts.SMBAddr != ""); err != nil {
+		return "", err
 	}
 
 	config := serviceConfig(agentDest, args)
@@ -781,10 +806,14 @@ func installOrUpdate(opts actionOptions) (string, error) {
 	if err := startMgrService(s); err != nil {
 		return "", err
 	}
-	if existed {
-		return fmt.Sprintf("Updated and started %s in %s.", serviceDisplayName, installDir), nil
+	note := ""
+	if opts.SMBAddr != "" {
+		note = fmt.Sprintf(" SMB accepts the alias %s; restart Windows once if the Server service was already running.", opts.SMBAlias)
 	}
-	return fmt.Sprintf("Installed and started %s in %s.", serviceDisplayName, installDir), nil
+	if existed {
+		return fmt.Sprintf("Updated and started %s in %s.%s", serviceDisplayName, installDir, note), nil
+	}
+	return fmt.Sprintf("Installed and started %s in %s.%s", serviceDisplayName, installDir, note), nil
 }
 
 func startService() (string, error) {
@@ -821,7 +850,13 @@ func stopService() (string, error) {
 	return fmt.Sprintf("Stopped %s.", serviceDisplayName), nil
 }
 
-func uninstallService() (string, error) {
+func uninstallService(installDir string) (string, error) {
+	if strings.TrimSpace(installDir) == "" {
+		installDir = defaultInstallDir()
+	}
+	if err := configureSMBAlias(installDir, "", false); err != nil {
+		return "", err
+	}
 	m, err := mgr.Connect()
 	if err != nil {
 		return "", err
@@ -858,6 +893,14 @@ func validateInstallInputs(opts actionOptions) error {
 			return fmt.Errorf("WinRM target must be host:port: %w", err)
 		}
 	}
+	if opts.SMBAddr != "" {
+		if _, _, err := net.SplitHostPort(opts.SMBAddr); err != nil {
+			return fmt.Errorf("SMB target must be host:port: %w", err)
+		}
+		if !validSMBAlias(opts.SMBAlias) {
+			return errors.New("SMB server alias must be a single DNS label containing only letters, numbers, and hyphens")
+		}
+	}
 	if _, err := os.Stat(opts.AgentPath); err != nil {
 		return fmt.Errorf("agent executable is not readable: %w", err)
 	}
@@ -871,7 +914,7 @@ func serviceConfig(exePath string, args []string) mgr.Config {
 		ErrorControl:   mgr.ErrorNormal,
 		BinaryPathName: serviceBinaryPath(exePath, args),
 		DisplayName:    serviceDisplayName,
-		Description:    "Work-side RDP and WinRM backend for DeskFerry.",
+		Description:    "Work-side RDP, WinRM, and SMB backend for DeskFerry.",
 	}
 }
 
@@ -979,6 +1022,12 @@ func relaunchElevatedAction(action string, opts actionOptions) error {
 	}
 	if opts.WinRMAddr != "" {
 		args = append(args, "-winrm", opts.WinRMAddr)
+	}
+	if opts.SMBAddr != "" {
+		args = append(args, "-smb", opts.SMBAddr)
+	}
+	if opts.SMBAlias != "" {
+		args = append(args, "-smb-alias", opts.SMBAlias)
 	}
 	if opts.ClearRoomPassword {
 		args = append(args, "-clear-room-password")
@@ -1094,6 +1143,102 @@ func copyFile(src, dst string) error {
 		return copyErr
 	}
 	return closeErr
+}
+
+func configureSMBAlias(installDir, alias string, enable bool) error {
+	recordPath := filepath.Join(installDir, "smb-alias.txt")
+	oldAlias := ""
+	if data, err := os.ReadFile(recordPath); err == nil {
+		oldAlias = strings.TrimSpace(string(data))
+	}
+	if !enable && oldAlias == "" {
+		return nil
+	}
+	key, _, err := registry.CreateKey(
+		registry.LOCAL_MACHINE,
+		`SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters`,
+		registry.QUERY_VALUE|registry.SET_VALUE,
+	)
+	if err != nil {
+		return fmt.Errorf("open SMB Server configuration: %w", err)
+	}
+	defer key.Close()
+
+	aliases := readSMBOptionalNames(key)
+	filtered := aliases[:0]
+	for _, existing := range aliases {
+		if oldAlias != "" && strings.EqualFold(existing, oldAlias) {
+			continue
+		}
+		if alias != "" && strings.EqualFold(existing, alias) {
+			continue
+		}
+		filtered = append(filtered, existing)
+	}
+	aliases = filtered
+	if enable {
+		alias = strings.TrimSpace(alias)
+		aliases = append(aliases, alias)
+		if err := key.SetDWordValue("DisableStrictNameChecking", 1); err != nil {
+			return fmt.Errorf("allow the DeskFerry SMB alias: %w", err)
+		}
+	}
+	if len(aliases) == 0 {
+		if err := key.DeleteValue("OptionalNames"); err != nil && !errors.Is(err, registry.ErrNotExist) {
+			return fmt.Errorf("remove DeskFerry SMB alias: %w", err)
+		}
+	} else if err := key.SetStringsValue("OptionalNames", aliases); err != nil {
+		return fmt.Errorf("save SMB server aliases: %w", err)
+	}
+	if enable {
+		if err := os.WriteFile(recordPath, []byte(alias+"\n"), 0600); err != nil {
+			return fmt.Errorf("save managed SMB alias: %w", err)
+		}
+	} else {
+		_ = os.Remove(recordPath)
+	}
+	return nil
+}
+
+func readSMBOptionalNames(key registry.Key) []string {
+	values, _, err := key.GetStringsValue("OptionalNames")
+	if err == nil {
+		return uniqueSMBAliases(values)
+	}
+	value, _, err := key.GetStringValue("OptionalNames")
+	if err != nil {
+		return nil
+	}
+	return uniqueSMBAliases(strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\r' || r == '\n'
+	}))
+}
+
+func uniqueSMBAliases(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]bool)
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		key := strings.ToLower(value)
+		if value != "" && !seen[key] {
+			seen[key] = true
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func validSMBAlias(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 1 || len(value) > 63 || value[0] == '-' || value[len(value)-1] == '-' {
+		return false
+	}
+	for _, r := range value {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func serviceStateText(state uint32) string {

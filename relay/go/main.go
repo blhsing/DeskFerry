@@ -33,6 +33,7 @@ const (
 	clientUnavailable = "client-unavailable"
 	serviceRDP        = "rdp"
 	serviceWinRM      = "winrm"
+	serviceSMB        = "smb"
 	// Resumable tunnel data messages contain a 64 KiB payload plus framing.
 	// Keep a bounded amount of headroom above that protocol maximum.
 	relayWebSocketReadLimit = 1 << 20
@@ -293,7 +294,7 @@ func readService(r *http.Request) string {
 	if value == "" {
 		return serviceRDP
 	}
-	if value == serviceRDP || value == serviceWinRM {
+	if value == serviceRDP || value == serviceWinRM || value == serviceSMB {
 		return value
 	}
 	return ""
