@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -30,15 +31,17 @@ import (
 
 	"deskferry/internal/diaglog"
 	"deskferry/internal/tunnel"
+	"deskferry/internal/wincred"
 )
 
 const (
-	defaultRelayURL    = "https://test-officialwebsite.azurewebsites.net/relay/workdesk"
-	defaultListenAddr  = "127.0.0.1:3390"
-	singleInstanceName = `Global\DeskFerryHomeAgent`
-	appIconResourceID  = 2
-	statusTileWidth    = 150
-	rdpStatusTileWidth = 230
+	defaultRelayURL        = "https://test-officialwebsite.azurewebsites.net/relay/workdesk"
+	defaultListenAddr      = "127.0.0.1:3390"
+	defaultWinRMListenAddr = "127.0.0.1:3391"
+	singleInstanceName     = `Global\DeskFerryHomeAgent`
+	appIconResourceID      = 2
+	statusTileWidth        = 150
+	rdpStatusTileWidth     = 230
 )
 
 type config struct {
@@ -47,13 +50,18 @@ type config struct {
 	RelayAddrs          []string             `json:"relay_addrs,omitempty"`
 	Proxy               string               `json:"proxy"`
 	RDPUser             string               `json:"rdp_user,omitempty"`
+	WinRMListenAddr     string               `json:"winrm_listen_addr,omitempty"`
+	WinRMUser           string               `json:"winrm_user,omitempty"`
+	RoomProof           string               `json:"room_proof,omitempty"`
 	Destinations        []destinationProfile `json:"destinations,omitempty"`
 	SelectedDestination string               `json:"selected_destination,omitempty"`
 }
 
 type destinationProfile struct {
-	Name       string   `json:"name"`
-	RelayAddrs []string `json:"relay_addrs"`
+	Name        string   `json:"name"`
+	RelayAddrs  []string `json:"relay_addrs"`
+	RoomProof   string   `json:"room_proof,omitempty"`
+	WindowsUser string   `json:"windows_user,omitempty"`
 }
 
 type relayURLFlag []string
@@ -71,22 +79,28 @@ type clientApp struct {
 	mw *walk.MainWindow
 	ni *walk.NotifyIcon
 
-	relayList         *walk.ListBox
-	relayEdit         *walk.LineEdit
-	relayAdd          *walk.PushButton
-	relayUpdate       *walk.PushButton
-	relayDelete       *walk.PushButton
-	relayUp           *walk.PushButton
-	relayDown         *walk.PushButton
-	destinationList   *walk.ComboBox
-	destinationEdit   *walk.LineEdit
-	destinationAdd    *walk.PushButton
-	destinationRename *walk.PushButton
-	destinationDelete *walk.PushButton
-	listenAddr        *walk.LineEdit
-	proxy             *walk.LineEdit
-	rdpUser           *walk.LineEdit
-	rdpPass           *walk.LineEdit
+	relayList          *walk.ListBox
+	relayEdit          *walk.LineEdit
+	relayAdd           *walk.PushButton
+	relayUpdate        *walk.PushButton
+	relayDelete        *walk.PushButton
+	relayUp            *walk.PushButton
+	relayDown          *walk.PushButton
+	destinationList    *walk.ComboBox
+	destinationEdit    *walk.LineEdit
+	destinationAdd     *walk.PushButton
+	destinationRename  *walk.PushButton
+	destinationDelete  *walk.PushButton
+	listenAddr         *walk.LineEdit
+	proxy              *walk.LineEdit
+	rdpUser            *walk.LineEdit
+	rdpPass            *walk.LineEdit
+	roomPass           *walk.LineEdit
+	clearRoomPassword  *walk.CheckBox
+	winrmListen        *walk.LineEdit
+	winrmCommand       *walk.TextEdit
+	winrmOutput        *walk.TextEdit
+	executeWinRMButton *walk.PushButton
 
 	tunnelStatus *walk.Label
 	workStatus   *walk.Label
@@ -114,7 +128,9 @@ type clientApp struct {
 	relayDragging       bool
 	cancel              context.CancelFunc
 	listener            net.Listener
+	winrmListener       net.Listener
 	activeLocal         int
+	activeWinRM         int
 	statusCancel        context.CancelFunc
 	exiting             bool
 }
@@ -258,124 +274,151 @@ func (a *clientApp) run(smokeTest bool) error {
 	window := MainWindow{
 		AssignTo: &a.mw,
 		Title:    appTitle(),
-		MinSize:  Size{Width: 780, Height: 540},
-		Size:     Size{Width: 900, Height: 650},
+		MinSize:  Size{Width: 1250, Height: 600},
+		Size:     Size{Width: 1320, Height: 680},
 		Icon:     appIcon(),
-		Layout:   VBox{Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 12}, Spacing: 9},
+		Layout:   VBox{MarginsZero: true},
 		Visible:  !smokeTest,
 		Children: []Widget{
 			Composite{
-				Layout: Grid{Columns: 2, Spacing: 6},
+				Layout: VBox{Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 12}, Spacing: 9},
 				Children: []Widget{
-					Label{
-						Text:      "DeskFerry Home",
-						Font:      Font{PointSize: 16, Bold: true},
-						TextColor: walk.RGB(31, 41, 55),
-					},
-					Label{
-						Text:          "Outbound WebSocket RDP",
-						TextAlignment: AlignFar,
-						TextColor:     walk.RGB(93, 104, 116),
-					},
-				},
-			},
-			GroupBox{
-				Title:  "Status",
-				Layout: Grid{Columns: 4, Spacing: 8},
-				Children: []Widget{
-					statusTile("Tunnel", &a.tunnelStatus, "Stopped", statusTileWidth),
-					statusTile("Work Agent", &a.workStatus, "Checking", statusTileWidth),
-					statusTile("Home App", &a.homeStatus, "Connecting", statusTileWidth),
-					statusTile("RDP", &a.rdpStatus, defaultListenAddr, rdpStatusTileWidth),
-				},
-			},
-			GroupBox{
-				Title:  "Connection",
-				Layout: Grid{Columns: 4, Spacing: 7},
-				Children: []Widget{
-					Label{Text: "Destination"},
-					ComboBox{
-						AssignTo:              &a.destinationList,
-						Model:                 destinationNames(a.cfg.Destinations),
-						OnCurrentIndexChanged: a.destinationSelectionChanged,
-					},
-					LineEdit{AssignTo: &a.destinationEdit, CueBanner: "Work destination name"},
-					Composite{
-						Layout: Flow{Spacing: 5},
+					GroupBox{
+						Title:  "Status",
+						Layout: Grid{Columns: 4, Spacing: 8},
 						Children: []Widget{
-							PushButton{AssignTo: &a.destinationAdd, Text: "Add", OnClicked: a.addDestination},
-							PushButton{AssignTo: &a.destinationRename, Text: "Rename", OnClicked: a.renameDestination},
-							PushButton{AssignTo: &a.destinationDelete, Text: "Delete", OnClicked: a.deleteDestination},
+							statusTile("Tunnel", &a.tunnelStatus, "Stopped", statusTileWidth),
+							statusTile("Work Agent", &a.workStatus, "Checking", statusTileWidth),
+							statusTile("Home App", &a.homeStatus, "Connecting", statusTileWidth),
+							statusTile("RDP", &a.rdpStatus, defaultListenAddr, rdpStatusTileWidth),
 						},
 					},
-					Label{Text: "Relay URLs"},
 					Composite{
-						ColumnSpan: 3,
-						Layout:     VBox{Spacing: 6},
+						StretchFactor: 1,
+						Layout:        HBox{MarginsZero: true, Spacing: 9},
 						Children: []Widget{
-							ListBox{
-								AssignTo:              &a.relayList,
-								Model:                 a.cfg.relayAddresses(),
-								MinSize:               Size{Height: 74},
-								OnCurrentIndexChanged: a.relaySelectionChanged,
-								OnMouseDown:           a.relayListMouseDown,
-								OnMouseMove:           a.relayListMouseMove,
-								OnMouseUp:             a.relayListMouseUp,
-							},
-							Composite{
-								Layout: Grid{Columns: 4, Spacing: 6},
+							GroupBox{
+								Title:         "Connection",
+								MinSize:       Size{Width: 580},
+								StretchFactor: 2,
+								Layout:        Grid{Columns: 4, Spacing: 7},
 								Children: []Widget{
-									Label{Text: "Selected URL"},
-									LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultRelayURL, ColumnSpan: 3},
+									Label{Text: "Destination"},
+									ComboBox{
+										AssignTo:              &a.destinationList,
+										Model:                 destinationNames(a.cfg.Destinations),
+										OnCurrentIndexChanged: a.destinationSelectionChanged,
+									},
+									LineEdit{AssignTo: &a.destinationEdit, CueBanner: "Work destination name"},
+									Composite{
+										Layout: Grid{Columns: 3, MarginsZero: true, Spacing: 5},
+										Children: []Widget{
+											PushButton{AssignTo: &a.destinationAdd, Text: "Add", OnClicked: a.addDestination},
+											PushButton{AssignTo: &a.destinationRename, Text: "Rename", OnClicked: a.renameDestination},
+											PushButton{AssignTo: &a.destinationDelete, Text: "Delete", OnClicked: a.deleteDestination},
+										},
+									},
+									Label{Text: "Relay URLs"},
+									Composite{
+										ColumnSpan: 3,
+										Layout:     VBox{Spacing: 6},
+										Children: []Widget{
+											ListBox{
+												AssignTo:              &a.relayList,
+												Model:                 a.cfg.relayAddresses(),
+												MinSize:               Size{Height: 74},
+												OnCurrentIndexChanged: a.relaySelectionChanged,
+												OnMouseDown:           a.relayListMouseDown,
+												OnMouseMove:           a.relayListMouseMove,
+												OnMouseUp:             a.relayListMouseUp,
+											},
+											Composite{
+												Layout: Grid{Columns: 4, Spacing: 6},
+												Children: []Widget{
+													Label{Text: "Selected URL"},
+													LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultRelayURL, ColumnSpan: 3},
+												},
+											},
+											Composite{
+												Layout: Grid{Columns: 5, Spacing: 6},
+												Children: []Widget{
+													PushButton{AssignTo: &a.relayAdd, Text: "Add", MinSize: Size{Height: 30}, OnClicked: a.addRelayURL},
+													PushButton{AssignTo: &a.relayUpdate, Text: "Update", MinSize: Size{Height: 30}, OnClicked: a.updateRelayURL},
+													PushButton{AssignTo: &a.relayDelete, Text: "Delete", MinSize: Size{Height: 30}, OnClicked: a.deleteRelayURL},
+													PushButton{AssignTo: &a.relayUp, Text: "Up", MinSize: Size{Height: 30}, OnClicked: func() { a.moveRelayURL(-1) }},
+													PushButton{AssignTo: &a.relayDown, Text: "Down", MinSize: Size{Height: 30}, OnClicked: func() { a.moveRelayURL(1) }},
+												},
+											},
+										},
+									},
+									Composite{
+										ColumnSpan: 4,
+										Layout:     VBox{MarginsZero: true, Spacing: 7},
+										Children: []Widget{
+											connectionPair(
+												"Local RDP address", LineEdit{AssignTo: &a.listenAddr, Text: a.cfg.ListenAddr, CueBanner: defaultListenAddr, StretchFactor: 1},
+												"Proxy", LineEdit{AssignTo: &a.proxy, Text: a.cfg.Proxy, CueBanner: "env, direct, or http(s)://host:port", StretchFactor: 1},
+											),
+											connectionPair(
+												"Room password", LineEdit{AssignTo: &a.roomPass, PasswordMode: true, CueBanner: "optional room password", MinSize: Size{Width: 162}, MaxSize: Size{Width: 162}, StretchFactor: 1},
+												"Password options", CheckBox{AssignTo: &a.clearRoomPassword, Text: "Clear saved room credential", StretchFactor: 1},
+											),
+											connectionPair(
+												"Windows username", LineEdit{AssignTo: &a.rdpUser, Text: a.cfg.RDPUser, CueBanner: `DOMAIN\user or user@example.com`, StretchFactor: 1},
+												"Windows password", LineEdit{AssignTo: &a.rdpPass, PasswordMode: true, CueBanner: "blank uses the saved profile login", StretchFactor: 1},
+											),
+										},
+									},
+									Composite{
+										ColumnSpan: 4,
+										Layout:     Grid{Columns: 4, Spacing: 6},
+										Children: []Widget{
+											PushButton{AssignTo: &a.connectButton, Text: "Connect", MinSize: Size{Height: 30}, OnClicked: func() { a.connectFromUI() }},
+											PushButton{AssignTo: &a.openRDPButton, Text: "Open Remote Desktop", MinSize: Size{Height: 30}, OnClicked: a.openRemoteDesktop},
+											PushButton{Text: "Save", MinSize: Size{Height: 30}, OnClicked: func() { a.saveFromUI(true) }},
+											PushButton{Text: "Copy RDP Address", MinSize: Size{Height: 30}, OnClicked: a.copyRDPAddress},
+											PushButton{Text: "Save Windows Login", MinSize: Size{Height: 30}, OnClicked: a.saveWindowsCredentials},
+											PushButton{Text: "Forget Windows Login", MinSize: Size{Height: 30}, OnClicked: a.forgetWindowsCredentials},
+											PushButton{Text: "Relay Dashboard", MinSize: Size{Height: 30}, OnClicked: a.openDashboard},
+											PushButton{Text: "Refresh", MinSize: Size{Height: 30}, OnClicked: a.refreshRelayStatusAsync},
+										},
+									},
 								},
 							},
-							Composite{
-								Layout: Flow{Spacing: 6},
+							GroupBox{
+								Title:         "WinRM Commands (uses the shared Windows login at left)",
+								MinSize:       Size{Width: 320},
+								StretchFactor: 2,
+								Layout:        VBox{Spacing: 6},
 								Children: []Widget{
-									PushButton{AssignTo: &a.relayAdd, Text: "Add", MinSize: Size{Width: 72, Height: 30}, OnClicked: a.addRelayURL},
-									PushButton{AssignTo: &a.relayUpdate, Text: "Update", MinSize: Size{Width: 82, Height: 30}, OnClicked: a.updateRelayURL},
-									PushButton{AssignTo: &a.relayDelete, Text: "Delete", MinSize: Size{Width: 78, Height: 30}, OnClicked: a.deleteRelayURL},
-									PushButton{AssignTo: &a.relayUp, Text: "Up", MinSize: Size{Width: 64, Height: 30}, OnClicked: func() { a.moveRelayURL(-1) }},
-									PushButton{AssignTo: &a.relayDown, Text: "Down", MinSize: Size{Width: 64, Height: 30}, OnClicked: func() { a.moveRelayURL(1) }},
+									Composite{
+										Layout: Grid{Columns: 3, Spacing: 7},
+										Children: []Widget{
+											Label{Text: "Local WinRM address"},
+											LineEdit{AssignTo: &a.winrmListen, Text: a.cfg.WinRMListenAddr, CueBanner: defaultWinRMListenAddr},
+											PushButton{AssignTo: &a.executeWinRMButton, Text: "Execute", OnClicked: a.executeWinRM},
+										},
+									},
+									Label{Text: "PowerShell command"},
+									TextEdit{AssignTo: &a.winrmCommand, MinSize: Size{Height: 48}, Text: "Get-ComputerInfo | Select-Object CsName, WindowsProductName, WindowsVersion"},
+									Label{Text: "Output"},
+									TextEdit{AssignTo: &a.winrmOutput, ReadOnly: true, VScroll: true, MinSize: Size{Height: 72}},
+								},
+							},
+							GroupBox{
+								Title:         "Monitoring",
+								MinSize:       Size{Width: 320},
+								StretchFactor: 2,
+								Layout:        VBox{Spacing: 5},
+								Children: []Widget{
+									Label{Text: "Room Details"},
+									TextEdit{AssignTo: &a.details, ReadOnly: true, VScroll: true, MinSize: Size{Height: 90}, StretchFactor: 1, Text: "Checking relay room..."},
+									Label{Text: "Activity"},
+									TextEdit{AssignTo: &a.logView, ReadOnly: true, VScroll: true, MinSize: Size{Height: 90}, StretchFactor: 1},
 								},
 							},
 						},
 					},
-					Label{Text: "Local RDP address"},
-					LineEdit{AssignTo: &a.listenAddr, Text: a.cfg.ListenAddr, CueBanner: defaultListenAddr},
-					Label{Text: "Proxy"},
-					LineEdit{AssignTo: &a.proxy, Text: a.cfg.Proxy, CueBanner: "env, direct, or http(s)://host:port"},
-					Label{Text: "RDP username"},
-					LineEdit{AssignTo: &a.rdpUser, Text: a.cfg.RDPUser, CueBanner: `DOMAIN\user or user@example.com`},
-					Label{Text: "RDP password"},
-					LineEdit{AssignTo: &a.rdpPass, PasswordMode: true, CueBanner: "not stored by DeskFerry"},
-				},
-			},
-			Composite{
-				Layout: Flow{Spacing: 7},
-				Children: []Widget{
-					PushButton{AssignTo: &a.connectButton, Text: "Connect", MinSize: Size{Width: 120, Height: 34}, OnClicked: func() { a.connectFromUI() }},
-					PushButton{AssignTo: &a.openRDPButton, Text: "Open Remote Desktop", MinSize: Size{Width: 150, Height: 34}, OnClicked: a.openRemoteDesktop},
-					PushButton{Text: "Save", MinSize: Size{Width: 88, Height: 34}, OnClicked: func() { a.saveFromUI(true) }},
-					PushButton{Text: "Copy RDP Address", MinSize: Size{Width: 130, Height: 34}, OnClicked: a.copyRDPAddress},
-					PushButton{Text: "Save RDP Login", MinSize: Size{Width: 120, Height: 34}, OnClicked: a.saveRDPCredentials},
-					PushButton{Text: "Forget RDP Login", MinSize: Size{Width: 120, Height: 34}, OnClicked: a.forgetRDPCredentials},
-					PushButton{Text: "Relay Dashboard", MinSize: Size{Width: 130, Height: 34}, OnClicked: a.openDashboard},
-					PushButton{Text: "Refresh", MinSize: Size{Width: 90, Height: 34}, OnClicked: a.refreshRelayStatusAsync},
-				},
-			},
-			GroupBox{
-				Title:  "Room Details",
-				Layout: VBox{Spacing: 5},
-				Children: []Widget{
-					TextEdit{AssignTo: &a.details, ReadOnly: true, VScroll: true, MinSize: Size{Height: 96}, Text: "Checking relay room..."},
-				},
-			},
-			GroupBox{
-				Title:  "Activity",
-				Layout: VBox{Spacing: 5},
-				Children: []Widget{
-					TextEdit{AssignTo: &a.logView, ReadOnly: true, VScroll: true, MinSize: Size{Height: 120}},
 				},
 			},
 		},
@@ -421,6 +464,28 @@ func (a *clientApp) run(smokeTest bool) error {
 	return nil
 }
 
+func connectionPair(leftTitle string, leftField Widget, rightTitle string, rightField Widget) Widget {
+	return Composite{
+		Layout: HBox{MarginsZero: true, Spacing: 7},
+		Children: []Widget{
+			connectionField(leftTitle, leftField),
+			connectionField(rightTitle, rightField),
+		},
+	}
+}
+
+func connectionField(title string, field Widget) Widget {
+	return Composite{
+		MinSize:       Size{Width: 270},
+		StretchFactor: 1,
+		Layout:        Grid{Columns: 2, MarginsZero: true, Spacing: 6},
+		Children: []Widget{
+			Label{Text: title, MinSize: Size{Width: 108}, MaxSize: Size{Width: 108}},
+			field,
+		},
+	}
+}
+
 func statusTile(title string, assignTo **walk.Label, initial string, width int) Widget {
 	return Composite{
 		MinSize:       Size{Width: width, Height: 66},
@@ -456,7 +521,7 @@ func destinationNames(values []destinationProfile) []string {
 func cloneDestinations(values []destinationProfile) []destinationProfile {
 	out := make([]destinationProfile, len(values))
 	for i, value := range values {
-		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...)}
+		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RoomProof: value.RoomProof, WindowsUser: value.WindowsUser}
 	}
 	return out
 }
@@ -486,6 +551,24 @@ func (a *clientApp) updateDestinationEditor() {
 	}
 	if a.selectedDestination >= 0 && a.selectedDestination < len(a.destinations) {
 		_ = a.destinationEdit.SetText(a.destinations[a.selectedDestination].Name)
+		if a.roomPass != nil {
+			_ = a.roomPass.SetText("")
+			if a.destinations[a.selectedDestination].RoomProof != "" {
+				a.roomPass.SetCueBanner("saved room credential configured")
+			} else {
+				a.roomPass.SetCueBanner("optional room password")
+			}
+		}
+		if a.clearRoomPassword != nil {
+			a.clearRoomPassword.SetChecked(false)
+		}
+		if a.rdpUser != nil {
+			_ = a.rdpUser.SetText(a.destinations[a.selectedDestination].WindowsUser)
+		}
+		if a.rdpPass != nil {
+			_ = a.rdpPass.SetText("")
+			a.rdpPass.SetCueBanner("blank uses the saved profile login")
+		}
 	}
 }
 
@@ -499,9 +582,12 @@ func (a *clientApp) updateDestinationButtons() {
 	}
 }
 
-func (a *clientApp) commitDestinationRelayURLs() {
+func (a *clientApp) commitDestinationProfile() {
 	if a.selectedDestination >= 0 && a.selectedDestination < len(a.destinations) {
 		a.destinations[a.selectedDestination].RelayAddrs = a.relayURLListValues()
+		if a.rdpUser != nil {
+			a.destinations[a.selectedDestination].WindowsUser = strings.TrimSpace(a.rdpUser.Text())
+		}
 	}
 }
 
@@ -519,7 +605,7 @@ func (a *clientApp) destinationSelectionChanged() {
 		a.changingDestination = false
 		return
 	}
-	a.commitDestinationRelayURLs()
+	a.commitDestinationProfile()
 	a.selectedDestination = index
 	a.setRelayURLList(a.destinations[index].RelayAddrs, 0)
 	a.updateDestinationEditor()
@@ -558,7 +644,7 @@ func (a *clientApp) addDestination() {
 		a.showError(err)
 		return
 	}
-	a.commitDestinationRelayURLs()
+	a.commitDestinationProfile()
 	a.destinations = append(a.destinations, destinationProfile{
 		Name: a.uniqueDestinationName(name, -1), RelayAddrs: []string{defaultRelayURL},
 	})
@@ -602,10 +688,11 @@ func (a *clientApp) persistDestinationSelection() {
 	if len(a.destinations) == 0 || a.selectedDestination < 0 || a.selectedDestination >= len(a.destinations) {
 		return
 	}
-	a.commitDestinationRelayURLs()
+	a.commitDestinationProfile()
 	cfg := a.currentConfig()
 	cfg.Destinations = cloneDestinations(a.destinations)
 	cfg.SelectedDestination = a.destinations[a.selectedDestination].Name
+	cfg.RDPUser = a.destinations[a.selectedDestination].WindowsUser
 	cfg.setRelayAddresses(a.destinations[a.selectedDestination].RelayAddrs)
 	a.mu.Lock()
 	a.cfg = cfg
@@ -948,13 +1035,14 @@ func (a *clientApp) saveFromUI(showMessage bool) error {
 
 func (a *clientApp) configFromUI() (config, error) {
 	relayURLs := a.relayURLListValues()
-	a.commitDestinationRelayURLs()
+	a.commitDestinationProfile()
 	cfg := config{
-		RelayAddrs:   relayURLs,
-		ListenAddr:   strings.TrimSpace(a.listenAddr.Text()),
-		Proxy:        strings.TrimSpace(a.proxy.Text()),
-		RDPUser:      strings.TrimSpace(a.rdpUser.Text()),
-		Destinations: cloneDestinations(a.destinations),
+		RelayAddrs:      relayURLs,
+		ListenAddr:      strings.TrimSpace(a.listenAddr.Text()),
+		WinRMListenAddr: strings.TrimSpace(a.winrmListen.Text()),
+		Proxy:           strings.TrimSpace(a.proxy.Text()),
+		RDPUser:         strings.TrimSpace(a.rdpUser.Text()),
+		Destinations:    cloneDestinations(a.destinations),
 	}
 	if a.selectedDestination >= 0 && a.selectedDestination < len(a.destinations) {
 		cfg.SelectedDestination = a.destinations[a.selectedDestination].Name
@@ -967,6 +1055,17 @@ func (a *clientApp) configFromUI() (config, error) {
 		return config{}, err
 	} else {
 		cfg.setRelayAddresses(normalized)
+	}
+	if a.selectedDestination >= 0 && a.selectedDestination < len(cfg.Destinations) {
+		cfg.Destinations[a.selectedDestination].WindowsUser = cfg.RDPUser
+		proof := cfg.Destinations[a.selectedDestination].RoomProof
+		if a.clearRoomPassword.Checked() {
+			proof = ""
+		} else if password := a.roomPass.Text(); password != "" {
+			proof = tunnel.RoomPasswordProof(cfg.primaryRelayAddress(), "", password)
+		}
+		cfg.Destinations[a.selectedDestination].RoomProof = proof
+		cfg.RoomProof = proof
 	}
 	if _, _, err := net.SplitHostPort(cfg.ListenAddr); err != nil {
 		return config{}, fmt.Errorf("local RDP address must be host:port: %w", err)
@@ -987,6 +1086,9 @@ func (a *clientApp) setConfig(cfg config) {
 		_ = a.listenAddr.SetText(cfg.ListenAddr)
 		_ = a.proxy.SetText(cfg.Proxy)
 		_ = a.rdpUser.SetText(cfg.RDPUser)
+		_ = a.winrmListen.SetText(cfg.WinRMListenAddr)
+		_ = a.roomPass.SetText("")
+		a.clearRoomPassword.SetChecked(false)
 	})
 }
 
@@ -1004,12 +1106,24 @@ func (a *clientApp) startTunnel(openRDP bool) error {
 		cancel()
 		return localListenError(cfg.ListenAddr, err)
 	}
+	var winrmListener net.Listener
+	if cfg.roomProof() != "" {
+		winrmListener, err = net.Listen("tcp", cfg.WinRMListenAddr)
+		if err != nil {
+			cancel()
+			_ = listener.Close()
+			return fmt.Errorf("listen for local WinRM on %s: %w", cfg.WinRMListenAddr, err)
+		}
+	}
 
 	a.mu.Lock()
 	if a.listener != nil {
 		a.mu.Unlock()
 		cancel()
 		_ = listener.Close()
+		if winrmListener != nil {
+			_ = winrmListener.Close()
+		}
 		if openRDP {
 			if err := launchMSTSC(cfg); err != nil {
 				a.appendLog("Could not open Remote Desktop: %v", err)
@@ -1019,10 +1133,15 @@ func (a *clientApp) startTunnel(openRDP bool) error {
 	}
 	a.cancel = cancel
 	a.listener = listener
+	a.winrmListener = winrmListener
 	a.activeLocal = 0
+	a.activeWinRM = 0
 	a.mu.Unlock()
 
 	a.appendLog("Local RDP listener started on %s.", listener.Addr())
+	if winrmListener != nil {
+		a.appendLog("Local WinRM listener started on %s.", winrmListener.Addr())
+	}
 	a.refreshLocalState()
 	go func() {
 		err := serveListener(ctx, cfg, listener, a.localConnStarted, a.localConnDone, a.appendLog)
@@ -1038,6 +1157,14 @@ func (a *clientApp) startTunnel(openRDP bool) error {
 		a.mu.Unlock()
 		a.refreshLocalState()
 	}()
+	if winrmListener != nil {
+		go func() {
+			err := serveWinRMListener(ctx, cfg, winrmListener, a.appendLog)
+			if err != nil && ctx.Err() == nil {
+				a.appendLog("WinRM listener stopped: %v", err)
+			}
+		}()
+	}
 
 	if openRDP {
 		if err := launchMSTSC(cfg); err != nil {
@@ -1051,9 +1178,12 @@ func (a *clientApp) stopTunnel() {
 	a.mu.Lock()
 	cancel := a.cancel
 	listener := a.listener
+	winrmListener := a.winrmListener
 	a.cancel = nil
 	a.listener = nil
+	a.winrmListener = nil
 	a.activeLocal = 0
+	a.activeWinRM = 0
 	a.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -1061,6 +1191,10 @@ func (a *clientApp) stopTunnel() {
 	if listener != nil {
 		_ = listener.Close()
 		a.appendLog("Local RDP listener stopped.")
+	}
+	if winrmListener != nil {
+		_ = winrmListener.Close()
+		a.appendLog("Local WinRM listener stopped.")
 	}
 	a.refreshLocalState()
 }
@@ -1156,7 +1290,85 @@ func (a *clientApp) copyRDPAddress() {
 	a.appendLog("Copied RDP address: %s", mstscTarget(cfg.ListenAddr))
 }
 
-func (a *clientApp) saveRDPCredentials() {
+func (a *clientApp) executeWinRM() {
+	if !a.isTunnelRunning() {
+		if err := a.saveFromUI(false); err != nil {
+			a.showError(err)
+			return
+		}
+	}
+	cfg := a.currentConfig()
+	if cfg.roomProof() == "" {
+		a.showError(errors.New("a room password is required before WinRM can be used"))
+		return
+	}
+	user := strings.TrimSpace(a.rdpUser.Text())
+	password := a.rdpPass.Text()
+	command := strings.TrimSpace(a.winrmCommand.Text())
+	if password == "" {
+		savedUser, savedPassword, savedErr := readWindowsCredential(cfg)
+		if savedErr != nil {
+			a.showError(errors.New("enter a Windows password or save a Windows login for this destination"))
+			return
+		}
+		user, password = savedUser, savedPassword
+		_ = a.rdpUser.SetText(user)
+	}
+	if user == "" || password == "" || command == "" {
+		a.showError(errors.New("Windows username, password, and PowerShell command are required"))
+		return
+	}
+	_, port, err := net.SplitHostPort(cfg.WinRMListenAddr)
+	if err != nil {
+		a.showError(err)
+		return
+	}
+	if !a.isTunnelRunning() {
+		if err := a.startTunnel(false); err != nil {
+			a.showError(err)
+			return
+		}
+	}
+	payload, err := json.Marshal(map[string]string{"user": user, "password": password, "command": command, "port": port})
+	if err != nil {
+		a.showError(err)
+		return
+	}
+	encoded := base64.StdEncoding.EncodeToString(payload)
+	_ = a.rdpPass.SetText("")
+	a.executeWinRMButton.SetEnabled(false)
+	_ = a.winrmOutput.SetText("Running...")
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		script := `$ErrorActionPreference = 'Stop'
+$payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('` + encoded + `')) | ConvertFrom-Json
+$secure = ConvertTo-SecureString ([string]$payload.password) -AsPlainText -Force
+$credential = [Management.Automation.PSCredential]::new([string]$payload.user, $secure)
+Invoke-Command -ComputerName localhost -Port ([int]$payload.port) -Authentication Negotiate -Credential $credential -ScriptBlock ([ScriptBlock]::Create([string]$payload.command)) | Out-String -Width 240
+`
+		cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-")
+		cmd.Stdin = strings.NewReader(script)
+		output, runErr := cmd.CombinedOutput()
+		text := strings.TrimSpace(string(output))
+		if runErr != nil {
+			if text != "" {
+				text += "\r\n\r\n"
+			}
+			text += "WinRM command failed: " + runErr.Error()
+		}
+		if text == "" {
+			text = "Command completed without output."
+		}
+		a.onUI(func() {
+			_ = a.winrmOutput.SetText(text)
+			a.executeWinRMButton.SetEnabled(true)
+		})
+		a.appendLog("WinRM command completed success=%t.", runErr == nil)
+	}()
+}
+
+func (a *clientApp) saveWindowsCredentials() {
 	if err := a.saveFromUI(false); err != nil {
 		a.showError(err)
 		return
@@ -1165,35 +1377,35 @@ func (a *clientApp) saveRDPCredentials() {
 	user := strings.TrimSpace(a.rdpUser.Text())
 	pass := a.rdpPass.Text()
 	if user == "" {
-		a.showError(errors.New("RDP username is required"))
+		a.showError(errors.New("Windows username is required"))
 		return
 	}
 	if pass == "" {
-		a.showError(errors.New("RDP password is required"))
+		a.showError(errors.New("Windows password is required"))
 		return
 	}
-	if err := saveRDPCredentialTargets(cfg.ListenAddr, user, pass); err != nil {
+	if err := saveWindowsCredential(cfg, user, pass); err != nil {
 		a.showError(err)
 		return
 	}
 	if _, err := writeMSTSCRDPFile(cfg); err != nil {
-		a.appendLog("Saved RDP credentials, but could not update the Remote Desktop profile: %v", err)
+		a.appendLog("Saved Windows login, but could not update the Remote Desktop profile: %v", err)
 	}
 	_ = a.rdpPass.SetText("")
-	a.appendLog("Saved RDP credentials in Windows Credential Manager for %s. Remote Desktop will use them automatically when Windows policy allows it.", mstscTarget(cfg.ListenAddr))
+	a.appendLog("Saved shared RDP and WinRM login in Windows Credential Manager for destination %s.", cfg.SelectedDestination)
 }
 
-func (a *clientApp) forgetRDPCredentials() {
+func (a *clientApp) forgetWindowsCredentials() {
 	cfg, err := a.configFromUI()
 	if err != nil {
 		a.showError(err)
 		return
 	}
-	if err := deleteRDPCredentialTargets(cfg.ListenAddr); err != nil {
+	if err := deleteWindowsCredential(cfg); err != nil {
 		a.showError(err)
 		return
 	}
-	a.appendLog("Removed saved RDP credentials for %s.", mstscTarget(cfg.ListenAddr))
+	a.appendLog("Removed the shared RDP and WinRM login for destination %s.", cfg.SelectedDestination)
 }
 
 func (a *clientApp) openDashboard() {
@@ -1364,6 +1576,7 @@ func loadConfig(relayURL, listenAddr, proxyFlag string) (config, error) {
 func defaultConfig() config {
 	return config{
 		ListenAddr:          defaultListenAddr,
+		WinRMListenAddr:     defaultWinRMListenAddr,
 		RelayAddr:           defaultRelayURL,
 		RelayAddrs:          []string{defaultRelayURL},
 		Proxy:               "env",
@@ -1405,6 +1618,8 @@ func saveSettingsConfig(cfg config) error {
 		RelayAddrs:          cfg.relayAddresses(),
 		Proxy:               cfg.Proxy,
 		RDPUser:             cfg.RDPUser,
+		WinRMListenAddr:     cfg.WinRMListenAddr,
+		RoomProof:           cfg.roomProof(),
 		Destinations:        cloneDestinations(cfg.Destinations),
 		SelectedDestination: cfg.SelectedDestination,
 	}, "", "  ")
@@ -1442,6 +1657,15 @@ func (c *config) merge(other config) {
 	if strings.TrimSpace(other.RDPUser) != "" {
 		c.RDPUser = other.RDPUser
 	}
+	if strings.TrimSpace(other.WinRMListenAddr) != "" {
+		c.WinRMListenAddr = other.WinRMListenAddr
+	}
+	if strings.TrimSpace(other.WinRMUser) != "" {
+		c.WinRMUser = other.WinRMUser
+	}
+	if strings.TrimSpace(other.RoomProof) != "" {
+		c.RoomProof = other.RoomProof
+	}
 	if len(other.Destinations) > 0 {
 		c.Destinations = cloneDestinations(other.Destinations)
 	}
@@ -1451,9 +1675,12 @@ func (c *config) merge(other config) {
 }
 
 func (c *config) ensureDestinations() error {
+	if c.RDPUser == "" && c.WinRMUser != "" {
+		c.RDPUser = c.WinRMUser
+	}
 	current := c.relayAddresses()
 	if len(c.Destinations) == 0 {
-		c.Destinations = []destinationProfile{{Name: "Work", RelayAddrs: current}}
+		c.Destinations = []destinationProfile{{Name: "Work", RelayAddrs: current, RoomProof: c.RoomProof, WindowsUser: c.RDPUser}}
 		c.SelectedDestination = "Work"
 		return nil
 	}
@@ -1473,7 +1700,16 @@ func (c *config) ensureDestinations() error {
 		if err != nil {
 			return fmt.Errorf("destination %q: %w", name, err)
 		}
-		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays})
+		room := ""
+		for _, relayAddr := range relays {
+			currentRoom := strings.ToLower(tunnel.RelayRoomToken(relayAddr, ""))
+			if room == "" {
+				room = currentRoom
+			} else if room != currentRoom {
+				return fmt.Errorf("destination %q relay URLs must use the same room name", name)
+			}
+		}
+		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RoomProof: destination.RoomProof, WindowsUser: destination.WindowsUser})
 	}
 	selected := 0
 	for i, destination := range normalized {
@@ -1483,8 +1719,15 @@ func (c *config) ensureDestinations() error {
 		}
 	}
 	normalized[selected].RelayAddrs = append([]string(nil), current...)
+	if c.RoomProof != "" && normalized[selected].RoomProof == "" {
+		normalized[selected].RoomProof = c.RoomProof
+	}
+	if c.RDPUser != "" && normalized[selected].WindowsUser == "" {
+		normalized[selected].WindowsUser = c.RDPUser
+	}
 	c.Destinations = normalized
 	c.SelectedDestination = normalized[selected].Name
+	c.RDPUser = normalized[selected].WindowsUser
 	return nil
 }
 
@@ -1497,6 +1740,9 @@ func (c *config) applyDefaults() {
 	}
 	if c.Proxy == "" {
 		c.Proxy = "env"
+	}
+	if c.WinRMListenAddr == "" {
+		c.WinRMListenAddr = defaultWinRMListenAddr
 	}
 }
 
@@ -1512,6 +1758,9 @@ func (c config) validate() error {
 		if _, err := url.ParseRequestURI(relayAddr); err != nil {
 			return fmt.Errorf("relay URL %q is invalid: %w", relayAddr, err)
 		}
+	}
+	if _, _, err := net.SplitHostPort(c.WinRMListenAddr); err != nil {
+		return fmt.Errorf("local WinRM address must be host:port: %w", err)
 	}
 	return nil
 }
@@ -1575,7 +1824,42 @@ func handleLocalConn(ctx context.Context, cfg config, localConn net.Conn, remote
 	logf("RDP session remote=%s relay=%s ended duration=%s end_initiator=%s local_to_relay_bytes=%d local_to_relay_error=%v local_to_relay_half_close_error=%v relay_to_local_bytes=%d relay_to_local_error=%v relay_to_local_half_close_error=%v local_close_error=%v relay_close_error=%v", remote, relayAddr, result.Duration.Round(time.Millisecond), result.EndInitiator("local_rdp", "relay"), result.AToB.Bytes, result.AToB.CopyErr, result.AToB.CloseWriteErr, result.BToA.Bytes, result.BToA.CopyErr, result.BToA.CloseWriteErr, result.ACloseErr, result.BCloseErr)
 }
 
+func serveWinRMListener(ctx context.Context, cfg config, listener net.Listener, logf func(string, ...any)) error {
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		go handleLocalServiceConn(ctx, cfg, conn, tunnel.ServiceWinRM, logf)
+	}
+}
+
+func handleLocalServiceConn(ctx context.Context, cfg config, localConn net.Conn, service string, logf func(string, ...any)) {
+	remote := localConn.RemoteAddr().String()
+	started := time.Now()
+	relayConn, relayAddr, err := dialRelayService(ctx, cfg, service)
+	if err != nil {
+		logf("%s session remote=%s relay dial failed after %s: %v", strings.ToUpper(service), remote, time.Since(started).Round(time.Millisecond), err)
+		_ = localConn.Close()
+		return
+	}
+	logf("%s session remote=%s connected relay=%s", strings.ToUpper(service), remote, relayAddr)
+	result := tunnel.PipeWithResult(localConn, relayConn)
+	logf("%s session remote=%s relay=%s ended duration=%s local_to_relay_bytes=%d relay_to_local_bytes=%d local_error=%v relay_error=%v", strings.ToUpper(service), remote, relayAddr, result.Duration.Round(time.Millisecond), result.AToB.Bytes, result.BToA.Bytes, result.AToB.CopyErr, result.BToA.CopyErr)
+}
+
 func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
+	return dialRelayService(ctx, cfg, tunnel.ServiceRDP)
+}
+
+func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn, string, error) {
 	deadline := time.Now().Add(5 * time.Minute)
 	backoff := 250 * time.Millisecond
 	var errs []string
@@ -1586,6 +1870,10 @@ func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
 			attemptCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 			headers := http.Header{}
 			headers.Set(tunnel.HeaderResumable, "1")
+			if proof := cfg.roomProof(); proof != "" {
+				headers.Set(tunnel.HeaderRoomProof, proof)
+			}
+			tunnel.AddServiceHeader(headers, service)
 			ws, err := tunnel.DialWebSocketWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
 			sessionID := ""
 			if err == nil {
@@ -1595,7 +1883,7 @@ func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
 				cancel()
 				log.Printf("relay client paired relay=%s via=%s duration=%s", relayAddr, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
 				if sessionID != "" {
-					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: sessionID, Side: "client"}), relayAddr, nil
+					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: sessionID, Side: "client", RoomProof: cfg.roomProof(), Service: service}), relayAddr, nil
 				}
 				return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil
 			}
@@ -1864,10 +2152,23 @@ func (c config) withRelayAddress(relayAddr string) config {
 	return next
 }
 
+func (c config) roomProof() string {
+	for _, destination := range c.Destinations {
+		if strings.EqualFold(destination.Name, c.SelectedDestination) {
+			return destination.RoomProof
+		}
+	}
+	return c.RoomProof
+}
+
 func dialWebSocketFallback(ctx context.Context, cfg config, role string) (*websocket.Conn, string, error) {
 	var errs []string
 	for _, relayAddr := range cfg.relayAddresses() {
-		conn, err := tunnel.DialWebSocket(ctx, relayAddr, cfg.Proxy, role, "")
+		headers := http.Header{}
+		if proof := cfg.roomProof(); proof != "" {
+			headers.Set(tunnel.HeaderRoomProof, proof)
+		}
+		conn, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, cfg.Proxy, role, "", headers)
 		if err == nil {
 			return conn, relayAddr, nil
 		}
@@ -1950,6 +2251,9 @@ func localListenError(listenAddr string, err error) error {
 }
 
 func launchMSTSC(cfg config) error {
+	if err := activateRDPProfileCredential(cfg); err != nil {
+		log.Printf("activate saved Windows login for RDP: %v", err)
+	}
 	if profile, err := writeMSTSCRDPFile(cfg); err == nil {
 		return exec.Command("mstsc.exe", profile).Start()
 	}
@@ -2028,6 +2332,60 @@ func saveRDPCredentialTargets(listenAddr, user, pass string) error {
 		}
 	}
 	return nil
+}
+
+func profileCredentialTarget(cfg config) string {
+	room := strings.ToLower(strings.TrimSpace(tunnel.RelayRoomToken(cfg.primaryRelayAddress(), "")))
+	if room == "" {
+		room = "default"
+	}
+	return "DeskFerry/room/" + room
+}
+
+func saveWindowsCredential(cfg config, user, pass string) error {
+	if err := wincred.Write(profileCredentialTarget(cfg), wincred.TypeGeneric, user, pass); err != nil {
+		return err
+	}
+	if err := saveRDPCredentialTargets(cfg.ListenAddr, user, pass); err != nil {
+		return err
+	}
+	return nil
+}
+
+func readWindowsCredential(cfg config) (user, pass string, err error) {
+	user, pass, err = wincred.Read(profileCredentialTarget(cfg), wincred.TypeGeneric)
+	if err == nil && user != "" && pass != "" {
+		return user, pass, nil
+	}
+	for _, target := range rdpCredentialTargets(cfg.ListenAddr) {
+		for _, credentialType := range []uint32{wincred.TypeDomainPassword, wincred.TypeGeneric} {
+			user, pass, err = wincred.Read(target, credentialType)
+			if err == nil && user != "" && pass != "" {
+				return user, pass, nil
+			}
+		}
+	}
+	return "", "", errors.New("no saved Windows login for this destination")
+}
+
+func activateRDPProfileCredential(cfg config) error {
+	user, pass, err := wincred.Read(profileCredentialTarget(cfg), wincred.TypeGeneric)
+	if err != nil {
+		return nil
+	}
+	if user == "" || pass == "" {
+		return nil
+	}
+	return saveRDPCredentialTargets(cfg.ListenAddr, user, pass)
+}
+
+func deleteWindowsCredential(cfg config) error {
+	profileErr := wincred.Delete(profileCredentialTarget(cfg), wincred.TypeGeneric)
+	rdpErr := deleteRDPCredentialTargets(cfg.ListenAddr)
+	if profileErr != nil {
+		return profileErr
+	}
+	return rdpErr
 }
 
 func deleteRDPCredentialTargets(listenAddr string) error {

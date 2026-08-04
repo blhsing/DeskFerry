@@ -3,6 +3,7 @@ package tunnel
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
@@ -90,11 +91,41 @@ const (
 	HeaderResumable   = "X-DeskFerry-Resumable"
 	HeaderSessionID   = "X-DeskFerry-Session"
 	HeaderSessionSide = "X-DeskFerry-Session-Side"
+	HeaderRoomProof   = "X-DeskFerry-Room-Proof"
+	HeaderService     = "X-DeskFerry-Service"
+
+	ServiceRDP   = "rdp"
+	ServiceWinRM = "winrm"
 
 	// Resumable data messages contain a 64 KiB payload plus framing. Keep a
 	// bounded amount of headroom above that protocol maximum.
 	webSocketReadLimit = 1 << 20
 )
+
+// RoomPasswordProof derives the credential presented to a relay. The password
+// itself is never placed in a relay URL, HTTP header, or diagnostic log.
+func RoomPasswordProof(relayAddr, token, password string) string {
+	if password == "" {
+		return ""
+	}
+	room := strings.ToLower(strings.TrimSpace(RelayRoomToken(relayAddr, token)))
+	sum := sha256.Sum256([]byte("DeskFerry room credential v1\x00" + room + "\x00" + password))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+func AddRoomPasswordHeader(headers http.Header, relayAddr, token, password string) {
+	if proof := RoomPasswordProof(relayAddr, token, password); proof != "" {
+		headers.Set(HeaderRoomProof, proof)
+	}
+}
+
+func AddServiceHeader(headers http.Header, service string) {
+	service = strings.ToLower(strings.TrimSpace(service))
+	if service == "" {
+		service = ServiceRDP
+	}
+	headers.Set(HeaderService, service)
+}
 
 func IsWebSocketRelay(relayAddr string) bool {
 	scheme := relayScheme(relayAddr)

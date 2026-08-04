@@ -1,3 +1,7 @@
+param(
+    [switch] $DebugWindows
+)
+
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -117,7 +121,17 @@ try {
         if ($target.ContainsKey('Ldflags')) {
             $ldflags = $target.Ldflags
         }
-        go build -trimpath -ldflags $ldflags -o $path $target.Package
+        if ($DebugWindows -and $target.GOOS -eq 'windows') {
+            $debugArgs = @('build', '-gcflags', 'all=-N -l')
+            if ($target.ContainsKey('Ldflags')) {
+                $debugArgs += @('-ldflags', $target.Ldflags)
+            }
+            $debugArgs += @('-o', $path, $target.Package)
+            go @debugArgs
+        }
+        else {
+            go build -trimpath -ldflags $ldflags -o $path $target.Package
+        }
         if ($LASTEXITCODE -ne 0) { throw "go build failed for $($target.Name)" }
         if (-not (Test-Path -LiteralPath $path)) {
             throw "go build did not produce $path. Endpoint protection may have quarantined the generated executable."

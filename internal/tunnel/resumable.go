@@ -29,6 +29,8 @@ type ResumableWebSocketOptions struct {
 	Token     string
 	SessionID string
 	Side      string
+	RoomProof string
+	Service   string
 }
 
 // NewResumableWebSocketConn exposes a reliable byte stream over replaceable
@@ -261,6 +263,10 @@ func (c *resumableWebSocketConn) dialResume(ctx context.Context) (*websocket.Con
 	headers := http.Header{}
 	headers.Set(HeaderSessionID, c.opts.SessionID)
 	headers.Set(HeaderSessionSide, c.opts.Side)
+	if c.opts.RoomProof != "" {
+		headers.Set(HeaderRoomProof, c.opts.RoomProof)
+	}
+	AddServiceHeader(headers, c.opts.Service)
 	ws, err := DialWebSocketWithHeaders(ctx, c.opts.RelayAddr, c.opts.Proxy, RoleResume, c.opts.Token, headers)
 	if err != nil {
 		return nil, err

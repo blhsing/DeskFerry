@@ -74,3 +74,41 @@ func TestEnsureDestinationsKeepsNonSelectedProfiles(t *testing.T) {
 		t.Fatalf("selected profile relay = %q, want %q", got, cfg.RelayAddrs[0])
 	}
 }
+
+func TestEnsureDestinationsMigratesAndKeepsSharedWindowsUsersPerProfile(t *testing.T) {
+	cfg := config{
+		RelayAddr:           "https://azure.example/relay/home",
+		RelayAddrs:          []string{"https://azure.example/relay/home"},
+		RDPUser:             `HOME\owner`,
+		SelectedDestination: "Home",
+		Destinations: []destinationProfile{
+			{Name: "Office", RelayAddrs: []string{"https://azure.example/relay/office"}, WindowsUser: `DOMAIN\worker`},
+			{Name: "Home", RelayAddrs: []string{"https://old.example/relay/home"}},
+		},
+	}
+	if err := cfg.ensureDestinations(); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Destinations[0].WindowsUser; got != `DOMAIN\worker` {
+		t.Fatalf("office Windows user = %q", got)
+	}
+	if got := cfg.Destinations[1].WindowsUser; got != `HOME\owner` {
+		t.Fatalf("migrated home Windows user = %q", got)
+	}
+	if got := cfg.RDPUser; got != `HOME\owner` {
+		t.Fatalf("selected shared Windows user = %q", got)
+	}
+}
+
+func TestEnsureDestinationsMigratesLegacyWinRMUser(t *testing.T) {
+	cfg := config{
+		RelayAddr: "https://azure.example/relay/work",
+		WinRMUser: `DOMAIN\legacy`,
+	}
+	if err := cfg.ensureDestinations(); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Destinations[0].WindowsUser; got != `DOMAIN\legacy` {
+		t.Fatalf("migrated WinRM user = %q", got)
+	}
+}

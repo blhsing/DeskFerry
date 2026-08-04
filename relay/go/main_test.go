@@ -30,6 +30,37 @@ func TestRoomIDMatchesOtherRelays(t *testing.T) {
 	}
 }
 
+func TestRoomPasswordAuthorizationAndIdleRotation(t *testing.T) {
+	room := NewRelayRoom("protected")
+	if !room.AuthorizeAgent("proof-a") {
+		t.Fatal("first agent proof rejected")
+	}
+	if !room.AuthorizeClient("proof-a") {
+		t.Fatal("matching client proof rejected")
+	}
+	if room.AuthorizeClient("") || room.AuthorizeClient("proof-b") {
+		t.Fatal("mismatched client proof accepted")
+	}
+	if !room.AuthorizeAgent("proof-b") {
+		t.Fatal("idle room did not accept password rotation")
+	}
+	if !room.AuthorizeClient("proof-b") || room.AuthorizeClient("proof-a") {
+		t.Fatal("rotated proof was not enforced")
+	}
+}
+
+func TestRoomSelectsWaitingAgentByService(t *testing.T) {
+	room := NewRelayRoom("services")
+	rdp, _ := room.EnqueueAgent(nil, "rdp", AgentIdentity{}, false, serviceRDP)
+	winrm, _ := room.EnqueueAgent(nil, "winrm", AgentIdentity{}, false, serviceWinRM)
+	if got := room.TryTakeAgent(serviceWinRM); got != winrm {
+		t.Fatalf("WinRM selection = %p, want %p", got, winrm)
+	}
+	if got := room.TryTakeAgent(serviceRDP); got != rdp {
+		t.Fatalf("RDP selection = %p, want %p", got, rdp)
+	}
+}
+
 func TestHealthAndEmptyStatus(t *testing.T) {
 	server := httptest.NewServer(newServer())
 	defer server.Close()

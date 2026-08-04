@@ -2,7 +2,7 @@
 
 # DeskFerry
 
-DeskFerry is an outbound-only RDP rendezvous tunnel for a work PC that cannot accept inbound connections. The current architecture uses an Azure App Service relay at `https://test-officialwebsite.azurewebsites.net/relay/` and an OCI Always Free fallback relay at `http://217.142.228.117/relay/`. The Azure relay implementation is .NET, the OCI relay implementation is a lightweight Go service, and a protocol-compatible Python/FastAPI relay is also available under `relay/python/`. The work-side Windows service and the Windows, macOS, and Android home agents connect out to relay web services over WebSockets.
+DeskFerry is an outbound-only RDP and WinRM rendezvous tunnel for a work PC that cannot accept inbound connections. The current architecture uses an Azure App Service relay at `https://test-officialwebsite.azurewebsites.net/relay/` and an OCI Always Free fallback relay at `http://217.142.228.117/relay/`. The Azure relay implementation is .NET, the OCI relay implementation is a lightweight Go service, and a protocol-compatible Python/FastAPI relay is also available under `relay/python/`. The work-side Windows service and the Windows, macOS, and Android home agents connect out to relay web services over WebSockets.
 
 Home apps accept one or more relay room URLs in priority order. The first URL is the primary relay; later URLs are fallbacks used when the primary cannot connect or cannot pair an RDP stream. The Windows and Android home apps organize those same-room URL lists into named work-destination profiles, so a user can choose among multiple work PCs without mixing different rooms into one fallback list. Existing single-list settings migrate automatically to a `Work` destination. The Windows, Android, and work-agent configurator UIs manage relay URLs as ordered lists with add, edit, delete, and reorder controls. The work agent can connect to one or more relay room URLs at the same time, as long as they use the same room name. For example:
 
@@ -11,7 +11,7 @@ https://test-officialwebsite.azurewebsites.net/relay/workdesk
 http://217.142.228.117/relay/workdesk
 ```
 
-The room name is the path segment after `/relay/`. The first endpoint to use a room creates it in memory on that relay, and later endpoints join the same room by using the same URL.
+The room name is the path segment after `/relay/`. The first work agent to use a room creates it in memory on that relay. Rooms may be left unprotected or protected with a password configured on the work agent; protected home clients must supply the same password.
 
 The Android app is a home-agent client like the Windows and macOS home agents. It is not a phone-hosted relay service.
 
@@ -46,7 +46,7 @@ The Android app is a home-agent client like the Windows and macOS home agents. I
   - [Endpoint Protection Flags Windows Binaries](#endpoint-protection-flags-windows-binaries)
   - [Home App Connects But RDP Fails](#home-app-connects-but-rdp-fails)
   - [OCI Relay Becomes Unresponsive](#oci-relay-becomes-unresponsive)
-  - [Saved RDP Login](#saved-rdp-login)
+  - [Saved Windows Login](#saved-windows-login)
   - [Azure Relay Status](#azure-relay-status)
 - [Development](#development)
 - [Repository Layout](#repository-layout)
@@ -72,10 +72,11 @@ Relay web service
         v
 agent.exe Windows service
   outbound WebSockets to one or more relay services, optionally through an HTTP or HTTPS proxy
-  per paired socket -> 127.0.0.1:3389
+  RDP sockets   -> 127.0.0.1:3389
+  WinRM sockets -> 127.0.0.1:5985 (when enabled)
 ```
 
-The relay groups sockets by room name. A waiting work-agent socket is paired with one home-client socket from the same room, then the relay copies binary WebSocket frames in both directions. The relay does not store credentials or generated client files.
+The relay groups sockets by room name and service type. A waiting work-agent socket is paired with one authenticated home-client socket for RDP or WinRM in the same room, then the relay copies binary WebSocket frames in both directions. The relay stores only an in-memory room-scoped password proof, never the room password or Windows login credentials.
 
 Current agents negotiate resumable RDP streams with the relay. If an HTTP proxy or network path drops an active WebSocket, both endpoints keep their local RDP sockets open, reconnect to the same relay session for up to five minutes, and replay only data that the peer has not acknowledged. Each endpoint buffers at most 8 MiB of unacknowledged data so an extended outage applies backpressure instead of consuming unbounded memory. Older agents and relays continue to use the original non-resumable stream protocol.
 
@@ -130,6 +131,12 @@ Build the native Linux relay binary:
 .\build\build-go.ps1
 ```
 
+On Windows hosts where endpoint protection falsely classifies stripped Go PE files, build the Windows deliverables with symbols and compiler optimizations disabled:
+
+```powershell
+.\build\build-go.ps1 -DebugWindows
+```
+
 Artifact:
 
 ```text
@@ -171,7 +178,9 @@ Run the configurator:
 deskferry-agent-configurator-windows-amd64.exe
 ```
 
-It defaults to `D:\DeskFerry\Agent` when `D:` exists. Select `deskferry-agent-windows-amd64.exe`, manage one or more relay room URLs in the ordered URL list, then click `Install / Update`. The configurator copies the work agent as `agent.exe`, installs or updates the automatic `DeskFerryAgent` Windows service, configures SCM restart recovery, and starts the service.
+It defaults to `D:\DeskFerry\Agent` when `D:` exists. Select `deskferry-agent-windows-amd64.exe`, manage one or more relay room URLs in the ordered URL list, optionally enter a room password, then click `Install / Update`. One password protects every configured relay room. The configurator encrypts it with machine-scope Windows DPAPI, copies the work agent as `agent.exe`, installs or updates the automatic `DeskFerryAgent` Windows service, configures SCM restart recovery, and starts the service.
+
+To enable remote command execution, set the WinRM target to `127.0.0.1:5985`. WinRM requires a non-empty room password. The target can be changed for an existing local WinRM configuration, but it must remain a `host:port` reachable by the work service.
 
 Command-line install is also supported:
 
@@ -201,11 +210,13 @@ Start the Windows home app, choose or create a named destination, and manage tha
 .\deskferry-home-windows-amd64.exe -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk -relay-url http://217.142.228.117/relay/workdesk
 ```
 
-The app opens a friendly control panel and a notification-area icon. Click `Connect` to start the local RDP listener and open Remote Desktop. The default local listener is `127.0.0.1:3390`, avoiding Windows' normal local RDP port `3389`, and the app opens one outbound WebSocket to the first reachable relay for each local RDP session.
+The app opens a friendly control panel and a notification-area icon. Enter the same room password once for the selected destination, then click `Connect` to start the local listeners and open Remote Desktop. The default RDP listener is `127.0.0.1:3390`, avoiding Windows' normal local RDP port `3389`. When a room credential is saved, the app also listens on `127.0.0.1:3391` for WinRM and opens one outbound WebSocket to the first reachable relay for each local connection.
+
+The **WinRM Commands** panel executes a PowerShell command on the work host using the same Windows username and password as RDP. Each named destination keeps its own username and optional shared login in Windows Credential Manager; **Save Windows Login** and **Forget Windows Login** affect both RDP and WinRM for that destination. Passwords are never written to the JSON profile. The work host must have WinRM enabled and allow the supplied account.
 
 Only one Windows home-app instance runs on the machine. Launching it again restores and focuses the existing control panel when it is in the same interactive session, instead of creating another tray icon, relay presence connection, or local listener.
 
-The home app stores its room URL list, local RDP address, and proxy mode in `%APPDATA%\DeskFerry\home-client.json`. Console debug mode is still available:
+The home app stores its destination profiles, usernames, room URL lists, local listener addresses, and proxy mode in `%APPDATA%\DeskFerry\home-client.json`. Saved Windows passwords remain in Windows Credential Manager. Console debug mode is still available:
 
 ```powershell
 .\deskferry-home-windows-amd64.exe -console -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk
@@ -219,7 +230,7 @@ Choose the binary for your Mac:
 
 ```sh
 chmod +x ./deskferry-home-macos-arm64
-./deskferry-home-macos-arm64 -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk -open-rdp
+./deskferry-home-macos-arm64 -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk -room-password 'strong password' -open-rdp
 ./deskferry-home-macos-arm64 -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk -relay-url http://217.142.228.117/relay/workdesk -open-rdp
 ```
 
@@ -239,7 +250,7 @@ Install the debug-signed APK:
 dist\android\deskferry-home-android-debug.apk
 ```
 
-Open DeskFerry Home, keep the local RDP port at `3389`, and choose or create a named destination. Each destination stores the same relay room URLs as one work agent in its own ordered URL list. Stop the tunnel before changing destinations. In an Android RDP client, connect to:
+Open DeskFerry Home, keep the local RDP port at `3389`, and choose or create a named destination. Each destination stores the same relay room URLs and optional room credential as one work agent in its own ordered URL list. Enter the same room password before starting a protected destination. Stop the tunnel before changing destinations. In an Android RDP client, connect to:
 
 ```text
 127.0.0.1:3389
@@ -361,6 +372,7 @@ It:
 - Prefers `D:\DeskFerry\Agent` as the install directory when `D:` exists.
 - Copies the selected agent binary to `agent.exe`.
 - Installs or updates the automatic `DeskFerryAgent` Windows service with the configured ordered relay URL list.
+- Protects every configured room with one optional DPAPI-encrypted password and enables an optional WinRM target when a password is present.
 - Provides add, update, delete, button reorder, and drag reorder controls for relay URLs.
 - Configures SCM restart recovery.
 - Starts, stops, restarts, uninstalls, refreshes status, opens the install folder, and runs `agent.exe -self-test`.
@@ -371,11 +383,12 @@ It:
 
 - A polished control panel with an ordered relay room URL list, local RDP address, proxy mode, status tiles, room details, and activity log.
 - A notification-area icon with open, connect, stop, Remote Desktop, and quit actions.
-- Windows Credential Manager integration for saved RDP login credentials.
+- Windows Credential Manager integration for one shared RDP and WinRM login per destination.
 - Persistent home-app presence on the relay dashboard.
 - Named work-destination profiles, each with its own primary/fallback relay URL list for presence, status, and RDP stream connections.
 - Destination add, rename, delete, and selection controls, plus relay URL add, update, delete, button reorder, and drag reorder controls.
 - A loopback RDP listener, normally `127.0.0.1:3390`.
+- A loopback WinRM listener, normally `127.0.0.1:3391`, plus an integrated PowerShell command panel.
 - Automatic Remote Desktop launch when the user clicks `Connect`.
 
 ### macOS Home Agent
@@ -408,13 +421,16 @@ Good free Android RDP client options include Microsoft's Remote Desktop/Windows 
 
 ## Security Model
 
-- Work and home endpoints make outbound HTTPS WebSocket connections only.
-- The room name in the URL is the pairing key.
+- Work and home endpoints make outbound WebSocket connections only; use HTTPS/WSS whenever the relay supports it.
+- The room name is the pairing key for an unprotected room. Protected rooms additionally require the room-scoped password proof set by the work agent.
+- Room passwords are not placed in URLs, service command lines, relay logs, or relay status. The work configurator stores the password as a machine-scope DPAPI blob; home profiles store only the derived proof.
+- A room proof is a bearer credential. Use a strong, unique room password and prefer `https://` relays. The plain-HTTP OCI fallback cannot protect a captured proof from interception and replay.
 - The relay never dials the work PC or home PC.
-- The work agent only dials `127.0.0.1:3389` after Azure has paired a same-room home connection.
-- Home apps listen on loopback by default, so other LAN devices cannot connect to the local RDP listener unless the user intentionally changes the listen address.
+- The work agent only dials its configured RDP or WinRM loopback target after a relay has paired an authenticated, same-room, same-service home connection.
+- WinRM is disabled unless the work configurator has both a room password and a WinRM target. Windows login credentials are supplied by the home user for each command and are not handled by the relay.
+- Home apps listen on loopback by default, so other LAN devices cannot connect to local RDP or WinRM listeners unless the user intentionally changes a listen address.
 
-Choose room names that are not obvious. Anyone who knows the room URL can attempt to join that room.
+Choose room names that are not obvious. For meaningful access control, also configure a strong room password and use TLS.
 
 This software can route around corporate egress controls to expose an internal RDP session. Confirm that use is permitted by workplace policy. This project intentionally does not add anti-monitoring, stealth, or obfuscation behavior.
 
@@ -625,11 +641,11 @@ swapon --show
 
 The health timer restarts the relay when the local `/relay/health` endpoint fails and reboots after repeated local failures. The systemd watchdog can recover some userland or kernel stalls. If SSH and HTTP both hang while OCI still shows the VM as running, the hypervisor-side virtual network path may be wedged; use an OCI instance reset, OCI-side monitoring with a recovery action, or a larger/more reliable relay host for that failure mode.
 
-### Saved RDP Login
+### Saved Windows Login
 
-The Windows home app can save RDP credentials through Windows Credential Manager. Enter the work Windows username and password, then click `Save RDP Login`. DeskFerry calls `cmdkey.exe` for the local RDP target, writes a password-free `%APPDATA%\DeskFerry\home-client.rdp` launch profile, and clears the password field after saving. The password is not written to `%APPDATA%\DeskFerry\home-client.json` or the `.rdp` profile.
+The Windows home app can save one shared RDP and WinRM login per destination through Windows Credential Manager. Enter the work Windows username and password, then click **Save Windows Login**. DeskFerry stores the destination credential for WinRM, calls `cmdkey.exe` for the local RDP target, writes a password-free `%APPDATA%\DeskFerry\home-client.rdp` launch profile, and clears the password field after saving. The password is not written to `%APPDATA%\DeskFerry\home-client.json` or the `.rdp` profile. **Forget Windows Login** removes both saved uses of the credential.
 
-`Open Remote Desktop` and `Connect` launch MSTSC with that `.rdp` profile, so saved credentials are used automatically when Windows allows them. Remote Desktop may still prompt if Windows policy blocks saved credential delegation. In that case, allow saved credentials for the `TERMSRV/*` target through Windows policy, or continue signing in manually.
+**Open Remote Desktop** and **Connect** launch MSTSC with that `.rdp` profile, so saved credentials are used automatically when Windows allows them. **Execute** in the WinRM Commands panel uses the same destination credential. Remote Desktop may still prompt if Windows policy blocks saved credential delegation. In that case, allow saved credentials for the `TERMSRV/*` target through Windows policy, or continue signing in manually.
 
 ### Azure Relay Status
 

@@ -32,10 +32,11 @@ const (
 )
 
 type config struct {
-	RelayAddr  string
-	RelayAddrs []string
-	ListenAddr string
-	Proxy      string
+	RelayAddr    string
+	RelayAddrs   []string
+	ListenAddr   string
+	Proxy        string
+	RoomPassword string
 }
 
 type relayURLFlag []string
@@ -89,12 +90,14 @@ func main() {
 	var relayURLs relayURLFlag
 	var listenAddr string
 	var proxyFlag string
+	var roomPassword string
 	var logRetentionDays int
 	var openRDP bool
 	var statusOnly bool
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.StringVar(&listenAddr, "listen", "", "local RDP listen address")
 	flag.StringVar(&proxyFlag, "proxy", "", "proxy: env, direct, or http(s)://host:port")
+	flag.StringVar(&roomPassword, "room-password", "", "optional room password")
 	flag.IntVar(&logRetentionDays, "log-retention-days", diaglog.DefaultRetentionDays, "number of calendar days of diagnostic logs to retain")
 	flag.BoolVar(&openRDP, "open-rdp", false, "open the local RDP profile after the tunnel starts")
 	flag.BoolVar(&statusOnly, "status", false, "print relay room status and exit")
@@ -105,7 +108,7 @@ func main() {
 		log.Printf("diagnostic log file: %s retention_days=%d", path, logRetentionDays)
 	}
 
-	cfg, err := loadConfig(relayURLs.String(), listenAddr, proxyFlag)
+	cfg, err := loadConfig(relayURLs.String(), listenAddr, proxyFlag, roomPassword)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -128,11 +131,14 @@ func main() {
 	}
 }
 
-func loadConfig(relayURL, listenAddr, proxyFlag string) (config, error) {
+func loadConfig(relayURL, listenAddr, proxyFlag string, roomPassword ...string) (config, error) {
 	cfg := config{
 		RelayAddr:  strings.TrimSpace(relayURL),
 		ListenAddr: strings.TrimSpace(listenAddr),
 		Proxy:      strings.TrimSpace(proxyFlag),
+	}
+	if len(roomPassword) > 0 {
+		cfg.RoomPassword = roomPassword[0]
 	}
 	cfg.applyDefaults()
 	normalized, err := normalizeRelayURLs(cfg.RelayAddr, cfg.RelayAddrs)
@@ -160,12 +166,19 @@ func (c config) validate() error {
 	if len(relayAddrs) == 0 {
 		return errors.New("relay URL is required")
 	}
+	room := ""
 	for _, relayAddr := range relayAddrs {
 		if !tunnel.IsWebSocketRelay(relayAddr) {
 			return fmt.Errorf("relay URL %q must start with https:// or http://", relayAddr)
 		}
 		if _, err := url.ParseRequestURI(relayAddr); err != nil {
 			return fmt.Errorf("relay URL %q is invalid: %w", relayAddr, err)
+		}
+		currentRoom := strings.ToLower(tunnel.RelayRoomToken(relayAddr, ""))
+		if room == "" {
+			room = currentRoom
+		} else if room != currentRoom {
+			return fmt.Errorf("all relay URLs must use the same room name")
 		}
 	}
 	if _, _, err := net.SplitHostPort(c.ListenAddr); err != nil {
@@ -269,6 +282,8 @@ func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
 			attemptCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 			headers := http.Header{}
 			headers.Set(tunnel.HeaderResumable, "1")
+			tunnel.AddRoomPasswordHeader(headers, relayAddr, "", cfg.RoomPassword)
+			tunnel.AddServiceHeader(headers, tunnel.ServiceRDP)
 			ws, err := tunnel.DialWebSocketWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
 			sessionID := ""
 			if err == nil {
@@ -283,6 +298,8 @@ func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
 						Proxy:     cfg.Proxy,
 						SessionID: sessionID,
 						Side:      "client",
+						RoomProof: tunnel.RoomPasswordProof(relayAddr, "", cfg.RoomPassword),
+						Service:   tunnel.ServiceRDP,
 					}), relayAddr, nil
 				}
 				return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil
@@ -609,7 +626,9 @@ func (c config) withRelayAddress(relayAddr string) config {
 func dialWebSocketFallback(ctx context.Context, cfg config, role string) (*websocket.Conn, string, error) {
 	var errs []string
 	for _, relayAddr := range cfg.relayAddresses() {
-		conn, err := tunnel.DialWebSocket(ctx, relayAddr, cfg.Proxy, role, "")
+		headers := http.Header{}
+		tunnel.AddRoomPasswordHeader(headers, relayAddr, "", cfg.RoomPassword)
+		conn, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, cfg.Proxy, role, "", headers)
 		if err == nil {
 			return conn, relayAddr, nil
 		}

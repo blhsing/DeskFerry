@@ -59,6 +59,8 @@ public class MainActivity extends Activity {
     private EditText relayUrlAddField;
     private Button relayAddButton;
     private EditText localPortField;
+    private EditText roomPasswordField;
+    private Button clearRoomPasswordButton;
     private EditText proxyField;
     private EditText logRetentionDaysField;
     private TextView tunnelStatus;
@@ -196,6 +198,24 @@ public class MainActivity extends Activity {
         localPortField.setInputType(InputType.TYPE_CLASS_NUMBER);
         configCard.addView(localPortField, matchWrap());
 
+        LinearLayout passwordRow = new LinearLayout(this);
+        passwordRow.setOrientation(LinearLayout.HORIZONTAL);
+        roomPasswordField = field("Room password (blank keeps saved credential)");
+        roomPasswordField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        passwordRow.addView(roomPasswordField, weightedField());
+        clearRoomPasswordButton = secondaryButton("Clear");
+        clearRoomPasswordButton.setOnClickListener(v -> {
+            if (!destinations.isEmpty()) {
+                destinations.get(selectedDestination).roomProof = "";
+                roomPasswordField.setText("");
+                HomePrefs.saveDestinations(this, destinations, selectedDestination,
+                        parsePortOrDefault(localPortField.getText().toString()));
+                Toast.makeText(this, "Saved room credential cleared.", Toast.LENGTH_SHORT).show();
+            }
+        });
+        passwordRow.addView(clearRoomPasswordButton, compactButtonParams());
+        configCard.addView(passwordRow, matchWrap());
+
         proxyField = field("Proxy: system, direct, or http(s)://host:port");
         proxyField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         configCard.addView(proxyField, matchWrap());
@@ -279,6 +299,7 @@ public class MainActivity extends Activity {
             relayUrls = Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL);
         }
         setRelayUrls(relayUrls);
+        roomPasswordField.setText("");
         localPortField.setText(String.valueOf(HomePrefs.loadLocalPort(this)));
         proxyField.setText(HomePrefs.loadProxy(this));
         logRetentionDaysField.setText(String.valueOf(HomePrefs.loadLogRetentionDays(this)));
@@ -287,6 +308,12 @@ public class MainActivity extends Activity {
     private void savePreferences(String relayUrl, int port, String proxy) {
         if (!destinations.isEmpty()) {
             destinations.get(selectedDestination).relayUrl = relayUrl;
+            String password = roomPasswordField.getText().toString();
+            if (!password.isEmpty()) {
+                destinations.get(selectedDestination).roomProof = RelayUrls.roomPasswordProof(
+                        RelayUrls.primaryRelayUrl(relayUrl), password);
+                roomPasswordField.setText("");
+            }
         }
         HomePrefs.saveDestinations(this, destinations, selectedDestination, port, proxy,
                 parseLogRetentionDays(logRetentionDaysField.getText().toString()));
@@ -319,6 +346,7 @@ public class MainActivity extends Activity {
         }
         commitSelectedDestination();
         selectedDestination = index;
+        roomPasswordField.setText("");
         try {
             setRelayUrls(RelayUrls.normalizeRelayUrls(destinations.get(index).relayUrl));
         } catch (URISyntaxException ex) {
@@ -334,6 +362,7 @@ public class MainActivity extends Activity {
             String unique = uniqueDestinationName(name, -1);
             destinations.add(new HomePrefs.Destination(unique, RelayUrls.DEFAULT_RELAY_URL));
             selectedDestination = destinations.size() - 1;
+            roomPasswordField.setText("");
             setRelayUrls(Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL));
             refreshDestinationSpinner();
             HomePrefs.saveDestinations(this, destinations, selectedDestination,
@@ -382,6 +411,7 @@ public class MainActivity extends Activity {
         }
         destinations.remove(selectedDestination);
         selectedDestination = Math.min(selectedDestination, destinations.size() - 1);
+        roomPasswordField.setText("");
         try {
             setRelayUrls(RelayUrls.normalizeRelayUrls(destinations.get(selectedDestination).relayUrl));
         } catch (URISyntaxException ex) {
@@ -450,12 +480,14 @@ public class MainActivity extends Activity {
         proxyField.setText(proxy);
         logRetentionDaysField.setText(String.valueOf(logRetentionDays));
         savePreferences(relayUrl, port, proxy);
+        String roomProof = destinations.isEmpty() ? "" : destinations.get(selectedDestination).roomProof;
 
         Intent intent = new Intent(this, TunnelService.class)
                 .setAction(TunnelService.ACTION_START)
                 .putExtra(TunnelService.EXTRA_RELAY_URL, relayUrl)
                 .putExtra(TunnelService.EXTRA_LOCAL_PORT, port)
                 .putExtra(TunnelService.EXTRA_PROXY, proxy)
+                .putExtra(TunnelService.EXTRA_ROOM_PROOF, roomProof)
                 .putExtra(TunnelService.EXTRA_LOG_RETENTION_DAYS, logRetentionDays);
         if (Build.VERSION.SDK_INT >= 26) {
             startForegroundService(intent);
@@ -498,6 +530,8 @@ public class MainActivity extends Activity {
         localPortField.setEnabled(!state.running);
         proxyField.setEnabled(!state.running);
         logRetentionDaysField.setEnabled(!state.running);
+        roomPasswordField.setEnabled(!state.running);
+        clearRoomPasswordButton.setEnabled(!state.running);
     }
 
     private void copyRdpTarget() {
@@ -542,6 +576,15 @@ public class MainActivity extends Activity {
 
     private List<String> normalizedRelayUrlsFromRows() throws URISyntaxException {
         List<String> normalized = RelayUrls.normalizeRelayUrls(RelayUrls.joinRelayUrls(relayUrls));
+        String room = "";
+        for (String relayUrl : normalized) {
+            String current = RelayUrls.roomToken(relayUrl, "").toLowerCase(Locale.ROOT);
+            if (room.isEmpty()) {
+                room = current;
+            } else if (!room.equals(current)) {
+                throw new URISyntaxException(relayUrl, "all relay URLs for a destination must use the same room name");
+            }
+        }
         setRelayUrls(normalized);
         return normalized;
     }

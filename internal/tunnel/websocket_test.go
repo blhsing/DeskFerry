@@ -5,8 +5,38 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 )
+
+func TestRoomPasswordProofIsScopedToRoomAndDoesNotExposePassword(t *testing.T) {
+	first := RoomPasswordProof("https://relay.example/relay/alpha", "", "correct horse")
+	second := RoomPasswordProof("https://relay.example/relay/beta", "", "correct horse")
+	if first == "" || first == second {
+		t.Fatalf("proofs are not room scoped: %q %q", first, second)
+	}
+	if want := "0uUP8ZmTPoS4RX9lmqvjaIA4RT9k-hgqpFVzNSyzs1s"; first != want {
+		t.Fatalf("proof = %q, want cross-platform vector %q", first, want)
+	}
+	if strings.Contains(first, "correct") {
+		t.Fatalf("proof contains password: %q", first)
+	}
+	if got := RoomPasswordProof("https://relay.example/relay/alpha", "", ""); got != "" {
+		t.Fatalf("empty password proof = %q", got)
+	}
+}
+
+func TestRoomAndServiceHeaders(t *testing.T) {
+	headers := http.Header{}
+	AddRoomPasswordHeader(headers, "https://relay.example/relay/alpha", "", "secret")
+	AddServiceHeader(headers, ServiceWinRM)
+	if headers.Get(HeaderRoomProof) == "" {
+		t.Fatal("missing room proof")
+	}
+	if got := headers.Get(HeaderService); got != ServiceWinRM {
+		t.Fatalf("service = %q", got)
+	}
+}
 
 func TestWebSocketEndpointUsesRelayPath(t *testing.T) {
 	endpoint, err := WebSocketEndpoint("https://test-officialwebsite.azurewebsites.net/relay/")

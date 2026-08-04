@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,8 @@ import (
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
+
+	"deskferry/internal/winsecret"
 )
 
 const (
@@ -44,6 +47,9 @@ type app struct {
 	relayDelete     *walk.PushButton
 	relayUp         *walk.PushButton
 	relayDown       *walk.PushButton
+	roomPassword    *walk.LineEdit
+	clearPassword   *walk.CheckBox
+	winrmAddr       *walk.LineEdit
 	status          *walk.Label
 	log             *walk.TextEdit
 	relayURLs       []string
@@ -53,9 +59,13 @@ type app struct {
 }
 
 type actionOptions struct {
-	InstallDir string
-	AgentPath  string
-	RelayURL   string
+	InstallDir        string
+	AgentPath         string
+	RelayURL          string
+	RoomPassword      string
+	RoomPasswordBlob  string
+	ClearRoomPassword bool
+	WinRMAddr         string
 }
 
 type serviceInfo struct {
@@ -146,6 +156,12 @@ func (a *app) run(smokeTest bool) error {
 							},
 						},
 					},
+					Label{Text: "Room password"},
+					LineEdit{AssignTo: &a.roomPassword, PasswordMode: true, CueBanner: "blank keeps the current password", ColumnSpan: 2},
+					Label{Text: "Password options"},
+					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM)", ColumnSpan: 2},
+					Label{Text: "WinRM target"},
+					LineEdit{AssignTo: &a.winrmAddr, CueBanner: "127.0.0.1:5985; blank disables WinRM", ColumnSpan: 2},
 				},
 			},
 			GroupBox{
@@ -481,6 +497,13 @@ func (a *app) runSelfTest() {
 			a.appendLog("Installed agent.exe differs from the selected agent executable. Click Install / Update to copy the selected executable before testing it.")
 		}
 		args := []string{"-self-test", "-relay-url", opts.RelayURL}
+		passwordFile := filepath.Join(opts.InstallDir, "room-password.dpapi")
+		if fileExists(passwordFile) {
+			args = append(args, "-room-password-file", passwordFile)
+		}
+		if opts.WinRMAddr != "" {
+			args = append(args, "-winrm", opts.WinRMAddr)
+		}
 		cmd := exec.Command(exePath, args...)
 		var output bytes.Buffer
 		cmd.Stdout = &output
@@ -587,9 +610,12 @@ func (a *app) refreshStatus() {
 
 func (a *app) options() actionOptions {
 	return actionOptions{
-		InstallDir: strings.TrimSpace(a.installDir.Text()),
-		AgentPath:  strings.TrimSpace(a.agentPath.Text()),
-		RelayURL:   joinRelayURLs(a.relayURLListValues()),
+		InstallDir:        strings.TrimSpace(a.installDir.Text()),
+		AgentPath:         strings.TrimSpace(a.agentPath.Text()),
+		RelayURL:          joinRelayURLs(a.relayURLListValues()),
+		RoomPassword:      a.roomPassword.Text(),
+		ClearRoomPassword: a.clearPassword.Checked(),
+		WinRMAddr:         strings.TrimSpace(a.winrmAddr.Text()),
 	}
 }
 
@@ -630,14 +656,20 @@ func runElevatedAction(args []string) {
 	installDir := fs.String("install-dir", "", "install directory")
 	agentPath := fs.String("agent", "", "agent executable")
 	relayURL := fs.String("relay-url", "", "relay URL")
+	roomPasswordBlob := fs.String("room-password-blob", "", "DPAPI room password blob")
+	clearRoomPassword := fs.Bool("clear-room-password", false, "clear room password")
+	winrmAddr := fs.String("winrm", "", "WinRM target")
 	if err := fs.Parse(args); err != nil {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(2)
 	}
 	message, err := performAction(*action, actionOptions{
-		InstallDir: *installDir,
-		AgentPath:  *agentPath,
-		RelayURL:   *relayURL,
+		InstallDir:        *installDir,
+		AgentPath:         *agentPath,
+		RelayURL:          *relayURL,
+		RoomPasswordBlob:  *roomPasswordBlob,
+		ClearRoomPassword: *clearRoomPassword,
+		WinRMAddr:         *winrmAddr,
 	})
 	if err != nil {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
@@ -675,6 +707,7 @@ func installOrUpdate(opts actionOptions) (string, error) {
 		return "", err
 	}
 	agentDest := installedPath(installDir)
+	passwordDest := filepath.Join(installDir, "room-password.dpapi")
 	if err := os.MkdirAll(installDir, 0755); err != nil {
 		return "", fmt.Errorf("create install directory: %w", err)
 	}
@@ -700,7 +733,24 @@ func installOrUpdate(opts actionOptions) (string, error) {
 	if err := copyFile(opts.AgentPath, agentDest); err != nil {
 		return "", fmt.Errorf("copy agent executable: %w", err)
 	}
+	if opts.RoomPasswordBlob != "" {
+		defer os.Remove(opts.RoomPasswordBlob)
+		if err := copyFile(opts.RoomPasswordBlob, passwordDest); err != nil {
+			return "", fmt.Errorf("install room password: %w", err)
+		}
+	} else if opts.ClearRoomPassword {
+		_ = os.Remove(passwordDest)
+	}
+	if opts.WinRMAddr != "" && !fileExists(passwordDest) {
+		return "", errors.New("WinRM requires a room password")
+	}
 	args := []string{"-service", "-relay-url", opts.RelayURL}
+	if fileExists(passwordDest) {
+		args = append(args, "-room-password-file", passwordDest)
+	}
+	if opts.WinRMAddr != "" {
+		args = append(args, "-winrm", opts.WinRMAddr)
+	}
 
 	config := serviceConfig(agentDest, args)
 	s, err := m.CreateService(serviceName, agentDest, config, args...)
@@ -803,6 +853,11 @@ func validateInstallInputs(opts actionOptions) error {
 	if opts.RelayURL == "" {
 		return errors.New("at least one relay URL is required")
 	}
+	if opts.WinRMAddr != "" {
+		if _, _, err := net.SplitHostPort(opts.WinRMAddr); err != nil {
+			return fmt.Errorf("WinRM target must be host:port: %w", err)
+		}
+	}
 	if _, err := os.Stat(opts.AgentPath); err != nil {
 		return fmt.Errorf("agent executable is not readable: %w", err)
 	}
@@ -816,7 +871,7 @@ func serviceConfig(exePath string, args []string) mgr.Config {
 		ErrorControl:   mgr.ErrorNormal,
 		BinaryPathName: serviceBinaryPath(exePath, args),
 		DisplayName:    serviceDisplayName,
-		Description:    "Work-side RDP backend for DeskFerry.",
+		Description:    "Work-side RDP and WinRM backend for DeskFerry.",
 	}
 }
 
@@ -921,6 +976,32 @@ func relaunchElevatedAction(action string, opts actionOptions) error {
 	}
 	if opts.RelayURL != "" {
 		args = append(args, "-relay-url", opts.RelayURL)
+	}
+	if opts.WinRMAddr != "" {
+		args = append(args, "-winrm", opts.WinRMAddr)
+	}
+	if opts.ClearRoomPassword {
+		args = append(args, "-clear-room-password")
+	} else if opts.RoomPassword != "" {
+		blob, err := winsecret.ProtectMachine(opts.RoomPassword)
+		if err != nil {
+			return err
+		}
+		file, err := os.CreateTemp("", "deskferry-room-password-*.dpapi")
+		if err != nil {
+			return err
+		}
+		path := file.Name()
+		if _, err := file.Write(blob); err != nil {
+			file.Close()
+			os.Remove(path)
+			return err
+		}
+		if err := file.Close(); err != nil {
+			os.Remove(path)
+			return err
+		}
+		args = append(args, "-room-password-blob", path)
 	}
 	return shellExecute("runas", exePath, joinWindowsArgs(args), "")
 }

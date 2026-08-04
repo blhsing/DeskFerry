@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -30,6 +31,8 @@ const (
 	started           = "started"
 	agentUnavailable  = "agent-unavailable"
 	clientUnavailable = "client-unavailable"
+	serviceRDP        = "rdp"
+	serviceWinRM      = "winrm"
 	// Resumable tunnel data messages contain a 64 KiB payload plus framing.
 	// Keep a bounded amount of headroom above that protocol maximum.
 	relayWebSocketReadLimit = 1 << 20
@@ -171,20 +174,33 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hub *RelayHub, room
 
 	remote := remoteAddr(r)
 	ctx := r.Context()
-	log.Printf("websocket connected role=%s room=%s remote=%s user_agent=%q", role, roomID(token), remote, r.UserAgent())
+	proof := readRoomProof(r)
+	service := readService(r)
+	if (role == "agent" || role == "client" || role == resumeRole) && service == "" {
+		closeQuietly(c, websocket.StatusPolicyViolation, "unsupported service")
+		return
+	}
+	log.Printf("websocket connected role=%s room=%s service=%s remote=%s user_agent=%q", role, roomID(token), service, remote, r.UserAgent())
 	switch role {
 	case dashboardRole:
 		hub.ServeDashboard(ctx, c, remote, room)
 	case "agent":
-		hub.ServeAgent(ctx, token, c, remote, readAgentIdentity(r), readResumable(r))
+		identity := readAgentIdentity(r)
+		identity.Service = service
+		hub.ServeAgent(ctx, token, c, remote, identity, readResumable(r), proof, service)
 	case "client":
-		hub.ServeClient(ctx, token, c, remote, readResumable(r))
+		hub.ServeClient(ctx, token, c, remote, readResumable(r), proof, service)
 	case resumeRole:
-		hub.ServeResume(ctx, token, c, remote, r.Header.Get("X-DeskFerry-Session"), r.Header.Get("X-DeskFerry-Session-Side"))
+		hub.ServeResume(ctx, token, c, remote, r.Header.Get("X-DeskFerry-Session"), r.Header.Get("X-DeskFerry-Session-Side"), proof, service)
 	case "home-agent":
-		hub.ServeHomeAgent(ctx, token, c, remote)
+		hub.ServeHomeAgent(ctx, token, c, remote, proof)
 	case "probe":
-		closeQuietly(c, websocket.StatusNormalClosure, "probe ok")
+		room := hub.roomFor(token)
+		if !room.AuthorizeClient(proof) {
+			closeQuietly(c, websocket.StatusPolicyViolation, "room authentication failed")
+		} else {
+			closeQuietly(c, websocket.StatusNormalClosure, "probe ok")
+		}
 	default:
 		closeQuietly(c, websocket.StatusPolicyViolation, "unsupported role")
 	}
@@ -259,6 +275,30 @@ func readResumable(r *http.Request) bool {
 	return value == "1" || strings.EqualFold(value, "true")
 }
 
+func readRoomProof(r *http.Request) string {
+	value := strings.TrimSpace(r.Header.Get("X-DeskFerry-Room-Proof"))
+	if len(value) != 43 {
+		return ""
+	}
+	for _, ch := range value {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+			return ""
+		}
+	}
+	return value
+}
+
+func readService(r *http.Request) string {
+	value := strings.ToLower(strings.TrimSpace(r.Header.Get("X-DeskFerry-Service")))
+	if value == "" {
+		return serviceRDP
+	}
+	if value == serviceRDP || value == serviceWinRM {
+		return value
+	}
+	return ""
+}
+
 func cleanAgentIdentity(value string) string {
 	value = strings.TrimSpace(value)
 	var b strings.Builder
@@ -319,10 +359,15 @@ func newRelayHub() *RelayHub {
 	}
 }
 
-func (h *RelayHub) ServeAgent(ctx context.Context, token string, c *websocket.Conn, remote string, identity AgentIdentity, resumable bool) {
+func (h *RelayHub) ServeAgent(ctx context.Context, token string, c *websocket.Conn, remote string, identity AgentIdentity, resumable bool, proof, service string) {
 	room := h.roomFor(token)
-	waiting, replaced := room.EnqueueAgent(c, remote, identity, resumable)
-	log.Printf("agent waiting room=%s remote=%s key=%s replaced=%d", room.ID, remote, identity.LogString(), replaced)
+	if !room.AuthorizeAgent(proof) {
+		log.Printf("agent rejected by room authentication room=%s service=%s remote=%s", room.ID, service, remote)
+		closeQuietly(c, websocket.StatusPolicyViolation, "room authentication failed")
+		return
+	}
+	waiting, replaced := room.EnqueueAgent(c, remote, identity, resumable, service)
+	log.Printf("agent waiting room=%s service=%s remote=%s key=%s replaced=%d", room.ID, service, remote, identity.LogString(), replaced)
 	h.NotifyDashboards()
 
 	var peer *HomePeer
@@ -349,9 +394,9 @@ func (h *RelayHub) ServeAgent(ctx context.Context, token string, c *websocket.Co
 	}
 
 paired:
-	log.Printf("pairing room=%s agent=%s client=%s", room.ID, remote, peer.Remote)
+	log.Printf("pairing room=%s service=%s agent=%s client=%s", room.ID, service, remote, peer.Remote)
 	if waiting.Resumable && peer.Resumable {
-		session := h.newResumeSession(room, remote, peer.Remote)
+		session := h.newResumeSession(room, remote, peer.Remote, proof, service)
 		if !sendControl(c, room.ID, remote, "agent", startMessage+" "+session.ID) {
 			peer.SetStarted(agentUnavailable)
 			session.Finish()
@@ -380,10 +425,15 @@ paired:
 	room.Bridge(ctx, c, peer.Conn, remote, peer.Remote, peer.Done, h.NotifyDashboards)
 }
 
-func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.Conn, remote string, resumable bool) {
+func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.Conn, remote string, resumable bool, proof, service string) {
 	room := h.roomFor(token)
+	if !room.AuthorizeClient(proof) {
+		log.Printf("client rejected by room authentication room=%s service=%s remote=%s", room.ID, service, remote)
+		closeQuietly(c, websocket.StatusPolicyViolation, "room authentication failed")
+		return
+	}
 	for {
-		waiting := room.TryTakeAgent()
+		waiting := room.TryTakeAgent(service)
 		if waiting == nil {
 			log.Printf("client rejected without agent room=%s remote=%s", room.ID, remote)
 			closeQuietly(c, websocket.StatusTryAgainLater, "no work agent connected")
@@ -415,14 +465,14 @@ func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.C
 	}
 }
 
-func (h *RelayHub) ServeResume(ctx context.Context, token string, c *websocket.Conn, remote, sessionID, side string) {
+func (h *RelayHub) ServeResume(ctx context.Context, token string, c *websocket.Conn, remote, sessionID, side, proof, service string) {
 	room := roomID(token)
 	sessionID = cleanSessionValue(sessionID)
 	key := room + "/" + sessionID
 	h.mu.Lock()
 	session := h.sessions[key]
 	h.mu.Unlock()
-	if session == nil || (side != "agent" && side != "client") {
+	if session == nil || (side != "agent" && side != "client") || session.Service != service || !proofEqual(session.RoomProof, proof) {
 		log.Printf("resume rejected room=%s session=%s side=%s remote=%s", room, sessionID, side, remote)
 		closeQuietly(c, websocket.StatusPolicyViolation, "unknown resumable session")
 		return
@@ -435,8 +485,8 @@ func (h *RelayHub) ServeResume(ctx context.Context, token string, c *websocket.C
 	}
 }
 
-func (h *RelayHub) newResumeSession(room *RelayRoom, agentRemote, clientRemote string) *ResumeSession {
-	session := NewResumeSession(randomID(), room, agentRemote, clientRemote, func(s *ResumeSession) {
+func (h *RelayHub) newResumeSession(room *RelayRoom, agentRemote, clientRemote, proof, service string) *ResumeSession {
+	session := NewResumeSession(randomID(), room, agentRemote, clientRemote, proof, service, func(s *ResumeSession) {
 		h.mu.Lock()
 		delete(h.sessions, room.ID+"/"+s.ID)
 		h.mu.Unlock()
@@ -447,8 +497,12 @@ func (h *RelayHub) newResumeSession(room *RelayRoom, agentRemote, clientRemote s
 	return session
 }
 
-func (h *RelayHub) ServeHomeAgent(ctx context.Context, token string, c *websocket.Conn, remote string) {
+func (h *RelayHub) ServeHomeAgent(ctx context.Context, token string, c *websocket.Conn, remote, proof string) {
 	room := h.roomFor(token)
+	if !room.AuthorizeClient(proof) {
+		closeQuietly(c, websocket.StatusPolicyViolation, "room authentication failed")
+		return
+	}
 	started := time.Now()
 	room.HomeAgentConnected(remote)
 	log.Printf("home app connected room=%s remote=%s", room.ID, remote)
@@ -567,6 +621,8 @@ type RelayRoom struct {
 
 	mu                       sync.Mutex
 	agents                   []*WaitingAgent
+	credentialSet            bool
+	roomProof                string
 	activePairs              int
 	totalPairs               int64
 	lastAgentRemote          *string
@@ -584,8 +640,36 @@ func NewRelayRoom(id string) *RelayRoom {
 	return &RelayRoom{ID: id}
 }
 
-func (r *RelayRoom) EnqueueAgent(c *websocket.Conn, remote string, identity AgentIdentity, resumable bool) (*WaitingAgent, int) {
-	waiting := NewWaitingAgent(c, remote, identity, resumable)
+func (r *RelayRoom) AuthorizeAgent(proof string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pruneClosedAgentsLocked()
+	if !r.credentialSet || (len(r.agents) == 0 && r.activePairs == 0) {
+		r.credentialSet = true
+		r.roomProof = proof
+		return true
+	}
+	return proofEqual(r.roomProof, proof)
+}
+
+func (r *RelayRoom) AuthorizeClient(proof string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.credentialSet {
+		return proof == ""
+	}
+	return proofEqual(r.roomProof, proof)
+}
+
+func proofEqual(expected, actual string) bool {
+	if len(expected) != len(actual) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) == 1
+}
+
+func (r *RelayRoom) EnqueueAgent(c *websocket.Conn, remote string, identity AgentIdentity, resumable bool, service string) (*WaitingAgent, int) {
+	waiting := NewWaitingAgent(c, remote, identity, resumable, service)
 	now := time.Now().UTC()
 	remoteCopy := remote
 	r.mu.Lock()
@@ -601,14 +685,13 @@ func (r *RelayRoom) EnqueueAgent(c *websocket.Conn, remote string, identity Agen
 	return waiting, len(replaced)
 }
 
-func (r *RelayRoom) TryTakeAgent() *WaitingAgent {
+func (r *RelayRoom) TryTakeAgent(service string) *WaitingAgent {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.pruneClosedAgentsLocked()
-	for len(r.agents) > 0 {
-		waiting := r.agents[0]
-		r.agents = r.agents[1:]
-		if waiting.IsOpen() {
+	for i, waiting := range r.agents {
+		if waiting.IsOpen() && waiting.Service == service {
+			r.agents = append(r.agents[:i], r.agents[i+1:]...)
 			return waiting
 		}
 	}
@@ -701,6 +784,7 @@ func (r *RelayRoom) Snapshot() RoomSnapshot {
 	return RoomSnapshot{
 		ID:                       r.ID,
 		WaitingAgents:            len(r.agents),
+		Protected:                r.credentialSet && r.roomProof != "",
 		ActivePairs:              r.activePairs,
 		TotalPairs:               r.totalPairs,
 		LastAgentRemote:          r.lastAgentRemote,
@@ -747,6 +831,7 @@ func (r *RelayRoom) replaceAgentLocked(identity AgentIdentity) []*WaitingAgent {
 type AgentIdentity struct {
 	Instance string
 	Slot     string
+	Service  string
 }
 
 func (i AgentIdentity) Valid() bool {
@@ -754,14 +839,14 @@ func (i AgentIdentity) Valid() bool {
 }
 
 func (i AgentIdentity) Equal(other AgentIdentity) bool {
-	return i.Instance == other.Instance && i.Slot == other.Slot && i.Valid()
+	return i.Instance == other.Instance && i.Slot == other.Slot && i.Service == other.Service && i.Valid()
 }
 
 func (i AgentIdentity) LogString() string {
 	if !i.Valid() {
 		return "legacy"
 	}
-	return i.Instance + "/" + i.Slot
+	return i.Instance + "/" + i.Service + "/" + i.Slot
 }
 
 type WaitingAgent struct {
@@ -769,6 +854,7 @@ type WaitingAgent struct {
 	Remote    string
 	Identity  AgentIdentity
 	Resumable bool
+	Service   string
 	Paired    chan *HomePeer
 	Done      chan struct{}
 
@@ -777,12 +863,13 @@ type WaitingAgent struct {
 	once   sync.Once
 }
 
-func NewWaitingAgent(c *websocket.Conn, remote string, identity AgentIdentity, resumable bool) *WaitingAgent {
+func NewWaitingAgent(c *websocket.Conn, remote string, identity AgentIdentity, resumable bool, service string) *WaitingAgent {
 	return &WaitingAgent{
 		Conn:      c,
 		Remote:    remote,
 		Identity:  identity,
 		Resumable: resumable,
+		Service:   service,
 		Paired:    make(chan *HomePeer, 1),
 		Done:      make(chan struct{}),
 	}
@@ -846,6 +933,8 @@ type ResumeSession struct {
 	Room         *RelayRoom
 	AgentRemote  string
 	ClientRemote string
+	RoomProof    string
+	Service      string
 
 	agent    chan *ResumeAttachment
 	client   chan *ResumeAttachment
@@ -854,12 +943,14 @@ type ResumeSession struct {
 	once     sync.Once
 }
 
-func NewResumeSession(id string, room *RelayRoom, agentRemote, clientRemote string, onFinish func(*ResumeSession)) *ResumeSession {
+func NewResumeSession(id string, room *RelayRoom, agentRemote, clientRemote, proof, service string, onFinish func(*ResumeSession)) *ResumeSession {
 	return &ResumeSession{
 		ID:           id,
 		Room:         room,
 		AgentRemote:  agentRemote,
 		ClientRemote: clientRemote,
+		RoomProof:    proof,
+		Service:      service,
 		agent:        make(chan *ResumeAttachment, 2),
 		client:       make(chan *ResumeAttachment, 2),
 		done:         make(chan struct{}),
@@ -1014,6 +1105,7 @@ type StatusSnapshot struct {
 type RoomSnapshot struct {
 	ID                       string     `json:"id"`
 	WaitingAgents            int        `json:"waiting_agents"`
+	Protected                bool       `json:"protected"`
 	ActivePairs              int        `json:"active_pairs"`
 	TotalPairs               int64      `json:"total_pairs"`
 	LastAgentRemote          *string    `json:"last_agent_remote"`

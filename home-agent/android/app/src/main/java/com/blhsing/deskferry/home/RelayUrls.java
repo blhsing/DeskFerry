@@ -1,7 +1,11 @@
 package com.blhsing.deskferry.home;
 
+import android.util.Base64;
+
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -144,6 +148,22 @@ final class RelayUrls {
         } catch (URISyntaxException ignored) {
         }
         return "default";
+    }
+
+    static String roomPasswordProof(String relayUrl, String password) {
+        String value = password == null ? "" : password;
+        if (value.isEmpty()) {
+            return "";
+        }
+        String room = roomToken(relayUrl, "").trim().toLowerCase(Locale.ROOT);
+        String material = "DeskFerry room credential v1\u0000" + room + "\u0000" + value;
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(material.getBytes(StandardCharsets.UTF_8));
+            return Base64.encodeToString(digest, Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP);
+        } catch (Exception ex) {
+            throw new IllegalStateException("SHA-256 is unavailable", ex);
+        }
     }
 
     static String rdpAddress(int port) {

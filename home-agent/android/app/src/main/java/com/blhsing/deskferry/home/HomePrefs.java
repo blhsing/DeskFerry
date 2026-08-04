@@ -52,10 +52,16 @@ final class HomePrefs {
     static final class Destination {
         String name;
         String relayUrl;
+        String roomProof;
 
         Destination(String name, String relayUrl) {
+            this(name, relayUrl, "");
+        }
+
+        Destination(String name, String relayUrl, String roomProof) {
             this.name = sanitizeName(name);
             this.relayUrl = relayUrl == null ? "" : relayUrl.trim();
+            this.roomProof = roomProof == null ? "" : roomProof.trim();
         }
     }
 
@@ -70,7 +76,8 @@ final class HomePrefs {
                     String name = sanitizeName(item.optString("name", "Work"));
                     String relayUrl = item.optString("relay_url", "").trim();
                     if (!relayUrl.isEmpty()) {
-                        result.add(new Destination(uniqueName(result, name), relayUrl));
+                        result.add(new Destination(uniqueName(result, name), relayUrl,
+                                item.optString("room_proof", "")));
                     }
                 }
             } catch (JSONException ignored) {
@@ -103,6 +110,7 @@ final class HomePrefs {
             try {
                 item.put("name", sanitizeName(destination.name));
                 item.put("relay_url", destination.relayUrl == null ? "" : destination.relayUrl.trim());
+                item.put("room_proof", destination.roomProof == null ? "" : destination.roomProof.trim());
             } catch (JSONException ignored) {
             }
             array.put(item);
@@ -118,6 +126,14 @@ final class HomePrefs {
                 .putString(PREF_PROXY, proxy)
                 .putInt(PREF_LOG_RETENTION_DAYS, sanitizeLogRetentionDays(logRetentionDays))
                 .apply();
+    }
+
+    static String loadSelectedRoomProof(Context context) {
+        List<Destination> destinations = loadDestinations(context);
+        if (destinations.isEmpty()) {
+            return "";
+        }
+        return destinations.get(loadSelectedDestination(context, destinations.size())).roomProof;
     }
 
     private static String sanitizeName(String value) {

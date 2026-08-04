@@ -29,6 +29,7 @@ import (
 
 	"deskferry/internal/diaglog"
 	"deskferry/internal/tunnel"
+	"deskferry/internal/winsecret"
 )
 
 const serviceName = "DeskFerryAgent"
@@ -37,12 +38,15 @@ const agentIDHeader = "X-DeskFerry-Agent-Instance"
 const agentSlotHeader = "X-DeskFerry-Agent-Slot"
 
 type config struct {
-	RelayAddr  string   `json:"relay_addr"`
-	RelayAddrs []string `json:"relay_addrs,omitempty"`
-	Proxy      string   `json:"proxy"`
-	RDPAddr    string   `json:"rdp_addr"`
-	MinBackoff string   `json:"min_backoff"`
-	MaxBackoff string   `json:"max_backoff"`
+	RelayAddr        string   `json:"relay_addr"`
+	RelayAddrs       []string `json:"relay_addrs,omitempty"`
+	Proxy            string   `json:"proxy"`
+	RDPAddr          string   `json:"rdp_addr"`
+	WinRMAddr        string   `json:"winrm_addr,omitempty"`
+	RoomPasswordFile string   `json:"room_password_file,omitempty"`
+	RoomPassword     string   `json:"-"`
+	MinBackoff       string   `json:"min_backoff"`
+	MaxBackoff       string   `json:"max_backoff"`
 }
 
 type relayURLFlag []string
@@ -61,6 +65,8 @@ func main() {
 	var relayURLs relayURLFlag
 	var proxyFlag string
 	var rdpFlag string
+	var winrmFlag string
+	var roomPasswordFile string
 	var logRetentionDays int
 	var consoleMode bool
 	var serviceMode bool
@@ -72,6 +78,8 @@ func main() {
 	flag.Var(&relayURLs, "relay-url", "relay service URL; repeat to add more relay URLs")
 	flag.StringVar(&proxyFlag, "proxy", "", "HTTP proxy for Azure relay WebSocket, or direct/env/auto")
 	flag.StringVar(&rdpFlag, "rdp", "", "local RDP target")
+	flag.StringVar(&winrmFlag, "winrm", "", "local WinRM target; blank disables WinRM")
+	flag.StringVar(&roomPasswordFile, "room-password-file", "", "DPAPI-protected room password file")
 	flag.IntVar(&logRetentionDays, "log-retention-days", diaglog.DefaultRetentionDays, "number of calendar days of diagnostic logs to retain")
 	flag.BoolVar(&consoleMode, "console", false, "run in the foreground for debugging")
 	flag.BoolVar(&serviceMode, "service", false, "run under the Windows service control manager")
@@ -100,7 +108,7 @@ func main() {
 		}
 	}
 	if runningAsService {
-		if err := runService(relayURL, proxyFlag, rdpFlag); err != nil {
+		if err := runService(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -124,7 +132,7 @@ func main() {
 		return
 	}
 	if selfTestMode {
-		cfg, err := loadConfig(relayURL, proxyFlag, rdpFlag)
+		cfg, err := loadConfig(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -135,13 +143,13 @@ func main() {
 		return
 	}
 	if installMode || !consoleMode {
-		if err := installService(relayURL, proxyFlag, rdpFlag); err != nil {
+		if err := installService(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
 
-	cfg, err := loadConfig(relayURL, proxyFlag, rdpFlag)
+	cfg, err := loadConfig(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -276,11 +284,30 @@ func waitForServiceState(s *mgr.Service, want svc.State, timeout time.Duration) 
 	}
 }
 
-func loadConfig(relayURL, proxyOverride, rdpOverride string) (config, error) {
+func loadConfig(relayURL, proxyOverride, rdpOverride string, extras ...string) (config, error) {
+	winrmOverride, passwordFile := "", ""
+	if len(extras) > 0 {
+		winrmOverride = extras[0]
+	}
+	if len(extras) > 1 {
+		passwordFile = extras[1]
+	}
 	cfg := config{
-		RelayAddrs: splitRelayURLs(relayURL),
-		Proxy:      strings.TrimSpace(proxyOverride),
-		RDPAddr:    strings.TrimSpace(rdpOverride),
+		RelayAddrs:       splitRelayURLs(relayURL),
+		Proxy:            strings.TrimSpace(proxyOverride),
+		RDPAddr:          strings.TrimSpace(rdpOverride),
+		WinRMAddr:        strings.TrimSpace(winrmOverride),
+		RoomPasswordFile: strings.TrimSpace(passwordFile),
+	}
+	if cfg.RoomPasswordFile != "" {
+		data, err := os.ReadFile(cfg.RoomPasswordFile)
+		if err != nil {
+			return config{}, fmt.Errorf("read room password file: %w", err)
+		}
+		cfg.RoomPassword, err = winsecret.Unprotect(data)
+		if err != nil {
+			return config{}, err
+		}
 	}
 	cfg.applyDefaults()
 	return cfg, cfg.validate()
@@ -307,16 +334,31 @@ func (c *config) applyDefaults() {
 }
 
 func (c config) validate() error {
+	if c.WinRMAddr != "" && c.RoomPassword == "" {
+		return fmt.Errorf("winrm requires a non-empty room password")
+	}
+	if c.WinRMAddr != "" {
+		if _, _, err := net.SplitHostPort(c.WinRMAddr); err != nil {
+			return fmt.Errorf("winrm target must be host:port: %w", err)
+		}
+	}
 	relayAddrs := c.relayAddresses()
 	if len(relayAddrs) == 0 {
 		return fmt.Errorf("relay_addr is required")
 	}
+	room := ""
 	for _, relayAddr := range relayAddrs {
 		if !tunnel.IsWebSocketRelay(relayAddr) {
 			return fmt.Errorf("relay URL %q must start with http://, https://, ws://, or wss://", relayAddr)
 		}
 		if _, err := tunnel.WebSocketEndpoint(relayAddr); err != nil {
 			return err
+		}
+		currentRoom := strings.ToLower(tunnel.RelayRoomToken(relayAddr, ""))
+		if room == "" {
+			room = currentRoom
+		} else if room != currentRoom {
+			return fmt.Errorf("all relay URLs must use the same room name; found %q and %q", room, currentRoom)
 		}
 	}
 	minBackoff, err := time.ParseDuration(c.MinBackoff)
@@ -391,12 +433,12 @@ func joinRelayURLs(values []string) string {
 	return strings.Join(uniqueRelayURLs(values), ";")
 }
 
-func installService(relayURL, proxyFlag, rdpFlag string) error {
+func installService(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile string) error {
 	if strings.TrimSpace(relayURL) == "" {
 		relayURL = defaultRelayURL
 	}
 	if !isElevated() {
-		return relaunchElevated(relayURL, proxyFlag, rdpFlag)
+		return relaunchElevated(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile)
 	}
 	exePath, err := os.Executable()
 	if err != nil {
@@ -408,7 +450,7 @@ func installService(relayURL, proxyFlag, rdpFlag string) error {
 	}
 	defer m.Disconnect()
 
-	args := serviceArgs(relayURL, proxyFlag, rdpFlag)
+	args := serviceArgs(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile)
 	serviceConfig := serviceInstallConfig(exePath, args)
 	s, err := m.CreateService(serviceName, exePath, serviceConfig, args...)
 	if err != nil {
@@ -422,7 +464,7 @@ func installService(relayURL, proxyFlag, rdpFlag string) error {
 				return fmt.Errorf("update existing service: %w", err)
 			}
 		} else if isAccessDenied(err) {
-			return installScheduledTask(relayURL, proxyFlag, rdpFlag)
+			return installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile)
 		} else {
 			return fmt.Errorf("create service: %w", err)
 		}
@@ -436,7 +478,7 @@ func installService(relayURL, proxyFlag, rdpFlag string) error {
 	return nil
 }
 
-func serviceArgs(relayURL, proxyFlag, rdpFlag string) []string {
+func serviceArgs(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile string) []string {
 	args := []string{"-service"}
 	if relayURL != "" {
 		args = append(args, "-relay-url", relayURL)
@@ -446,6 +488,12 @@ func serviceArgs(relayURL, proxyFlag, rdpFlag string) []string {
 	}
 	if rdpFlag != "" {
 		args = append(args, "-rdp", rdpFlag)
+	}
+	if winrmFlag != "" {
+		args = append(args, "-winrm", winrmFlag)
+	}
+	if roomPasswordFile != "" {
+		args = append(args, "-room-password-file", roomPasswordFile)
 	}
 	return args
 }
@@ -509,20 +557,22 @@ func printStatus() error {
 	return nil
 }
 
-func runService(relayURL, proxyFlag, rdpFlag string) error {
-	return svc.Run(serviceName, &agentService{relayURL: relayURL, proxyFlag: proxyFlag, rdpFlag: rdpFlag})
+func runService(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile string) error {
+	return svc.Run(serviceName, &agentService{relayURL: relayURL, proxyFlag: proxyFlag, rdpFlag: rdpFlag, winrmFlag: winrmFlag, roomPasswordFile: roomPasswordFile})
 }
 
 type agentService struct {
-	relayURL  string
-	proxyFlag string
-	rdpFlag   string
+	relayURL         string
+	proxyFlag        string
+	rdpFlag          string
+	winrmFlag        string
+	roomPasswordFile string
 }
 
 func (s *agentService) Execute(_ []string, requests <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
 	const accepts = svc.AcceptStop | svc.AcceptShutdown
 	changes <- svc.Status{State: svc.StartPending}
-	cfg, err := loadConfig(s.relayURL, s.proxyFlag, s.rdpFlag)
+	cfg, err := loadConfig(s.relayURL, s.proxyFlag, s.rdpFlag, s.winrmFlag, s.roomPasswordFile)
 	if err != nil {
 		logEvent(eventlog.Error, "load config failed: %v", err)
 		return false, 1
@@ -562,21 +612,27 @@ func run(ctx context.Context, cfg config) error {
 
 func runWebSocketPools(ctx context.Context, cfg config) error {
 	const slots = 4
+	targets := []serviceTarget{{Service: tunnel.ServiceRDP, Address: cfg.RDPAddr}}
+	if cfg.WinRMAddr != "" {
+		targets = append(targets, serviceTarget{Service: tunnel.ServiceWinRM, Address: cfg.WinRMAddr})
+	}
 	var wg sync.WaitGroup
 	relayAddrs := cfg.relayAddresses()
 	agentID, err := loadOrCreateAgentID()
 	if err != nil {
 		log.Printf("using temporary agent identity: %v", err)
 	}
-	log.Printf("starting websocket agent pools for %d relay URL(s)", len(relayAddrs))
+	log.Printf("starting websocket agent pools for %d relay URL(s) and %d service(s)", len(relayAddrs), len(targets))
 	for _, relayAddr := range relayAddrs {
 		relayCfg := cfg.withRelayAddress(relayAddr)
-		for i := 0; i < slots; i++ {
-			wg.Add(1)
-			go func(slot int, slotCfg config) {
-				defer wg.Done()
-				runWebSocketSlot(ctx, slotCfg, slot, agentID)
-			}(i+1, relayCfg)
+		for _, target := range targets {
+			for i := 0; i < slots; i++ {
+				wg.Add(1)
+				go func(slot int, slotCfg config, service serviceTarget) {
+					defer wg.Done()
+					runWebSocketSlot(ctx, slotCfg, slot, agentID, service)
+				}(i+1, relayCfg, target)
+			}
 		}
 	}
 	<-ctx.Done()
@@ -584,18 +640,23 @@ func runWebSocketPools(ctx context.Context, cfg config) error {
 	return nil
 }
 
-func runWebSocketSlot(ctx context.Context, cfg config, slot int, agentID string) {
+type serviceTarget struct {
+	Service string
+	Address string
+}
+
+func runWebSocketSlot(ctx context.Context, cfg config, slot int, agentID string, target serviceTarget) {
 	minBackoff, _ := time.ParseDuration(cfg.MinBackoff)
 	maxBackoff, _ := time.ParseDuration(cfg.MaxBackoff)
 	backoff := minBackoff
 	for ctx.Err() == nil {
-		connected, err := runWebSocketOnce(ctx, cfg, slot, agentID)
+		connected, err := runWebSocketOnce(ctx, cfg, slot, agentID, target)
 		if ctx.Err() != nil {
 			return
 		}
 		delay, nextBackoff := reconnectDelay(backoff, minBackoff, maxBackoff, connected)
 		backoff = nextBackoff
-		log.Printf("websocket agent slot %d for relay %s disconnected: %v; reconnecting in %s", slot, cfg.RelayAddr, err, delay)
+		log.Printf("websocket agent service=%s slot=%d for relay %s disconnected: %v; reconnecting in %s", target.Service, slot, cfg.RelayAddr, err, delay)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -617,7 +678,7 @@ func reconnectDelay(backoff, minBackoff, maxBackoff time.Duration, connected boo
 	return backoff, nextBackoff
 }
 
-func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string) (bool, error) {
+func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string, target serviceTarget) (bool, error) {
 	connectedAt := time.Now()
 	headers := http.Header{}
 	if agentID != "" {
@@ -625,19 +686,21 @@ func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string)
 		headers.Set(agentSlotHeader, strconv.Itoa(slot))
 	}
 	headers.Set(tunnel.HeaderResumable, "1")
+	tunnel.AddRoomPasswordHeader(headers, cfg.RelayAddr, "", cfg.RoomPassword)
+	tunnel.AddServiceHeader(headers, target.Service)
 	ws, err := tunnel.DialWebSocketWithHeaders(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgent, "", headers)
 	if err != nil {
 		return false, fmt.Errorf("dial after %s: %w", time.Since(connectedAt).Round(time.Millisecond), err)
 	}
 	defer tunnel.CloseWebSocket(ws)
 
-	log.Printf("websocket agent slot %d connected to relay %s via %s", slot, cfg.RelayAddr, tunnel.ProxySpecForLog(cfg.Proxy))
+	log.Printf("websocket agent service=%s slot=%d connected to relay %s via %s", target.Service, slot, cfg.RelayAddr, tunnel.ProxySpecForLog(cfg.Proxy))
 	sessionID, err := tunnel.AwaitWebSocketStartSession(ctx, ws)
 	if err != nil {
 		return true, fmt.Errorf("wait for pairing after %s: %w", time.Since(connectedAt).Round(time.Millisecond), err)
 	}
 	pairedAt := time.Now()
-	log.Printf("websocket agent slot %d paired on relay %s after idle=%s; forwarding to %s", slot, cfg.RelayAddr, pairedAt.Sub(connectedAt).Round(time.Millisecond), cfg.RDPAddr)
+	log.Printf("websocket agent service=%s slot=%d paired on relay %s after idle=%s; forwarding to %s", target.Service, slot, cfg.RelayAddr, pairedAt.Sub(connectedAt).Round(time.Millisecond), target.Address)
 	stream := net.Conn(tunnel.WebSocketNetConn(ctx, ws))
 	if sessionID != "" {
 		stream = tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{
@@ -645,9 +708,11 @@ func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string)
 			Proxy:     cfg.Proxy,
 			SessionID: sessionID,
 			Side:      "agent",
+			RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword),
+			Service:   target.Service,
 		})
 	}
-	handleStream(ctx, stream, cfg.RDPAddr, cfg.RelayAddr, slot)
+	handleStream(ctx, stream, target, cfg.RelayAddr, slot)
 	return true, fmt.Errorf("paired stream completed after %s", time.Since(pairedAt).Round(time.Millisecond))
 }
 
@@ -733,6 +798,14 @@ func selfTest(parent context.Context, cfg config) error {
 		return fmt.Errorf("local RDP target %s is not reachable: %w", cfg.RDPAddr, err)
 	}
 	_ = rdpConn.Close()
+	if cfg.WinRMAddr != "" {
+		log.Printf("self-test local WinRM target: %s", cfg.WinRMAddr)
+		winrmConn, err := d.DialContext(ctx, "tcp", cfg.WinRMAddr)
+		if err != nil {
+			return fmt.Errorf("local WinRM target %s is not reachable: %w", cfg.WinRMAddr, err)
+		}
+		_ = winrmConn.Close()
+	}
 
 	var failures []error
 	for _, relayAddr := range cfg.relayAddresses() {
@@ -749,7 +822,9 @@ func selfTest(parent context.Context, cfg config) error {
 
 func selfTestRelay(ctx context.Context, cfg config) error {
 	log.Printf("self-test relay target: %s via %s", cfg.RelayAddr, tunnel.ProxySpecForLog(cfg.Proxy))
-	ws, err := tunnel.DialWebSocket(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleProbe, "")
+	headers := http.Header{}
+	tunnel.AddRoomPasswordHeader(headers, cfg.RelayAddr, "", cfg.RoomPassword)
+	ws, err := tunnel.DialWebSocketWithHeaders(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleProbe, "", headers)
 	if err != nil {
 		return fmt.Errorf("websocket relay connection test failed: %w. %s", err, relayDialHint(err, cfg))
 	}
@@ -794,21 +869,21 @@ func relayPortForHint(addr string) string {
 	return port
 }
 
-func handleStream(ctx context.Context, stream net.Conn, rdpAddr, relayAddr string, slot int) {
+func handleStream(ctx context.Context, stream net.Conn, target serviceTarget, relayAddr string, slot int) {
 	started := time.Now()
 	var d net.Dialer
-	rdpConn, err := d.DialContext(ctx, "tcp", rdpAddr)
+	localConn, err := d.DialContext(ctx, "tcp", target.Address)
 	if err != nil {
-		log.Printf("RDP stream slot=%d relay=%s target=%s dial failed after %s: %v", slot, relayAddr, rdpAddr, time.Since(started).Round(time.Millisecond), err)
+		log.Printf("%s stream slot=%d relay=%s target=%s dial failed after %s: %v", strings.ToUpper(target.Service), slot, relayAddr, target.Address, time.Since(started).Round(time.Millisecond), err)
 		_ = stream.Close()
 		return
 	}
-	log.Printf("RDP stream slot=%d relay=%s target=%s opened local=%s remote=%s dial_duration=%s", slot, relayAddr, rdpAddr, rdpConn.LocalAddr(), rdpConn.RemoteAddr(), time.Since(started).Round(time.Millisecond))
-	result := tunnel.PipeWithResult(stream, rdpConn)
-	log.Printf("RDP stream slot=%d relay=%s target=%s ended duration=%s end_initiator=%s relay_to_rdp_bytes=%d relay_to_rdp_error=%v relay_to_rdp_half_close_error=%v rdp_to_relay_bytes=%d rdp_to_relay_error=%v rdp_to_relay_half_close_error=%v relay_close_error=%v rdp_close_error=%v", slot, relayAddr, rdpAddr, result.Duration.Round(time.Millisecond), result.EndInitiator("relay", "local_rdp"), result.AToB.Bytes, result.AToB.CopyErr, result.AToB.CloseWriteErr, result.BToA.Bytes, result.BToA.CopyErr, result.BToA.CloseWriteErr, result.ACloseErr, result.BCloseErr)
+	log.Printf("%s stream slot=%d relay=%s target=%s opened local=%s remote=%s dial_duration=%s", strings.ToUpper(target.Service), slot, relayAddr, target.Address, localConn.LocalAddr(), localConn.RemoteAddr(), time.Since(started).Round(time.Millisecond))
+	result := tunnel.PipeWithResult(stream, localConn)
+	log.Printf("%s stream slot=%d relay=%s target=%s ended duration=%s end_initiator=%s relay_to_local_bytes=%d relay_to_local_error=%v local_to_relay_bytes=%d local_to_relay_error=%v", strings.ToUpper(target.Service), slot, relayAddr, target.Address, result.Duration.Round(time.Millisecond), result.EndInitiator("relay", "local_"+target.Service), result.AToB.Bytes, result.AToB.CopyErr, result.BToA.Bytes, result.BToA.CopyErr)
 }
 
-func installScheduledTask(relayURL, proxyFlag, rdpFlag string) error {
+func installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile string) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
@@ -823,6 +898,12 @@ func installScheduledTask(relayURL, proxyFlag, rdpFlag string) error {
 	if rdpFlag != "" {
 		args = append(args, "-rdp", strconv.Quote(rdpFlag))
 	}
+	if winrmFlag != "" {
+		args = append(args, "-winrm", strconv.Quote(winrmFlag))
+	}
+	if roomPasswordFile != "" {
+		args = append(args, "-room-password-file", strconv.Quote(roomPasswordFile))
+	}
 	out, err := exec.Command("schtasks", "/Create", "/TN", "DeskFerry Agent", "/SC", "ONLOGON", "/TR", strings.Join(args, " "), "/F").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("service install requires admin and Scheduled Task fallback failed: %v: %s", err, out)
@@ -831,7 +912,7 @@ func installScheduledTask(relayURL, proxyFlag, rdpFlag string) error {
 	return nil
 }
 
-func relaunchElevated(relayURL, proxyFlag, rdpFlag string) error {
+func relaunchElevated(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile string) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
@@ -846,12 +927,18 @@ func relaunchElevated(relayURL, proxyFlag, rdpFlag string) error {
 	if rdpFlag != "" {
 		args = append(args, "-rdp", rdpFlag)
 	}
+	if winrmFlag != "" {
+		args = append(args, "-winrm", winrmFlag)
+	}
+	if roomPasswordFile != "" {
+		args = append(args, "-room-password-file", roomPasswordFile)
+	}
 	verb, _ := windows.UTF16PtrFromString("runas")
 	exe, _ := windows.UTF16PtrFromString(exePath)
 	params, _ := windows.UTF16PtrFromString(joinWindowsArgs(args))
 	if err := windows.ShellExecute(0, verb, exe, params, nil, windows.SW_NORMAL); err != nil {
 		if isAccessDenied(err) {
-			return installScheduledTask(relayURL, proxyFlag, rdpFlag)
+			return installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, roomPasswordFile)
 		}
 		return err
 	}

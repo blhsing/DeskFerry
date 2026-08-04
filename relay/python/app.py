@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import time
@@ -121,11 +122,20 @@ def read_agent_identity(websocket: WebSocket) -> AgentIdentity:
     return AgentIdentity(
         clean_agent_identity(websocket.headers.get("x-deskferry-agent-instance")),
         clean_agent_identity(websocket.headers.get("x-deskferry-agent-slot")),
+        read_service(websocket),
     )
 
 
 def read_resumable(websocket: WebSocket) -> bool:
     return websocket.headers.get("x-deskferry-resumable", "").strip().lower() in {"1", "true"}
+
+
+def read_room_proof(websocket: WebSocket) -> str:
+    return websocket.headers.get("x-deskferry-room-proof", "").strip()
+
+
+def read_service(websocket: WebSocket) -> str:
+    return "winrm" if websocket.headers.get("x-deskferry-service", "").strip().lower() == "winrm" else "rdp"
 
 
 def clean_session_value(value: str | None) -> str:
@@ -217,6 +227,7 @@ async def send_control(websocket: WebSocket, message: str, side: str, room: str,
 class AgentIdentity:
     instance: str = ""
     slot: str = ""
+    service: str = "rdp"
 
     @property
     def is_valid(self) -> bool:
@@ -224,7 +235,7 @@ class AgentIdentity:
 
     @property
     def log_string(self) -> str:
-        return f"{self.instance}/{self.slot}" if self.is_valid else "legacy"
+        return f"{self.instance}/{self.service}/{self.slot}" if self.is_valid else "legacy"
 
 
 @dataclass
@@ -242,6 +253,7 @@ class WaitingAgent:
     remote: str
     identity: AgentIdentity = field(default_factory=AgentIdentity)
     resumable: bool = False
+    service: str = "rdp"
     paired: asyncio.Future[HomePeer] = field(default_factory=asyncio.Future)
 
     @property
@@ -265,6 +277,8 @@ class RelayRoom:
         self._lock = asyncio.Lock()
         self._agents: deque[WaitingAgent] = deque()
         self._active_pairs = 0
+        self._credential_set = False
+        self._room_proof = ""
         self._total_pairs = 0
         self._last_agent_remote: str | None = None
         self._last_agent_connected_at: datetime | None = None
@@ -276,8 +290,23 @@ class RelayRoom:
         self._last_client_connected_at: datetime | None = None
         self._last_client_disconnected_at: datetime | None = None
 
-    async def enqueue_agent(self, websocket: WebSocket, remote: str, identity: AgentIdentity, resumable: bool = False) -> tuple[WaitingAgent, int]:
-        waiting = WaitingAgent(websocket, remote, identity, resumable)
+    async def authorize_agent(self, proof: str) -> bool:
+        async with self._lock:
+            self._prune_closed_agents_locked()
+            if not self._credential_set or (not self._agents and self._active_pairs == 0):
+                self._credential_set = True
+                self._room_proof = proof
+                return True
+            return hmac.compare_digest(self._room_proof, proof)
+
+    async def authorize_client(self, proof: str) -> bool:
+        async with self._lock:
+            return (not self._credential_set and not proof) or (
+                self._credential_set and hmac.compare_digest(self._room_proof, proof)
+            )
+
+    async def enqueue_agent(self, websocket: WebSocket, remote: str, identity: AgentIdentity, resumable: bool = False, service: str = "rdp") -> tuple[WaitingAgent, int]:
+        waiting = WaitingAgent(websocket, remote, identity, resumable, service)
         replaced: list[WaitingAgent] = []
         async with self._lock:
             self._prune_closed_agents_locked()
@@ -298,13 +327,15 @@ class RelayRoom:
             await close_quietly(agent.websocket, reason="replaced by newer agent socket")
         return waiting, len(replaced)
 
-    async def try_take_agent(self) -> WaitingAgent | None:
+    async def try_take_agent(self, service: str = "rdp") -> WaitingAgent | None:
         async with self._lock:
             self._prune_closed_agents_locked()
-            while self._agents:
+            for _ in range(len(self._agents)):
                 waiting = self._agents.popleft()
-                if waiting.is_open:
+                if waiting.is_open and waiting.service == service:
                     return waiting
+                if waiting.is_open:
+                    self._agents.append(waiting)
         return None
 
     async def remove_waiting(self, waiting: WaitingAgent) -> None:
@@ -380,6 +411,7 @@ class RelayRoom:
             self._prune_closed_agents_locked()
             return {
                 "id": self.id,
+                "protected": self._credential_set and bool(self._room_proof),
                 "waiting_agents": len(self._agents),
                 "active_pairs": self._active_pairs,
                 "total_pairs": self._total_pairs,
@@ -414,11 +446,15 @@ class ResumeSession:
         agent_remote: str,
         client_remote: str,
         on_finish: Any,
+        room_proof: str = "",
+        service: str = "rdp",
     ) -> None:
         self.id = session_id
         self.room = room
         self.agent_remote = agent_remote
         self.client_remote = client_remote
+        self.room_proof = room_proof
+        self.service = service
         self._agent: asyncio.Queue[ResumeAttachment] = asyncio.Queue(maxsize=2)
         self._client: asyncio.Queue[ResumeAttachment] = asyncio.Queue(maxsize=2)
         self._done = asyncio.Event()
@@ -538,11 +574,16 @@ class RelayHub:
         remote: str,
         identity: AgentIdentity | None = None,
         resumable: bool = False,
+        proof: str = "",
+        service: str = "rdp",
     ) -> None:
         room = await self._room_for(token)
+        if not await room.authorize_agent(proof):
+            await close_quietly(websocket, 1008, "room authentication failed")
+            return
         identity = identity or AgentIdentity()
-        waiting, replaced = await room.enqueue_agent(websocket, remote, identity, resumable)
-        logger.info("agent waiting room=%s remote=%s key=%s replaced=%s", room.id, remote, identity.log_string, replaced)
+        waiting, replaced = await room.enqueue_agent(websocket, remote, identity, resumable, service)
+        logger.info("agent waiting room=%s service=%s remote=%s key=%s replaced=%s", room.id, service, remote, identity.log_string, replaced)
         self.notify_dashboards()
 
         peer: HomePeer | None = None
@@ -550,7 +591,7 @@ class RelayHub:
             peer = await waiting.paired
             logger.info("pairing room=%s agent=%s client=%s", room.id, remote, peer.remote)
             if waiting.resumable and peer.resumable:
-                session = self._new_resume_session(room, remote, peer.remote)
+                session = self._new_resume_session(room, remote, peer.remote, proof, service)
                 if not await send_control(websocket, f"start {session.id}", "agent", room.id, remote):
                     try_set_result(peer.started, AGENT_UNAVAILABLE)
                     session.finish()
@@ -587,10 +628,13 @@ class RelayHub:
             await room.remove_waiting(waiting)
             self.notify_dashboards()
 
-    async def serve_client(self, token: str, websocket: WebSocket, remote: str, resumable: bool = False) -> None:
+    async def serve_client(self, token: str, websocket: WebSocket, remote: str, resumable: bool = False, proof: str = "", service: str = "rdp") -> None:
         room = await self._room_for(token)
+        if not await room.authorize_client(proof):
+            await close_quietly(websocket, 1008, "room authentication failed")
+            return
         while websocket_is_connected(websocket):
-            waiting = await room.try_take_agent()
+            waiting = await room.try_take_agent(service)
             if waiting is None:
                 logger.info("client rejected without agent room=%s remote=%s", room.id, remote)
                 await close_quietly(websocket, 1013, "no work agent connected")
@@ -616,26 +660,30 @@ class RelayHub:
 
         await close_quietly(websocket)
 
-    async def serve_resume(self, token: str, websocket: WebSocket, remote: str, session_id: str | None, side: str | None) -> None:
+    async def serve_resume(self, token: str, websocket: WebSocket, remote: str, session_id: str | None, side: str | None, proof: str = "", service: str = "rdp") -> None:
         session_id = clean_session_value(session_id)
         side = (side or "").strip().lower()
         session = self._sessions.get(f"{room_id(token)}/{session_id}")
-        if not session_id or side not in {"agent", "client"} or session is None:
+        if (not session_id or side not in {"agent", "client"} or session is None or
+                session.service != service or not hmac.compare_digest(session.room_proof, proof)):
             await close_quietly(websocket, 1008, "unknown resumable session")
             return
         if not await session.attach(side, websocket, remote):
             await close_quietly(websocket, 1013, "resumable session unavailable")
 
-    def _new_resume_session(self, room: RelayRoom, agent_remote: str, client_remote: str) -> ResumeSession:
+    def _new_resume_session(self, room: RelayRoom, agent_remote: str, client_remote: str, proof: str, service: str) -> ResumeSession:
         def remove(session: ResumeSession) -> None:
             self._sessions.pop(f"{room.id}/{session.id}", None)
 
-        session = ResumeSession(uuid.uuid4().hex, room, agent_remote, client_remote, remove)
+        session = ResumeSession(uuid.uuid4().hex, room, agent_remote, client_remote, remove, proof, service)
         self._sessions[f"{room.id}/{session.id}"] = session
         return session
 
-    async def serve_home_agent(self, token: str, websocket: WebSocket, remote: str) -> None:
+    async def serve_home_agent(self, token: str, websocket: WebSocket, remote: str, proof: str = "") -> None:
         room = await self._room_for(token)
+        if not await room.authorize_client(proof):
+            await close_quietly(websocket, 1008, "room authentication failed")
+            return
         started_at = time.monotonic()
         await room.home_agent_connected(remote)
         logger.info("home app connected room=%s remote=%s", room.id, remote)
@@ -647,6 +695,13 @@ class RelayHub:
             await room.home_agent_disconnected(remote)
             self.notify_dashboards()
             logger.info("home app disconnected room=%s remote=%s", room.id, remote)
+
+    async def serve_probe(self, token: str, websocket: WebSocket, proof: str = "") -> None:
+        room = await self._room_for(token)
+        if not await room.authorize_client(proof):
+            await close_quietly(websocket, 1008, "room authentication failed")
+            return
+        await close_quietly(websocket, 1000, "probe ok")
 
     async def serve_dashboard(self, websocket: WebSocket, remote: str, room: str | None) -> None:
         client = DashboardClient(str(uuid.uuid4()), websocket, room_id(room) if room else None)
@@ -760,15 +815,15 @@ async def relay_websocket(websocket: WebSocket, room: str | None) -> None:
     if role == DASHBOARD_ROLE:
         await hub.serve_dashboard(websocket, remote, room)
     elif role == "agent":
-        await hub.serve_agent(token, websocket, remote, read_agent_identity(websocket), read_resumable(websocket))
+        await hub.serve_agent(token, websocket, remote, read_agent_identity(websocket), read_resumable(websocket), read_room_proof(websocket), read_service(websocket))
     elif role == "client":
-        await hub.serve_client(token, websocket, remote, read_resumable(websocket))
+        await hub.serve_client(token, websocket, remote, read_resumable(websocket), read_room_proof(websocket), read_service(websocket))
     elif role == RESUME_ROLE:
-        await hub.serve_resume(token, websocket, remote, websocket.headers.get("x-deskferry-session"), websocket.headers.get("x-deskferry-session-side"))
+        await hub.serve_resume(token, websocket, remote, websocket.headers.get("x-deskferry-session"), websocket.headers.get("x-deskferry-session-side"), read_room_proof(websocket), read_service(websocket))
     elif role == "home-agent":
-        await hub.serve_home_agent(token, websocket, remote)
+        await hub.serve_home_agent(token, websocket, remote, read_room_proof(websocket))
     elif role == "probe":
-        await close_quietly(websocket, 1000, "probe ok")
+        await hub.serve_probe(token, websocket, read_room_proof(websocket))
     else:
         await close_quietly(websocket, 1008, "unsupported role")
 

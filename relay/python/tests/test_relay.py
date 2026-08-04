@@ -15,6 +15,8 @@ class FakeWebSocket:
         self.text_messages = []
         self.byte_messages = []
         self.closed = False
+        self.close_code = None
+        self.close_reason = ""
         self._received = asyncio.Queue()
 
     async def send_text(self, text):
@@ -30,6 +32,8 @@ class FakeWebSocket:
 
     async def close(self, code=1000, reason=""):
         self.closed = True
+        self.close_code = code
+        self.close_reason = reason
         self.client_state = WebSocketState.DISCONNECTED
         self.application_state = WebSocketState.DISCONNECTED
 
@@ -218,5 +222,60 @@ def test_agent_identity_replaces_existing_waiting_socket():
         for task in (first_task, second_task):
             task.cancel()
         await asyncio.gather(first_task, second_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_room_password_rejects_wrong_client_proof():
+    async def scenario():
+        hub = RelayHub()
+        agent = FakeWebSocket()
+        wrong_home = FakeWebSocket()
+
+        agent_task = asyncio.create_task(
+            hub.serve_agent("unit-protected", agent, "work", proof="correct-proof")
+        )
+        await asyncio.sleep(0)
+        await hub.serve_client("unit-protected", wrong_home, "home", proof="wrong-proof")
+
+        assert wrong_home.closed is True
+        assert wrong_home.close_code == 1008
+        assert wrong_home.close_reason == "room authentication failed"
+        snapshot = await hub.snapshot("unit-protected")
+        assert snapshot["rooms"][0]["protected"] is True
+
+        agent_task.cancel()
+        await asyncio.gather(agent_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_service_channels_do_not_cross_pair():
+    async def scenario():
+        hub = RelayHub()
+        agent = FakeWebSocket()
+        rdp_home = FakeWebSocket()
+        winrm_home = FakeWebSocket()
+
+        agent_task = asyncio.create_task(
+            hub.serve_agent("unit-services", agent, "work", proof="proof", service="winrm")
+        )
+        await asyncio.sleep(0)
+        await hub.serve_client("unit-services", rdp_home, "rdp-home", proof="proof", service="rdp")
+        assert rdp_home.close_code == 1013
+
+        client_task = asyncio.create_task(
+            hub.serve_client("unit-services", winrm_home, "winrm-home", proof="proof", service="winrm")
+        )
+        for _ in range(50):
+            if winrm_home.text_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert agent.text_messages == ["start"]
+        assert winrm_home.text_messages == ["start"]
+
+        for task in (agent_task, client_task):
+            task.cancel()
+        await asyncio.gather(agent_task, client_task, return_exceptions=True)
 
     asyncio.run(scenario())

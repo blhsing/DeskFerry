@@ -57,6 +57,7 @@ public class TunnelService extends Service {
     static final String EXTRA_LOCAL_PORT = "local_port";
     static final String EXTRA_PROXY = "proxy";
     static final String EXTRA_LOG_RETENTION_DAYS = "log_retention_days";
+    static final String EXTRA_ROOM_PROOF = "room_proof";
 
     private static final String CHANNEL_ID = "deskferry_home";
     private static final int NOTIFICATION_ID = 7310;
@@ -85,6 +86,7 @@ public class TunnelService extends Service {
     private volatile String relayUrl = RelayUrls.DEFAULT_RELAY_URL;
     private volatile List<String> relayUrls = Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL);
     private volatile int localPort = HomePrefs.DEFAULT_LOCAL_PORT;
+    private volatile String roomProof = "";
     private volatile int logRetentionDays = HomePrefs.DEFAULT_LOG_RETENTION_DAYS;
     private volatile String lastPrunedLogDate = "";
     private volatile int activeConnections;
@@ -124,8 +126,11 @@ public class TunnelService extends Service {
         int requestedLogRetentionDays = intent != null && intent.hasExtra(EXTRA_LOG_RETENTION_DAYS)
                 ? intent.getIntExtra(EXTRA_LOG_RETENTION_DAYS, HomePrefs.DEFAULT_LOG_RETENTION_DAYS)
                 : HomePrefs.loadLogRetentionDays(this);
+        String requestedRoomProof = intent != null && intent.hasExtra(EXTRA_ROOM_PROOF)
+                ? intent.getStringExtra(EXTRA_ROOM_PROOF)
+                : HomePrefs.loadSelectedRoomProof(this);
         startForeground(NOTIFICATION_ID, buildNotification());
-        startTunnel(requestedRelay, requestedPort, requestedProxy, requestedLogRetentionDays);
+        startTunnel(requestedRelay, requestedPort, requestedProxy, requestedLogRetentionDays, requestedRoomProof);
         return START_STICKY;
     }
 
@@ -143,13 +148,15 @@ public class TunnelService extends Service {
         return null;
     }
 
-    private void startTunnel(String requestedRelay, int requestedPort, String requestedProxy, int requestedLogRetentionDays) {
+    private void startTunnel(String requestedRelay, int requestedPort, String requestedProxy, int requestedLogRetentionDays,
+                             String requestedRoomProof) {
         synchronized (lock) {
             stopTunnelLocked();
             try {
                 relayUrls = RelayUrls.normalizeRelayUrls(requestedRelay);
                 relayUrl = RelayUrls.joinRelayUrls(relayUrls);
                 localPort = sanitizePort(requestedPort);
+                roomProof = requestedRoomProof == null ? "" : requestedRoomProof.trim();
                 logRetentionDays = HomePrefs.sanitizeLogRetentionDays(requestedLogRetentionDays);
                 OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
                         .pingInterval(25, TimeUnit.SECONDS)
@@ -376,13 +383,19 @@ public class TunnelService extends Service {
     private Request webSocketRequest(String relayUrl, String role) throws URISyntaxException {
         String endpoint = RelayUrls.webSocketEndpoint(relayUrl);
         String token = RelayUrls.roomToken(relayUrl, "");
-        return new Request.Builder()
+        Request.Builder request = new Request.Builder()
                 .url(endpoint)
                 .header("Authorization", "Bearer " + token)
                 .header("X-DeskFerry-Role", role)
                 .header("X-TunnelDesktop-Role", role)
-                .header("User-Agent", "DeskFerry-Android/0.5.7")
-                .build();
+                .header("User-Agent", "DeskFerry-Android/0.6.0");
+        if (!roomProof.isEmpty() && !"dashboard".equals(role)) {
+            request.header("X-DeskFerry-Room-Proof", roomProof);
+        }
+        if ("client".equals(role) || "resume".equals(role)) {
+            request.header("X-DeskFerry-Service", "rdp");
+        }
+        return request.build();
     }
 
     private List<String> relayUrlsSnapshot() {
