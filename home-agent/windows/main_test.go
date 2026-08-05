@@ -50,26 +50,23 @@ func TestWinRMSessionKeyChangesWithCredentialAndDestination(t *testing.T) {
 	}
 }
 
-func TestInstalledHomeSetupPathUsesInstallMetadata(t *testing.T) {
+func TestReadHomeInstallMetadata(t *testing.T) {
 	programData := t.TempDir()
 	installDir := t.TempDir()
 	t.Setenv("ProgramData", programData)
 	if err := os.MkdirAll(filepath.Join(programData, "DeskFerry"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	setupPath := filepath.Join(installDir, "DeskFerryHomeSetup.exe")
-	if err := os.WriteFile(setupPath, []byte("setup"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	metadata, err := json.Marshal(homeInstallMetadata{InstallDir: installDir, Alias: "office-files", EnableNetwork: true})
+	metadata, err := json.Marshal(homeInstallMetadata{InstallDir: installDir, Destination: "Office", Alias: "office-files", EnableNetwork: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(programData, "DeskFerry", "home-install.json"), metadata, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if got := installedHomeSetupPath(); got != setupPath {
-		t.Fatalf("installed setup path = %q, want %q", got, setupPath)
+	got, ok := readHomeInstallMetadata()
+	if !ok || got.InstallDir != installDir || got.Destination != "Office" || got.Alias != "office-files" {
+		t.Fatalf("installed metadata = %#v, ok=%t", got, ok)
 	}
 }
 
@@ -225,6 +222,62 @@ func TestEnsureDestinationsMigratesAndKeepsSharedWindowsUsersPerProfile(t *testi
 	}
 	if got := cfg.RDPUser; got != `HOME\owner` {
 		t.Fatalf("selected shared Windows user = %q", got)
+	}
+}
+
+func TestEnsureDestinationsKeepsSMBAliasPerProfile(t *testing.T) {
+	cfg := config{
+		RelayAddr:           "https://azure.example/relay/home",
+		SelectedDestination: "Home",
+		Destinations: []destinationProfile{
+			{Name: "Office", RelayAddrs: []string{"https://azure.example/relay/office"}, SMBAlias: "office-files"},
+			{Name: "Home", RelayAddrs: []string{"https://azure.example/relay/home"}, SMBAlias: "home-files"},
+		},
+	}
+	if err := cfg.ensureDestinations(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Destinations[0].SMBAlias != "office-files" || cfg.Destinations[1].SMBAlias != "home-files" {
+		t.Fatalf("SMB aliases changed: %#v", cfg.Destinations)
+	}
+	if got := selectedSMBAlias(cfg); got != "home-files" {
+		t.Fatalf("selected SMB alias = %q", got)
+	}
+}
+
+func TestSlicesEqualFold(t *testing.T) {
+	if !slicesEqualFold([]string{" HTTPS://Relay/Room "}, []string{"https://relay/room"}) {
+		t.Fatal("equivalent relay lists did not compare equal")
+	}
+	if slicesEqualFold([]string{"a", "b"}, []string{"b", "a"}) {
+		t.Fatal("ordered relay lists compared equal after reordering")
+	}
+}
+
+func TestSelectedSMBProfileSyncSkipsMatchingActiveProfile(t *testing.T) {
+	programData := t.TempDir()
+	t.Setenv("ProgramData", programData)
+	if err := os.MkdirAll(filepath.Join(programData, "DeskFerry"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata, _ := json.Marshal(homeInstallMetadata{
+		InstallDir: `C:\Program Files\DeskFerry Home`, Destination: "Office",
+		RelayAddrs: []string{"https://relay.example/relay/office"}, Proxy: "direct",
+		Alias: "office-files", EnableNetwork: true,
+	})
+	if err := os.WriteFile(filepath.Join(programData, "DeskFerry", "home-install.json"), metadata, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config{
+		Proxy: "direct", SelectedDestination: "Office",
+		Destinations: []destinationProfile{{
+			Name: "Office", RelayAddrs: []string{"https://relay.example/relay/office"},
+			RoomProof: "proof", SMBAlias: "office-files",
+		}},
+	}
+	requested, err := requestSelectedSMBProfileSync(cfg, false)
+	if err != nil || requested {
+		t.Fatalf("requested=%t error=%v", requested, err)
 	}
 }
 

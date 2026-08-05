@@ -31,3 +31,16 @@ func TestConfigRequiresProof(t *testing.T) {
 		t.Fatal("expected an empty room proof to be rejected")
 	}
 }
+
+func TestValidateAlias(t *testing.T) {
+	for _, alias := range []string{"deskferry-work", "office2", "A"} {
+		if err := ValidateAlias(alias); err != nil {
+			t.Fatalf("ValidateAlias(%q): %v", alias, err)
+		}
+	}
+	for _, alias := range []string{"", "bad alias", "-leading", "trailing-", "share.example"} {
+		if err := ValidateAlias(alias); err == nil {
+			t.Fatalf("ValidateAlias(%q) succeeded", alias)
+		}
+	}
+}

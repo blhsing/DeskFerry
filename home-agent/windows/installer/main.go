@@ -97,11 +97,12 @@ func main() {
 		return
 	}
 	requestFile := flag.String("elevated-request", "", "DPAPI-protected setup request")
+	networkRequestFile := flag.String("elevated-network-request", "", "DPAPI-protected selected-profile network request")
 	uninstall := flag.Bool("elevated-uninstall", false, "uninstall DeskFerry Home")
 	smokeTest := flag.Bool("ui-smoke-test", false, "open and close the setup UI")
 	noDialog := flag.Bool("no-dialog", false, "write the result to the console instead of displaying a dialog")
 	flag.Parse()
-	if *requestFile != "" || *uninstall {
+	if *requestFile != "" || *networkRequestFile != "" || *uninstall {
 		if !isElevated() {
 			if err := relaunchElevated(os.Args[1:]); err != nil {
 				reportResult(*noDialog, "", err)
@@ -112,6 +113,8 @@ func main() {
 		var err error
 		if *uninstall {
 			message, err = uninstallProduct()
+		} else if *networkRequestFile != "" {
+			message, err = configureNetworkFromRequest(*networkRequestFile)
 		} else {
 			message, err = installFromRequest(*requestFile)
 		}
@@ -497,20 +500,74 @@ func (a *setupApp) relayListIndexAt(x, y int) int {
 }
 
 func installFromRequest(path string) (string, error) {
-	defer os.Remove(path)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	plain, err := winsecret.Unprotect(data)
-	if err != nil {
-		return "", err
-	}
 	var opts setupOptions
-	if err := json.Unmarshal([]byte(plain), &opts); err != nil {
+	if err := readSetupRequest(path, &opts); err != nil {
 		return "", err
 	}
 	return installProduct(opts)
+}
+
+func configureNetworkFromRequest(path string) (string, error) {
+	var opts setupOptions
+	if err := readSetupRequest(path, &opts); err != nil {
+		return "", err
+	}
+	if !opts.EnableNetwork {
+		return "", errors.New("selected-profile SMB configuration requires the virtual network adapter")
+	}
+	installedDir := installedLocation()
+	if strings.TrimSpace(installedDir) == "" {
+		return "", errors.New("DeskFerry Home is not installed")
+	}
+	opts.InstallDir = installedDir
+	for _, name := range []string{"DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll"} {
+		if _, err := os.Stat(filepath.Join(installedDir, name)); err != nil {
+			return "", fmt.Errorf("installed network component is missing %s", name)
+		}
+	}
+	cfg := networkConfig(opts)
+	if err := cfg.Validate(); err != nil {
+		return "", err
+	}
+	if err := stopAndDeleteNetworkService(); err != nil {
+		return "", err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath()), 0755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(configPath(), append(data, '\n'), 0600); err != nil {
+		return "", err
+	}
+	if err := restrictConfigACL(configPath()); err != nil {
+		return "", err
+	}
+	if err := updateHostsAlias(cfg.Alias, cfg.RemoteAddress); err != nil {
+		return "", err
+	}
+	if err := createAndStartNetworkService(filepath.Join(installedDir, "DeskFerryHomeNetwork.exe"), configPath()); err != nil {
+		return "", err
+	}
+	if err := writeInstallMetadata(opts); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("DeskFerry SMB now uses profile %s at \\\\%s\\sharename.", opts.Destination, cfg.Alias), nil
+}
+
+func readSetupRequest(path string, opts *setupOptions) error {
+	defer os.Remove(path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	plain, err := winsecret.Unprotect(data)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal([]byte(plain), opts)
 }
 
 func writeSetupRequest(opts setupOptions) (string, error) {
@@ -730,10 +787,12 @@ type homeClientDestination struct {
 	RelayAddrs  []string `json:"relay_addrs"`
 	RoomProof   string   `json:"room_proof"`
 	WindowsUser string   `json:"windows_user,omitempty"`
+	SMBAlias    string   `json:"smb_alias,omitempty"`
 }
 
 type installMetadata struct {
 	InstallDir    string   `json:"install_dir"`
+	Destination   string   `json:"destination,omitempty"`
 	RelayAddrs    []string `json:"relay_addrs,omitempty"`
 	Proxy         string   `json:"proxy,omitempty"`
 	Alias         string   `json:"alias,omitempty"`
@@ -787,10 +846,10 @@ func existingSetupOptions(sourceDir string) setupOptions {
 		return opts
 	}
 	if settingsLoaded {
-		relays, proof := settings.RelayAddrs, settings.RoomProof
+		relays, proof, alias := settings.RelayAddrs, settings.RoomProof, ""
 		for _, destination := range settings.Destinations {
 			if destination.Name == settings.SelectedDestination {
-				relays, proof = destination.RelayAddrs, destination.RoomProof
+				relays, proof, alias = destination.RelayAddrs, destination.RoomProof, destination.SMBAlias
 				break
 			}
 		}
@@ -800,6 +859,9 @@ func existingSetupOptions(sourceDir string) setupOptions {
 		}
 		if strings.TrimSpace(settings.Proxy) != "" {
 			opts.Proxy = strings.TrimSpace(settings.Proxy)
+		}
+		if strings.TrimSpace(alias) != "" {
+			opts.Alias = strings.TrimSpace(alias)
 		}
 	}
 	return opts
@@ -1049,6 +1111,7 @@ func configureHomeClient(opts setupOptions, proof string) error {
 	settings.Destinations[index].Name = destinationName
 	settings.Destinations[index].RelayAddrs = relays
 	settings.Destinations[index].RoomProof = strings.TrimSpace(proof)
+	settings.Destinations[index].SMBAlias = strings.TrimSpace(opts.Alias)
 	settings.SelectedDestination = destinationName
 	settings.RelayAddr = relays[0]
 	settings.RelayAddrs = relays
@@ -1188,6 +1251,7 @@ func materializePayload(sourceDir string, networkEnabled bool) (string, func(), 
 func writeInstallMetadata(opts setupOptions) error {
 	data, err := json.Marshal(installMetadata{
 		InstallDir:    opts.InstallDir,
+		Destination:   strings.TrimSpace(opts.Destination),
 		RelayAddrs:    uniqueRelayURLs(opts.RelayAddrs),
 		Proxy:         strings.TrimSpace(opts.Proxy),
 		Alias:         strings.TrimSpace(opts.Alias),

@@ -6,11 +6,34 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"deskferry/internal/homenetwork"
 )
+
+func TestSelectedProfileSetupRequestRoundTrip(t *testing.T) {
+	want := setupOptions{
+		InstallDir: `C:\Program Files\DeskFerry Home`, Destination: "Office",
+		RelayAddrs: []string{"https://relay.example/relay/office"}, Proxy: "direct",
+		RoomProof: "derived-proof", Alias: "office-files", EnableNetwork: true,
+	}
+	path, err := writeSetupRequest(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got setupOptions
+	if err := readSetupRequest(path, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("request = %#v, want %#v", got, want)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("protected request was not removed: %v", err)
+	}
+}
 
 func TestRemoveManagedHostsBlock(t *testing.T) {
 	input := "127.0.0.1 localhost\r\n" + hostsBeginMarker + "\r\n198.18.0.2 old-name\r\n" + hostsEndMarker + "\r\n10.0.0.1 intranet\r\n"
@@ -142,6 +165,7 @@ func TestConfigureHomeClientUpdatesSelectedDestination(t *testing.T) {
 			"http://relay-backup.example/relay/b",
 		},
 		Proxy: "direct",
+		Alias: "room-b-files",
 	}
 	if err := configureHomeClient(opts, "room-b-proof"); err != nil {
 		t.Fatal(err)
@@ -157,7 +181,7 @@ func TestConfigureHomeClientUpdatesSelectedDestination(t *testing.T) {
 	if got.SelectedDestination != "Room b" || got.RoomProof != "room-b-proof" || got.Proxy != "direct" || got.WinRMUser != settings.WinRMUser {
 		t.Fatalf("settings = %#v", got)
 	}
-	if len(got.Destinations) != 3 || got.Destinations[2].RoomProof != "room-b-proof" || got.Destinations[0].WindowsUser != `DOMAIN\user` {
+	if len(got.Destinations) != 3 || got.Destinations[2].RoomProof != "room-b-proof" || got.Destinations[2].SMBAlias != "room-b-files" || got.Destinations[0].WindowsUser != `DOMAIN\user` {
 		t.Fatalf("destinations = %#v", got.Destinations)
 	}
 }

@@ -89,8 +89,8 @@ func (c Config) Validate() error {
 	if c.RoomProof == "" {
 		return errors.New("SMB file access requires a room password")
 	}
-	if !aliasPattern.MatchString(c.Alias) {
-		return errors.New("work computer alias must be a single DNS label containing only letters, numbers, and hyphens")
+	if err := ValidateAlias(c.Alias); err != nil {
+		return err
 	}
 	interfaceIP, subnet, err := net.ParseCIDR(c.InterfaceAddress)
 	if err != nil || interfaceIP.To4() == nil {
@@ -109,6 +109,13 @@ func (c Config) Validate() error {
 	}
 	if c.Tun2SocksPath == "" {
 		return errors.New("tun2socks executable path is required")
+	}
+	return nil
+}
+
+func ValidateAlias(alias string) error {
+	if !aliasPattern.MatchString(strings.TrimSpace(alias)) {
+		return errors.New("work computer alias must be a single DNS label containing only letters, numbers, and hyphens")
 	}
 	return nil
 }

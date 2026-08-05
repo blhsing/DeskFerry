@@ -32,6 +32,7 @@ import (
 	"deskferry/internal/homenetwork"
 	"deskferry/internal/tunnel"
 	"deskferry/internal/wincred"
+	"deskferry/internal/winsecret"
 )
 
 const (
@@ -62,6 +63,7 @@ type destinationProfile struct {
 	RelayAddrs  []string `json:"relay_addrs"`
 	RoomProof   string   `json:"room_proof,omitempty"`
 	WindowsUser string   `json:"windows_user,omitempty"`
+	SMBAlias    string   `json:"smb_alias,omitempty"`
 }
 
 type relayURLFlag []string
@@ -95,6 +97,8 @@ type clientApp struct {
 	proxy              *walk.LineEdit
 	rdpUser            *walk.LineEdit
 	rdpPass            *walk.LineEdit
+	smbAlias           *walk.LineEdit
+	smbUNCPreview      *walk.LineEdit
 	roomPass           *walk.LineEdit
 	clearRoomPassword  *walk.CheckBox
 	winrmListen        *walk.LineEdit
@@ -371,6 +375,10 @@ func (a *clientApp) run(smokeTest bool) error {
 												"Windows username", LineEdit{AssignTo: &a.rdpUser, Text: a.cfg.RDPUser, CueBanner: `DOMAIN\user or user@example.com`, StretchFactor: 1},
 												"Windows password", LineEdit{AssignTo: &a.rdpPass, PasswordMode: true, CueBanner: "blank uses the saved profile login", StretchFactor: 1},
 											),
+											connectionPair(
+												"SMB alias", LineEdit{AssignTo: &a.smbAlias, Text: homenetwork.DefaultAlias, CueBanner: homenetwork.DefaultAlias, StretchFactor: 1, OnTextChanged: a.updateSMBUNCPreview},
+												"UNC example", LineEdit{AssignTo: &a.smbUNCPreview, Text: `\\deskferry-work\sharename`, ReadOnly: true, StretchFactor: 1},
+											),
 										},
 									},
 									Composite{
@@ -383,9 +391,7 @@ func (a *clientApp) run(smokeTest bool) error {
 											PushButton{Text: "Copy RDP Address", MinSize: Size{Height: 30}, OnClicked: a.copyRDPAddress},
 											PushButton{Text: "Save Windows Login", MinSize: Size{Height: 30}, OnClicked: a.saveWindowsCredentials},
 											PushButton{Text: "Forget Windows Login", MinSize: Size{Height: 30}, OnClicked: a.forgetWindowsCredentials},
-											PushButton{Text: "Configure SMB Alias", MinSize: Size{Height: 30}, OnClicked: a.openHomeSetup},
 											PushButton{Text: "Relay Dashboard", MinSize: Size{Height: 30}, OnClicked: a.openDashboard},
-											PushButton{Text: "Refresh", MinSize: Size{Height: 30}, OnClicked: a.refreshRelayStatusAsync},
 										},
 									},
 								},
@@ -526,7 +532,7 @@ func destinationNames(values []destinationProfile) []string {
 func cloneDestinations(values []destinationProfile) []destinationProfile {
 	out := make([]destinationProfile, len(values))
 	for i, value := range values {
-		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RoomProof: value.RoomProof, WindowsUser: value.WindowsUser}
+		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RoomProof: value.RoomProof, WindowsUser: value.WindowsUser, SMBAlias: value.SMBAlias}
 	}
 	return out
 }
@@ -574,7 +580,21 @@ func (a *clientApp) updateDestinationEditor() {
 			_ = a.rdpPass.SetText("")
 			a.rdpPass.SetCueBanner("blank uses the saved profile login")
 		}
+		if a.smbAlias != nil {
+			_ = a.smbAlias.SetText(a.destinations[a.selectedDestination].SMBAlias)
+		}
 	}
+}
+
+func (a *clientApp) updateSMBUNCPreview() {
+	if a.smbUNCPreview == nil || a.smbAlias == nil {
+		return
+	}
+	alias := strings.TrimSpace(a.smbAlias.Text())
+	if alias == "" {
+		alias = homenetwork.DefaultAlias
+	}
+	_ = a.smbUNCPreview.SetText(`\\` + alias + `\sharename`)
 }
 
 func (a *clientApp) updateDestinationButtons() {
@@ -587,13 +607,21 @@ func (a *clientApp) updateDestinationButtons() {
 	}
 }
 
-func (a *clientApp) commitDestinationProfile() {
+func (a *clientApp) commitDestinationProfile() error {
 	if a.selectedDestination >= 0 && a.selectedDestination < len(a.destinations) {
 		a.destinations[a.selectedDestination].RelayAddrs = a.relayURLListValues()
 		if a.rdpUser != nil {
 			a.destinations[a.selectedDestination].WindowsUser = strings.TrimSpace(a.rdpUser.Text())
 		}
+		if a.smbAlias != nil {
+			alias := strings.TrimSpace(a.smbAlias.Text())
+			if err := homenetwork.ValidateAlias(alias); err != nil {
+				return err
+			}
+			a.destinations[a.selectedDestination].SMBAlias = alias
+		}
 	}
+	return nil
 }
 
 func (a *clientApp) destinationSelectionChanged() {
@@ -610,7 +638,13 @@ func (a *clientApp) destinationSelectionChanged() {
 		a.changingDestination = false
 		return
 	}
-	a.commitDestinationProfile()
+	if err := a.commitDestinationProfile(); err != nil {
+		a.changingDestination = true
+		_ = a.destinationList.SetCurrentIndex(a.selectedDestination)
+		a.changingDestination = false
+		a.showError(err)
+		return
+	}
 	a.closeWinRMSession()
 	a.selectedDestination = index
 	a.setRelayURLList(a.destinations[index].RelayAddrs, 0)
@@ -650,9 +684,12 @@ func (a *clientApp) addDestination() {
 		a.showError(err)
 		return
 	}
-	a.commitDestinationProfile()
+	if err := a.commitDestinationProfile(); err != nil {
+		a.showError(err)
+		return
+	}
 	a.destinations = append(a.destinations, destinationProfile{
-		Name: a.uniqueDestinationName(name, -1), RelayAddrs: []string{defaultRelayURL},
+		Name: a.uniqueDestinationName(name, -1), RelayAddrs: []string{defaultRelayURL}, SMBAlias: homenetwork.DefaultAlias,
 	})
 	a.selectedDestination = len(a.destinations) - 1
 	a.setDestinations(a.destinations, a.destinations[a.selectedDestination].Name)
@@ -694,11 +731,15 @@ func (a *clientApp) persistDestinationSelection() {
 	if len(a.destinations) == 0 || a.selectedDestination < 0 || a.selectedDestination >= len(a.destinations) {
 		return
 	}
-	a.commitDestinationProfile()
+	if err := a.commitDestinationProfile(); err != nil {
+		a.showError(err)
+		return
+	}
 	cfg := a.currentConfig()
 	cfg.Destinations = cloneDestinations(a.destinations)
 	cfg.SelectedDestination = a.destinations[a.selectedDestination].Name
 	cfg.RDPUser = a.destinations[a.selectedDestination].WindowsUser
+	cfg.RoomProof = a.destinations[a.selectedDestination].RoomProof
 	cfg.setRelayAddresses(a.destinations[a.selectedDestination].RelayAddrs)
 	a.mu.Lock()
 	a.cfg = cfg
@@ -709,6 +750,11 @@ func (a *clientApp) persistDestinationSelection() {
 	}
 	if err := activateWindowsProfileCredential(cfg); err != nil {
 		a.appendLog("Could not activate the selected destination's Windows login: %v", err)
+	}
+	if requested, err := requestSelectedSMBProfileSync(cfg, false); err != nil {
+		a.appendLog("Could not apply the selected SMB profile: %v", err)
+	} else if requested {
+		a.appendLog("Approve the elevation request to apply SMB alias %s for profile %s.", selectedSMBAlias(cfg), cfg.SelectedDestination)
 	}
 	a.restartHomePresence()
 	a.refreshRelayStatusAsync()
@@ -1008,6 +1054,7 @@ func (a *clientApp) connectFromUI() {
 }
 
 func (a *clientApp) saveFromUI(showMessage bool) error {
+	roomCredentialChanged := a.roomPass.Text() != "" || a.clearRoomPassword.Checked()
 	cfg, err := a.configFromUI()
 	if err != nil {
 		if showMessage {
@@ -1027,6 +1074,17 @@ func (a *clientApp) saveFromUI(showMessage bool) error {
 		}
 		return err
 	}
+	if err := activateWindowsProfileCredential(cfg); err != nil {
+		a.appendLog("Could not activate the selected destination's Windows login: %v", err)
+	}
+	if requested, syncErr := requestSelectedSMBProfileSync(cfg, roomCredentialChanged); syncErr != nil {
+		if showMessage {
+			a.showError(syncErr)
+		}
+		a.appendLog("Could not apply the selected SMB profile: %v", syncErr)
+	} else if requested {
+		a.appendLog("Approve the elevation request to apply SMB alias %s for profile %s.", selectedSMBAlias(cfg), cfg.SelectedDestination)
+	}
 	a.restartHomePresence()
 	a.refreshRelayStatusAsync()
 	if wasRunning {
@@ -1045,7 +1103,9 @@ func (a *clientApp) saveFromUI(showMessage bool) error {
 
 func (a *clientApp) configFromUI() (config, error) {
 	relayURLs := a.relayURLListValues()
-	a.commitDestinationProfile()
+	if err := a.commitDestinationProfile(); err != nil {
+		return config{}, err
+	}
 	cfg := config{
 		RelayAddrs:      relayURLs,
 		ListenAddr:      strings.TrimSpace(a.listenAddr.Text()),
@@ -1068,6 +1128,10 @@ func (a *clientApp) configFromUI() (config, error) {
 	}
 	if a.selectedDestination >= 0 && a.selectedDestination < len(cfg.Destinations) {
 		cfg.Destinations[a.selectedDestination].WindowsUser = cfg.RDPUser
+		cfg.Destinations[a.selectedDestination].SMBAlias = strings.TrimSpace(a.smbAlias.Text())
+		if err := homenetwork.ValidateAlias(cfg.Destinations[a.selectedDestination].SMBAlias); err != nil {
+			return config{}, err
+		}
 		proof := cfg.Destinations[a.selectedDestination].RoomProof
 		if a.clearRoomPassword.Checked() {
 			proof = ""
@@ -1096,6 +1160,9 @@ func (a *clientApp) setConfig(cfg config) {
 		_ = a.listenAddr.SetText(cfg.ListenAddr)
 		_ = a.proxy.SetText(cfg.Proxy)
 		_ = a.rdpUser.SetText(cfg.RDPUser)
+		if selected := cfg.selectedProfile(); selected != nil {
+			_ = a.smbAlias.SetText(selected.SMBAlias)
+		}
 		_ = a.winrmListen.SetText(cfg.WinRMListenAddr)
 		_ = a.roomPass.SetText("")
 		a.clearRoomPassword.SetChecked(false)
@@ -1429,22 +1496,6 @@ func (a *clientApp) openDashboard() {
 	}
 }
 
-func (a *clientApp) openHomeSetup() {
-	path := installedHomeSetupPath()
-	if path == "" {
-		a.showError(errors.New("DeskFerry Home Setup is not installed; run DeskFerryHomeSetup.exe to configure the SMB alias"))
-		return
-	}
-	if err := shellOpen(path); err != nil {
-		a.showError(fmt.Errorf("open DeskFerry Home Setup: %w", err))
-		return
-	}
-	// Setup updates the Home executable in place, so release its file handle
-	// before the user applies an alias or adapter configuration change.
-	a.exiting = true
-	_ = a.mw.Close()
-}
-
 func (a *clientApp) restartHomePresence() {
 	a.mu.Lock()
 	if a.statusCancel != nil {
@@ -1597,6 +1648,14 @@ func loadConfig(relayURL, listenAddr, proxyFlag string) (config, error) {
 		return config{}, err
 	}
 	cfg.setRelayAddresses(normalized)
+	if alias := installedSMBCredentialTarget(); alias != "" {
+		for index := range cfg.Destinations {
+			if strings.EqualFold(cfg.Destinations[index].Name, cfg.SelectedDestination) && strings.TrimSpace(cfg.Destinations[index].SMBAlias) == "" {
+				cfg.Destinations[index].SMBAlias = alias
+				break
+			}
+		}
+	}
 	if err := cfg.ensureDestinations(); err != nil {
 		return config{}, err
 	}
@@ -1610,7 +1669,7 @@ func defaultConfig() config {
 		RelayAddr:           defaultRelayURL,
 		RelayAddrs:          []string{defaultRelayURL},
 		Proxy:               "env",
-		Destinations:        []destinationProfile{{Name: "Work", RelayAddrs: []string{defaultRelayURL}}},
+		Destinations:        []destinationProfile{{Name: "Work", RelayAddrs: []string{defaultRelayURL}, SMBAlias: homenetwork.DefaultAlias}},
 		SelectedDestination: "Work",
 	}
 }
@@ -1710,7 +1769,7 @@ func (c *config) ensureDestinations() error {
 	}
 	current := c.relayAddresses()
 	if len(c.Destinations) == 0 {
-		c.Destinations = []destinationProfile{{Name: "Work", RelayAddrs: current, RoomProof: c.RoomProof, WindowsUser: c.RDPUser}}
+		c.Destinations = []destinationProfile{{Name: "Work", RelayAddrs: current, RoomProof: c.RoomProof, WindowsUser: c.RDPUser, SMBAlias: homenetwork.DefaultAlias}}
 		c.SelectedDestination = "Work"
 		return nil
 	}
@@ -1739,7 +1798,14 @@ func (c *config) ensureDestinations() error {
 				return fmt.Errorf("destination %q relay URLs must use the same room name", name)
 			}
 		}
-		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RoomProof: destination.RoomProof, WindowsUser: destination.WindowsUser})
+		alias := strings.TrimSpace(destination.SMBAlias)
+		if alias == "" {
+			alias = homenetwork.DefaultAlias
+		}
+		if err := homenetwork.ValidateAlias(alias); err != nil {
+			return fmt.Errorf("destination %q: %w", name, err)
+		}
+		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RoomProof: destination.RoomProof, WindowsUser: destination.WindowsUser, SMBAlias: alias})
 	}
 	selected := 0
 	for i, destination := range normalized {
@@ -1758,6 +1824,18 @@ func (c *config) ensureDestinations() error {
 	c.Destinations = normalized
 	c.SelectedDestination = normalized[selected].Name
 	c.RDPUser = normalized[selected].WindowsUser
+	return nil
+}
+
+func (c *config) selectedProfile() *destinationProfile {
+	for index := range c.Destinations {
+		if strings.EqualFold(c.Destinations[index].Name, c.SelectedDestination) {
+			return &c.Destinations[index]
+		}
+	}
+	if len(c.Destinations) > 0 {
+		return &c.Destinations[0]
+	}
 	return nil
 }
 
@@ -2401,7 +2479,7 @@ func saveWindowsCredential(cfg config, user, pass string) error {
 	if err := saveRDPCredentialTargets(cfg.ListenAddr, user, pass); err != nil {
 		return err
 	}
-	if err := saveSMBCredential(user, pass); err != nil {
+	if err := saveSMBCredential(cfg, user, pass); err != nil {
 		return err
 	}
 	return nil
@@ -2434,40 +2512,118 @@ func activateWindowsProfileCredential(cfg config) error {
 	if err := saveRDPCredentialTargets(cfg.ListenAddr, user, pass); err != nil {
 		return err
 	}
-	return saveSMBCredential(user, pass)
+	return saveSMBCredential(cfg, user, pass)
 }
 
 func deleteWindowsCredential(cfg config) error {
 	profileErr := wincred.Delete(profileCredentialTarget(cfg), wincred.TypeGeneric)
 	rdpErr := deleteRDPCredentialTargets(cfg.ListenAddr)
-	smbErr := deleteSMBCredential()
+	smbErr := deleteSMBCredential(cfg)
 	return errors.Join(profileErr, rdpErr, smbErr)
 }
 
 type homeInstallMetadata struct {
-	InstallDir    string `json:"install_dir"`
-	Alias         string `json:"alias"`
-	EnableNetwork bool   `json:"enable_network"`
+	InstallDir    string   `json:"install_dir"`
+	Destination   string   `json:"destination,omitempty"`
+	RelayAddrs    []string `json:"relay_addrs,omitempty"`
+	Proxy         string   `json:"proxy,omitempty"`
+	Alias         string   `json:"alias"`
+	EnableNetwork bool     `json:"enable_network"`
 }
 
-func installedHomeSetupPath() string {
+type selectedSMBSetupRequest struct {
+	InstallDir    string   `json:"install_dir"`
+	Destination   string   `json:"destination,omitempty"`
+	RelayAddrs    []string `json:"relay_addrs"`
+	Proxy         string   `json:"proxy"`
+	RoomProof     string   `json:"room_proof,omitempty"`
+	Alias         string   `json:"alias"`
+	EnableNetwork bool     `json:"enable_network"`
+}
+
+func requestSelectedSMBProfileSync(cfg config, force bool) (bool, error) {
+	metadata, ok := readHomeInstallMetadata()
+	if !ok || !metadata.EnableNetwork {
+		return false, nil
+	}
+	profile := cfg.selectedProfile()
+	if profile == nil {
+		return false, errors.New("no selected destination profile")
+	}
+	alias := strings.TrimSpace(profile.SMBAlias)
+	if err := homenetwork.ValidateAlias(alias); err != nil {
+		return false, err
+	}
+	relays := uniqueRelayURLs(profile.RelayAddrs)
+	proxy := strings.TrimSpace(cfg.Proxy)
+	if !force && strings.EqualFold(metadata.Destination, profile.Name) && strings.EqualFold(metadata.Alias, alias) && strings.EqualFold(metadata.Proxy, proxy) && slicesEqualFold(metadata.RelayAddrs, relays) {
+		return false, nil
+	}
+	if strings.TrimSpace(profile.RoomProof) == "" {
+		return false, errors.New("SMB file access requires a saved room password for the selected profile")
+	}
+	setupPath := filepath.Join(strings.TrimSpace(metadata.InstallDir), "DeskFerryHomeSetup.exe")
+	if _, err := os.Stat(setupPath); err != nil {
+		return false, errors.New("DeskFerry Home Setup is not installed")
+	}
+	request := selectedSMBSetupRequest{
+		InstallDir: metadata.InstallDir, Destination: profile.Name, RelayAddrs: relays,
+		Proxy: proxy, RoomProof: profile.RoomProof, Alias: alias, EnableNetwork: true,
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		return false, err
+	}
+	protected, err := winsecret.ProtectMachine(string(data))
+	if err != nil {
+		return false, err
+	}
+	file, err := os.CreateTemp("", "deskferry-home-network-*.dpapi")
+	if err != nil {
+		return false, err
+	}
+	requestPath := file.Name()
+	if _, err = file.Write(protected); err == nil {
+		err = file.Close()
+	} else {
+		_ = file.Close()
+	}
+	if err != nil {
+		_ = os.Remove(requestPath)
+		return false, err
+	}
+	params := "-elevated-network-request " + syscall.EscapeArg(requestPath) + " -no-dialog"
+	if err := shellExecute("runas", setupPath, params, filepath.Dir(setupPath)); err != nil {
+		_ = os.Remove(requestPath)
+		return false, err
+	}
+	time.AfterFunc(10*time.Minute, func() { _ = os.Remove(requestPath) })
+	return true, nil
+}
+
+func readHomeInstallMetadata() (homeInstallMetadata, bool) {
 	base := strings.TrimSpace(os.Getenv("ProgramData"))
 	if base == "" {
 		base = `C:\ProgramData`
 	}
-	data, err := os.ReadFile(filepath.Join(base, "DeskFerry", "home-install.json"))
-	if err != nil {
-		return ""
-	}
 	var metadata homeInstallMetadata
-	if json.Unmarshal(data, &metadata) != nil || strings.TrimSpace(metadata.InstallDir) == "" {
-		return ""
+	data, err := os.ReadFile(filepath.Join(base, "DeskFerry", "home-install.json"))
+	if err != nil || json.Unmarshal(data, &metadata) != nil {
+		return metadata, false
 	}
-	path := filepath.Join(strings.TrimSpace(metadata.InstallDir), "DeskFerryHomeSetup.exe")
-	if _, err := os.Stat(path); err != nil {
-		return ""
+	return metadata, true
+}
+
+func slicesEqualFold(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
 	}
-	return path
+	for index := range left {
+		if !strings.EqualFold(strings.TrimSpace(left[index]), strings.TrimSpace(right[index])) {
+			return false
+		}
+	}
+	return true
 }
 
 func installedSMBCredentialTarget() string {
@@ -2494,8 +2650,8 @@ func smbCredentialTargetFromMetadata(data []byte) string {
 	return alias
 }
 
-func saveSMBCredential(user, pass string) error {
-	target := installedSMBCredentialTarget()
+func saveSMBCredential(cfg config, user, pass string) error {
+	target := selectedSMBAlias(cfg)
 	if target == "" {
 		return nil
 	}
@@ -2505,8 +2661,8 @@ func saveSMBCredential(user, pass string) error {
 	return nil
 }
 
-func deleteSMBCredential() error {
-	target := installedSMBCredentialTarget()
+func deleteSMBCredential(cfg config) error {
+	target := selectedSMBAlias(cfg)
 	if target == "" {
 		return nil
 	}
@@ -2514,6 +2670,13 @@ func deleteSMBCredential() error {
 		return fmt.Errorf("delete SMB credentials for %s: %w", target, err)
 	}
 	return nil
+}
+
+func selectedSMBAlias(cfg config) string {
+	if profile := cfg.selectedProfile(); profile != nil && strings.TrimSpace(profile.SMBAlias) != "" {
+		return strings.TrimSpace(profile.SMBAlias)
+	}
+	return installedSMBCredentialTarget()
 }
 
 func deleteRDPCredentialTargets(listenAddr string) error {

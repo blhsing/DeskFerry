@@ -245,7 +245,7 @@ dist\windows-home-installer\DeskFerryHomeSetup.exe
 
 **Enable `\\deskferry-work\...` file access with the DeskFerry virtual network adapter** is selected by default and can be cleared for an app-only installation. When selected, enter the same relay room URL list and room password as the work agent. Setup installs the Home GUI, Start menu and Apps & Features entries, the automatic restricted network service, signed Wintun, and tun2socks. When it is cleared during an update, setup removes the network service, adapter helpers, and managed hostname while leaving the Home GUI installed.
 
-Setup doubles as the installed Home configurator. Open it from **Configure SMB Alias** in the Home app (or from the Start menu) to edit the work-computer alias, relay list, proxy, and adapter state. The Home app exits after opening Setup so its installed files can be updated; use **Open DeskFerry Home** when configuration finishes. Setup preserves the protected derived room proof during an elevated same-room update, so the password is not required again; changing rooms or enabling file access without an existing proof does require it. A complete non-interactive install or reconfiguration can be run from an elevated PowerShell session:
+Setup installs and removes the optional network component. After installation, each named destination in the Home app owns its own **SMB alias** alongside its relay URLs, room proof, and Windows login. Edit the alias directly in the Home UI and click **Save**; when the selected profile differs from the active network configuration, approve the elevation request that updates the restricted adapter service and managed hosts entry. Selecting another profile similarly offers to retarget SMB to that profile. Setup preserves the protected derived room proof during an elevated same-room update, so the password is not required again; changing rooms or enabling file access without an existing proof does require it. A complete non-interactive install or reconfiguration can be run from an elevated PowerShell session:
 
 ```powershell
 Read-Host "Room password" -MaskInput | .\DeskFerryHomeSetup.exe `
@@ -261,7 +261,7 @@ Read-Host "Room password" -MaskInput | .\DeskFerryHomeSetup.exe `
 
 The CLI actions are `install`, `configure`, `uninstall`, and `status`. `install` and `configure` update the named Home app destination as well as the optional adapter, so both use the same ordered relay list, proxy mode, and derived room proof. Use `-destination <name>` to select or create that profile, `-enable-network=false` for an app-only configuration, `-room-password-blob <path>` to read an existing machine-scope DPAPI room-password blob, and `-cli-help` for all options. From a non-elevated shell, Setup requests UAC elevation and returns after launching the elevated action.
 
-The virtual adapter has one work-destination configuration. Home Setup synchronizes it with the Home app destination named by `-destination`, but later selecting a different destination in the Home app does not automatically retarget SMB. Configure Home Setup with the relay URLs and room password for the exact work computer whose shares should appear under `\\deskferry-work`. The matching work agent must use that room, the same password, and an SMB target such as `127.0.0.1:445`. Do not point the Home adapter at a room served by a work agent on the Home PC itself: that creates a valid tunnel back to the Home PC's SMB server, so a path such as `\\deskferry-work\c$` displays the Home PC's local `C:` drive.
+The virtual adapter carries one selected work destination at a time. The Home app keeps the SMB alias per profile and retargets the privileged network service when that profile is saved or selected after UAC approval. The matching work agent must use that profile's room, the same password, and an SMB target such as `127.0.0.1:445`. Do not point the Home adapter at a room served by a work agent on the Home PC itself: that creates a valid tunnel back to the Home PC's SMB server, so a path such as `\\deskferry-work\c$` displays the Home PC's local `C:` drive.
 
 After both sides are configured, open an existing work share in Explorer:
 
@@ -731,17 +731,17 @@ Check:
 
 Check:
 
-- Home Setup's relay room is the intended file-server work computer. This setting is independent of the destination selected in the Home RDP app.
-- The work configurator has SMB target `127.0.0.1:445`, the alias used by Home setup, and a room password.
-- Home setup used the same room name and password and its file-access checkbox was selected.
+- The selected Home profile names the intended file-server work computer and has been applied after approving the elevation request.
+- The work configurator has SMB target `127.0.0.1:445`, the alias saved in the selected Home profile, and a room password.
+- The selected Home profile uses the same room name and password, and Home Setup installed the file-access component.
 - The relay dashboard reports that room as protected and shows an SMB-capable work control connection. A work agent exposing only RDP cannot serve file access.
 - The `DeskFerryHomeNetwork` service is running and the `DeskFerry` adapter has address `198.18.0.1`.
-- `Test-NetConnection deskferry-work -Port 445` reaches `198.18.0.2` on the Home PC.
+- `Test-NetConnection <profile-alias> -Port 445` reaches `198.18.0.2` on the Home PC.
 - The named Windows share exists and the supplied Windows account has both share and NTFS permission.
-- **Save Windows Login** was used for the selected destination. This registers an explicit credential for the installed SMB alias so an off-domain Home PC does not need to contact the work domain controller before Explorer authenticates to the work host.
+- **Save Windows Login** was used for the selected destination. This registers an explicit credential for that profile's SMB alias so an off-domain Home PC does not need to contact the work domain controller before Explorer authenticates to the work host.
 - The work PC was restarted once after adding or changing the SMB server alias.
 
-If `\\deskferry-work\c$` opens the Home PC's own system drive, the adapter is targeting a room whose work agent runs on the Home PC. Reconfigure Home Setup with the remote work computer's room; also enable a password and SMB on that remote work agent before retrying.
+If `\\deskferry-work\c$` opens the Home PC's own system drive, the selected profile targets a room whose work agent runs on the Home PC. Select or configure the remote work computer's profile and approve the SMB retargeting request; also enable a password and SMB on that remote work agent before retrying.
 
 If Windows reports that the target account name is incorrect in a domain, the alias lacks a matching Kerberos SPN. Register the alias through the domain's normal computer-alias/SPN administration, use the actual work hostname as the configured alias, or permit the organization's approved NTLM fallback. Microsoft documents the alias/SPN behavior in [SMB file server share access through an alias](https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/dns-cname-alias-cannot-access-smb-file-server-share).
 
@@ -762,7 +762,7 @@ The health timer restarts the relay when the local `/relay/health` endpoint fail
 
 ### Saved Windows Login
 
-The Windows home app can save one shared RDP, WinRM, and SMB login per destination through Windows Credential Manager. Enter the work Windows username and password, then click **Save Windows Login**. DeskFerry stores the destination credential for WinRM, registers it for the local RDP target and the SMB alias selected by Home Setup, writes a password-free `%APPDATA%\DeskFerry\home-client.rdp` launch profile, and clears the password field after saving. The SMB registration uses the Windows domain-password credential type directly, so the password is not exposed on a `cmdkey.exe` command line. It is never written to `%APPDATA%\DeskFerry\home-client.json` or the `.rdp` profile. **Forget Windows Login** removes all saved uses of the credential.
+The Windows home app can save one shared RDP, WinRM, and SMB login per destination through Windows Credential Manager. Enter the work Windows username and password, then click **Save Windows Login**. DeskFerry stores the destination credential for WinRM, registers it for the local RDP target and that profile's SMB alias, writes a password-free `%APPDATA%\DeskFerry\home-client.rdp` launch profile, and clears the password field after saving. The SMB registration uses the Windows domain-password credential type directly, so the password is not exposed on a `cmdkey.exe` command line. It is never written to `%APPDATA%\DeskFerry\home-client.json` or the `.rdp` profile. **Forget Windows Login** removes all saved uses of the credential.
 
 **Open Remote Desktop** and **Connect** launch MSTSC with that `.rdp` profile, so saved credentials are used automatically when Windows allows them. **Execute** in the WinRM Commands panel uses the same destination credential and keeps one authenticated PowerShell Remoting session warm for five idle minutes. Startup and destination selection or connection refresh the installed SMB alias credential, so Explorer can authenticate to paths such as `\\deskferry-work\c$` without requiring manual `cmdkey` or `net use` commands. Remote Desktop may still prompt if Windows policy blocks saved credential delegation. In that case, allow saved credentials for the `TERMSRV/*` target through Windows policy, or continue signing in manually.
 

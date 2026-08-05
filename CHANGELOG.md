@@ -5,7 +5,8 @@
 - Reused one authenticated PowerShell Remoting session for WinRM commands in the Windows Home app, with five-minute idle expiration and teardown on destination, credential, tunnel, and app changes.
 - Added per-command elapsed-time and session-reuse diagnostics plus an opt-in live WinRM benchmark.
 - Avoided automatically replaying commands after ambiguous session failures, preventing duplicate remote side effects.
-- Added a **Configure SMB Alias** action to the Windows Home app that opens the installed Home Setup configurator.
+- Made the SMB alias a per-destination Home profile setting editable directly in the Home UI, and added elevated selected-profile synchronization for the restricted adapter service and managed hosts entry.
+- Removed the redundant Home **Refresh** button because relay and presence status already update automatically.
 
 ## 0.8.0 - 2026-08-05
 
