@@ -36,7 +36,7 @@ const (
 	networkServiceName    = "DeskFerryHomeNetwork"
 	networkServiceDisplay = "DeskFerry Home Network"
 	defaultRelayURL       = "https://test-officialwebsite.azurewebsites.net/relay/workdesk"
-	productVersion        = "0.9.0"
+	productVersion        = "0.9.1"
 	hostsBeginMarker      = "# BEGIN DeskFerry Home managed alias"
 	hostsEndMarker        = "# END DeskFerry Home managed alias"
 )

@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## 0.9.1 - 2026-08-05
 
 - Stopped new local RDP negotiation or retry sockets from forcibly closing an established desktop session in the Windows and macOS Home agents.
 - Tracked concurrent local RDP sockets independently while still closing all of them cleanly when a tunnel stops.
