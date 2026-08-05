@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.7.1 - 2026-08-05
+
+- Fixed Windows PowerShell stdin adding one or more UTF-8 byte-order marks to room passwords supplied through the command-line configurators.
+- Added regression coverage for BOM-prefixed password input in both the Work Agent Configurator and Home installer.
+- Prevented apparently successful protected-room setup from storing a credential that Home agents cannot authenticate with.
+
 ## 0.7.0 - 2026-08-04
 
 - Added optional room passwords shared by RDP, WinRM, and SMB connections.

@@ -62,7 +62,7 @@ func TestParseCLIInstall(t *testing.T) {
 		"-alias", "deskferry-work",
 		"-enable-network=true",
 		"-room-password-stdin",
-	}, strings.NewReader("secret\r\n"))
+	}, strings.NewReader("\uFEFF\uFEFFsecret\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}

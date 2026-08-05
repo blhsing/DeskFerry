@@ -43,7 +43,7 @@ func TestParseCLIInstall(t *testing.T) {
 		"-winrm", "127.0.0.1:5985",
 		"-smb", "127.0.0.1:445",
 		"-smb-alias", "deskferry-work",
-	}, strings.NewReader("secret\r\n"))
+	}, strings.NewReader("\uFEFF\uFEFFsecret\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}

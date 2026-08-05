@@ -36,7 +36,7 @@ const (
 	networkServiceName    = "DeskFerryHomeNetwork"
 	networkServiceDisplay = "DeskFerry Home Network"
 	defaultRelayURL       = "https://test-officialwebsite.azurewebsites.net/relay/workdesk"
-	productVersion        = "0.7.0"
+	productVersion        = "0.7.1"
 	hostsBeginMarker      = "# BEGIN DeskFerry Home managed alias"
 	hostsEndMarker        = "# END DeskFerry Home managed alias"
 )
@@ -604,7 +604,11 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, setupOptions, error) 
 		if err != nil {
 			return "", opts, fmt.Errorf("read room password: %w", err)
 		}
-		opts.RoomPassword = strings.TrimSuffix(strings.TrimSuffix(string(value), "\n"), "\r")
+		password := string(value)
+		for strings.HasPrefix(password, "\uFEFF") {
+			password = strings.TrimPrefix(password, "\uFEFF")
+		}
+		opts.RoomPassword = strings.TrimSuffix(strings.TrimSuffix(password, "\n"), "\r")
 		if opts.RoomPassword == "" {
 			return "", opts, errors.New("room password from standard input is empty")
 		}

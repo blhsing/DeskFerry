@@ -795,7 +795,11 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error)
 		if err != nil {
 			return "", opts, fmt.Errorf("read room password: %w", err)
 		}
-		opts.RoomPassword = strings.TrimSuffix(strings.TrimSuffix(string(value), "\n"), "\r")
+		password := string(value)
+		for strings.HasPrefix(password, "\uFEFF") {
+			password = strings.TrimPrefix(password, "\uFEFF")
+		}
+		opts.RoomPassword = strings.TrimSuffix(strings.TrimSuffix(password, "\n"), "\r")
 		if opts.RoomPassword == "" {
 			return "", opts, errors.New("room password from standard input is empty")
 		}
