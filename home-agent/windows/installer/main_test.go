@@ -56,6 +56,7 @@ func TestParseCLIInstall(t *testing.T) {
 		"-cli-action", "configure",
 		"-install-dir", filepath.Join(t.TempDir(), "Home"),
 		"-source-dir", sourceDir,
+		"-destination", "Room h",
 		"-relay-url", "https://relay.example/relay/h",
 		"-relay-url", "http://relay-backup.example/relay/h",
 		"-proxy", "direct",
@@ -66,7 +67,7 @@ func TestParseCLIInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if action != "configure" || opts.RoomPassword != "secret" || len(opts.RelayAddrs) != 2 || opts.Proxy != "direct" || !opts.EnableNetwork {
+	if action != "configure" || opts.Destination != "Room h" || opts.RoomPassword != "secret" || len(opts.RelayAddrs) != 2 || opts.Proxy != "direct" || !opts.EnableNetwork {
 		t.Fatalf("action=%q options=%#v", action, opts)
 	}
 }
@@ -110,5 +111,53 @@ func TestExistingSetupOptionsLoadsInstalledNetworkConfig(t *testing.T) {
 	opts := existingSetupOptions(t.TempDir())
 	if opts.InstallDir != installDir || !opts.EnableNetwork || opts.RoomProof != "saved-proof" || opts.Proxy != "direct" {
 		t.Fatalf("options = %#v", opts)
+	}
+}
+
+func TestConfigureHomeClientUpdatesSelectedDestination(t *testing.T) {
+	appData := t.TempDir()
+	t.Setenv("APPDATA", appData)
+	settings := homeClientSettings{
+		ListenAddr:          "127.0.0.1:3390",
+		Proxy:               "env",
+		WinRMListenAddr:     "127.0.0.1:3391",
+		WinRMUser:           `DOMAIN\legacy`,
+		SelectedDestination: "Room a",
+		Destinations: []homeClientDestination{
+			{Name: "Room a", RelayAddrs: []string{"https://relay.example/relay/a"}, RoomProof: "old-proof", WindowsUser: `DOMAIN\user`},
+			{Name: "Other", RelayAddrs: []string{"https://relay.example/relay/other"}, RoomProof: "other-proof"},
+		},
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.MkdirAll(filepath.Dir(homeClientSettingsPath()), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(homeClientSettingsPath(), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	opts := setupOptions{
+		Destination: "Room b",
+		RelayAddrs: []string{
+			"https://relay.example/relay/b",
+			"http://relay-backup.example/relay/b",
+		},
+		Proxy: "direct",
+	}
+	if err := configureHomeClient(opts, "room-b-proof"); err != nil {
+		t.Fatal(err)
+	}
+	var got homeClientSettings
+	written, err := os.ReadFile(homeClientSettingsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(written, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.SelectedDestination != "Room b" || got.RoomProof != "room-b-proof" || got.Proxy != "direct" || got.WinRMUser != settings.WinRMUser {
+		t.Fatalf("settings = %#v", got)
+	}
+	if len(got.Destinations) != 3 || got.Destinations[2].RoomProof != "room-b-proof" || got.Destinations[0].WindowsUser != `DOMAIN\user` {
+		t.Fatalf("destinations = %#v", got.Destinations)
 	}
 }

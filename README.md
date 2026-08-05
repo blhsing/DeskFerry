@@ -250,6 +250,7 @@ Setup doubles as the installed Home configurator. When reopened, its UI and CLI 
 ```powershell
 Read-Host "Room password" -MaskInput | .\DeskFerryHomeSetup.exe `
   -cli-action configure `
+  -destination 'Work desk' `
   -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk `
   -relay-url http://217.142.228.117/relay/workdesk `
   -proxy direct `
@@ -258,9 +259,9 @@ Read-Host "Room password" -MaskInput | .\DeskFerryHomeSetup.exe `
   -room-password-stdin
 ```
 
-The CLI actions are `install`, `configure`, `uninstall`, and `status`. Use `-enable-network=false` for an app-only configuration, `-room-password-blob <path>` to read an existing machine-scope DPAPI room-password blob, and `-cli-help` for all options. From a non-elevated shell, Setup requests UAC elevation and returns after launching the elevated action.
+The CLI actions are `install`, `configure`, `uninstall`, and `status`. `install` and `configure` update the named Home app destination as well as the optional adapter, so both use the same ordered relay list, proxy mode, and derived room proof. Use `-destination <name>` to select or create that profile, `-enable-network=false` for an app-only configuration, `-room-password-blob <path>` to read an existing machine-scope DPAPI room-password blob, and `-cli-help` for all options. From a non-elevated shell, Setup requests UAC elevation and returns after launching the elevated action.
 
-The virtual adapter has its own single work-destination configuration. It does not automatically follow the destination currently selected in the Home RDP app. Configure Home Setup with the relay URLs and room password for the exact work computer whose shares should appear under `\\deskferry-work`; changing the selected RDP destination alone does not retarget SMB. The matching work agent must use that room, the same password, and an SMB target such as `127.0.0.1:445`. Do not point the Home adapter at a room served by a work agent on the Home PC itself: that creates a valid tunnel back to the Home PC's SMB server, so a path such as `\\deskferry-work\c$` displays the Home PC's local `C:` drive.
+The virtual adapter has one work-destination configuration. Home Setup synchronizes it with the Home app destination named by `-destination`, but later selecting a different destination in the Home app does not automatically retarget SMB. Configure Home Setup with the relay URLs and room password for the exact work computer whose shares should appear under `\\deskferry-work`. The matching work agent must use that room, the same password, and an SMB target such as `127.0.0.1:445`. Do not point the Home adapter at a room served by a work agent on the Home PC itself: that creates a valid tunnel back to the Home PC's SMB server, so a path such as `\\deskferry-work\c$` displays the Home PC's local `C:` drive.
 
 After both sides are configured, open an existing work share in Explorer:
 

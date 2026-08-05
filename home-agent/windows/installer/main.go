@@ -54,6 +54,7 @@ var installedFiles = []string{
 type setupOptions struct {
 	InstallDir    string   `json:"install_dir"`
 	SourceDir     string   `json:"source_dir"`
+	Destination   string   `json:"destination,omitempty"`
 	RelayAddrs    []string `json:"relay_addrs"`
 	Proxy         string   `json:"proxy"`
 	RoomPassword  string   `json:"room_password"`
@@ -84,6 +85,7 @@ type setupApp struct {
 	relayDragging   bool
 	roomProof       string
 	roomProofRoom   string
+	destination     string
 }
 
 func main() {
@@ -224,6 +226,7 @@ func (a *setupApp) run(smokeTest bool) error {
 	_ = a.alias.SetText(initial.Alias)
 	a.roomProof = initial.RoomProof
 	a.roomProofRoom = relayRoom(initial.RelayAddrs)
+	a.destination = initial.Destination
 	a.setRelayURLList(initial.RelayAddrs, 0)
 	a.updateNetworkControls()
 	a.refreshStatus()
@@ -270,6 +273,7 @@ func (a *setupApp) options() setupOptions {
 	opts := setupOptions{
 		InstallDir:    strings.TrimSpace(a.installDir.Text()),
 		SourceDir:     filepath.Dir(exe),
+		Destination:   strings.TrimSpace(a.destination),
 		RelayAddrs:    append([]string(nil), a.relayURLs...),
 		Proxy:         strings.TrimSpace(a.proxy.Text()),
 		RoomPassword:  a.roomPassword.Text(),
@@ -558,6 +562,7 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, setupOptions, error) 
 	action := fs.String("cli-action", "", "install, configure, uninstall, or status")
 	fs.StringVar(&opts.InstallDir, "install-dir", initial.InstallDir, "installation directory")
 	fs.StringVar(&opts.SourceDir, "source-dir", initial.SourceDir, "setup payload directory")
+	fs.StringVar(&opts.Destination, "destination", initial.Destination, "Home app destination name to configure")
 	fs.Var(&relayURLs, "relay-url", "relay room URL; repeat for multiple relays")
 	fs.StringVar(&opts.Proxy, "proxy", initial.Proxy, "env, direct, or an HTTP(S) proxy URL")
 	fs.StringVar(&opts.Alias, "alias", initial.Alias, "work computer alias")
@@ -697,6 +702,7 @@ func printCLIUsage(output io.Writer) {
 	fmt.Fprintln(output, "Actions: install, configure, uninstall, status")
 	fmt.Fprintln(output, "  -install-dir PATH          Installation directory")
 	fmt.Fprintln(output, "  -source-dir PATH           Setup payload directory")
+	fmt.Fprintln(output, "  -destination NAME         Home app destination profile to configure")
 	fmt.Fprintln(output, "  -relay-url URL             Relay room URL; repeat for multiple relays")
 	fmt.Fprintln(output, "  -proxy VALUE               env, direct, or an HTTP(S) proxy URL")
 	fmt.Fprintln(output, "  -alias NAME                Work computer alias")
@@ -707,17 +713,23 @@ func printCLIUsage(output io.Writer) {
 }
 
 type homeClientSettings struct {
+	ListenAddr          string                  `json:"listen_addr,omitempty"`
+	RelayAddr           string                  `json:"relay_addr,omitempty"`
 	RelayAddrs          []string                `json:"relay_addrs"`
 	Proxy               string                  `json:"proxy"`
+	RDPUser             string                  `json:"rdp_user,omitempty"`
+	WinRMListenAddr     string                  `json:"winrm_listen_addr,omitempty"`
+	WinRMUser           string                  `json:"winrm_user,omitempty"`
 	RoomProof           string                  `json:"room_proof"`
 	Destinations        []homeClientDestination `json:"destinations"`
 	SelectedDestination string                  `json:"selected_destination"`
 }
 
 type homeClientDestination struct {
-	Name       string   `json:"name"`
-	RelayAddrs []string `json:"relay_addrs"`
-	RoomProof  string   `json:"room_proof"`
+	Name        string   `json:"name"`
+	RelayAddrs  []string `json:"relay_addrs"`
+	RoomProof   string   `json:"room_proof"`
+	WindowsUser string   `json:"windows_user,omitempty"`
 }
 
 type installMetadata struct {
@@ -754,6 +766,13 @@ func existingSetupOptions(sourceDir string) setupOptions {
 		}
 		opts.EnableNetwork = metadata.EnableNetwork
 	}
+	settingsPath := homeClientSettingsPath()
+	var settings homeClientSettings
+	settingsLoaded := false
+	if data, err := os.ReadFile(settingsPath); err == nil && json.Unmarshal(data, &settings) == nil {
+		settingsLoaded = true
+		opts.Destination = strings.TrimSpace(settings.SelectedDestination)
+	}
 	var cfg homenetwork.Config
 	if data, err := os.ReadFile(configPath()); err == nil && json.Unmarshal(data, &cfg) == nil {
 		cfg = cfg.WithDefaults(opts.InstallDir)
@@ -767,9 +786,7 @@ func existingSetupOptions(sourceDir string) setupOptions {
 	if metadataLoaded {
 		return opts
 	}
-	settingsPath := filepath.Join(strings.TrimSpace(os.Getenv("APPDATA")), "DeskFerry", "home-client.json")
-	var settings homeClientSettings
-	if data, err := os.ReadFile(settingsPath); err == nil && json.Unmarshal(data, &settings) == nil {
+	if settingsLoaded {
 		relays, proof := settings.RelayAddrs, settings.RoomProof
 		for _, destination := range settings.Destinations {
 			if destination.Name == settings.SelectedDestination {
@@ -942,6 +959,9 @@ func installProduct(opts setupOptions) (string, error) {
 		if err := writeInstallMetadata(opts); err != nil {
 			return "", err
 		}
+		if err := configureHomeClient(opts, networkConfig(opts).RoomProof); err != nil {
+			return "", err
+		}
 		return "DeskFerry Home was installed without the optional virtual network adapter.", nil
 	}
 	for _, name := range []string{"DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
@@ -972,7 +992,80 @@ func installProduct(opts setupOptions) (string, error) {
 	if err := writeInstallMetadata(opts); err != nil {
 		return "", err
 	}
+	if err := configureHomeClient(opts, cfg.RoomProof); err != nil {
+		return "", err
+	}
 	return fmt.Sprintf("DeskFerry Home and file access were installed. Open \\\\%s\\sharename after the work agent enables SMB.", cfg.Alias), nil
+}
+
+func configureHomeClient(opts setupOptions, proof string) error {
+	path := homeClientSettingsPath()
+	settings := homeClientSettings{
+		ListenAddr:      "127.0.0.1:3390",
+		WinRMListenAddr: "127.0.0.1:3391",
+		Proxy:           "env",
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &settings); err != nil {
+			return fmt.Errorf("decode Home app settings: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read Home app settings: %w", err)
+	}
+	relays := uniqueRelayURLs(opts.RelayAddrs)
+	if len(relays) == 0 {
+		return errors.New("at least one relay room URL is required to configure the Home app")
+	}
+	destinationName := strings.TrimSpace(opts.Destination)
+	if destinationName == "" {
+		destinationName = strings.TrimSpace(settings.SelectedDestination)
+	}
+	if destinationName == "" {
+		destinationName = "Work"
+	}
+	index := -1
+	for i := range settings.Destinations {
+		if strings.EqualFold(strings.TrimSpace(settings.Destinations[i].Name), destinationName) {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		settings.Destinations = append(settings.Destinations, homeClientDestination{Name: destinationName})
+		index = len(settings.Destinations) - 1
+	}
+	existing := settings.Destinations[index]
+	if proof == "" && relayRoom(existing.RelayAddrs) == relayRoom(relays) {
+		proof = strings.TrimSpace(existing.RoomProof)
+	}
+	settings.Destinations[index].Name = destinationName
+	settings.Destinations[index].RelayAddrs = relays
+	settings.Destinations[index].RoomProof = strings.TrimSpace(proof)
+	settings.SelectedDestination = destinationName
+	settings.RelayAddr = relays[0]
+	settings.RelayAddrs = relays
+	settings.RoomProof = strings.TrimSpace(proof)
+	settings.Proxy = strings.TrimSpace(opts.Proxy)
+	if settings.Proxy == "" {
+		settings.Proxy = "env"
+	}
+	if strings.TrimSpace(settings.ListenAddr) == "" {
+		settings.ListenAddr = "127.0.0.1:3390"
+	}
+	if strings.TrimSpace(settings.WinRMListenAddr) == "" {
+		settings.WinRMListenAddr = "127.0.0.1:3391"
+	}
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0600); err != nil {
+		return fmt.Errorf("save Home app settings: %w", err)
+	}
+	return nil
 }
 
 func uninstallProduct() (string, error) {
@@ -1320,6 +1413,14 @@ func configPath() string {
 		base = `C:\ProgramData`
 	}
 	return filepath.Join(base, "DeskFerry", "home-network.json")
+}
+
+func homeClientSettingsPath() string {
+	base := strings.TrimSpace(os.Getenv("APPDATA"))
+	if base == "" {
+		base = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Roaming")
+	}
+	return filepath.Join(base, "DeskFerry", "home-client.json")
 }
 
 func installMetadataPath() string {
