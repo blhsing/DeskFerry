@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## 0.9.0 - 2026-08-05
 
 - Reused one authenticated PowerShell Remoting session for WinRM commands in the Windows Home app, with five-minute idle expiration and teardown on destination, credential, tunnel, and app changes.
 - Added per-command elapsed-time and session-reuse diagnostics plus an opt-in live WinRM benchmark.
