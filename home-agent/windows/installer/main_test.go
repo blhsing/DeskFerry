@@ -161,3 +161,44 @@ func TestConfigureHomeClientUpdatesSelectedDestination(t *testing.T) {
 		t.Fatalf("destinations = %#v", got.Destinations)
 	}
 }
+
+func TestConfigureHomeClientPreservesSelectedDestinationProofOnUpgrade(t *testing.T) {
+	appData := t.TempDir()
+	t.Setenv("APPDATA", appData)
+	settings := homeClientSettings{
+		SelectedDestination: "Work",
+		Destinations: []homeClientDestination{
+			{
+				Name:       "Work",
+				RelayAddrs: []string{"https://relay.example/relay/h", "http://relay-backup.example/relay/h"},
+				RoomProof:  "home-profile-proof",
+			},
+		},
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.MkdirAll(filepath.Dir(homeClientSettingsPath()), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(homeClientSettingsPath(), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	opts := setupOptions{
+		Destination: "Work",
+		RelayAddrs:  []string{"https://relay.example/relay/h", "http://relay-backup.example/relay/h"},
+		RoomProof:   "network-component-proof",
+	}
+	if err := configureHomeClient(opts, opts.RoomProof); err != nil {
+		t.Fatal(err)
+	}
+	var got homeClientSettings
+	written, err := os.ReadFile(homeClientSettingsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(written, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.RoomProof != "home-profile-proof" || got.Destinations[0].RoomProof != "home-profile-proof" {
+		t.Fatalf("upgrade replaced the selected destination proof: %#v", got)
+	}
+}

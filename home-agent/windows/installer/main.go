@@ -1035,8 +1035,16 @@ func configureHomeClient(opts setupOptions, proof string) error {
 		index = len(settings.Destinations) - 1
 	}
 	existing := settings.Destinations[index]
-	if proof == "" && relayRoom(existing.RelayAddrs) == relayRoom(relays) {
-		proof = strings.TrimSpace(existing.RoomProof)
+	if relayRoom(existing.RelayAddrs) == relayRoom(relays) {
+		existingProof := strings.TrimSpace(existing.RoomProof)
+		if opts.RoomPassword == "" && existingProof != "" {
+			// An in-place install loads the network component's proof from
+			// machine metadata. Do not let it overwrite the Home user's
+			// independently saved proof unless a new password was supplied.
+			proof = existingProof
+		} else if proof == "" {
+			proof = existingProof
+		}
 	}
 	settings.Destinations[index].Name = destinationName
 	settings.Destinations[index].RelayAddrs = relays
