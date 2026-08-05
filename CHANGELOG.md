@@ -8,6 +8,7 @@
 - Made normal completion, unknown-session rejection, and authentication rejection terminal so completed sessions no longer create resume storms or temporary slot starvation.
 - Preserved the legacy slot protocol behind dual-protocol relays and the `DESKFERRY_FORCE_LEGACY=1` work-service rollback switch.
 - Expanded relay status with control identities, protocol version, active and pending sessions by service, and busy/no-agent rejection counters.
+- Made in-place Windows Home upgrades preserve the selected destination's saved room password proof unless a new password is explicitly supplied.
 
 ## 0.7.2 - 2026-08-05
 
