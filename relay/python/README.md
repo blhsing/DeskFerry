@@ -8,7 +8,8 @@ It matches the .NET relay contract:
 - `GET /relay/health` health JSON.
 - `GET /relay/status?room=<room>` status JSON.
 - `GET /relay/ws` and `GET /relay/<room>/ws` WebSocket endpoints.
-- WebSocket roles through `X-DeskFerry-Role`: `agent`, `client`, `home-agent`, `probe`, and `dashboard`.
+- WebSocket roles through `X-DeskFerry-Role`: `agent-control`, `agent-session`, `client`, `resume`, legacy `agent`, `home-agent`, `probe`, and `dashboard`.
+- Typed protocol-v2 session offers, immediate busy/no-agent results, on-demand data connections, and legacy rollback compatibility.
 
 Run locally:
 

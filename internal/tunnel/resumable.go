@@ -233,6 +233,10 @@ func (c *resumableWebSocketConn) connectionLoop(initial *websocket.Conn) {
 			ws = candidate
 			continue
 		}
+		if IsTerminalSessionError(err) {
+			c.setTerminal(fmt.Errorf("relay session %s is closed: %w", c.opts.SessionID, err))
+			return
+		}
 		timer := time.NewTimer(backoff)
 		select {
 		case <-c.ctx.Done():

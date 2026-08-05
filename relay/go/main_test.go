@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -179,6 +181,171 @@ func TestAgentClientPairAndBridgeBytes(t *testing.T) {
 	}
 }
 
+func TestV2OnDemandSessionPairingAndBusyRejection(t *testing.T) {
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	relayAddr := server.URL + "/relay/unit-v2"
+	controlHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(controlHeaders)
+	controlHeaders.Set(tunnel.HeaderAgentInstance, "unit-agent")
+	controlHeaders.Set(tunnel.HeaderAgentServices, tunnel.ServiceRDP)
+	controlHeaders.Set(tunnel.HeaderConcurrency, "1")
+	control, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleAgentControl, "", controlHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(control)
+	if err := tunnel.AwaitControlReady(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+
+	clientHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(clientHeaders)
+	clientHeaders.Set(tunnel.HeaderResumable, "1")
+	tunnel.AddServiceHeader(clientHeaders, tunnel.ServiceRDP)
+	client, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleClient, "", clientHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(client)
+	offer, err := tunnel.ReadControlMessage(ctx, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tunnel.ValidateSessionOffer(offer, "unit-v2", "unit-agent", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tunnel.WriteControlMessage(ctx, control, tunnel.ControlMessage{Type: tunnel.MessageAccept, SessionID: offer.SessionID}); err != nil {
+		t.Fatal(err)
+	}
+
+	agentHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(agentHeaders)
+	agentHeaders.Set(tunnel.HeaderAgentInstance, "unit-agent")
+	agentHeaders.Set(tunnel.HeaderSessionID, offer.SessionID)
+	agentHeaders.Set(tunnel.HeaderResumable, "1")
+	tunnel.AddServiceHeader(agentHeaders, tunnel.ServiceRDP)
+	agent, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleAgentSession, "", agentHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(agent)
+	if id, err := tunnel.AwaitSessionReady(ctx, agent); err != nil || id != offer.SessionID {
+		t.Fatalf("agent ready id=%q error=%v", id, err)
+	}
+	if id, v2, err := tunnel.AwaitSessionReadyCompatible(ctx, client); err != nil || !v2 || id != offer.SessionID {
+		t.Fatalf("client ready id=%q v2=%t error=%v", id, v2, err)
+	}
+
+	busyClient, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleClient, "", clientHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(busyClient)
+	started := time.Now()
+	_, _, err = tunnel.AwaitSessionReadyCompatible(ctx, busyClient)
+	var rejected *tunnel.SessionResultError
+	if !errors.As(err, &rejected) || rejected.Result != tunnel.MessageBusy {
+		t.Fatalf("busy rejection = %v", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("busy rejection took %s", time.Since(started))
+	}
+
+	if err := client.Write(ctx, websocket.MessageBinary, []byte("from-home-v2")); err != nil {
+		t.Fatal(err)
+	}
+	expectBinary(t, ctx, agent, "from-home-v2")
+	status := getStatus(t, server.URL, "unit-v2")
+	if len(status.Rooms) != 1 || status.Rooms[0].ControlConnections != 1 || status.Rooms[0].PendingRequests != 0 || status.Rooms[0].BusyRejections != 1 {
+		t.Fatalf("unexpected v2 status: %+v", status.Rooms)
+	}
+}
+
+func TestV2NoAgentIsImmediateTypedResult(t *testing.T) {
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	headers := http.Header{}
+	tunnel.AddProtocolV2Header(headers)
+	client, err := tunnel.DialWebSocketWithHeaders(ctx, server.URL+"/relay/unit-no-agent", "direct", tunnel.RoleClient, "", headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(client)
+	started := time.Now()
+	_, _, err = tunnel.AwaitSessionReadyCompatible(ctx, client)
+	var rejected *tunnel.SessionResultError
+	if !errors.As(err, &rejected) || rejected.Result != tunnel.MessageNoAgent {
+		t.Fatalf("no-agent rejection = %v", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("no-agent rejection took %s", time.Since(started))
+	}
+}
+
+func TestLegacyClientPairsThroughV2Control(t *testing.T) {
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	relayAddr := server.URL + "/relay/unit-mixed"
+	controlHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(controlHeaders)
+	controlHeaders.Set(tunnel.HeaderAgentInstance, "unit-agent")
+	controlHeaders.Set(tunnel.HeaderAgentServices, tunnel.ServiceSMB)
+	controlHeaders.Set(tunnel.HeaderConcurrency, "1")
+	control, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleAgentControl, "", controlHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(control)
+	if err := tunnel.AwaitControlReady(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+	legacyHeaders := http.Header{}
+	tunnel.AddServiceHeader(legacyHeaders, tunnel.ServiceSMB)
+	client, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleClient, "", legacyHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(client)
+	offer, err := tunnel.ReadControlMessage(ctx, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offer.Resumable || offer.Service != tunnel.ServiceSMB {
+		t.Fatalf("mixed offer resumable=%t service=%q", offer.Resumable, offer.Service)
+	}
+	if err := tunnel.WriteControlMessage(ctx, control, tunnel.ControlMessage{Type: tunnel.MessageAccept, SessionID: offer.SessionID}); err != nil {
+		t.Fatal(err)
+	}
+	agentHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(agentHeaders)
+	agentHeaders.Set(tunnel.HeaderAgentInstance, "unit-agent")
+	agentHeaders.Set(tunnel.HeaderSessionID, offer.SessionID)
+	tunnel.AddServiceHeader(agentHeaders, tunnel.ServiceSMB)
+	agent, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleAgentSession, "", agentHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(agent)
+	if _, err := tunnel.AwaitSessionReady(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := tunnel.AwaitWebSocketStartSession(ctx, client); err != nil || id != offer.SessionID {
+		t.Fatalf("legacy start id=%q error=%v", id, err)
+	}
+	if err := client.Write(ctx, websocket.MessageBinary, []byte("legacy-smb")); err != nil {
+		t.Fatal(err)
+	}
+	expectBinary(t, ctx, agent, "legacy-smb")
+}
+
 func TestResumablePairReattachesAfterWebSocketDrop(t *testing.T) {
 	server := httptest.NewServer(newServer())
 	defer server.Close()
@@ -312,6 +479,21 @@ func TestAgentIdentityReplacesExistingWaitingSocket(t *testing.T) {
 	defer stopRead()
 	if _, _, err := first.Read(readCtx); err == nil {
 		t.Fatal("replaced agent socket stayed readable/open")
+	}
+}
+
+func TestProtocolV2ControlRemovesSameAgentLegacySlots(t *testing.T) {
+	room := NewRelayRoom("rollout")
+	for slot := 1; slot <= 4; slot++ {
+		identity := AgentIdentity{Instance: "agent-a", Slot: fmt.Sprint(slot), Service: serviceRDP}
+		room.EnqueueAgent(nil, "legacy", identity, true, serviceRDP)
+	}
+	other, _ := room.EnqueueAgent(nil, "other", AgentIdentity{Instance: "agent-b", Slot: "1", Service: serviceRDP}, true, serviceRDP)
+	if removed := room.RemoveLegacyAgents("agent-a"); removed != 4 {
+		t.Fatalf("removed legacy slots = %d, want 4", removed)
+	}
+	if got := room.TryTakeAgent(serviceRDP); got != other {
+		t.Fatalf("remaining legacy agent = %p, want %p", got, other)
 	}
 }
 

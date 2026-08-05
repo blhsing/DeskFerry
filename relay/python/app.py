@@ -21,7 +21,9 @@ RESUME_ROLE = "resume"
 STARTED = "started"
 AGENT_UNAVAILABLE = "agent-unavailable"
 CLIENT_UNAVAILABLE = "client-unavailable"
-VALID_ROLES = {"agent", "client", "home-agent", "probe", RESUME_ROLE, DASHBOARD_ROLE}
+VALID_ROLES = {"agent", "agent-control", "agent-session", "client", "home-agent", "probe", RESUME_ROLE, DASHBOARD_ROLE}
+PROTOCOL_VERSION = 2
+SESSION_OFFER_SECONDS = 8
 
 logger = logging.getLogger("deskferry.relay")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -130,6 +132,22 @@ def read_resumable(websocket: WebSocket) -> bool:
     return websocket.headers.get("x-deskferry-resumable", "").strip().lower() in {"1", "true"}
 
 
+def read_agent_services(websocket: WebSocket) -> set[str]:
+    return {
+        value.strip().lower()
+        for value in websocket.headers.get("x-deskferry-agent-services", "").split(",")
+        if value.strip().lower() in {"rdp", "winrm", "smb"}
+    }
+
+
+def read_concurrency(websocket: WebSocket) -> int:
+    try:
+        value = int(websocket.headers.get("x-deskferry-concurrency", "4"))
+    except ValueError:
+        return 4
+    return value if 1 <= value <= 256 else 4
+
+
 def read_room_proof(websocket: WebSocket) -> str:
     return websocket.headers.get("x-deskferry-room-proof", "").strip()
 
@@ -224,6 +242,17 @@ async def send_control(websocket: WebSocket, message: str, side: str, room: str,
         return False
 
 
+async def send_v2(websocket: WebSocket, message: dict[str, Any]) -> bool:
+    message = {**message, "protocol_version": message.get("protocol_version", PROTOCOL_VERSION)}
+    try:
+        await asyncio.wait_for(websocket.send_json(message), timeout=5)
+        return True
+    except (asyncio.CancelledError, WebSocketDisconnect):
+        return False
+    except Exception:
+        return False
+
+
 @dataclass
 class AgentIdentity:
     instance: str = ""
@@ -278,6 +307,13 @@ class RelayRoom:
         self._lock = asyncio.Lock()
         self._agents: deque[WaitingAgent] = deque()
         self._active_pairs = 0
+        self._control_connections = 0
+        self._pending_requests = 0
+        self._busy_rejections = 0
+        self._no_agent_rejections = 0
+        self._control_agents: dict[str, int] = {}
+        self._pending_by_service: dict[str, int] = {}
+        self._active_by_service: dict[str, int] = {}
         self._credential_set = False
         self._room_proof = ""
         self._total_pairs = 0
@@ -294,7 +330,7 @@ class RelayRoom:
     async def authorize_agent(self, proof: str) -> bool:
         async with self._lock:
             self._prune_closed_agents_locked()
-            if not self._credential_set or (not self._agents and self._active_pairs == 0):
+            if not self._credential_set or (not self._agents and self._control_connections == 0 and self._active_pairs == 0):
                 self._credential_set = True
                 self._room_proof = proof
                 return True
@@ -339,10 +375,74 @@ class RelayRoom:
                     self._agents.append(waiting)
         return None
 
+    async def has_waiting_agent(self, service: str) -> bool:
+        async with self._lock:
+            self._prune_closed_agents_locked()
+            return any(waiting.is_open and waiting.service == service for waiting in self._agents)
+
+    async def control_connected(self, agent_id: str, remote: str) -> None:
+        async with self._lock:
+            self._control_connections += 1
+            self._control_agents[agent_id] = self._control_agents.get(agent_id, 0) + 1
+            self._last_agent_remote = remote
+            self._last_agent_connected_at = utc_now()
+
+    async def control_disconnected(self, agent_id: str) -> None:
+        async with self._lock:
+            self._control_connections = max(0, self._control_connections - 1)
+            count = self._control_agents.get(agent_id, 0)
+            if count <= 1:
+                self._control_agents.pop(agent_id, None)
+            else:
+                self._control_agents[agent_id] = count - 1
+            self._last_agent_disconnected_at = utc_now()
+
+    async def pending_started(self, service: str) -> None:
+        async with self._lock:
+            self._pending_requests += 1
+            self._pending_by_service[service] = self._pending_by_service.get(service, 0) + 1
+
+    async def pending_ended(self, service: str) -> None:
+        async with self._lock:
+            self._pending_requests = max(0, self._pending_requests - 1)
+            self._pending_by_service[service] = max(0, self._pending_by_service.get(service, 0) - 1)
+
+    async def service_session_started(self, service: str) -> None:
+        async with self._lock:
+            self._active_by_service[service] = self._active_by_service.get(service, 0) + 1
+
+    async def service_session_ended(self, service: str) -> None:
+        async with self._lock:
+            self._active_by_service[service] = max(0, self._active_by_service.get(service, 0) - 1)
+
+    async def record_rejection(self, result: str) -> None:
+        async with self._lock:
+            if result == "busy":
+                self._busy_rejections += 1
+            elif result == "no-agent":
+                self._no_agent_rejections += 1
+
     async def remove_waiting(self, waiting: WaitingAgent) -> None:
         async with self._lock:
             self._agents = deque(agent for agent in self._agents if agent is not waiting)
             self._last_agent_disconnected_at = utc_now()
+
+    async def remove_legacy_agents(self, instance: str) -> int:
+        removed: list[WaitingAgent] = []
+        async with self._lock:
+            self._prune_closed_agents_locked()
+            kept: deque[WaitingAgent] = deque()
+            while self._agents:
+                agent = self._agents.popleft()
+                if instance and agent.identity.instance == instance:
+                    agent.try_cancel()
+                    removed.append(agent)
+                else:
+                    kept.append(agent)
+            self._agents = kept
+        for agent in removed:
+            await close_quietly(agent.websocket, 1000, "replaced by protocol v2 control connection")
+        return len(removed)
 
     async def home_agent_connected(self, remote: str) -> None:
         async with self._lock:
@@ -414,6 +514,14 @@ class RelayRoom:
                 "id": self.id,
                 "protected": self._credential_set and bool(self._room_proof),
                 "waiting_agents": len(self._agents),
+                "control_connections": self._control_connections,
+                "pending_requests": self._pending_requests,
+                "busy_rejections": self._busy_rejections,
+                "no_agent_rejections": self._no_agent_rejections,
+                "control_agents": sorted(self._control_agents),
+                "protocol_version": PROTOCOL_VERSION,
+                "pending_by_service": dict(self._pending_by_service),
+                "active_sessions_by_service": dict(self._active_by_service),
                 "active_pairs": self._active_pairs,
                 "total_pairs": self._total_pairs,
                 "last_agent_remote": self._last_agent_remote,
@@ -488,7 +596,7 @@ class ResumeSession:
         try:
             while True:
                 first, second = await bridge_once(agent, client)
-                if first.close_code == 1000:
+                if first.close_code == 1000 or second.close_code == 1000:
                     await close_quietly(agent, 1000, "session closed")
                     await close_quietly(client, 1000, "session closed")
                     if agent_attachment is not None:
@@ -561,12 +669,255 @@ class DashboardClient:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+@dataclass
+class AgentControl:
+    room: RelayRoom
+    websocket: WebSocket
+    remote: str
+    agent_id: str
+    services: set[str]
+    concurrency: int
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    in_use: int = 0
+    closed: bool = False
+
+    def reserve(self) -> bool:
+        if self.closed or self.in_use >= self.concurrency:
+            return False
+        self.in_use += 1
+        return True
+
+    def release(self) -> None:
+        self.in_use = max(0, self.in_use - 1)
+
+    async def send(self, message: dict[str, Any]) -> bool:
+        async with self.send_lock:
+            return not self.closed and await send_v2(self.websocket, message)
+
+
+@dataclass
+class AgentDataSocket:
+    websocket: WebSocket
+    remote: str
+    resumable: bool
+    done: asyncio.Future[None] = field(default_factory=asyncio.Future)
+
+
+@dataclass
+class PendingSession:
+    id: str
+    room: RelayRoom
+    control: AgentControl
+    client: WebSocket
+    remote: str
+    proof: str
+    service: str
+    resumable: bool
+    created_at: datetime
+    expires_at: datetime
+    response: asyncio.Future[dict[str, Any]] = field(default_factory=asyncio.Future)
+    agent: asyncio.Future[AgentDataSocket] = field(default_factory=asyncio.Future)
+
+
 class RelayHub:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._rooms: dict[str, RelayRoom] = {}
         self._dashboards: dict[str, DashboardClient] = {}
         self._sessions: dict[str, ResumeSession] = {}
+        self._controls: dict[str, AgentControl] = {}
+        self._pending: dict[str, PendingSession] = {}
+
+    async def serve_agent_control(
+        self, token: str, websocket: WebSocket, remote: str, agent_id: str,
+        services: set[str], concurrency: int, proof: str = "",
+    ) -> None:
+        room = await self._room_for(token)
+        if not agent_id or not services:
+            await send_v2(websocket, {"type": "invalid-request", "reason": "agent identity and services are required"})
+            await close_quietly(websocket, 1008, "invalid agent control request")
+            return
+        if not await room.authorize_agent(proof):
+            await send_v2(websocket, {"type": "authentication-failed", "reason": "room authentication failed"})
+            await close_quietly(websocket, 1008, "room authentication failed")
+            return
+        control = AgentControl(room, websocket, remote, agent_id, services, concurrency)
+        key = f"{room.id}/{agent_id}"
+        previous = self._controls.get(key)
+        self._controls[key] = control
+        await room.control_connected(agent_id, remote)
+        removed_legacy = await room.remove_legacy_agents(agent_id)
+        if previous is not None:
+            previous.closed = True
+            await close_quietly(previous.websocket, 1000, "replaced by newer control connection")
+        self.notify_dashboards()
+        try:
+            if not await control.send({"type": "control-ready", "agent_id": agent_id}):
+                return
+            logger.info("agent control connected room=%s agent=%s services=%s concurrency=%s remote=%s removed_legacy_slots=%s", room.id, agent_id, sorted(services), concurrency, remote, removed_legacy)
+            while websocket_is_connected(websocket):
+                message = await websocket.receive_json()
+                if not isinstance(message, dict):
+                    continue
+                message_type = str(message.get("type", "")).strip().lower()
+                session_id = clean_session_value(str(message.get("session_id", "")))
+                if not session_id:
+                    continue
+                if message_type == "session-closed":
+                    session = self._sessions.get(f"{room.id}/{session_id}")
+                    if session is not None:
+                        session.finish()
+                    continue
+                pending = self._pending.get(f"{room.id}/{session_id}")
+                if pending is not None and pending.control is control and message_type in {"accept", "busy", "service-disabled", "unsupported-version"}:
+                    message["type"] = message_type
+                    try_set_result(pending.response, message)
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            pass
+        except Exception:
+            logger.exception("agent control ended room=%s agent=%s remote=%s", room.id, agent_id, remote)
+        finally:
+            if self._controls.get(key) is control:
+                self._controls.pop(key, None)
+            control.closed = True
+            for pending in list(self._pending.values()):
+                if pending.control is control:
+                    try_set_result(pending.response, {"type": "no-agent", "session_id": pending.id, "reason": "work control disconnected"})
+            await close_quietly(websocket)
+            await room.control_disconnected(agent_id)
+            self.notify_dashboards()
+
+    async def serve_v2_client(
+        self, token: str, websocket: WebSocket, remote: str, resumable: bool = False,
+        proof: str = "", service: str = "rdp",
+    ) -> None:
+        room = await self._room_for(token)
+        if not await room.authorize_client(proof):
+            await send_v2(websocket, {"type": "authentication-failed", "reason": "room authentication failed"})
+            await close_quietly(websocket, 1008, "room authentication failed")
+            return
+        control = self._select_control(room.id, service)
+        if control is None:
+            if await room.has_waiting_agent(service):
+                await self.serve_client(token, websocket, remote, resumable, proof, service)
+                return
+            service_control_exists = any(
+                key.startswith(f"{room.id}/") and service in value.services
+                for key, value in self._controls.items()
+            )
+            result = "busy" if service_control_exists else "no-agent"
+            reason = "work agent concurrency limit reached" if service_control_exists else "no work agent control connection"
+            await room.record_rejection(result)
+            await send_v2(websocket, {"type": result, "reason": reason})
+            await close_quietly(websocket, 1000, reason)
+            return
+        await self._serve_on_demand_client(room, websocket, remote, resumable, proof, service, control, True)
+
+    async def _serve_on_demand_client(
+        self, room: RelayRoom, websocket: WebSocket, remote: str, resumable: bool,
+        proof: str, service: str, control: AgentControl, typed: bool,
+    ) -> None:
+        if len(self._pending) >= 4096:
+            control.release()
+            await room.record_rejection("busy")
+            await self._reject_session_client(websocket, typed, "busy", "", "relay pending-session limit reached")
+            return
+        created_at = utc_now()
+        expires_at = datetime.fromtimestamp(created_at.timestamp() + SESSION_OFFER_SECONDS, timezone.utc)
+        pending = PendingSession(uuid.uuid4().hex, room, control, websocket, remote, proof, service, resumable, created_at, expires_at)
+        key = f"{room.id}/{pending.id}"
+        self._pending[key] = pending
+        await room.pending_started(service)
+        self.notify_dashboards()
+        pending_open = True
+        try:
+            offer = {
+                "type": "session-offer", "session_id": pending.id, "room": room.id,
+                "service": service, "agent_id": control.agent_id,
+                "created_at": json_time(created_at), "expires_at": json_time(expires_at),
+                "resumable": resumable,
+            }
+            if not await control.send(offer):
+                await room.record_rejection("no-agent")
+                await self._reject_session_client(websocket, typed, "no-agent", pending.id, "work control disconnected")
+                return
+            try:
+                response = await asyncio.wait_for(asyncio.shield(pending.response), SESSION_OFFER_SECONDS)
+            except asyncio.TimeoutError:
+                await room.record_rejection("timeout")
+                await self._reject_session_client(websocket, typed, "timeout", pending.id, "work agent did not answer the offer")
+                return
+            if response.get("type") != "accept":
+                result = str(response.get("type") or "invalid-request")
+                await room.record_rejection(result)
+                await self._reject_session_client(websocket, typed, result, pending.id, str(response.get("reason") or ""))
+                return
+            remaining = max(0.001, pending.expires_at.timestamp() - utc_now().timestamp())
+            try:
+                agent = await asyncio.wait_for(asyncio.shield(pending.agent), remaining)
+            except asyncio.TimeoutError:
+                await room.record_rejection("timeout")
+                await self._reject_session_client(websocket, typed, "timeout", pending.id, "accepted work session did not connect")
+                return
+            self._pending.pop(key, None)
+            await room.pending_ended(service)
+            pending_open = False
+            ready = {"type": "session-ready", "session_id": pending.id}
+            client_ready = await send_v2(websocket, ready) if typed else await send_control(websocket, f"start {pending.id}", "legacy-client", room.id, remote)
+            if not await send_v2(agent.websocket, ready) or not client_ready:
+                await close_quietly(agent.websocket)
+                return
+            logger.info("v2 pairing room=%s session=%s service=%s agent=%s client=%s", room.id, pending.id, service, agent.remote, remote)
+            await room.service_session_started(service)
+            try:
+                if resumable and agent.resumable:
+                    session = self._new_resume_session(room, agent.remote, remote, proof, service, pending.id)
+                    await session.run(agent.websocket, websocket, agent.done, self.notify_dashboards)
+                else:
+                    await room.bridge(agent.websocket, websocket, agent.remote, remote, agent.done, self.notify_dashboards)
+            finally:
+                await room.service_session_ended(service)
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            pass
+        finally:
+            if pending_open:
+                self._pending.pop(key, None)
+                await room.pending_ended(service)
+            control.release()
+            self.notify_dashboards()
+
+    async def _reject_session_client(self, websocket: WebSocket, typed: bool, result: str, session_id: str, reason: str) -> None:
+        if typed:
+            await send_v2(websocket, {"type": result, "session_id": session_id, "reason": reason})
+        await close_quietly(websocket, 1013, reason)
+
+    async def serve_agent_session(
+        self, token: str, websocket: WebSocket, remote: str, agent_id: str,
+        session_id: str | None, resumable: bool, proof: str, service: str,
+    ) -> None:
+        session_id = clean_session_value(session_id)
+        pending = self._pending.get(f"{room_id(token)}/{session_id}")
+        if (not session_id or pending is None or pending.control.agent_id != agent_id or pending.service != service or
+                not hmac.compare_digest(pending.proof, proof) or utc_now() >= pending.expires_at):
+            await send_v2(websocket, {"type": "invalid-request", "session_id": session_id, "reason": "unknown or expired pending session"})
+            await close_quietly(websocket, 1008, "unknown pending session")
+            return
+        data = AgentDataSocket(websocket, remote, resumable)
+        if pending.agent.done():
+            await close_quietly(websocket, 1008, "duplicate agent session")
+            return
+        pending.agent.set_result(data)
+        try:
+            await data.done
+        except asyncio.CancelledError:
+            pass
+
+    def _select_control(self, room: str, service: str) -> AgentControl | None:
+        controls = sorted(
+            (value for key, value in self._controls.items() if key.startswith(f"{room}/") and service in value.services),
+            key=lambda value: value.in_use,
+        )
+        return next((control for control in controls if control.reserve()), None)
 
     async def serve_agent(
         self,
@@ -634,6 +985,14 @@ class RelayHub:
         if not await room.authorize_client(proof):
             await close_quietly(websocket, 1008, "room authentication failed")
             return
+        control = self._select_control(room.id, service)
+        if control is not None:
+            await self._serve_on_demand_client(room, websocket, remote, resumable, proof, service, control, False)
+            return
+        if any(key.startswith(f"{room.id}/") and service in value.services for key, value in self._controls.items()):
+            await room.record_rejection("busy")
+            await close_quietly(websocket, 1013, "work agent concurrency limit reached")
+            return
         while websocket_is_connected(websocket):
             waiting = await room.try_take_agent(service)
             if waiting is None:
@@ -672,11 +1031,11 @@ class RelayHub:
         if not await session.attach(side, websocket, remote):
             await close_quietly(websocket, 1013, "resumable session unavailable")
 
-    def _new_resume_session(self, room: RelayRoom, agent_remote: str, client_remote: str, proof: str, service: str) -> ResumeSession:
+    def _new_resume_session(self, room: RelayRoom, agent_remote: str, client_remote: str, proof: str, service: str, session_id: str | None = None) -> ResumeSession:
         def remove(session: ResumeSession) -> None:
             self._sessions.pop(f"{room.id}/{session.id}", None)
 
-        session = ResumeSession(uuid.uuid4().hex, room, agent_remote, client_remote, remove, proof, service)
+        session = ResumeSession(session_id or uuid.uuid4().hex, room, agent_remote, client_remote, remove, proof, service)
         self._sessions[f"{room.id}/{session.id}"] = session
         return session
 
@@ -817,8 +1176,15 @@ async def relay_websocket(websocket: WebSocket, room: str | None) -> None:
         await hub.serve_dashboard(websocket, remote, room)
     elif role == "agent":
         await hub.serve_agent(token, websocket, remote, read_agent_identity(websocket), read_resumable(websocket), read_room_proof(websocket), read_service(websocket))
+    elif role == "agent-control":
+        await hub.serve_agent_control(token, websocket, remote, read_agent_identity(websocket).instance, read_agent_services(websocket), read_concurrency(websocket), read_room_proof(websocket))
+    elif role == "agent-session":
+        await hub.serve_agent_session(token, websocket, remote, read_agent_identity(websocket).instance, websocket.headers.get("x-deskferry-session"), read_resumable(websocket), read_room_proof(websocket), read_service(websocket))
     elif role == "client":
-        await hub.serve_client(token, websocket, remote, read_resumable(websocket), read_room_proof(websocket), read_service(websocket))
+        if websocket.headers.get("x-deskferry-protocol", "").strip() == "2":
+            await hub.serve_v2_client(token, websocket, remote, read_resumable(websocket), read_room_proof(websocket), read_service(websocket))
+        else:
+            await hub.serve_client(token, websocket, remote, read_resumable(websocket), read_room_proof(websocket), read_service(websocket))
     elif role == RESUME_ROLE:
         await hub.serve_resume(token, websocket, remote, websocket.headers.get("x-deskferry-session"), websocket.headers.get("x-deskferry-session-side"), read_room_proof(websocket), read_service(websocket))
     elif role == "home-agent":
@@ -1116,11 +1482,12 @@ def dashboard_html(room: str) -> str:
     function render(data) {{
       const rooms = data.rooms || [];
       const waitingAgents = rooms.reduce((sum, r) => sum + (r.waiting_agents || 0), 0);
+      const controls = rooms.reduce((sum, r) => sum + (r.control_connections || 0), 0);
       const activePairs = rooms.reduce((sum, r) => sum + (r.active_pairs || 0), 0);
       const homeAgents = rooms.filter(r => r.home_agent_connected).length;
       const homeActiveRooms = rooms.filter(r => r.home_agent_connected || (r.active_pairs || 0) > 0).length;
-      setValue(workStatus, waitingAgents + activePairs > 0 ? "Connected" : "Waiting", waitingAgents + activePairs > 0 ? "ok" : "warn");
-      workDetail.textContent = `${{waitingAgents}} idle work sockets, ${{activePairs}} paired streams.`;
+      setValue(workStatus, controls + waitingAgents + activePairs > 0 ? "Connected" : "Waiting", controls + waitingAgents + activePairs > 0 ? "ok" : "warn");
+      workDetail.textContent = `${{controls}} control connections, ${{activePairs}} active sessions.`;
       setValue(homeStatus, homeActiveRooms > 0 ? "Active" : "Waiting", homeActiveRooms > 0 ? "ok" : "warn");
       homeDetail.textContent = `${{homeAgents}} presence socket${{homeAgents === 1 ? "" : "s"}}, ${{activePairs}} active RDP stream${{activePairs === 1 ? "" : "s"}}.`;
       streamStatus.textContent = activePairs.toString();
@@ -1130,7 +1497,7 @@ def dashboard_html(room: str) -> str:
         return;
       }}
       roomsBody.innerHTML = rooms.map(r => {{
-        const workConnected = (r.waiting_agents || 0) + (r.active_pairs || 0) > 0;
+        const workConnected = (r.control_connections || 0) + (r.waiting_agents || 0) + (r.active_pairs || 0) > 0;
         const homePresence = !!r.home_agent_connected;
         const streamActive = (r.active_pairs || 0) > 0;
         const homeState = homePresence ? "presence" : (streamActive ? "active stream" : "waiting");
@@ -1139,7 +1506,7 @@ def dashboard_html(room: str) -> str:
           : `${{r.active_pairs || 0}} active<br>${{esc(fmt(r.last_client_connected_at))}}`;
         return `<tr>
           <td><code>${{esc(r.id)}}</code></td>
-          <td>${{pill(workConnected, workConnected ? "connected" : "waiting")}}<br><span class="subtle">${{r.waiting_agents || 0}} idle<br>${{esc(fmt(r.last_agent_connected_at))}}</span></td>
+          <td>${{pill(workConnected, workConnected ? "connected" : "waiting")}}<br><span class="subtle">${{r.control_connections || 0}} controls<br>${{esc(fmt(r.last_agent_connected_at))}}</span></td>
           <td>${{pill(homePresence || streamActive, homeState)}}<br><span class="subtle">${{homeInfo}}</span></td>
           <td>${{r.active_pairs || 0}}<br><span class="subtle">${{r.total_pairs || 0}} total</span></td>
           <td><span class="subtle">${{esc(r.last_client_remote || "")}}<br>${{esc(fmt(r.last_client_connected_at))}}</span></td>

@@ -79,13 +79,13 @@ agent.exe Windows service
   SMB sockets   -> 127.0.0.1:445 (when enabled)
 ```
 
-The relay groups sockets by room name and service type. A waiting work-agent socket is paired with one authenticated home-client socket for RDP, WinRM, or SMB in the same room, then the relay copies binary WebSocket frames in both directions. The relay stores only an in-memory room-scoped password proof, never the room password or Windows login credentials.
+The relay groups connections by room name and service type. Each work agent keeps one lightweight `agent-control` WebSocket per configured relay. After authenticating a Home `client` request, the relay sends a short-lived session offer over that control channel; an accepted offer creates a separate outbound `agent-session` data WebSocket that is paired with the Home socket. The relay stores only an in-memory room-scoped password proof, never the room password or Windows login credentials.
 
 On Windows Home PCs, the optional `DeskFerryHomeNetwork` service creates a Wintun Layer-3 adapter for the synthetic `198.18.0.0/30` network. The installer maps `deskferry-work` to `198.18.0.2`; tun2socks sends that adapter's TCP stream to a DeskFerry-owned loopback SOCKS endpoint, which accepts only the synthetic address on TCP port 445. The work agent then connects to the work PC's existing loopback SMB server. Normal Internet and LAN routes are not changed.
 
 Current agents negotiate resumable RDP streams with the relay. If an HTTP proxy or network path drops an active WebSocket, both endpoints keep their local RDP sockets open, reconnect to the same relay session for up to five minutes, and replay only data that the peer has not acknowledged. Each endpoint buffers at most 8 MiB of unacknowledged data so an extended outage applies backpressure instead of consuming unbounded memory. Older agents and relays continue to use the original non-resumable stream protocol.
 
-Resumption is enabled only when both paired endpoints send `X-DeskFerry-Resumable: 1`. The relay then returns a random session ID in `start <session-id>`. Following an abnormal transport close, each endpoint reconnects with the `resume` role, the session ID, and its `agent` or `client` side; the relay reattaches both sockets to the existing logical pair. A normal WebSocket close still ends the RDP session immediately. Relay restarts cannot preserve sessions because resume state is intentionally in memory.
+Resumption is enabled only when both paired endpoints send `X-DeskFerry-Resumable: 1`. Protocol v2 returns the random session ID in a typed `session-ready` result; legacy pairs use `start <session-id>`. Following an abnormal transport close, each endpoint reconnects with the `resume` role, the session ID, and its `agent` or `client` side. Normal closure, explicit completion, unknown-session rejection, and authentication rejection are terminal and never enter the resume loop. Relay restarts cannot preserve sessions because resume state is intentionally in memory.
 
 The home app also keeps a lightweight `home-agent` presence WebSocket open while it is running. That presence socket lets the relay dashboard and home control panels show whether the home side is online; RDP data still flows only when a home agent starts a local listener and an RDP client connects to it.
 
@@ -345,15 +345,18 @@ Android writes the same daily diagnostics to the app-specific external-files `lo
 WebSocket clients identify their role with:
 
 ```text
-X-DeskFerry-Role: agent | client | home-agent | probe | dashboard
+X-DeskFerry-Role: agent-control | agent-session | client | resume | agent | home-agent | probe | dashboard
 ```
 
 Relays also accept the former `X-TunnelDesktop-Role` header during the rename transition.
 
 Roles:
 
-- `agent`: work-side idle socket waiting to be paired.
-- `client`: home-side data socket for one RDP connection.
+- `agent-control`: persistent work-side offer channel; it never carries tunnel payload.
+- `agent-session`: work-side data socket for one accepted v2 session.
+- `client`: home-side data socket and v2 session request for RDP, WinRM, or SMB.
+- `resume`: reattaches one side of a genuinely interrupted active session.
+- `agent`: legacy rollback-mode work-side idle socket.
 - `home-agent`: Windows, macOS, or Android home-agent status presence.
 - `probe`: self-test connection.
 - `dashboard`: browser status stream.
@@ -419,9 +422,11 @@ Default behavior:
 - `agent.exe` with no args uses the default relay room URL.
 - `-relay-url <url>` selects a named room.
 - `-relay-url` can be repeated to add more relay URLs.
-- The service keeps a small pool of idle outbound WebSockets per configured relay URL.
-- Each installed work agent keeps a persistent local agent identity and tags each idle socket by slot, allowing relays to replace stale idle sockets after reconnects or service restarts.
-- When any configured relay pairs a socket, the agent dials `127.0.0.1:3389` and pipes bytes.
+- The service keeps one lightweight control WebSocket per configured relay URL and opens data sockets only for accepted requests.
+- A persistent local agent identity lets each relay replace stale control connections after reconnects or service restarts.
+- Live-session concurrency defaults to four and can be changed with the service environment variable `DESKFERRY_MAX_SESSIONS`.
+- `DESKFERRY_FORCE_LEGACY=1` temporarily restores four legacy slots per enabled service and relay for rollback.
+- When any configured relay offers a session, the agent validates its room, service, identity, protocol version, and deadline before dialing the configured local target.
 
 Debug and operations:
 
@@ -623,7 +628,7 @@ Rules:
 - Reusing the same URL joins the same room.
 - The work agent may use multiple relay URLs at once when each URL uses the same `<room>`.
 - Home apps may use multiple relay URLs as an ordered primary/fallback list when each URL uses the same `<room>`; graphical apps treat the first row as primary and later rows as fallbacks.
-- Relays accept work-agent identity headers and keep only one waiting socket per agent instance and slot, preventing reconnects from inflating idle work-socket counts.
+- Relays accept work-agent identity headers and keep only the latest control connection per room and agent identity. Legacy instance/slot deduplication remains available during rollout.
 - The WebSocket endpoint is derived automatically as `/relay/<room>/ws`.
 - The base `/relay/` path is an overview dashboard.
 - No generated pairing files are required for the normal Azure WebSocket path.
@@ -716,7 +721,7 @@ Check:
 
 - The home app status tiles show a room URL that is also configured on the work agent.
 - OCI room URLs use `http://217.142.228.117/...`, not `https://217.142.228.117/...`.
-- The room dashboard shows waiting work-agent sockets.
+- The room dashboard shows at least one work control connection.
 - The agent service is running.
 - Work PC allows RDP.
 - The configured Windows account is allowed to log in remotely.
@@ -729,7 +734,7 @@ Check:
 - Home Setup's relay room is the intended file-server work computer. This setting is independent of the destination selected in the Home RDP app.
 - The work configurator has SMB target `127.0.0.1:445`, the alias used by Home setup, and a room password.
 - Home setup used the same room name and password and its file-access checkbox was selected.
-- The relay dashboard reports that room as protected and shows waiting work-agent capacity for SMB. A room exposing only RDP capacity cannot serve file access.
+- The relay dashboard reports that room as protected and shows an SMB-capable work control connection. A work agent exposing only RDP cannot serve file access.
 - The `DeskFerryHomeNetwork` service is running and the `DeskFerry` adapter has address `198.18.0.1`.
 - `Test-NetConnection deskferry-work -Port 445` reaches `198.18.0.2` on the Home PC.
 - The named Windows share exists and the supplied Windows account has both share and NTFS permission.
@@ -771,7 +776,9 @@ https://test-officialwebsite.azurewebsites.net/relay/workdesk
 
 The dashboard receives live status over WebSocket. Useful fields:
 
-- waiting work-agent sockets
+- work control connections and agent identities
+- active and pending sessions by service
+- busy and no-agent rejection counters
 - home-app presence
 - active RDP stream pairs
 - total stream pairs

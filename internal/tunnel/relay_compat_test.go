@@ -60,6 +60,137 @@ func TestExternalRelayResumption(t *testing.T) {
 	compatTransfer(t, ctx, agentConn, clientConn, []byte("after-resume"))
 }
 
+// TestExternalRelayV2OnDemand exercises the same v2 control/data flow against
+// any of the Go, Azure .NET, or Python relay implementations.
+func TestExternalRelayV2OnDemand(t *testing.T) {
+	baseURL := strings.TrimRight(os.Getenv("DESKFERRY_COMPAT_RELAY_URL"), "/")
+	if baseURL == "" {
+		t.Skip("DESKFERRY_COMPAT_RELAY_URL is not set")
+	}
+	proxySpec := strings.TrimSpace(os.Getenv("DESKFERRY_COMPAT_PROXY"))
+	if proxySpec == "" {
+		proxySpec = "direct"
+	}
+	room := "compat-v2-" + time.Now().Format("150405.000000")
+	relayAddr := baseURL + "/relay/" + room
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	controlHeaders := http.Header{}
+	AddProtocolV2Header(controlHeaders)
+	controlHeaders.Set(HeaderAgentInstance, "compat-agent")
+	controlHeaders.Set(HeaderAgentServices, ServiceRDP)
+	controlHeaders.Set(HeaderConcurrency, "2")
+	control, err := DialWebSocketWithHeaders(ctx, relayAddr, proxySpec, RoleAgentControl, "", controlHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseWebSocket(control)
+	if err := AwaitControlReady(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+
+	clientHeaders := http.Header{}
+	AddProtocolV2Header(clientHeaders)
+	AddServiceHeader(clientHeaders, ServiceRDP)
+	client, err := DialWebSocketWithHeaders(ctx, relayAddr, proxySpec, RoleClient, "", clientHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseWebSocket(client)
+	offer, err := ReadControlMessage(ctx, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateSessionOffer(offer, room, "compat-agent", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteControlMessage(ctx, control, ControlMessage{Type: MessageAccept, SessionID: offer.SessionID}); err != nil {
+		t.Fatal(err)
+	}
+	agentHeaders := http.Header{}
+	AddProtocolV2Header(agentHeaders)
+	agentHeaders.Set(HeaderAgentInstance, "compat-agent")
+	agentHeaders.Set(HeaderSessionID, offer.SessionID)
+	AddServiceHeader(agentHeaders, ServiceRDP)
+	agent, err := DialWebSocketWithHeaders(ctx, relayAddr, proxySpec, RoleAgentSession, "", agentHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseWebSocket(agent)
+	if _, err := AwaitSessionReady(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := AwaitSessionReadyCompatible(ctx, client); err != nil {
+		t.Fatal(err)
+	}
+	agentStream := WebSocketNetConn(ctx, agent)
+	clientStream := WebSocketNetConn(ctx, client)
+	compatTransfer(t, ctx, clientStream, agentStream, []byte("protocol-v2"))
+}
+
+func TestExternalRelayLegacyClientThroughV2Control(t *testing.T) {
+	baseURL := strings.TrimRight(os.Getenv("DESKFERRY_COMPAT_RELAY_URL"), "/")
+	if baseURL == "" {
+		t.Skip("DESKFERRY_COMPAT_RELAY_URL is not set")
+	}
+	proxySpec := strings.TrimSpace(os.Getenv("DESKFERRY_COMPAT_PROXY"))
+	if proxySpec == "" {
+		proxySpec = "direct"
+	}
+	room := "compat-mixed-" + time.Now().Format("150405.000000")
+	relayAddr := baseURL + "/relay/" + room
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	controlHeaders := http.Header{}
+	AddProtocolV2Header(controlHeaders)
+	controlHeaders.Set(HeaderAgentInstance, "compat-agent")
+	controlHeaders.Set(HeaderAgentServices, ServiceSMB)
+	controlHeaders.Set(HeaderConcurrency, "1")
+	control, err := DialWebSocketWithHeaders(ctx, relayAddr, proxySpec, RoleAgentControl, "", controlHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseWebSocket(control)
+	if err := AwaitControlReady(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+	legacyHeaders := http.Header{}
+	AddServiceHeader(legacyHeaders, ServiceSMB)
+	client, err := DialWebSocketWithHeaders(ctx, relayAddr, proxySpec, RoleClient, "", legacyHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseWebSocket(client)
+	offer, err := ReadControlMessage(ctx, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offer.Resumable || offer.Service != ServiceSMB {
+		t.Fatalf("mixed offer resumable=%t service=%q", offer.Resumable, offer.Service)
+	}
+	if err := WriteControlMessage(ctx, control, ControlMessage{Type: MessageAccept, SessionID: offer.SessionID}); err != nil {
+		t.Fatal(err)
+	}
+	agentHeaders := http.Header{}
+	AddProtocolV2Header(agentHeaders)
+	agentHeaders.Set(HeaderAgentInstance, "compat-agent")
+	agentHeaders.Set(HeaderSessionID, offer.SessionID)
+	AddServiceHeader(agentHeaders, ServiceSMB)
+	agent, err := DialWebSocketWithHeaders(ctx, relayAddr, proxySpec, RoleAgentSession, "", agentHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseWebSocket(agent)
+	if _, err := AwaitSessionReady(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := AwaitWebSocketStartSession(ctx, client); err != nil || id != offer.SessionID {
+		t.Fatalf("legacy start id=%q error=%v", id, err)
+	}
+	compatTransfer(t, ctx, WebSocketNetConn(ctx, client), WebSocketNetConn(ctx, agent), []byte("mixed-version"))
+}
+
 func waitExternalAgent(t *testing.T, ctx context.Context, baseURL, room string) {
 	t.Helper()
 	type roomStatus struct {

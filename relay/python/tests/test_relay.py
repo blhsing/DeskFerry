@@ -13,6 +13,7 @@ class FakeWebSocket:
         self.application_state = WebSocketState.CONNECTED
         self.fail_text = fail_text
         self.text_messages = []
+        self.json_messages = []
         self.byte_messages = []
         self.closed = False
         self.close_code = None
@@ -27,7 +28,13 @@ class FakeWebSocket:
     async def send_bytes(self, payload):
         self.byte_messages.append(payload)
 
+    async def send_json(self, payload):
+        self.json_messages.append(payload)
+
     async def receive(self):
+        return await self._received.get()
+
+    async def receive_json(self):
         return await self._received.get()
 
     async def close(self, code=1000, reason=""):
@@ -308,5 +315,121 @@ def test_smb_service_channel_pairs_only_smb():
         for task in (agent_task, client_task):
             task.cancel()
         await asyncio.gather(agent_task, client_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_v2_on_demand_pairing_and_busy_rejection():
+    async def scenario():
+        hub = RelayHub()
+        control = FakeWebSocket()
+        home = FakeWebSocket()
+        agent = FakeWebSocket()
+        control_task = asyncio.create_task(
+            hub.serve_agent_control("unit-v2", control, "work", "unit-agent", {"rdp"}, 1)
+        )
+        for _ in range(50):
+            if control.json_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert control.json_messages[0]["type"] == "control-ready"
+
+        home_task = asyncio.create_task(hub.serve_v2_client("unit-v2", home, "home", True))
+        for _ in range(50):
+            if len(control.json_messages) > 1:
+                break
+            await asyncio.sleep(0.01)
+        offer = control.json_messages[1]
+        assert offer["type"] == "session-offer"
+        assert offer["service"] == "rdp"
+        await control._received.put({"type": "accept", "session_id": offer["session_id"]})
+        agent_task = asyncio.create_task(
+            hub.serve_agent_session("unit-v2", agent, "work-data", "unit-agent", offer["session_id"], True, "", "rdp")
+        )
+        for _ in range(50):
+            if home.json_messages and agent.json_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert home.json_messages[-1]["type"] == "session-ready"
+        assert agent.json_messages[-1]["session_id"] == offer["session_id"]
+
+        busy = FakeWebSocket()
+        await hub.serve_v2_client("unit-v2", busy, "home-2", True)
+        assert busy.json_messages[-1]["type"] == "busy"
+        status = (await hub.snapshot("unit-v2"))["rooms"][0]
+        assert status["control_connections"] == 1
+        assert status["pending_requests"] == 0
+        assert status["busy_rejections"] == 1
+
+        await home._received.put({"type": "websocket.receive", "bytes": b"v2-data"})
+        for _ in range(50):
+            if agent.byte_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert agent.byte_messages == [b"v2-data"]
+
+        for task in (home_task, agent_task, control_task):
+            task.cancel()
+        await asyncio.gather(home_task, agent_task, control_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_v2_no_agent_is_typed_and_immediate():
+    async def scenario():
+        hub = RelayHub()
+        home = FakeWebSocket()
+        started = time.monotonic()
+        await hub.serve_v2_client("unit-no-agent", home, "home")
+        assert time.monotonic() - started < 0.5
+        assert home.json_messages[-1]["type"] == "no-agent"
+        assert home.close_code == 1000
+
+    import time
+    asyncio.run(scenario())
+
+
+def test_legacy_client_is_translated_to_v2_control_offer():
+    async def scenario():
+        hub = RelayHub()
+        control = FakeWebSocket()
+        legacy_home = FakeWebSocket()
+        agent = FakeWebSocket()
+        control_task = asyncio.create_task(
+            hub.serve_agent_control("unit-mixed", control, "work", "unit-agent", {"smb"}, 1)
+        )
+        for _ in range(50):
+            if control.json_messages:
+                break
+            await asyncio.sleep(0.01)
+        home_task = asyncio.create_task(
+            hub.serve_client("unit-mixed", legacy_home, "old-home", False, "", "smb")
+        )
+        for _ in range(50):
+            if len(control.json_messages) > 1:
+                break
+            await asyncio.sleep(0.01)
+        offer = control.json_messages[1]
+        assert offer["type"] == "session-offer"
+        assert offer["resumable"] is False
+        await control._received.put({"type": "accept", "session_id": offer["session_id"]})
+        agent_task = asyncio.create_task(
+            hub.serve_agent_session("unit-mixed", agent, "work-data", "unit-agent", offer["session_id"], False, "", "smb")
+        )
+        for _ in range(50):
+            if legacy_home.text_messages and agent.json_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert legacy_home.text_messages == ["start " + offer["session_id"]]
+        assert agent.json_messages[-1]["type"] == "session-ready"
+        await legacy_home._received.put({"type": "websocket.receive", "bytes": b"legacy-smb"})
+        for _ in range(50):
+            if agent.byte_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert agent.byte_messages == [b"legacy-smb"]
+        for task in (home_task, agent_task, control_task):
+            task.cancel()
+        await asyncio.gather(home_task, agent_task, control_task, return_exceptions=True)
 
     asyncio.run(scenario())

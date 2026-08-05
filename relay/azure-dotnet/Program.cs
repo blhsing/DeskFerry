@@ -4,6 +4,8 @@ using System.Diagnostics;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading.Channels;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -82,8 +84,21 @@ async Task RelayWebSocketHandler(HttpContext context, RelayHub hub)
         case "agent":
             await hub.ServeAgentAsync(token, socket, remote, ReadAgentIdentity(context.Request), ReadResumable(context.Request), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
             break;
+        case "agent-control":
+            await hub.ServeAgentControlAsync(token, socket, remote, ReadAgentIdentity(context.Request).Instance, ReadAgentServices(context.Request), ReadConcurrency(context.Request), ReadRoomProof(context.Request), context.RequestAborted);
+            break;
+        case "agent-session":
+            await hub.ServeAgentSessionAsync(token, socket, remote, ReadAgentIdentity(context.Request).Instance, context.Request.Headers["X-DeskFerry-Session"].FirstOrDefault(), ReadResumable(context.Request), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
+            break;
         case "client":
-            await hub.ServeClientAsync(token, socket, remote, ReadResumable(context.Request), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
+            if (context.Request.Headers["X-DeskFerry-Protocol"].FirstOrDefault()?.Trim() == "2")
+            {
+                await hub.ServeV2ClientAsync(token, socket, remote, ReadResumable(context.Request), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
+            }
+            else
+            {
+                await hub.ServeClientAsync(token, socket, remote, ReadResumable(context.Request), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
+            }
             break;
         case "resume":
             await hub.ServeResumeAsync(token, socket, remote, context.Request.Headers["X-DeskFerry-Session"].FirstOrDefault(), context.Request.Headers["X-DeskFerry-Session-Side"].FirstOrDefault(), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
@@ -108,8 +123,20 @@ static string? ReadRole(HttpRequest request)
         ?? request.Headers["X-TunnelDesktop-Role"].FirstOrDefault()
         ?? request.Query["role"].FirstOrDefault();
     role = role?.Trim().ToLowerInvariant();
-    return role is "agent" or "client" or "home-agent" or "probe" or "dashboard" or "resume" ? role : null;
+    return role is "agent" or "agent-control" or "agent-session" or "client" or "home-agent" or "probe" or "dashboard" or "resume" ? role : null;
 }
+
+static HashSet<string> ReadAgentServices(HttpRequest request)
+{
+    return (request.Headers["X-DeskFerry-Agent-Services"].FirstOrDefault() ?? "")
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(value => value.ToLowerInvariant())
+        .Where(value => value is "rdp" or "winrm" or "smb")
+        .ToHashSet(StringComparer.Ordinal);
+}
+
+static int ReadConcurrency(HttpRequest request) =>
+    int.TryParse(request.Headers["X-DeskFerry-Concurrency"].FirstOrDefault(), out var value) && value is >= 1 and <= 256 ? value : 4;
 
 static bool ReadResumable(HttpRequest request)
 {
@@ -483,12 +510,13 @@ static string DashboardHtml(string room = "")
       try {
         const rooms = data.rooms || [];
         const waitingAgents = rooms.reduce((sum, r) => sum + (r.waiting_agents || 0), 0);
+        const controls = rooms.reduce((sum, r) => sum + (r.control_connections || 0), 0);
         const activePairs = rooms.reduce((sum, r) => sum + (r.active_pairs || 0), 0);
         const homeAgents = rooms.filter(r => r.home_agent_connected).length;
         const homeActiveRooms = rooms.filter(r => r.home_agent_connected || (r.active_pairs || 0) > 0).length;
 
-        setValue(workStatus, waitingAgents + activePairs > 0 ? "Connected" : "Waiting", waitingAgents + activePairs > 0 ? "ok" : "warn");
-        workDetail.textContent = `${waitingAgents} idle work sockets, ${activePairs} paired streams.`;
+        setValue(workStatus, controls + waitingAgents + activePairs > 0 ? "Connected" : "Waiting", controls + waitingAgents + activePairs > 0 ? "ok" : "warn");
+        workDetail.textContent = `${controls} control connections, ${activePairs} active sessions.`;
         setValue(homeStatus, homeActiveRooms > 0 ? "Active" : "Waiting", homeActiveRooms > 0 ? "ok" : "warn");
         homeDetail.textContent = `${homeAgents} presence socket${homeAgents === 1 ? "" : "s"}, ${activePairs} active RDP stream${activePairs === 1 ? "" : "s"}.`;
         streamStatus.textContent = activePairs.toString();
@@ -499,7 +527,7 @@ static string DashboardHtml(string room = "")
           return;
         }
         roomsBody.innerHTML = rooms.map(r => {
-          const workConnected = (r.waiting_agents || 0) + (r.active_pairs || 0) > 0;
+          const workConnected = (r.control_connections || 0) + (r.waiting_agents || 0) + (r.active_pairs || 0) > 0;
           const homePresence = !!r.home_agent_connected;
           const streamActive = (r.active_pairs || 0) > 0;
           const homeState = homePresence ? "presence" : (streamActive ? "active stream" : "waiting");
@@ -508,7 +536,7 @@ static string DashboardHtml(string room = "")
             : `${r.active_pairs || 0} active<br>${esc(fmt(r.last_client_connected_at))}`;
           return `<tr>
             <td><code>${esc(r.id)}</code></td>
-            <td>${pill(workConnected, workConnected ? "connected" : "waiting")}<br><span class="subtle">${r.waiting_agents || 0} idle<br>${esc(fmt(r.last_agent_connected_at))}</span></td>
+            <td>${pill(workConnected, workConnected ? "connected" : "waiting")}<br><span class="subtle">${r.control_connections || 0} controls<br>${esc(fmt(r.last_agent_connected_at))}</span></td>
             <td>${pill(homePresence || streamActive, homeState)}<br><span class="subtle">${homeInfo}</span></td>
             <td>${r.active_pairs || 0}<br><span class="subtle">${r.total_pairs || 0} total</span></td>
             <td><span class="subtle">${esc(r.last_client_remote || "")}<br>${esc(fmt(r.last_client_connected_at))}</span></td>
@@ -554,20 +582,388 @@ static string DashboardHtml(string room = "")
 """;
 }
 
+[method: JsonConstructor]
+sealed record ControlMessage(
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("session_id")] string? SessionId = null,
+    [property: JsonPropertyName("room")] string? Room = null,
+    [property: JsonPropertyName("service")] string? Service = null,
+    [property: JsonPropertyName("agent_id")] string? AgentId = null,
+    [property: JsonPropertyName("created_at")] DateTimeOffset? CreatedAt = null,
+    [property: JsonPropertyName("expires_at")] DateTimeOffset? ExpiresAt = null,
+    [property: JsonPropertyName("protocol_version")] int ProtocolVersion = 0,
+    [property: JsonPropertyName("resumable")] bool Resumable = false,
+    [property: JsonPropertyName("reason")] string? Reason = null);
+
+sealed class AgentControl
+{
+    private int _closed;
+    private int _inUse;
+
+    public AgentControl(RelayRoom room, WebSocket socket, string remote, string agentId, HashSet<string> services, int concurrency)
+    {
+        Room = room;
+        Socket = socket;
+        Remote = remote;
+        AgentId = agentId;
+        Services = services;
+        Concurrency = concurrency;
+    }
+
+    public RelayRoom Room { get; }
+    public WebSocket Socket { get; }
+    public string Remote { get; }
+    public string AgentId { get; }
+    public HashSet<string> Services { get; }
+    public int Concurrency { get; }
+    public int InUse => Volatile.Read(ref _inUse);
+    public SemaphoreSlim SendLock { get; } = new(1, 1);
+
+    public bool TryReserve()
+    {
+        while (Volatile.Read(ref _closed) == 0)
+        {
+            var current = Volatile.Read(ref _inUse);
+            if (current >= Concurrency)
+            {
+                return false;
+            }
+            if (Interlocked.CompareExchange(ref _inUse, current + 1, current) == current)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public void Release()
+    {
+        if (Interlocked.Decrement(ref _inUse) < 0)
+        {
+            Interlocked.Exchange(ref _inUse, 0);
+        }
+    }
+
+    public async Task<bool> SendAsync(ControlMessage message, CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _closed) != 0)
+        {
+            return false;
+        }
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(5));
+        try
+        {
+            await SendLock.WaitAsync(timeout.Token);
+            try
+            {
+                await Socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(message), WebSocketMessageType.Text, true, timeout.Token);
+                return true;
+            }
+            finally
+            {
+                SendLock.Release();
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public void Close(string reason)
+    {
+        if (Interlocked.Exchange(ref _closed, 1) == 0)
+        {
+            _ = RelayRoom.CloseQuietlyAsync(Socket, WebSocketCloseStatus.NormalClosure, reason);
+        }
+    }
+}
+
+sealed record AgentDataSocket(WebSocket Socket, string Remote, bool Resumable, TaskCompletionSource Done);
+
+sealed class PendingSession
+{
+    public PendingSession(string id, RelayRoom room, AgentControl control, WebSocket client, string remote, string proof, string service, bool resumable, DateTimeOffset expiresAt)
+    {
+        Id = id;
+        Room = room;
+        Control = control;
+        Client = client;
+        Remote = remote;
+        Proof = proof;
+        Service = service;
+        Resumable = resumable;
+        ExpiresAt = expiresAt;
+    }
+
+    public string Id { get; }
+    public RelayRoom Room { get; }
+    public AgentControl Control { get; }
+    public WebSocket Client { get; }
+    public string Remote { get; }
+    public string Proof { get; }
+    public string Service { get; }
+    public bool Resumable { get; }
+    public DateTimeOffset ExpiresAt { get; }
+    public TaskCompletionSource<ControlMessage> Response { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource<AgentDataSocket> Agent { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+}
+
 sealed class RelayHub
 {
     private const string Started = "started";
     private const string AgentUnavailable = "agent-unavailable";
     private const string ClientUnavailable = "client-unavailable";
+    private const int ProtocolVersion = 2;
+    private static readonly TimeSpan SessionOfferTtl = TimeSpan.FromSeconds(8);
 
     private readonly ConcurrentDictionary<string, RelayRoom> _rooms = new();
     private readonly ConcurrentDictionary<Guid, DashboardClient> _dashboards = new();
     private readonly ConcurrentDictionary<string, ResumeSession> _sessions = new();
+    private readonly ConcurrentDictionary<string, AgentControl> _controls = new();
+    private readonly ConcurrentDictionary<string, PendingSession> _pending = new();
     private readonly ILogger<RelayHub> _log;
 
     public RelayHub(ILogger<RelayHub> log)
     {
         _log = log;
+    }
+
+    public async Task ServeAgentControlAsync(string token, WebSocket socket, string remote, string agentId, HashSet<string> services, int concurrency, string proof, CancellationToken abort)
+    {
+        var room = RoomFor(token);
+        if (agentId.Length == 0 || services.Count == 0)
+        {
+            await SendV2Async(socket, new ControlMessage("invalid-request", Reason: "agent identity and services are required"), CancellationToken.None);
+            await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "invalid agent control request");
+            return;
+        }
+        if (!room.AuthorizeAgent(proof))
+        {
+            await SendV2Async(socket, new ControlMessage("authentication-failed", Reason: "room authentication failed"), CancellationToken.None);
+            await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "room authentication failed");
+            return;
+        }
+
+        var control = new AgentControl(room, socket, remote, agentId, services, concurrency);
+        var key = $"{room.Id}/{agentId}";
+        var previous = _controls.AddOrUpdate(key, control, (_, existing) =>
+        {
+            existing.Close("replaced by newer control connection");
+            return control;
+        });
+        _ = previous;
+        room.ControlConnected(agentId, remote);
+        var removedLegacy = await room.RemoveLegacyAgentsAsync(agentId);
+        NotifyDashboards();
+        try
+        {
+            if (!await control.SendAsync(new ControlMessage("control-ready", AgentId: agentId, ProtocolVersion: ProtocolVersion), abort))
+            {
+                return;
+            }
+            _log.LogInformation("agent control connected room={Room} agent={Agent} services={Services} concurrency={Concurrency} remote={Remote} removed_legacy_slots={RemovedLegacy}", room.Id, agentId, string.Join(',', services.OrderBy(value => value)), concurrency, remote, removedLegacy);
+            while (!abort.IsCancellationRequested && socket.State == WebSocketState.Open)
+            {
+                var message = await ReceiveV2Async(socket, abort);
+                var sessionId = CleanSessionValue(message.SessionId);
+                if (sessionId.Length == 0)
+                {
+                    continue;
+                }
+                if (message.Type == "session-closed")
+                {
+                    if (_sessions.TryGetValue($"{room.Id}/{sessionId}", out var active))
+                    {
+                        active.Finish();
+                    }
+                    continue;
+                }
+                if (_pending.TryGetValue($"{room.Id}/{sessionId}", out var pending) && ReferenceEquals(pending.Control, control) &&
+                    message.Type is "accept" or "busy" or "service-disabled" or "unsupported-version")
+                {
+                    pending.Response.TrySetResult(message);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (WebSocketException exception)
+        {
+            _log.LogInformation("agent control receive ended room={Room} agent={Agent} remote={Remote} error={Error}", room.Id, agentId, remote, exception.Message);
+        }
+        catch (Exception exception)
+        {
+            _log.LogWarning(exception, "agent control failed room={Room} agent={Agent} remote={Remote}", room.Id, agentId, remote);
+        }
+        finally
+        {
+            ((ICollection<KeyValuePair<string, AgentControl>>)_controls).Remove(new KeyValuePair<string, AgentControl>(key, control));
+            foreach (var pending in _pending.Values.Where(value => ReferenceEquals(value.Control, control)))
+            {
+                pending.Response.TrySetResult(new ControlMessage("no-agent", SessionId: pending.Id, Reason: "work control disconnected"));
+            }
+            control.Close("");
+            room.ControlDisconnected(agentId);
+            NotifyDashboards();
+        }
+    }
+
+    public async Task ServeV2ClientAsync(string token, WebSocket socket, string remote, bool resumable, string proof, string service, CancellationToken abort)
+    {
+        var room = RoomFor(token);
+        if (!room.AuthorizeClient(proof))
+        {
+            await SendV2Async(socket, new ControlMessage("authentication-failed", Reason: "room authentication failed"), CancellationToken.None);
+            await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "room authentication failed");
+            return;
+        }
+        var control = SelectControl(room.Id, service);
+        if (control is null)
+        {
+            if (room.HasWaitingAgent(service))
+            {
+                await ServeClientAsync(token, socket, remote, resumable, proof, service, abort);
+                return;
+            }
+            var serviceControlExists = _controls.Any(item => item.Key.StartsWith(room.Id + "/", StringComparison.Ordinal) && item.Value.Services.Contains(service));
+            var result = serviceControlExists ? "busy" : "no-agent";
+            var reason = serviceControlExists ? "work agent concurrency limit reached" : "no work agent control connection";
+            room.RecordRejection(result);
+            await SendV2Async(socket, new ControlMessage(result, Reason: reason), CancellationToken.None);
+            await CloseQuietlyAsync(socket, WebSocketCloseStatus.NormalClosure, reason);
+            return;
+        }
+		await ServeOnDemandClientAsync(room, socket, remote, resumable, proof, service, control, true, abort);
+    }
+
+    private async Task ServeOnDemandClientAsync(RelayRoom room, WebSocket socket, string remote, bool resumable, string proof, string service, AgentControl control, bool typed, CancellationToken abort)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var pending = new PendingSession(Guid.NewGuid().ToString("N"), room, control, socket, remote, proof, service, resumable, now.Add(SessionOfferTtl));
+        var key = $"{room.Id}/{pending.Id}";
+        if (_pending.Count >= 4096 || !_pending.TryAdd(key, pending))
+        {
+            control.Release();
+            room.RecordRejection("busy");
+            await RejectSessionClientAsync(socket, typed, "busy", null, "relay pending-session limit reached");
+            return;
+        }
+        room.PendingStarted(service);
+        NotifyDashboards();
+        var pendingOpen = true;
+        try
+        {
+            var offer = new ControlMessage("session-offer", pending.Id, room.Id, service, control.AgentId, now, pending.ExpiresAt, ProtocolVersion, resumable);
+            if (!await control.SendAsync(offer, abort))
+            {
+                room.RecordRejection("no-agent");
+                await RejectSessionClientAsync(socket, typed, "no-agent", pending.Id, "work control disconnected");
+                return;
+            }
+            ControlMessage response;
+            try
+            {
+                response = await pending.Response.Task.WaitAsync(SessionOfferTtl, abort);
+            }
+            catch (TimeoutException)
+            {
+                room.RecordRejection("timeout");
+                await RejectSessionClientAsync(socket, typed, "timeout", pending.Id, "work agent did not answer the offer");
+                return;
+            }
+            if (response.Type != "accept")
+            {
+                room.RecordRejection(response.Type);
+                await RejectSessionClientAsync(socket, typed, response.Type, pending.Id, response.Reason ?? "");
+                return;
+            }
+            AgentDataSocket agent;
+            try
+            {
+                var remaining = pending.ExpiresAt - DateTimeOffset.UtcNow;
+                agent = await pending.Agent.Task.WaitAsync(remaining > TimeSpan.Zero ? remaining : TimeSpan.FromMilliseconds(1), abort);
+            }
+            catch (TimeoutException)
+            {
+                room.RecordRejection("timeout");
+                await RejectSessionClientAsync(socket, typed, "timeout", pending.Id, "accepted work session did not connect");
+                return;
+            }
+            _pending.TryRemove(key, out _);
+            room.PendingEnded(service);
+            pendingOpen = false;
+            var ready = new ControlMessage("session-ready", pending.Id, ProtocolVersion: ProtocolVersion);
+            var clientReady = typed
+                ? await SendV2Async(socket, ready, CancellationToken.None)
+                : await TrySendControlAsync(socket, room.Id, remote, "legacy-client", $"start {pending.Id}", CancellationToken.None);
+            if (!await SendV2Async(agent.Socket, ready, CancellationToken.None) || !clientReady)
+            {
+                await CloseQuietlyAsync(agent.Socket);
+                return;
+            }
+            _log.LogInformation("v2 pairing room={Room} session={Session} service={Service} agent={AgentRemote} client={ClientRemote}", room.Id, pending.Id, service, agent.Remote, remote);
+            room.ServiceSessionStarted(service);
+            try
+            {
+                if (resumable && agent.Resumable)
+                {
+                    var session = NewResumeSession(pending.Id, room, agent.Remote, remote, proof, service);
+                    await session.RunAsync(agent.Socket, socket, agent.Done, NotifyDashboards);
+                }
+                else
+                {
+                    await room.BridgeAsync(agent.Socket, socket, agent.Remote, remote, agent.Done, NotifyDashboards, abort);
+                }
+            }
+            finally
+            {
+                room.ServiceSessionEnded(service);
+            }
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            if (pendingOpen)
+            {
+                _pending.TryRemove(key, out _);
+                room.PendingEnded(service);
+            }
+            control.Release();
+            NotifyDashboards();
+        }
+    }
+
+    public async Task ServeAgentSessionAsync(string token, WebSocket socket, string remote, string agentId, string? sessionId, bool resumable, string proof, string service, CancellationToken abort)
+    {
+        var roomId = RoomId(token);
+        sessionId = CleanSessionValue(sessionId);
+        if (sessionId.Length == 0 || !_pending.TryGetValue($"{roomId}/{sessionId}", out var pending) || pending.Control.AgentId != agentId ||
+            pending.Service != service || !RelayRoom.ProofEquals(pending.Proof, proof) || DateTimeOffset.UtcNow >= pending.ExpiresAt)
+        {
+            await SendV2Async(socket, new ControlMessage("invalid-request", sessionId, Reason: "unknown or expired pending session"), CancellationToken.None);
+            await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "unknown pending session");
+            return;
+        }
+        var data = new AgentDataSocket(socket, remote, resumable, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+        if (!pending.Agent.TrySetResult(data))
+        {
+            await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "duplicate agent session");
+            return;
+        }
+        await Task.WhenAny(data.Done.Task, Task.Delay(Timeout.InfiniteTimeSpan, abort));
+    }
+
+    private AgentControl? SelectControl(string roomId, string service)
+    {
+        foreach (var control in _controls.Where(item => item.Key.StartsWith(roomId + "/", StringComparison.Ordinal)).Select(item => item.Value).OrderBy(item => item.InUse))
+        {
+            if (control.Services.Contains(service) && control.TryReserve())
+            {
+                return control;
+            }
+        }
+        return null;
     }
 
     public async Task ServeAgentAsync(string token, WebSocket socket, string remote, AgentIdentity identity, bool resumable, string proof, string service, CancellationToken abort)
@@ -652,13 +1048,25 @@ sealed class RelayHub
             await RelayRoom.CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "room authentication failed");
             return;
         }
+        var control = SelectControl(room.Id, service);
+        if (control is not null)
+        {
+            await ServeOnDemandClientAsync(room, socket, remote, resumable, proof, service, control, false, abort);
+            return;
+        }
+        if (_controls.Any(item => item.Key.StartsWith(room.Id + "/", StringComparison.Ordinal) && item.Value.Services.Contains(service)))
+        {
+            room.RecordRejection("busy");
+            await CloseQuietlyAsync(socket, WebSocketCloseStatus.EndpointUnavailable, "work agent concurrency limit reached");
+            return;
+        }
         while (socket.State == WebSocketState.Open && !abort.IsCancellationRequested)
         {
             var peer = room.TryTakeAgent(service);
             if (peer is null)
             {
                 _log.LogInformation("client rejected without agent room={Room} remote={Remote}", room.Id, remote);
-                await socket.CloseAsync(WebSocketCloseStatus.EndpointUnavailable, "no work agent connected", CancellationToken.None);
+                await CloseQuietlyAsync(socket, WebSocketCloseStatus.EndpointUnavailable, "no work agent connected");
                 return;
             }
 
@@ -724,7 +1132,12 @@ sealed class RelayHub
 
     private ResumeSession NewResumeSession(RelayRoom room, string agentRemote, string clientRemote, string proof, string service)
     {
-        var session = new ResumeSession(Guid.NewGuid().ToString("N"), room, agentRemote, clientRemote, proof, service, _log, completed =>
+        return NewResumeSession(Guid.NewGuid().ToString("N"), room, agentRemote, clientRemote, proof, service);
+    }
+
+    private ResumeSession NewResumeSession(string id, RelayRoom room, string agentRemote, string clientRemote, string proof, string service)
+    {
+        var session = new ResumeSession(id, room, agentRemote, clientRemote, proof, service, _log, completed =>
         {
             _sessions.TryRemove($"{room.Id}/{completed.Id}", out _);
         });
@@ -849,6 +1262,75 @@ sealed class RelayHub
         await socket.SendAsync(payload, WebSocketMessageType.Text, true, cancellationToken);
     }
 
+    private static async Task<bool> SendV2Async(WebSocket socket, ControlMessage message, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            var payload = JsonSerializer.SerializeToUtf8Bytes(message);
+            await socket.SendAsync(payload, WebSocketMessageType.Text, true, timeout.Token);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static async Task RejectSessionClientAsync(WebSocket socket, bool typed, string result, string? sessionId, string reason)
+    {
+        if (typed)
+        {
+            await SendV2Async(socket, new ControlMessage(result, sessionId, ProtocolVersion: ProtocolVersion, Reason: reason), CancellationToken.None);
+        }
+        await CloseQuietlyAsync(socket, WebSocketCloseStatus.EndpointUnavailable, reason);
+    }
+
+    private static async Task<ControlMessage> ReceiveV2Async(WebSocket socket, CancellationToken cancellationToken)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(16 * 1024);
+        try
+        {
+            using var payload = new MemoryStream();
+            while (true)
+            {
+                var result = await socket.ReceiveAsync(buffer, cancellationToken);
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    throw new WebSocketException(WebSocketError.ConnectionClosedPrematurely, result.CloseStatusDescription);
+                }
+                if (result.MessageType != WebSocketMessageType.Text)
+                {
+                    if (result.EndOfMessage)
+                    {
+                        payload.SetLength(0);
+                    }
+                    continue;
+                }
+                payload.Write(buffer, 0, result.Count);
+                if (payload.Length > 64 * 1024)
+                {
+                    throw new InvalidDataException("control message exceeds 64 KiB");
+                }
+                if (!result.EndOfMessage)
+                {
+                    continue;
+                }
+                var message = JsonSerializer.Deserialize<ControlMessage>(payload.ToArray()) ?? throw new InvalidDataException("empty control message");
+                return message with
+                {
+                    Type = message.Type.Trim().ToLowerInvariant(),
+                    SessionId = message.SessionId?.Trim().ToLowerInvariant()
+                };
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
     private async Task<bool> TrySendStartAsync(WebSocket socket, string room, string remote, string side, CancellationToken cancellationToken)
     {
         return await TrySendControlAsync(socket, room, remote, side, "start", cancellationToken);
@@ -970,6 +1452,13 @@ sealed class RelayRoom
     private readonly Queue<WaitingAgent> _agents = new();
     private readonly ILogger _log;
     private int _activePairs;
+    private int _controlConnections;
+    private int _pendingRequests;
+    private long _busyRejections;
+    private long _noAgentRejections;
+    private readonly Dictionary<string, int> _controlAgents = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _pendingByService = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _activeByService = new(StringComparer.Ordinal);
     private bool _credentialSet;
     private string _roomProof = "";
     private long _totalPairs;
@@ -996,7 +1485,7 @@ sealed class RelayRoom
         lock (_gate)
         {
             PruneClosedAgents();
-            if (!_credentialSet || (_agents.Count == 0 && _activePairs == 0))
+            if (!_credentialSet || (_agents.Count == 0 && _controlConnections == 0 && _activePairs == 0))
             {
                 _credentialSet = true;
                 _roomProof = proof;
@@ -1080,6 +1569,74 @@ sealed class RelayRoom
         }
     }
 
+    public bool HasWaitingAgent(string service)
+    {
+        lock (_gate)
+        {
+            PruneClosedAgents();
+            return _agents.Any(agent => agent.IsOpen && agent.Service == service);
+        }
+    }
+
+    public void ControlConnected(string agentId, string remote)
+    {
+        lock (_gate)
+        {
+            _controlConnections++;
+            _controlAgents[agentId] = _controlAgents.GetValueOrDefault(agentId) + 1;
+            _lastAgentRemote = remote;
+            _lastAgentConnectedAt = DateTimeOffset.UtcNow;
+        }
+    }
+
+    public void ControlDisconnected(string agentId)
+    {
+        lock (_gate)
+        {
+            if (_controlConnections > 0) _controlConnections--;
+            var count = _controlAgents.GetValueOrDefault(agentId);
+            if (count <= 1) _controlAgents.Remove(agentId); else _controlAgents[agentId] = count - 1;
+            _lastAgentDisconnectedAt = DateTimeOffset.UtcNow;
+        }
+    }
+
+    public void PendingStarted(string service)
+    {
+        lock (_gate)
+        {
+            _pendingRequests++;
+            _pendingByService[service] = _pendingByService.GetValueOrDefault(service) + 1;
+        }
+    }
+
+    public void PendingEnded(string service)
+    {
+        lock (_gate)
+        {
+            if (_pendingRequests > 0) _pendingRequests--;
+            _pendingByService[service] = Math.Max(0, _pendingByService.GetValueOrDefault(service) - 1);
+        }
+    }
+
+    public void ServiceSessionStarted(string service)
+    {
+        lock (_gate) _activeByService[service] = _activeByService.GetValueOrDefault(service) + 1;
+    }
+
+    public void ServiceSessionEnded(string service)
+    {
+        lock (_gate) _activeByService[service] = Math.Max(0, _activeByService.GetValueOrDefault(service) - 1);
+    }
+
+    public void RecordRejection(string type)
+    {
+        lock (_gate)
+        {
+            if (type == "busy") _busyRejections++;
+            if (type == "no-agent") _noAgentRejections++;
+        }
+    }
+
     public void RemoveWaiting(WaitingAgent waiting)
     {
         lock (_gate)
@@ -1095,6 +1652,34 @@ sealed class RelayRoom
             }
             _lastAgentDisconnectedAt = DateTimeOffset.UtcNow;
         }
+    }
+
+    public async Task<int> RemoveLegacyAgentsAsync(string instance)
+    {
+        List<WaitingAgent> removed = [];
+        lock (_gate)
+        {
+            PruneClosedAgents();
+            var count = _agents.Count;
+            for (var i = 0; i < count; i++)
+            {
+                var agent = _agents.Dequeue();
+                if (instance.Length > 0 && agent.Identity.Instance == instance)
+                {
+                    agent.TryCancel();
+                    removed.Add(agent);
+                }
+                else
+                {
+                    _agents.Enqueue(agent);
+                }
+            }
+        }
+        foreach (var agent in removed)
+        {
+            await CloseQuietlyAsync(agent.Socket, WebSocketCloseStatus.NormalClosure, "replaced by protocol v2 control connection");
+        }
+        return removed.Count;
     }
 
     public void HomeAgentConnected(string remote)
@@ -1182,6 +1767,14 @@ sealed class RelayRoom
                 id = Id,
                 @protected = _credentialSet && _roomProof.Length > 0,
                 waiting_agents = _agents.Count,
+                control_connections = _controlConnections,
+                pending_requests = _pendingRequests,
+                busy_rejections = _busyRejections,
+                no_agent_rejections = _noAgentRejections,
+                control_agents = _controlAgents.Keys.OrderBy(value => value).ToArray(),
+                protocol_version = 2,
+                pending_by_service = new Dictionary<string, int>(_pendingByService),
+                active_sessions_by_service = new Dictionary<string, int>(_activeByService),
                 active_pairs = _activePairs,
                 total_pairs = _totalPairs,
                 last_agent_remote = _lastAgentRemote,
@@ -1328,7 +1921,7 @@ sealed class ResumeSession
             while (true)
             {
                 var (first, second) = await BridgeOnceAsync(agent, client);
-                if (first.CloseStatus == WebSocketCloseStatus.NormalClosure)
+                if (first.CloseStatus == WebSocketCloseStatus.NormalClosure || second.CloseStatus == WebSocketCloseStatus.NormalClosure)
                 {
                     await Task.WhenAll(
                         RelayRoom.CloseQuietlyAsync(agent, WebSocketCloseStatus.NormalClosure, "session closed"),

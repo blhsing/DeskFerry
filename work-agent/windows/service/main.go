@@ -22,6 +22,8 @@ import (
 	"syscall"
 	"time"
 
+	"nhooyr.io/websocket"
+
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/eventlog"
@@ -48,6 +50,8 @@ type config struct {
 	RoomPassword     string   `json:"-"`
 	MinBackoff       string   `json:"min_backoff"`
 	MaxBackoff       string   `json:"max_backoff"`
+	ConcurrencyLimit int      `json:"concurrency_limit,omitempty"`
+	LegacyMode       bool     `json:"legacy_mode,omitempty"`
 }
 
 type relayURLFlag []string
@@ -338,6 +342,12 @@ func (c *config) applyDefaults() {
 	if c.MaxBackoff == "" {
 		c.MaxBackoff = "60s"
 	}
+	if c.ConcurrencyLimit == 0 {
+		c.ConcurrencyLimit = envPositiveInt("DESKFERRY_MAX_SESSIONS", 4)
+	}
+	if envBool("DESKFERRY_FORCE_LEGACY") {
+		c.LegacyMode = true
+	}
 }
 
 func (c config) validate() error {
@@ -384,7 +394,27 @@ func (c config) validate() error {
 	if err != nil || maxBackoff < minBackoff {
 		return fmt.Errorf("max_backoff must be a duration >= min_backoff")
 	}
+	if c.ConcurrencyLimit < 1 || c.ConcurrencyLimit > 256 {
+		return fmt.Errorf("concurrency_limit must be between 1 and 256")
+	}
 	return nil
+}
+
+func envPositiveInt(name string, fallback int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *config) normalizeRelayAddresses() {
@@ -630,7 +660,6 @@ func run(ctx context.Context, cfg config) error {
 }
 
 func runWebSocketPools(ctx context.Context, cfg config) error {
-	const slots = 4
 	targets := []serviceTarget{{Service: tunnel.ServiceRDP, Address: cfg.RDPAddr}}
 	if cfg.WinRMAddr != "" {
 		targets = append(targets, serviceTarget{Service: tunnel.ServiceWinRM, Address: cfg.WinRMAddr})
@@ -644,22 +673,192 @@ func runWebSocketPools(ctx context.Context, cfg config) error {
 	if err != nil {
 		log.Printf("using temporary agent identity: %v", err)
 	}
-	log.Printf("starting websocket agent pools for %d relay URL(s) and %d service(s)", len(relayAddrs), len(targets))
+	if agentID == "" {
+		agentID, _ = randomAgentID()
+	}
+	limiter := make(chan struct{}, cfg.ConcurrencyLimit)
+	log.Printf("starting websocket agent controls for %d relay URL(s), %d service(s), concurrency=%d legacy=%t", len(relayAddrs), len(targets), cfg.ConcurrencyLimit, cfg.LegacyMode)
 	for _, relayAddr := range relayAddrs {
 		relayCfg := cfg.withRelayAddress(relayAddr)
-		for _, target := range targets {
-			for i := 0; i < slots; i++ {
-				wg.Add(1)
-				go func(slot int, slotCfg config, service serviceTarget) {
-					defer wg.Done()
-					runWebSocketSlot(ctx, slotCfg, slot, agentID, service)
-				}(i+1, relayCfg, target)
-			}
-		}
+		wg.Add(1)
+		go func(slotCfg config) {
+			defer wg.Done()
+			runRelayAgent(ctx, slotCfg, agentID, targets, limiter)
+		}(relayCfg)
 	}
 	<-ctx.Done()
 	wg.Wait()
 	return nil
+}
+
+var errControlUnsupported = errors.New("relay does not support protocol v2 control channels")
+
+func runRelayAgent(ctx context.Context, cfg config, agentID string, targets []serviceTarget, limiter chan struct{}) {
+	if cfg.LegacyMode {
+		runLegacyPools(ctx, cfg, agentID, targets)
+		return
+	}
+	minBackoff, _ := time.ParseDuration(cfg.MinBackoff)
+	maxBackoff, _ := time.ParseDuration(cfg.MaxBackoff)
+	backoff := minBackoff
+	for ctx.Err() == nil {
+		connected, err := runAgentControlOnce(ctx, cfg, agentID, targets, limiter)
+		if errors.Is(err, errControlUnsupported) {
+			log.Printf("relay %s does not support protocol v2; using legacy slots for rollback compatibility", cfg.RelayAddr)
+			runLegacyPools(ctx, cfg, agentID, targets)
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		delay, next := reconnectDelay(backoff, minBackoff, maxBackoff, connected)
+		backoff = next
+		log.Printf("agent control relay=%s disconnected: %v; reconnecting in %s", cfg.RelayAddr, err, delay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func runLegacyPools(ctx context.Context, cfg config, agentID string, targets []serviceTarget) {
+	const slots = 4
+	var wg sync.WaitGroup
+	for _, target := range targets {
+		for i := 0; i < slots; i++ {
+			wg.Add(1)
+			go func(slot int, service serviceTarget) {
+				defer wg.Done()
+				runWebSocketSlot(ctx, cfg, slot, agentID, service)
+			}(i+1, target)
+		}
+	}
+	<-ctx.Done()
+	wg.Wait()
+}
+
+type controlWriter struct {
+	mu sync.Mutex
+	ws *websocket.Conn
+}
+
+func (w *controlWriter) send(ctx context.Context, message tunnel.ControlMessage) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return tunnel.WriteControlMessage(writeCtx, w.ws, message)
+}
+
+func runAgentControlOnce(ctx context.Context, cfg config, agentID string, targets []serviceTarget, limiter chan struct{}) (bool, error) {
+	headers := http.Header{}
+	tunnel.AddProtocolV2Header(headers)
+	headers.Set(tunnel.HeaderAgentInstance, agentID)
+	headers.Set(tunnel.HeaderConcurrency, strconv.Itoa(cfg.ConcurrencyLimit))
+	services := make([]string, 0, len(targets))
+	targetByService := make(map[string]serviceTarget, len(targets))
+	for _, target := range targets {
+		services = append(services, target.Service)
+		targetByService[target.Service] = target
+	}
+	headers.Set(tunnel.HeaderAgentServices, strings.Join(services, ","))
+	tunnel.AddRoomPasswordHeader(headers, cfg.RelayAddr, "", cfg.RoomPassword)
+	ws, err := tunnel.DialWebSocketWithHeaders(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgentControl, "", headers)
+	if err != nil {
+		return false, err
+	}
+	defer tunnel.CloseWebSocket(ws)
+	readyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	err = tunnel.AwaitControlReady(readyCtx, ws)
+	cancel()
+	if err != nil {
+		if tunnel.IsTerminalSessionError(err) && strings.Contains(strings.ToLower(err.Error()), "missing relay role") {
+			return false, errControlUnsupported
+		}
+		return false, err
+	}
+	writer := &controlWriter{ws: ws}
+	log.Printf("agent control connected relay=%s room=%s services=%s concurrency=%d via=%s", cfg.RelayAddr, tunnel.RelayRoomToken(cfg.RelayAddr, ""), strings.Join(services, ","), cfg.ConcurrencyLimit, tunnel.ProxySpecForLog(cfg.Proxy))
+	for {
+		message, err := tunnel.ReadControlMessage(ctx, ws)
+		if err != nil {
+			return true, err
+		}
+		if message.Type != tunnel.MessageSessionOffer {
+			continue
+		}
+		if err := tunnel.ValidateSessionOffer(message, tunnel.RelayRoomToken(cfg.RelayAddr, ""), agentID, time.Now().UTC()); err != nil {
+			result := tunnel.MessageUnsupportedVersion
+			if message.ProtocolVersion == tunnel.ProtocolVersion2 {
+				result = tunnel.MessageServiceDisabled
+			}
+			_ = writer.send(ctx, tunnel.ControlMessage{Type: result, SessionID: message.SessionID, Reason: err.Error()})
+			continue
+		}
+		target, enabled := targetByService[message.Service]
+		if !enabled {
+			_ = writer.send(ctx, tunnel.ControlMessage{Type: tunnel.MessageServiceDisabled, SessionID: message.SessionID, Reason: "requested service is disabled"})
+			continue
+		}
+		select {
+		case limiter <- struct{}{}:
+			go serveOfferedSession(ctx, cfg, agentID, target, message, writer, limiter)
+		default:
+			_ = writer.send(ctx, tunnel.ControlMessage{Type: tunnel.MessageBusy, SessionID: message.SessionID, Reason: "work agent concurrency limit reached"})
+			log.Printf("session rejected busy relay=%s session=%s service=%s concurrency=%d", cfg.RelayAddr, message.SessionID, message.Service, cfg.ConcurrencyLimit)
+		}
+	}
+}
+
+func serveOfferedSession(parent context.Context, cfg config, agentID string, target serviceTarget, offer tunnel.ControlMessage, writer *controlWriter, limiter chan struct{}) {
+	defer func() { <-limiter }()
+	sessionCtx, cancel := context.WithDeadline(parent, offer.ExpiresAt)
+	defer cancel()
+	started := time.Now()
+	var dialer net.Dialer
+	localConn, err := dialer.DialContext(sessionCtx, "tcp", target.Address)
+	if err != nil {
+		_ = writer.send(parent, tunnel.ControlMessage{Type: tunnel.MessageServiceDisabled, SessionID: offer.SessionID, Reason: "local service unavailable"})
+		log.Printf("session offer local dial failed relay=%s session=%s service=%s target=%s duration=%s error=%v", cfg.RelayAddr, offer.SessionID, target.Service, target.Address, time.Since(started).Round(time.Millisecond), err)
+		return
+	}
+	if err := writer.send(parent, tunnel.ControlMessage{Type: tunnel.MessageAccept, SessionID: offer.SessionID}); err != nil {
+		_ = localConn.Close()
+		return
+	}
+	headers := http.Header{}
+	tunnel.AddProtocolV2Header(headers)
+	headers.Set(tunnel.HeaderAgentInstance, agentID)
+	headers.Set(tunnel.HeaderSessionID, offer.SessionID)
+	if offer.Resumable {
+		headers.Set(tunnel.HeaderResumable, "1")
+	}
+	tunnel.AddRoomPasswordHeader(headers, cfg.RelayAddr, "", cfg.RoomPassword)
+	tunnel.AddServiceHeader(headers, target.Service)
+	ws, err := tunnel.DialWebSocketWithHeaders(sessionCtx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgentSession, "", headers)
+	if err != nil {
+		_ = localConn.Close()
+		log.Printf("agent session dial failed relay=%s session=%s service=%s duration=%s error=%v", cfg.RelayAddr, offer.SessionID, target.Service, time.Since(started).Round(time.Millisecond), err)
+		return
+	}
+	if _, err := tunnel.AwaitSessionReady(sessionCtx, ws); err != nil {
+		_ = localConn.Close()
+		tunnel.CloseWebSocket(ws)
+		log.Printf("agent session rejected relay=%s session=%s service=%s error=%v", cfg.RelayAddr, offer.SessionID, target.Service, err)
+		return
+	}
+	cancel()
+	stream := net.Conn(tunnel.WebSocketNetConn(parent, ws))
+	if offer.Resumable {
+		stream = tunnel.NewResumableWebSocketConn(parent, ws, tunnel.ResumableWebSocketOptions{RelayAddr: cfg.RelayAddr, Proxy: cfg.Proxy, SessionID: offer.SessionID, Side: "agent", RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword), Service: target.Service})
+	}
+	log.Printf("session ready relay=%s session=%s service=%s target=%s setup_duration=%s", cfg.RelayAddr, offer.SessionID, target.Service, target.Address, time.Since(started).Round(time.Millisecond))
+	result := tunnel.PipeWithResult(stream, localConn)
+	_ = writer.send(parent, tunnel.ControlMessage{Type: tunnel.MessageSessionClosed, SessionID: offer.SessionID, Service: target.Service, Reason: result.EndInitiator("relay", "local_"+target.Service)})
+	log.Printf("session closed relay=%s session=%s service=%s duration=%s end_initiator=%s relay_to_local_bytes=%d local_to_relay_bytes=%d", cfg.RelayAddr, offer.SessionID, target.Service, result.Duration.Round(time.Millisecond), result.EndInitiator("relay", "local_"+target.Service), result.AToB.Bytes, result.BToA.Bytes)
 }
 
 type serviceTarget struct {

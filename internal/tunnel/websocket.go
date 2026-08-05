@@ -432,7 +432,7 @@ func proxyFunc(relayAddr, proxySpec string) func(*http.Request) (*url.URL, error
 
 func validateWebSocketRole(role string) error {
 	switch role {
-	case RoleAgent, RoleClient, RoleProbe, RoleHomeAgent, RoleResume:
+	case RoleAgent, RoleClient, RoleAgentControl, RoleAgentSession, RoleProbe, RoleHomeAgent, RoleResume:
 		return nil
 	default:
 		return fmt.Errorf("invalid websocket role %q", role)

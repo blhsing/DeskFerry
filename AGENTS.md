@@ -10,7 +10,7 @@ DeskFerry is a Go + .NET + Python + Android project for outbound-only RDP, WinRM
 - The OCI Go relay is a compatible alternate broker, currently deployed as `deskferry-relay.service` on `217.142.228.117`.
 - A named room URL under `/relay/<room>` is the normal and only user-facing pairing configuration.
 - The work agent may be configured with multiple relay room URLs simultaneously when they use the same room name, so home apps can choose any reachable relay.
-- The work agent sends a persistent agent identity plus slot number on idle `agent` WebSockets; relays should replace older waiting sockets with the same identity/slot instead of counting duplicates.
+- The work agent normally maintains one `agent-control` WebSocket per relay room URL and opens `agent-session` data sockets on demand. Legacy `agent` slots remain dual-protocol rollback compatibility only.
 - Graphical relay URL list UIs should use CRUD controls with inline or selected-row editing plus drag-to-reorder; avoid returning to semicolon-separated or multiline free-form entry for user-facing multi-value relay URLs.
 - Do not reintroduce generated client files or file-based pairing artifacts for the normal path.
 - The Azure relay WebSocket endpoint is `/relay/ws` for the overview room and `/relay/<room>/ws` for named rooms.
@@ -155,7 +155,7 @@ Android lint may need uncached artifacts from `dl.google.com`; if this host cann
 ## Coding Guidance
 
 - Prefer existing package boundaries and helper APIs.
-- Keep `internal/tunnel` focused on current protocol primitives: WebSocket dialing, proxy URL handling, role constants, and byte piping.
+- Keep `internal/tunnel` focused on current protocol primitives: WebSocket dialing, proxy URL handling, v2 control messages, role constants, resumption, and byte piping.
 - Keep the Windows home app URL-first; it should store a room URL and local UI settings, not implement the broker.
 - Use `apply_patch` for manual file edits.
 - Avoid committing generated private key material under `dist/` or elsewhere.

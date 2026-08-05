@@ -340,18 +340,36 @@ func writeSOCKSReply(writer io.Writer, code byte) error {
 func dialSMBRelay(ctx context.Context, cfg homenetwork.Config) (net.Conn, string, error) {
 	var failures []error
 	for _, relayAddr := range cfg.RelayAddrs {
+		attemptStarted := time.Now()
+		attemptCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 		headers := http.Header{}
+		tunnel.AddProtocolV2Header(headers)
+		headers.Set(tunnel.HeaderResumable, "1")
 		headers.Set(tunnel.HeaderRoomProof, cfg.RoomProof)
 		tunnel.AddServiceHeader(headers, tunnel.ServiceSMB)
-		ws, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
+		ws, err := tunnel.DialWebSocketWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
 		if err != nil {
+			cancel()
+			log.Printf("relay attempt failed relay=%s service=%s elapsed=%s result=transport-failure error=%v", relayAddr, tunnel.ServiceSMB, time.Since(attemptStarted).Round(time.Millisecond), err)
 			failures = append(failures, fmt.Errorf("%s: %w", relayAddr, err))
 			continue
 		}
-		if err := tunnel.AwaitWebSocketStart(ctx, ws); err != nil {
+		sessionID, v2, err := tunnel.AwaitSessionReadyCompatible(attemptCtx, ws)
+		if err != nil {
+			cancel()
 			tunnel.CloseWebSocket(ws)
+			log.Printf("relay attempt failed relay=%s service=%s elapsed=%s error=%v", relayAddr, tunnel.ServiceSMB, time.Since(attemptStarted).Round(time.Millisecond), err)
 			failures = append(failures, fmt.Errorf("%s: %w", relayAddr, err))
+			var rejected *tunnel.SessionResultError
+			if errors.As(err, &rejected) && (rejected.Result == tunnel.MessageAuthFailed || rejected.Result == tunnel.MessageServiceDisabled || rejected.Result == tunnel.MessageInvalidRequest) {
+				break
+			}
 			continue
+		}
+		cancel()
+		log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t elapsed=%s", relayAddr, tunnel.ServiceSMB, v2, time.Since(attemptStarted).Round(time.Millisecond))
+		if sessionID != "" {
+			return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: sessionID, Side: "client", RoomProof: cfg.RoomProof, Service: tunnel.ServiceSMB}), relayAddr, nil
 		}
 		return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil
 	}

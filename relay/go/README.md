@@ -13,8 +13,10 @@ It exposes:
 WebSocket clients identify their role with `X-DeskFerry-Role`:
 
 ```text
-agent | client | home-agent | probe | dashboard
+agent-control | agent-session | client | resume | agent | home-agent | probe | dashboard
 ```
+
+Protocol v2 uses one persistent `agent-control` connection per work agent and creates an `agent-session` data connection for each accepted Home request. The legacy `agent` role remains available for rollback compatibility.
 
 ## Build
 

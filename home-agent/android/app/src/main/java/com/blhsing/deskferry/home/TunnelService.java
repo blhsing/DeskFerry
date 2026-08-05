@@ -388,7 +388,7 @@ public class TunnelService extends Service {
                 .header("Authorization", "Bearer " + token)
                 .header("X-DeskFerry-Role", role)
                 .header("X-TunnelDesktop-Role", role)
-                .header("User-Agent", "DeskFerry-Android/0.7.2");
+                .header("User-Agent", "DeskFerry-Android/0.8.0");
         if (!roomProof.isEmpty() && !"dashboard".equals(role)) {
             request.header("X-DeskFerry-Room-Proof", roomProof);
         }
@@ -728,12 +728,15 @@ public class TunnelService extends Service {
                             long dialStarted = SystemClock.elapsedRealtime();
                             connectRelay(candidate);
                             selectedRelay = candidate;
-                            append("RDP session remote=" + remote + " connected relay=" + candidate + " dial_duration_ms=" + elapsedMillis(dialStarted) + ".");
+                            append("Relay attempt selected relay=" + candidate + " service=rdp protocol_v2=true elapsed_ms=" + elapsedMillis(dialStarted) + ".");
                         } catch (Exception ex) {
                             lastError = candidate + ": " + ex.getMessage();
                             closeWebSocketOnly();
                             if (!closed.get()) {
-                                append("RDP bridge via " + candidate + " failed; retrying: " + ex.getMessage());
+                                append("Relay attempt failed relay=" + candidate + " service=rdp result=" + relayAttemptResult(ex) + " error=" + ex.getMessage() + ".");
+                            }
+                            if (ex instanceof SessionRejectedException && ((SessionRejectedException) ex).terminal()) {
+                                throw ex;
                             }
                             continue;
                         }
@@ -770,14 +773,18 @@ public class TunnelService extends Service {
             AtomicReference<Throwable> failure = new AtomicReference<>();
             Request request = webSocketRequest(candidate, "client").newBuilder()
                     .header("X-DeskFerry-Resumable", "1")
+                    .header("X-DeskFerry-Protocol", "2")
                     .build();
             WebSocket socket = httpClient.newWebSocket(request, bridgeListener(paired, started, failure, true));
             webSocket = socket;
-            if (!paired.await(30, TimeUnit.SECONDS)) {
+            if (!paired.await(12, TimeUnit.SECONDS)) {
                 throw new IOException("relay did not pair with a work agent");
             }
             Throwable err = failure.get();
             if (err != null) {
+                if (err instanceof SessionRejectedException) {
+                    throw (SessionRejectedException) err;
+                }
                 throw new IOException("relay connection failed", err);
             }
             if (!started.get()) {
@@ -790,9 +797,31 @@ public class TunnelService extends Service {
                 @Override
                 public void onMessage(WebSocket socket, String text) {
                     String value = text.trim();
-                    if (initial && ("start".equals(value) || value.startsWith("start "))) {
-                        if (value.startsWith("start ")) {
+                    if (initial && ("start".equals(value) || value.startsWith("start ") || value.startsWith("{"))) {
+                        if (value.startsWith("{")) {
+                            try {
+                                JSONObject message = new JSONObject(value);
+                                String result = message.optString("type", "invalid-request");
+                                if (!"session-ready".equals(result)) {
+                                    failure.set(new SessionRejectedException(result, message.optString("reason", "")));
+                                    ready.countDown();
+                                    return;
+                                }
+                                sessionId = message.optString("session_id", "").trim();
+                                if (sessionId.isEmpty()) {
+                                    failure.set(new IOException("relay session-ready result omitted the session ID"));
+                                    ready.countDown();
+                                    return;
+                                }
+                            } catch (Exception ex) {
+                                failure.set(ex);
+                                ready.countDown();
+                                return;
+                            }
+                        } else if (value.startsWith("start ")) {
                             sessionId = value.substring("start ".length()).trim();
+                        }
+                        if (!sessionId.isEmpty()) {
                             if (!attachTransport(socket)) {
                                 failure.set(new IOException("failed to initialize resumable relay stream"));
                             }
@@ -823,9 +852,12 @@ public class TunnelService extends Service {
                 public void onClosed(WebSocket socket, int code, String reason) {
                     ready.countDown();
                     if (!started.get()) {
+                        if (failure.get() == null) {
+                            failure.set(new IOException("relay closed before pairing code=" + code + " reason=" + reason));
+                        }
                         return;
                     }
-                    if (!sessionId.isEmpty() && code != 1000 && !closed.get()) {
+                    if (!sessionId.isEmpty() && code != 1000 && code != 1008 && !closed.get()) {
                         markTransportLost(socket, "websocket_closed code=" + code + " reason=" + quoted(reason));
                     } else {
                         recordTermination("websocket_closed code=" + code + " reason=" + quoted(reason));
@@ -840,7 +872,8 @@ public class TunnelService extends Service {
                     if (!started.get()) {
                         return;
                     }
-                    if (!sessionId.isEmpty() && !closed.get()) {
+                    int status = response == null ? 0 : response.code();
+                    if (!sessionId.isEmpty() && status != 401 && status != 403 && !closed.get()) {
                         markTransportLost(socket, "websocket_failure error=" + throwableText(t) + " http_status=" + responseStatus(response));
                     } else {
                         recordTermination("websocket_failure error=" + throwableText(t) + " http_status=" + responseStatus(response));
@@ -848,6 +881,27 @@ public class TunnelService extends Service {
                     }
                 }
             };
+        }
+
+        private String relayAttemptResult(Exception error) {
+            if (error instanceof SessionRejectedException) {
+                return ((SessionRejectedException) error).result;
+            }
+            String text = String.valueOf(error.getMessage()).toLowerCase(Locale.ROOT);
+            return text.contains("did not pair") || text.contains("timeout") ? "timeout" : "transport-failure";
+        }
+
+        private final class SessionRejectedException extends IOException {
+            final String result;
+
+            SessionRejectedException(String result, String reason) {
+                super("relay session rejected: " + result + (reason.isEmpty() ? "" : " (" + reason + ")"));
+                this.result = result;
+            }
+
+            boolean terminal() {
+                return "authentication-failed".equals(result) || "service-disabled".equals(result) || "invalid-request".equals(result);
+            }
         }
 
         private boolean attachTransport(WebSocket socket) {

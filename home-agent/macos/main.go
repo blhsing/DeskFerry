@@ -279,19 +279,21 @@ func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
 		errs = errs[:0]
 		for _, relayAddr := range cfg.relayAddresses() {
 			attemptStarted := time.Now()
-			attemptCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			attemptCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 			headers := http.Header{}
+			tunnel.AddProtocolV2Header(headers)
 			headers.Set(tunnel.HeaderResumable, "1")
 			tunnel.AddRoomPasswordHeader(headers, relayAddr, "", cfg.RoomPassword)
 			tunnel.AddServiceHeader(headers, tunnel.ServiceRDP)
 			ws, err := tunnel.DialWebSocketWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
 			sessionID := ""
+			v2 := false
 			if err == nil {
-				sessionID, err = tunnel.AwaitWebSocketStartSession(attemptCtx, ws)
+				sessionID, v2, err = tunnel.AwaitSessionReadyCompatible(attemptCtx, ws)
 			}
 			if err == nil {
 				cancel()
-				log.Printf("relay client paired relay=%s via=%s duration=%s", relayAddr, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
+				log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t via=%s elapsed=%s", relayAddr, tunnel.ServiceRDP, v2, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
 				if sessionID != "" {
 					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{
 						RelayAddr: relayAddr,
@@ -306,7 +308,13 @@ func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
 			}
 			cancel()
 			tunnel.CloseWebSocket(ws)
-			errs = append(errs, fmt.Sprintf("%s after %s: %v", relayAddr, time.Since(attemptStarted).Round(time.Millisecond), err))
+			elapsed := time.Since(attemptStarted).Round(time.Millisecond)
+			log.Printf("relay attempt failed relay=%s service=%s elapsed=%s result=%s error=%v", relayAddr, tunnel.ServiceRDP, elapsed, relayAttemptResult(err), err)
+			errs = append(errs, fmt.Sprintf("%s after %s: %v", relayAddr, elapsed, err))
+			var rejected *tunnel.SessionResultError
+			if errors.As(err, &rejected) && (rejected.Result == tunnel.MessageAuthFailed || rejected.Result == tunnel.MessageServiceDisabled || rejected.Result == tunnel.MessageInvalidRequest) {
+				return nil, "", fmt.Errorf("relay rejected non-retryable RDP session: %w", err)
+			}
 			if ctx.Err() != nil {
 				break
 			}
@@ -328,6 +336,20 @@ func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
 		}
 	}
 	return nil, "", fmt.Errorf("relay retry window ended: %s", strings.Join(errs, "; "))
+}
+
+func relayAttemptResult(err error) string {
+	if err == nil {
+		return "selected"
+	}
+	var rejected *tunnel.SessionResultError
+	if errors.As(err, &rejected) {
+		return rejected.Result
+	}
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "deadline exceeded") {
+		return "timeout"
+	}
+	return "transport-failure"
 }
 
 func launchRDP(cfg config) error {

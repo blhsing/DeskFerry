@@ -14,10 +14,13 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"deskferry/internal/tunnel"
 
 	"nhooyr.io/websocket"
 )
@@ -34,18 +37,24 @@ const (
 	serviceRDP        = "rdp"
 	serviceWinRM      = "winrm"
 	serviceSMB        = "smb"
+	agentControlRole  = "agent-control"
+	agentSessionRole  = "agent-session"
+	protocolV2        = "2"
+	sessionOfferTTL   = 8 * time.Second
 	// Resumable tunnel data messages contain a 64 KiB payload plus framing.
 	// Keep a bounded amount of headroom above that protocol maximum.
 	relayWebSocketReadLimit = 1 << 20
 )
 
 var validRoles = map[string]bool{
-	"agent":       true,
-	"client":      true,
-	"home-agent":  true,
-	"probe":       true,
-	resumeRole:    true,
-	dashboardRole: true,
+	"agent":          true,
+	agentControlRole: true,
+	agentSessionRole: true,
+	"client":         true,
+	"home-agent":     true,
+	"probe":          true,
+	resumeRole:       true,
+	dashboardRole:    true,
 }
 
 func main() {
@@ -177,7 +186,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hub *RelayHub, room
 	ctx := r.Context()
 	proof := readRoomProof(r)
 	service := readService(r)
-	if (role == "agent" || role == "client" || role == resumeRole) && service == "" {
+	if (role == "agent" || role == "client" || role == agentSessionRole || role == resumeRole) && service == "" {
 		closeQuietly(c, websocket.StatusPolicyViolation, "unsupported service")
 		return
 	}
@@ -189,8 +198,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hub *RelayHub, room
 		identity := readAgentIdentity(r)
 		identity.Service = service
 		hub.ServeAgent(ctx, token, c, remote, identity, readResumable(r), proof, service)
+	case agentControlRole:
+		hub.ServeAgentControl(ctx, token, c, remote, readAgentIdentity(r).Instance, readAgentServices(r), readConcurrency(r), proof)
+	case agentSessionRole:
+		hub.ServeAgentSession(ctx, token, c, remote, readAgentIdentity(r).Instance, r.Header.Get(tunnel.HeaderSessionID), readResumable(r), proof, service)
 	case "client":
-		hub.ServeClient(ctx, token, c, remote, readResumable(r), proof, service)
+		if strings.TrimSpace(r.Header.Get(tunnel.HeaderProtocolVersion)) == protocolV2 {
+			hub.ServeV2Client(ctx, token, c, remote, readResumable(r), proof, service)
+		} else {
+			hub.ServeClient(ctx, token, c, remote, readResumable(r), proof, service)
+		}
 	case resumeRole:
 		hub.ServeResume(ctx, token, c, remote, r.Header.Get("X-DeskFerry-Session"), r.Header.Get("X-DeskFerry-Session-Side"), proof, service)
 	case "home-agent":
@@ -276,6 +293,25 @@ func readResumable(r *http.Request) bool {
 	return value == "1" || strings.EqualFold(value, "true")
 }
 
+func readAgentServices(r *http.Request) map[string]bool {
+	services := make(map[string]bool)
+	for _, value := range strings.Split(r.Header.Get(tunnel.HeaderAgentServices), ",") {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == serviceRDP || value == serviceWinRM || value == serviceSMB {
+			services[value] = true
+		}
+	}
+	return services
+}
+
+func readConcurrency(r *http.Request) int {
+	value, err := strconv.Atoi(strings.TrimSpace(r.Header.Get(tunnel.HeaderConcurrency)))
+	if err != nil || value < 1 || value > 256 {
+		return 4
+	}
+	return value
+}
+
 func readRoomProof(r *http.Request) string {
 	value := strings.TrimSpace(r.Header.Get("X-DeskFerry-Room-Proof"))
 	if len(value) != 43 {
@@ -350,6 +386,8 @@ type RelayHub struct {
 	rooms      map[string]*RelayRoom
 	dashboards map[string]*DashboardClient
 	sessions   map[string]*ResumeSession
+	controls   map[string]*AgentControl
+	pending    map[string]*PendingSession
 }
 
 func newRelayHub() *RelayHub {
@@ -357,7 +395,340 @@ func newRelayHub() *RelayHub {
 		rooms:      make(map[string]*RelayRoom),
 		dashboards: make(map[string]*DashboardClient),
 		sessions:   make(map[string]*ResumeSession),
+		controls:   make(map[string]*AgentControl),
+		pending:    make(map[string]*PendingSession),
 	}
+}
+
+type AgentControl struct {
+	Room        *RelayRoom
+	Conn        *websocket.Conn
+	Remote      string
+	AgentID     string
+	Services    map[string]bool
+	Concurrency int
+	SendMu      sync.Mutex
+	Done        chan struct{}
+	Active      atomic.Int32
+	closed      atomic.Bool
+}
+
+func (a *AgentControl) TryReserve() bool {
+	for !a.closed.Load() {
+		current := a.Active.Load()
+		if int(current) >= a.Concurrency {
+			return false
+		}
+		if a.Active.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *AgentControl) Release() {
+	for {
+		current := a.Active.Load()
+		if current <= 0 || a.Active.CompareAndSwap(current, current-1) {
+			return
+		}
+	}
+}
+
+func (a *AgentControl) Send(message tunnel.ControlMessage) bool {
+	a.SendMu.Lock()
+	defer a.SendMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tunnel.WriteControlMessage(ctx, a.Conn, message); err != nil {
+		return false
+	}
+	return true
+}
+
+func (a *AgentControl) Close(reason string) {
+	if a.closed.CompareAndSwap(false, true) {
+		close(a.Done)
+		closeQuietly(a.Conn, websocket.StatusNormalClosure, reason)
+	}
+}
+
+type AgentDataSocket struct {
+	Conn      *websocket.Conn
+	Remote    string
+	Resumable bool
+	Done      chan struct{}
+}
+
+type PendingSession struct {
+	ID        string
+	Room      *RelayRoom
+	Control   *AgentControl
+	Client    *websocket.Conn
+	Remote    string
+	Proof     string
+	Service   string
+	Resumable bool
+	ExpiresAt time.Time
+	Response  chan tunnel.ControlMessage
+	Agent     chan *AgentDataSocket
+}
+
+func (h *RelayHub) ServeAgentControl(ctx context.Context, token string, c *websocket.Conn, remote, agentID string, services map[string]bool, concurrency int, proof string) {
+	room := h.roomFor(token)
+	if agentID == "" || len(services) == 0 {
+		sendV2Result(c, tunnel.MessageInvalidRequest, "", "agent identity and services are required")
+		closeQuietly(c, websocket.StatusPolicyViolation, "invalid agent control request")
+		return
+	}
+	if !room.AuthorizeAgent(proof) {
+		sendV2Result(c, tunnel.MessageAuthFailed, "", "room authentication failed")
+		closeQuietly(c, websocket.StatusPolicyViolation, "room authentication failed")
+		return
+	}
+	control := &AgentControl{Room: room, Conn: c, Remote: remote, AgentID: agentID, Services: services, Concurrency: concurrency, Done: make(chan struct{})}
+	key := room.ID + "/" + agentID
+	h.mu.Lock()
+	previous := h.controls[key]
+	h.controls[key] = control
+	h.mu.Unlock()
+	room.ControlConnected(agentID, remote)
+	removedLegacy := room.RemoveLegacyAgents(agentID)
+	if previous != nil {
+		previous.Close("replaced by newer control connection")
+	}
+	defer func() {
+		h.mu.Lock()
+		if h.controls[key] == control {
+			delete(h.controls, key)
+		}
+		for _, pending := range h.pending {
+			if pending.Control == control {
+				select {
+				case pending.Response <- tunnel.ControlMessage{Type: tunnel.MessageNoAgent, SessionID: pending.ID, Reason: "work control disconnected"}:
+				default:
+				}
+			}
+		}
+		h.mu.Unlock()
+		control.Close("")
+		room.ControlDisconnected(agentID, remote)
+		h.NotifyDashboards()
+		log.Printf("agent control disconnected room=%s agent=%s remote=%s", room.ID, agentID, remote)
+	}()
+	if !control.Send(tunnel.ControlMessage{Type: tunnel.MessageControlReady, AgentID: agentID, ProtocolVersion: tunnel.ProtocolVersion2}) {
+		return
+	}
+	log.Printf("agent control connected room=%s agent=%s services=%v concurrency=%d remote=%s removed_legacy_slots=%d", room.ID, agentID, sortedServices(services), concurrency, remote, removedLegacy)
+	h.NotifyDashboards()
+	for {
+		message, err := tunnel.ReadControlMessage(ctx, c)
+		if err != nil {
+			return
+		}
+		if cleanSessionValue(message.SessionID) == "" {
+			continue
+		}
+		h.mu.Lock()
+		pending := h.pending[room.ID+"/"+message.SessionID]
+		session := h.sessions[room.ID+"/"+message.SessionID]
+		h.mu.Unlock()
+		if message.Type == tunnel.MessageSessionClosed {
+			if session != nil {
+				session.Finish()
+			}
+			continue
+		}
+		if pending == nil || pending.Control != control {
+			continue
+		}
+		switch message.Type {
+		case tunnel.MessageAccept, tunnel.MessageBusy, tunnel.MessageServiceDisabled, tunnel.MessageUnsupportedVersion:
+			select {
+			case pending.Response <- message:
+			default:
+			}
+		}
+	}
+}
+
+func (h *RelayHub) ServeV2Client(ctx context.Context, token string, c *websocket.Conn, remote string, resumable bool, proof, service string) {
+	room := h.roomFor(token)
+	if !room.AuthorizeClient(proof) {
+		sendV2Result(c, tunnel.MessageAuthFailed, "", "room authentication failed")
+		closeQuietly(c, websocket.StatusPolicyViolation, "room authentication failed")
+		return
+	}
+	control, serviceControlExists := h.selectControl(room.ID, service)
+	if control == nil {
+		if room.HasLegacyAgent(service) {
+			h.ServeClient(ctx, token, c, remote, resumable, proof, service)
+			return
+		}
+		result, reason := tunnel.MessageNoAgent, "no work agent control connection"
+		if serviceControlExists {
+			result, reason = tunnel.MessageBusy, "work agent concurrency limit reached"
+		}
+		room.RecordRejection(result)
+		sendV2Result(c, result, "", reason)
+		closeQuietly(c, websocket.StatusNormalClosure, reason)
+		return
+	}
+	h.serveOnDemandClient(ctx, room, c, remote, resumable, proof, service, control, true)
+}
+
+func (h *RelayHub) serveOnDemandClient(ctx context.Context, room *RelayRoom, c *websocket.Conn, remote string, resumable bool, proof, service string, control *AgentControl, typed bool) {
+	defer control.Release()
+	now := time.Now().UTC()
+	pending := &PendingSession{
+		ID: randomID(), Room: room, Control: control, Client: c, Remote: remote, Proof: proof, Service: service,
+		Resumable: resumable, ExpiresAt: now.Add(sessionOfferTTL), Response: make(chan tunnel.ControlMessage, 1), Agent: make(chan *AgentDataSocket, 1),
+	}
+	key := room.ID + "/" + pending.ID
+	h.mu.Lock()
+	if len(h.pending) >= 4096 {
+		h.mu.Unlock()
+		room.RecordRejection(tunnel.MessageBusy)
+		rejectSessionClient(c, typed, tunnel.MessageBusy, "", "relay pending-session limit reached")
+		return
+	}
+	h.pending[key] = pending
+	h.mu.Unlock()
+	room.PendingStarted(service)
+	pendingOpen := true
+	cleanupPending := func() {
+		if !pendingOpen {
+			return
+		}
+		pendingOpen = false
+		h.mu.Lock()
+		delete(h.pending, key)
+		h.mu.Unlock()
+		room.PendingEnded(service)
+		h.NotifyDashboards()
+	}
+	defer cleanupPending()
+	offer := tunnel.ControlMessage{Type: tunnel.MessageSessionOffer, SessionID: pending.ID, Room: room.ID, Service: service, AgentID: control.AgentID, CreatedAt: now, ExpiresAt: pending.ExpiresAt, ProtocolVersion: tunnel.ProtocolVersion2, Resumable: resumable}
+	if !control.Send(offer) {
+		room.RecordRejection(tunnel.MessageNoAgent)
+		rejectSessionClient(c, typed, tunnel.MessageNoAgent, pending.ID, "work control disconnected")
+		return
+	}
+	h.NotifyDashboards()
+	var response tunnel.ControlMessage
+	timer := time.NewTimer(time.Until(pending.ExpiresAt))
+	defer timer.Stop()
+	select {
+	case response = <-pending.Response:
+	case <-timer.C:
+		room.RecordRejection(tunnel.MessageTimeout)
+		rejectSessionClient(c, typed, tunnel.MessageTimeout, pending.ID, "work agent did not answer the offer")
+		return
+	case <-ctx.Done():
+		return
+	}
+	if response.Type != tunnel.MessageAccept {
+		room.RecordRejection(response.Type)
+		rejectSessionClient(c, typed, response.Type, pending.ID, response.Reason)
+		return
+	}
+	var agent *AgentDataSocket
+	select {
+	case agent = <-pending.Agent:
+	case <-timer.C:
+		room.RecordRejection(tunnel.MessageTimeout)
+		rejectSessionClient(c, typed, tunnel.MessageTimeout, pending.ID, "accepted work session did not connect")
+		return
+	case <-ctx.Done():
+		return
+	}
+	cleanupPending()
+	clientReady := false
+	if typed {
+		clientReady = sendV2Result(c, tunnel.MessageSessionReady, pending.ID, "")
+	} else {
+		clientReady = sendControl(c, room.ID, remote, "legacy-client", startMessage+" "+pending.ID)
+	}
+	if !sendV2Result(agent.Conn, tunnel.MessageSessionReady, pending.ID, "") || !clientReady {
+		closeQuietly(agent.Conn, websocket.StatusNormalClosure, "peer unavailable")
+		return
+	}
+	log.Printf("v2 pairing room=%s session=%s service=%s agent=%s client=%s", room.ID, pending.ID, service, agent.Remote, remote)
+	room.ServiceSessionStarted(service)
+	defer room.ServiceSessionEnded(service)
+	if resumable && agent.Resumable {
+		session := h.newResumeSessionWithID(pending.ID, room, agent.Remote, remote, proof, service)
+		session.Run(agent.Conn, c, agent.Done, h.NotifyDashboards)
+		return
+	}
+	room.Bridge(ctx, agent.Conn, c, agent.Remote, remote, agent.Done, h.NotifyDashboards)
+}
+
+func (h *RelayHub) ServeAgentSession(ctx context.Context, token string, c *websocket.Conn, remote, agentID, sessionID string, resumable bool, proof, service string) {
+	room := roomID(token)
+	sessionID = cleanSessionValue(sessionID)
+	h.mu.Lock()
+	pending := h.pending[room+"/"+sessionID]
+	h.mu.Unlock()
+	if pending == nil || pending.Control.AgentID != agentID || pending.Service != service || !proofEqual(pending.Proof, proof) || time.Now().After(pending.ExpiresAt) {
+		sendV2Result(c, tunnel.MessageInvalidRequest, sessionID, "unknown or expired pending session")
+		closeQuietly(c, websocket.StatusPolicyViolation, "unknown pending session")
+		return
+	}
+	data := &AgentDataSocket{Conn: c, Remote: remote, Resumable: resumable, Done: make(chan struct{})}
+	select {
+	case pending.Agent <- data:
+	case <-ctx.Done():
+		return
+	default:
+		closeQuietly(c, websocket.StatusPolicyViolation, "duplicate agent session")
+		return
+	}
+	select {
+	case <-data.Done:
+	case <-ctx.Done():
+	}
+}
+
+func (h *RelayHub) selectControl(room, service string) (*AgentControl, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	controls := make([]*AgentControl, 0)
+	for key, control := range h.controls {
+		if !strings.HasPrefix(key, room+"/") || control.closed.Load() || !control.Services[service] {
+			continue
+		}
+		controls = append(controls, control)
+	}
+	sort.Slice(controls, func(i, j int) bool { return controls[i].Active.Load() < controls[j].Active.Load() })
+	for _, control := range controls {
+		if control.TryReserve() {
+			return control, true
+		}
+	}
+	return nil, len(controls) > 0
+}
+
+func sortedServices(services map[string]bool) []string {
+	out := make([]string, 0, len(services))
+	for service := range services {
+		out = append(out, service)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sendV2Result(c *websocket.Conn, result, sessionID, reason string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return tunnel.WriteControlMessage(ctx, c, tunnel.ControlMessage{Type: result, SessionID: sessionID, ProtocolVersion: tunnel.ProtocolVersion2, Reason: reason}) == nil
+}
+
+func rejectSessionClient(c *websocket.Conn, typed bool, result, sessionID, reason string) {
+	if typed {
+		sendV2Result(c, result, sessionID, reason)
+	}
+	closeQuietly(c, websocket.StatusTryAgainLater, reason)
 }
 
 func (h *RelayHub) ServeAgent(ctx context.Context, token string, c *websocket.Conn, remote string, identity AgentIdentity, resumable bool, proof, service string) {
@@ -433,6 +804,16 @@ func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.C
 		closeQuietly(c, websocket.StatusPolicyViolation, "room authentication failed")
 		return
 	}
+	control, serviceControlExists := h.selectControl(room.ID, service)
+	if control != nil {
+		h.serveOnDemandClient(ctx, room, c, remote, resumable, proof, service, control, false)
+		return
+	}
+	if serviceControlExists {
+		room.RecordRejection(tunnel.MessageBusy)
+		closeQuietly(c, websocket.StatusTryAgainLater, "work agent concurrency limit reached")
+		return
+	}
 	for {
 		waiting := room.TryTakeAgent(service)
 		if waiting == nil {
@@ -487,7 +868,11 @@ func (h *RelayHub) ServeResume(ctx context.Context, token string, c *websocket.C
 }
 
 func (h *RelayHub) newResumeSession(room *RelayRoom, agentRemote, clientRemote, proof, service string) *ResumeSession {
-	session := NewResumeSession(randomID(), room, agentRemote, clientRemote, proof, service, func(s *ResumeSession) {
+	return h.newResumeSessionWithID(randomID(), room, agentRemote, clientRemote, proof, service)
+}
+
+func (h *RelayHub) newResumeSessionWithID(id string, room *RelayRoom, agentRemote, clientRemote, proof, service string) *ResumeSession {
+	session := NewResumeSession(id, room, agentRemote, clientRemote, proof, service, func(s *ResumeSession) {
 		h.mu.Lock()
 		delete(h.sessions, room.ID+"/"+s.ID)
 		h.mu.Unlock()
@@ -625,6 +1010,12 @@ type RelayRoom struct {
 	credentialSet            bool
 	roomProof                string
 	activePairs              int
+	controlConnections       int
+	pendingRequests          int
+	rejections               map[string]int64
+	controlAgents            map[string]int
+	pendingByService         map[string]int
+	activeByService          map[string]int
 	totalPairs               int64
 	lastAgentRemote          *string
 	lastAgentConnectedAt     *time.Time
@@ -638,19 +1029,83 @@ type RelayRoom struct {
 }
 
 func NewRelayRoom(id string) *RelayRoom {
-	return &RelayRoom{ID: id}
+	return &RelayRoom{ID: id, rejections: make(map[string]int64), controlAgents: make(map[string]int), pendingByService: make(map[string]int), activeByService: make(map[string]int)}
 }
 
 func (r *RelayRoom) AuthorizeAgent(proof string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.pruneClosedAgentsLocked()
-	if !r.credentialSet || (len(r.agents) == 0 && r.activePairs == 0) {
+	if !r.credentialSet || (len(r.agents) == 0 && r.controlConnections == 0 && r.activePairs == 0) {
 		r.credentialSet = true
 		r.roomProof = proof
 		return true
 	}
 	return proofEqual(r.roomProof, proof)
+}
+
+func (r *RelayRoom) ControlConnected(agentID, remote string) {
+	now := time.Now().UTC()
+	remoteCopy := remote
+	r.mu.Lock()
+	r.controlConnections++
+	r.controlAgents[agentID]++
+	r.lastAgentRemote = &remoteCopy
+	r.lastAgentConnectedAt = &now
+	r.mu.Unlock()
+}
+
+func (r *RelayRoom) ControlDisconnected(agentID, remote string) {
+	now := time.Now().UTC()
+	r.mu.Lock()
+	if r.controlConnections > 0 {
+		r.controlConnections--
+	}
+	if r.controlAgents[agentID] <= 1 {
+		delete(r.controlAgents, agentID)
+	} else {
+		r.controlAgents[agentID]--
+	}
+	r.lastAgentDisconnectedAt = &now
+	r.mu.Unlock()
+}
+
+func (r *RelayRoom) PendingStarted(service string) {
+	r.mu.Lock()
+	r.pendingRequests++
+	r.pendingByService[service]++
+	r.mu.Unlock()
+}
+
+func (r *RelayRoom) PendingEnded(service string) {
+	r.mu.Lock()
+	if r.pendingRequests > 0 {
+		r.pendingRequests--
+	}
+	if r.pendingByService[service] > 0 {
+		r.pendingByService[service]--
+	}
+	r.mu.Unlock()
+}
+
+func (r *RelayRoom) ServiceSessionStarted(service string) {
+	r.mu.Lock()
+	r.activeByService[service]++
+	r.mu.Unlock()
+}
+
+func (r *RelayRoom) ServiceSessionEnded(service string) {
+	r.mu.Lock()
+	if r.activeByService[service] > 0 {
+		r.activeByService[service]--
+	}
+	r.mu.Unlock()
+}
+
+func (r *RelayRoom) RecordRejection(kind string) {
+	r.mu.Lock()
+	r.rejections[kind]++
+	r.mu.Unlock()
 }
 
 func (r *RelayRoom) AuthorizeClient(proof string) bool {
@@ -699,6 +1154,18 @@ func (r *RelayRoom) TryTakeAgent(service string) *WaitingAgent {
 	return nil
 }
 
+func (r *RelayRoom) HasLegacyAgent(service string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pruneClosedAgentsLocked()
+	for _, waiting := range r.agents {
+		if waiting.IsOpen() && waiting.Service == service {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *RelayRoom) RemoveWaiting(waiting *WaitingAgent) {
 	now := time.Now().UTC()
 	r.mu.Lock()
@@ -711,6 +1178,27 @@ func (r *RelayRoom) RemoveWaiting(waiting *WaitingAgent) {
 	r.agents = kept
 	r.lastAgentDisconnectedAt = &now
 	r.mu.Unlock()
+}
+
+func (r *RelayRoom) RemoveLegacyAgents(instance string) int {
+	r.mu.Lock()
+	r.pruneClosedAgentsLocked()
+	removed := make([]*WaitingAgent, 0)
+	kept := r.agents[:0]
+	for _, agent := range r.agents {
+		if agent.Identity.Instance == instance && instance != "" {
+			agent.Cancel()
+			removed = append(removed, agent)
+			continue
+		}
+		kept = append(kept, agent)
+	}
+	r.agents = kept
+	r.mu.Unlock()
+	for _, agent := range removed {
+		closeQuietly(agent.Conn, websocket.StatusNormalClosure, "replaced by protocol v2 control connection")
+	}
+	return len(removed)
 }
 
 func (r *RelayRoom) HomeAgentConnected(remote string) {
@@ -785,6 +1273,14 @@ func (r *RelayRoom) Snapshot() RoomSnapshot {
 	return RoomSnapshot{
 		ID:                       r.ID,
 		WaitingAgents:            len(r.agents),
+		ControlConnections:       r.controlConnections,
+		PendingRequests:          r.pendingRequests,
+		BusyRejections:           r.rejections[tunnel.MessageBusy],
+		NoAgentRejections:        r.rejections[tunnel.MessageNoAgent],
+		ControlAgents:            sortedIntKeys(r.controlAgents),
+		ProtocolVersion:          tunnel.ProtocolVersion2,
+		PendingByService:         cloneIntMap(r.pendingByService),
+		ActiveSessionsByService:  cloneIntMap(r.activeByService),
 		Protected:                r.credentialSet && r.roomProof != "",
 		ActivePairs:              r.activePairs,
 		TotalPairs:               r.totalPairs,
@@ -799,6 +1295,23 @@ func (r *RelayRoom) Snapshot() RoomSnapshot {
 		LastClientConnectedAt:    r.lastClientConnectedAt,
 		LastClientDisconnectedAt: r.lastClientDisconnectedAt,
 	}
+}
+
+func sortedIntKeys(values map[string]int) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func cloneIntMap(values map[string]int) map[string]int {
+	out := make(map[string]int, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
 }
 
 func (r *RelayRoom) pruneClosedAgentsLocked() {
@@ -995,7 +1508,7 @@ func (s *ResumeSession) Run(agent, client *websocket.Conn, clientDone chan struc
 	var agentAttachment, clientAttachment *ResumeAttachment
 	for {
 		first, second := bridgeSockets(agent, client)
-		if websocket.CloseStatus(first.Err) == websocket.StatusNormalClosure {
+		if websocket.CloseStatus(first.Err) == websocket.StatusNormalClosure || websocket.CloseStatus(second.Err) == websocket.StatusNormalClosure {
 			closeQuietly(agent, websocket.StatusNormalClosure, "session closed")
 			closeQuietly(client, websocket.StatusNormalClosure, "session closed")
 			if agentAttachment != nil {
@@ -1104,21 +1617,29 @@ type StatusSnapshot struct {
 }
 
 type RoomSnapshot struct {
-	ID                       string     `json:"id"`
-	WaitingAgents            int        `json:"waiting_agents"`
-	Protected                bool       `json:"protected"`
-	ActivePairs              int        `json:"active_pairs"`
-	TotalPairs               int64      `json:"total_pairs"`
-	LastAgentRemote          *string    `json:"last_agent_remote"`
-	LastAgentConnectedAt     *time.Time `json:"last_agent_connected_at"`
-	LastAgentDisconnectedAt  *time.Time `json:"last_agent_disconnected_at"`
-	HomeAgentConnected       bool       `json:"home_agent_connected"`
-	HomeAgentRemote          *string    `json:"home_agent_remote"`
-	HomeAgentConnectedAt     *time.Time `json:"home_agent_connected_at"`
-	HomeAgentDisconnectedAt  *time.Time `json:"home_agent_disconnected_at"`
-	LastClientRemote         *string    `json:"last_client_remote"`
-	LastClientConnectedAt    *time.Time `json:"last_client_connected_at"`
-	LastClientDisconnectedAt *time.Time `json:"last_client_disconnected_at"`
+	ID                       string         `json:"id"`
+	WaitingAgents            int            `json:"waiting_agents"`
+	ControlConnections       int            `json:"control_connections"`
+	PendingRequests          int            `json:"pending_requests"`
+	BusyRejections           int64          `json:"busy_rejections"`
+	NoAgentRejections        int64          `json:"no_agent_rejections"`
+	ControlAgents            []string       `json:"control_agents"`
+	ProtocolVersion          int            `json:"protocol_version"`
+	PendingByService         map[string]int `json:"pending_by_service"`
+	ActiveSessionsByService  map[string]int `json:"active_sessions_by_service"`
+	Protected                bool           `json:"protected"`
+	ActivePairs              int            `json:"active_pairs"`
+	TotalPairs               int64          `json:"total_pairs"`
+	LastAgentRemote          *string        `json:"last_agent_remote"`
+	LastAgentConnectedAt     *time.Time     `json:"last_agent_connected_at"`
+	LastAgentDisconnectedAt  *time.Time     `json:"last_agent_disconnected_at"`
+	HomeAgentConnected       bool           `json:"home_agent_connected"`
+	HomeAgentRemote          *string        `json:"home_agent_remote"`
+	HomeAgentConnectedAt     *time.Time     `json:"home_agent_connected_at"`
+	HomeAgentDisconnectedAt  *time.Time     `json:"home_agent_disconnected_at"`
+	LastClientRemote         *string        `json:"last_client_remote"`
+	LastClientConnectedAt    *time.Time     `json:"last_client_connected_at"`
+	LastClientDisconnectedAt *time.Time     `json:"last_client_disconnected_at"`
 }
 
 func sendStart(c *websocket.Conn, room, remote, side string) bool {
@@ -1306,17 +1827,17 @@ func dashboardHTML(room string) string {
     function setValue(node,text,cls){node.className="value "+cls;node.textContent=text}
     function relayRoomUrl(room){return room?location.origin+'/relay/'+encodeURIComponent(room):location.origin+'/relay/'}
     function render(data){
-      const rooms=data.rooms||[],waitingAgents=rooms.reduce((s,r)=>s+(r.waiting_agents||0),0),activePairs=rooms.reduce((s,r)=>s+(r.active_pairs||0),0),homeAgents=rooms.filter(r=>r.home_agent_connected).length,homeActiveRooms=rooms.filter(r=>r.home_agent_connected||(r.active_pairs||0)>0).length;
-      setValue(workStatus,waitingAgents+activePairs>0?"Connected":"Waiting",waitingAgents+activePairs>0?"ok":"warn");
-      workDetail.textContent=waitingAgents+' idle work sockets, '+activePairs+' paired streams.';
+      const rooms=data.rooms||[],controls=rooms.reduce((s,r)=>s+(r.control_connections||0),0),waitingAgents=rooms.reduce((s,r)=>s+(r.waiting_agents||0),0),activePairs=rooms.reduce((s,r)=>s+(r.active_pairs||0),0),homeAgents=rooms.filter(r=>r.home_agent_connected).length,homeActiveRooms=rooms.filter(r=>r.home_agent_connected||(r.active_pairs||0)>0).length;
+      setValue(workStatus,controls+waitingAgents+activePairs>0?"Connected":"Waiting",controls+waitingAgents+activePairs>0?"ok":"warn");
+      workDetail.textContent=controls+' control connections, '+activePairs+' active sessions.';
       setValue(homeStatus,homeActiveRooms>0?"Active":"Waiting",homeActiveRooms>0?"ok":"warn");
       homeDetail.textContent=homeAgents+' presence socket'+(homeAgents===1?'':'s')+', '+activePairs+' active RDP stream'+(activePairs===1?'':'s')+'.';
       streamStatus.textContent=activePairs.toString();
       streamDetail.textContent=activePairs===0?'No active RDP streams.':activePairs+' RDP stream'+(activePairs===1?'':'s')+' bridged.';
       if(rooms.length===0){roomsBody.innerHTML='<tr><td colspan="5" class="subtle">No rooms have connected yet.</td></tr>';return}
       roomsBody.innerHTML=rooms.map(r=>{
-        const workConnected=(r.waiting_agents||0)+(r.active_pairs||0)>0,homePresence=!!r.home_agent_connected,streamActive=(r.active_pairs||0)>0,homeState=homePresence?'presence':(streamActive?'active stream':'waiting'),homeInfo=homePresence?esc(r.home_agent_remote||'')+'<br>'+esc(fmt(r.home_agent_connected_at)):(r.active_pairs||0)+' active<br>'+esc(fmt(r.last_client_connected_at));
-        return '<tr><td><code>'+esc(r.id)+'</code></td><td>'+pill(workConnected,workConnected?'connected':'waiting')+'<br><span class="subtle">'+(r.waiting_agents||0)+' idle<br>'+esc(fmt(r.last_agent_connected_at))+'</span></td><td>'+pill(homePresence||streamActive,homeState)+'<br><span class="subtle">'+homeInfo+'</span></td><td>'+(r.active_pairs||0)+'<br><span class="subtle">'+(r.total_pairs||0)+' total</span></td><td><span class="subtle">'+esc(r.last_client_remote||'')+'<br>'+esc(fmt(r.last_client_connected_at))+'</span></td></tr>';
+        const workConnected=(r.control_connections||0)+(r.waiting_agents||0)+(r.active_pairs||0)>0,homePresence=!!r.home_agent_connected,streamActive=(r.active_pairs||0)>0,homeState=homePresence?'presence':(streamActive?'active stream':'waiting'),homeInfo=homePresence?esc(r.home_agent_remote||'')+'<br>'+esc(fmt(r.home_agent_connected_at)):(r.active_pairs||0)+' active<br>'+esc(fmt(r.last_client_connected_at));
+        return '<tr><td><code>'+esc(r.id)+'</code></td><td>'+pill(workConnected,workConnected?'connected':'waiting')+'<br><span class="subtle">'+(r.control_connections||0)+' controls<br>'+esc(fmt(r.last_agent_connected_at))+'</span></td><td>'+pill(homePresence||streamActive,homeState)+'<br><span class="subtle">'+homeInfo+'</span></td><td>'+(r.active_pairs||0)+'<br><span class="subtle">'+(r.total_pairs||0)+' total</span></td><td><span class="subtle">'+esc(r.last_client_remote||'')+'<br>'+esc(fmt(r.last_client_connected_at))+'</span></td></tr>';
       }).join("");
     }
     function connectDashboard(){

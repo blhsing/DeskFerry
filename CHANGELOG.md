@@ -1,5 +1,14 @@
 # Release Notes
 
+## 0.8.0 - 2026-08-05
+
+- Replaced fixed work-agent data slots with one protocol-v2 control connection per relay and on-demand RDP, WinRM, and SMB session sockets.
+- Added bounded pending offers, configurable live-session concurrency, and immediate typed `busy`, `no-agent`, authentication, service, version, and timeout results across the Azure .NET, OCI Go, and Python relays.
+- Made Windows, macOS, Android, and the Windows Home network service log every relay attempt and select fallback relays promptly while treating authentication and configuration failures as terminal.
+- Made normal completion, unknown-session rejection, and authentication rejection terminal so completed sessions no longer create resume storms or temporary slot starvation.
+- Preserved the legacy slot protocol behind dual-protocol relays and the `DESKFERRY_FORCE_LEGACY=1` work-service rollback switch.
+- Expanded relay status with control identities, protocol version, active and pending sessions by service, and busy/no-agent rejection counters.
+
 ## 0.7.2 - 2026-08-05
 
 - Made the Windows Home app register the selected destination's saved Windows login for the installed SMB alias as well as RDP and WinRM.
