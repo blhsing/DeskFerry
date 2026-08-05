@@ -660,6 +660,8 @@ Relay diagnostics are written to standard output and retained by the hosting pla
 
 When investigating a disconnect, collect the home-agent and work-agent entries covering the same timestamp, then correlate them with Azure App Service logs or `journalctl` on the relay that was selected. Pair identifiers and close details distinguish a relay-side termination from a home-to-relay, work-to-relay, or local-RDP failure.
 
+MSTSC may open a short negotiation socket, close it after exchanging only a few bytes, and continue the desktop on a second local socket. That first `end_initiator=local_rdp` entry is not a session disconnect when another RDP connection immediately follows and remains active. Home agents keep these local sockets independent; a negotiation or retry socket must not close an established desktop session.
+
 ### Repeated RDP Disconnects After A Network Drop
 
 Some corporate proxies expire outbound WebSockets on a fixed interval even while the local RDP session remains active. A reconnect or `replaced waiting agent` message roughly every 15 minutes points to that network path rather than an RDP authentication failure.

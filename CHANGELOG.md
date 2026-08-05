@@ -1,5 +1,10 @@
 # Release Notes
 
+## Unreleased
+
+- Stopped new local RDP negotiation or retry sockets from forcibly closing an established desktop session in the Windows and macOS Home agents.
+- Tracked concurrent local RDP sockets independently while still closing all of them cleanly when a tunnel stops.
+
 ## 0.9.0 - 2026-08-05
 
 - Reused one authenticated PowerShell Remoting session for WinRM commands in the Windows Home app, with five-minute idle expiration and teardown on destination, credential, tunnel, and app changes.

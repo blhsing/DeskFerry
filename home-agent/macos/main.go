@@ -207,7 +207,7 @@ func run(ctx context.Context, cfg config, openRDP bool) error {
 		}
 	}
 
-	var localSessions tunnel.LatestConnGroup
+	var localSessions tunnel.ConnGroup
 	defer localSessions.Close()
 	for {
 		conn, err := listener.Accept()
@@ -219,10 +219,7 @@ func run(ctx context.Context, cfg config, openRDP bool) error {
 		}
 		remote := conn.RemoteAddr().String()
 		log.Printf("RDP connection from %s", remote)
-		connCtx, release, replaced := localSessions.Begin(ctx, conn)
-		if replaced {
-			log.Printf("RDP connection remote=%s superseded previous local retry", remote)
-		}
+		connCtx, release := localSessions.Begin(ctx, conn)
 		go func() {
 			defer release()
 			handleLocalConn(connCtx, cfg, conn, remote)

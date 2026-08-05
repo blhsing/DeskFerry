@@ -1891,7 +1891,7 @@ func run(ctx context.Context, cfg config, openMSTSC bool) error {
 }
 
 func serveListener(ctx context.Context, cfg config, listener net.Listener, started func(string), done func(string), logf func(string, ...any)) error {
-	var localSessions tunnel.LatestConnGroup
+	var localSessions tunnel.ConnGroup
 	defer localSessions.Close()
 	go func() {
 		<-ctx.Done()
@@ -1907,10 +1907,7 @@ func serveListener(ctx context.Context, cfg config, listener net.Listener, start
 		}
 		remote := conn.RemoteAddr().String()
 		started(remote)
-		connCtx, release, replaced := localSessions.Begin(ctx, conn)
-		if replaced {
-			logf("RDP connection remote=%s superseded previous local retry", remote)
-		}
+		connCtx, release := localSessions.Begin(ctx, conn)
 		go func() {
 			defer release()
 			handleLocalConn(connCtx, cfg, conn, remote, done, logf)
