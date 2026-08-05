@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -133,6 +132,7 @@ type clientApp struct {
 	activeLocal         int
 	activeWinRM         int
 	statusCancel        context.CancelFunc
+	winRMSession        *winRMSessionManager
 	exiting             bool
 }
 
@@ -224,7 +224,7 @@ func main() {
 		return
 	}
 
-	app := &clientApp{cfg: cfg, relayDragIndex: -1}
+	app := &clientApp{cfg: cfg, relayDragIndex: -1, winRMSession: newWinRMSessionManager(defaultWinRMSessionIdleTimeout)}
 	if err := app.run(smokeTest); err != nil {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(1)
@@ -383,6 +383,7 @@ func (a *clientApp) run(smokeTest bool) error {
 											PushButton{Text: "Copy RDP Address", MinSize: Size{Height: 30}, OnClicked: a.copyRDPAddress},
 											PushButton{Text: "Save Windows Login", MinSize: Size{Height: 30}, OnClicked: a.saveWindowsCredentials},
 											PushButton{Text: "Forget Windows Login", MinSize: Size{Height: 30}, OnClicked: a.forgetWindowsCredentials},
+											PushButton{Text: "Configure SMB Alias", MinSize: Size{Height: 30}, OnClicked: a.openHomeSetup},
 											PushButton{Text: "Relay Dashboard", MinSize: Size{Height: 30}, OnClicked: a.openDashboard},
 											PushButton{Text: "Refresh", MinSize: Size{Height: 30}, OnClicked: a.refreshRelayStatusAsync},
 										},
@@ -610,6 +611,7 @@ func (a *clientApp) destinationSelectionChanged() {
 		return
 	}
 	a.commitDestinationProfile()
+	a.closeWinRMSession()
 	a.selectedDestination = index
 	a.setRelayURLList(a.destinations[index].RelayAddrs, 0)
 	a.updateDestinationEditor()
@@ -1014,6 +1016,7 @@ func (a *clientApp) saveFromUI(showMessage bool) error {
 		return err
 	}
 	wasRunning := a.isTunnelRunning()
+	a.closeWinRMSession()
 	if wasRunning {
 		a.stopTunnel()
 	}
@@ -1185,6 +1188,7 @@ func (a *clientApp) startTunnel(openRDP bool) error {
 }
 
 func (a *clientApp) stopTunnel() {
+	a.closeWinRMSession()
 	a.mu.Lock()
 	cancel := a.cancel
 	listener := a.listener
@@ -1339,28 +1343,20 @@ func (a *clientApp) executeWinRM() {
 			return
 		}
 	}
-	payload, err := json.Marshal(map[string]string{"user": user, "password": password, "command": command, "port": port})
-	if err != nil {
-		a.showError(err)
-		return
-	}
-	encoded := base64.StdEncoding.EncodeToString(payload)
 	_ = a.rdpPass.SetText("")
 	a.executeWinRMButton.SetEnabled(false)
 	_ = a.winrmOutput.SetText("Running...")
 	go func() {
+		started := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		script := `$ErrorActionPreference = 'Stop'
-$payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('` + encoded + `')) | ConvertFrom-Json
-$secure = ConvertTo-SecureString ([string]$payload.password) -AsPlainText -Force
-$credential = [Management.Automation.PSCredential]::new([string]$payload.user, $secure)
-Invoke-Command -ComputerName localhost -Port ([int]$payload.port) -Authentication Negotiate -Credential $credential -ScriptBlock ([ScriptBlock]::Create([string]$payload.command)) | Out-String -Width 240
-`
-		cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-")
-		cmd.Stdin = strings.NewReader(script)
-		output, runErr := cmd.CombinedOutput()
-		text := strings.TrimSpace(string(output))
+		manager := a.winRMSession
+		if manager == nil {
+			manager = newWinRMSessionManager(defaultWinRMSessionIdleTimeout)
+			a.winRMSession = manager
+		}
+		response, runErr := manager.Execute(ctx, cfg.SelectedDestination, user, password, command, port)
+		text := strings.TrimSpace(response.Output)
 		if runErr != nil {
 			if text != "" {
 				text += "\r\n\r\n"
@@ -1374,8 +1370,14 @@ Invoke-Command -ComputerName localhost -Port ([int]$payload.port) -Authenticatio
 			_ = a.winrmOutput.SetText(text)
 			a.executeWinRMButton.SetEnabled(true)
 		})
-		a.appendLog("WinRM command completed success=%t.", runErr == nil)
+		a.appendLog("WinRM command completed success=%t reused_session=%t elapsed=%s.", runErr == nil, response.Reused, time.Since(started).Round(time.Millisecond))
 	}()
+}
+
+func (a *clientApp) closeWinRMSession() {
+	if a.winRMSession != nil {
+		a.winRMSession.Close()
+	}
 }
 
 func (a *clientApp) saveWindowsCredentials() {
@@ -1398,6 +1400,7 @@ func (a *clientApp) saveWindowsCredentials() {
 		a.showError(err)
 		return
 	}
+	a.closeWinRMSession()
 	if _, err := writeMSTSCRDPFile(cfg); err != nil {
 		a.appendLog("Saved Windows login, but could not update the Remote Desktop profile: %v", err)
 	}
@@ -1415,6 +1418,7 @@ func (a *clientApp) forgetWindowsCredentials() {
 		a.showError(err)
 		return
 	}
+	a.closeWinRMSession()
 	a.appendLog("Removed the shared RDP, WinRM, and SMB login for destination %s.", cfg.SelectedDestination)
 }
 
@@ -1423,6 +1427,22 @@ func (a *clientApp) openDashboard() {
 	if err := shellOpen(dashboardURL(cfg.primaryRelayAddress())); err != nil {
 		a.showError(err)
 	}
+}
+
+func (a *clientApp) openHomeSetup() {
+	path := installedHomeSetupPath()
+	if path == "" {
+		a.showError(errors.New("DeskFerry Home Setup is not installed; run DeskFerryHomeSetup.exe to configure the SMB alias"))
+		return
+	}
+	if err := shellOpen(path); err != nil {
+		a.showError(fmt.Errorf("open DeskFerry Home Setup: %w", err))
+		return
+	}
+	// Setup updates the Home executable in place, so release its file handle
+	// before the user applies an alias or adapter configuration change.
+	a.exiting = true
+	_ = a.mw.Close()
 }
 
 func (a *clientApp) restartHomePresence() {
@@ -2425,8 +2445,29 @@ func deleteWindowsCredential(cfg config) error {
 }
 
 type homeInstallMetadata struct {
+	InstallDir    string `json:"install_dir"`
 	Alias         string `json:"alias"`
 	EnableNetwork bool   `json:"enable_network"`
+}
+
+func installedHomeSetupPath() string {
+	base := strings.TrimSpace(os.Getenv("ProgramData"))
+	if base == "" {
+		base = `C:\ProgramData`
+	}
+	data, err := os.ReadFile(filepath.Join(base, "DeskFerry", "home-install.json"))
+	if err != nil {
+		return ""
+	}
+	var metadata homeInstallMetadata
+	if json.Unmarshal(data, &metadata) != nil || strings.TrimSpace(metadata.InstallDir) == "" {
+		return ""
+	}
+	path := filepath.Join(strings.TrimSpace(metadata.InstallDir), "DeskFerryHomeSetup.exe")
+	if _, err := os.Stat(path); err != nil {
+		return ""
+	}
+	return path
 }
 
 func installedSMBCredentialTarget() string {

@@ -1,5 +1,12 @@
 # Release Notes
 
+## Unreleased
+
+- Reused one authenticated PowerShell Remoting session for WinRM commands in the Windows Home app, with five-minute idle expiration and teardown on destination, credential, tunnel, and app changes.
+- Added per-command elapsed-time and session-reuse diagnostics plus an opt-in live WinRM benchmark.
+- Avoided automatically replaying commands after ambiguous session failures, preventing duplicate remote side effects.
+- Added a **Configure SMB Alias** action to the Windows Home app that opens the installed Home Setup configurator.
+
 ## 0.8.0 - 2026-08-05
 
 - Replaced fixed work-agent data slots with one protocol-v2 control connection per relay and on-demand RDP, WinRM, and SMB session sockets.
