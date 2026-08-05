@@ -112,3 +112,23 @@ func TestEnsureDestinationsMigratesLegacyWinRMUser(t *testing.T) {
 		t.Fatalf("migrated WinRM user = %q", got)
 	}
 }
+
+func TestSMBCredentialTargetFromMetadata(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{name: "invalid", data: `{`, want: ""},
+		{name: "network disabled", data: `{"alias":"deskferry-work","enable_network":false}`, want: ""},
+		{name: "default alias", data: `{"enable_network":true}`, want: "deskferry-work"},
+		{name: "custom alias", data: `{"alias":" work-files ","enable_network":true}`, want: "work-files"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := smbCredentialTargetFromMetadata([]byte(test.data)); got != test.want {
+				t.Fatalf("target = %q, want %q", got, test.want)
+			}
+		})
+	}
+}

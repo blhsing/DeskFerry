@@ -30,6 +30,7 @@ import (
 	"nhooyr.io/websocket"
 
 	"deskferry/internal/diaglog"
+	"deskferry/internal/homenetwork"
 	"deskferry/internal/tunnel"
 	"deskferry/internal/wincred"
 )
@@ -210,6 +211,9 @@ func main() {
 	if err != nil {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(1)
+	}
+	if err := activateWindowsProfileCredential(cfg); err != nil {
+		log.Printf("activate saved Windows login for RDP and SMB at startup: %v", err)
 	}
 	if consoleMode {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -701,6 +705,9 @@ func (a *clientApp) persistDestinationSelection() {
 		a.showError(err)
 		return
 	}
+	if err := activateWindowsProfileCredential(cfg); err != nil {
+		a.appendLog("Could not activate the selected destination's Windows login: %v", err)
+	}
 	a.restartHomePresence()
 	a.refreshRelayStatusAsync()
 }
@@ -1100,6 +1107,9 @@ func (a *clientApp) currentConfig() config {
 
 func (a *clientApp) startTunnel(openRDP bool) error {
 	cfg := a.currentConfig()
+	if err := activateWindowsProfileCredential(cfg); err != nil {
+		log.Printf("activate saved Windows login for RDP and SMB: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	listener, err := listenLocalRDP(cfg)
 	if err != nil {
@@ -1392,7 +1402,7 @@ func (a *clientApp) saveWindowsCredentials() {
 		a.appendLog("Saved Windows login, but could not update the Remote Desktop profile: %v", err)
 	}
 	_ = a.rdpPass.SetText("")
-	a.appendLog("Saved shared RDP and WinRM login in Windows Credential Manager for destination %s.", cfg.SelectedDestination)
+	a.appendLog("Saved shared RDP, WinRM, and SMB login in Windows Credential Manager for destination %s.", cfg.SelectedDestination)
 }
 
 func (a *clientApp) forgetWindowsCredentials() {
@@ -1405,7 +1415,7 @@ func (a *clientApp) forgetWindowsCredentials() {
 		a.showError(err)
 		return
 	}
-	a.appendLog("Removed the shared RDP and WinRM login for destination %s.", cfg.SelectedDestination)
+	a.appendLog("Removed the shared RDP, WinRM, and SMB login for destination %s.", cfg.SelectedDestination)
 }
 
 func (a *clientApp) openDashboard() {
@@ -2251,8 +2261,8 @@ func localListenError(listenAddr string, err error) error {
 }
 
 func launchMSTSC(cfg config) error {
-	if err := activateRDPProfileCredential(cfg); err != nil {
-		log.Printf("activate saved Windows login for RDP: %v", err)
+	if err := activateWindowsProfileCredential(cfg); err != nil {
+		log.Printf("activate saved Windows login for RDP and SMB: %v", err)
 	}
 	if profile, err := writeMSTSCRDPFile(cfg); err == nil {
 		return exec.Command("mstsc.exe", profile).Start()
@@ -2349,6 +2359,9 @@ func saveWindowsCredential(cfg config, user, pass string) error {
 	if err := saveRDPCredentialTargets(cfg.ListenAddr, user, pass); err != nil {
 		return err
 	}
+	if err := saveSMBCredential(user, pass); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2368,7 +2381,7 @@ func readWindowsCredential(cfg config) (user, pass string, err error) {
 	return "", "", errors.New("no saved Windows login for this destination")
 }
 
-func activateRDPProfileCredential(cfg config) error {
+func activateWindowsProfileCredential(cfg config) error {
 	user, pass, err := wincred.Read(profileCredentialTarget(cfg), wincred.TypeGeneric)
 	if err != nil {
 		return nil
@@ -2376,16 +2389,68 @@ func activateRDPProfileCredential(cfg config) error {
 	if user == "" || pass == "" {
 		return nil
 	}
-	return saveRDPCredentialTargets(cfg.ListenAddr, user, pass)
+	if err := saveRDPCredentialTargets(cfg.ListenAddr, user, pass); err != nil {
+		return err
+	}
+	return saveSMBCredential(user, pass)
 }
 
 func deleteWindowsCredential(cfg config) error {
 	profileErr := wincred.Delete(profileCredentialTarget(cfg), wincred.TypeGeneric)
 	rdpErr := deleteRDPCredentialTargets(cfg.ListenAddr)
-	if profileErr != nil {
-		return profileErr
+	smbErr := deleteSMBCredential()
+	return errors.Join(profileErr, rdpErr, smbErr)
+}
+
+type homeInstallMetadata struct {
+	Alias         string `json:"alias"`
+	EnableNetwork bool   `json:"enable_network"`
+}
+
+func installedSMBCredentialTarget() string {
+	base := strings.TrimSpace(os.Getenv("ProgramData"))
+	if base == "" {
+		base = `C:\ProgramData`
 	}
-	return rdpErr
+	data, err := os.ReadFile(filepath.Join(base, "DeskFerry", "home-install.json"))
+	if err != nil {
+		return ""
+	}
+	return smbCredentialTargetFromMetadata(data)
+}
+
+func smbCredentialTargetFromMetadata(data []byte) string {
+	var metadata homeInstallMetadata
+	if json.Unmarshal(data, &metadata) != nil || !metadata.EnableNetwork {
+		return ""
+	}
+	alias := strings.TrimSpace(metadata.Alias)
+	if alias == "" {
+		alias = homenetwork.DefaultAlias
+	}
+	return alias
+}
+
+func saveSMBCredential(user, pass string) error {
+	target := installedSMBCredentialTarget()
+	if target == "" {
+		return nil
+	}
+	if err := wincred.Write(target, wincred.TypeDomainPassword, user, pass); err != nil {
+		return fmt.Errorf("save SMB credentials for %s: %w", target, err)
+	}
+	return nil
+}
+
+func deleteSMBCredential() error {
+	target := installedSMBCredentialTarget()
+	if target == "" {
+		return nil
+	}
+	if err := wincred.Delete(target, wincred.TypeDomainPassword); err != nil {
+		return fmt.Errorf("delete SMB credentials for %s: %w", target, err)
+	}
+	return nil
 }
 
 func deleteRDPCredentialTargets(listenAddr string) error {

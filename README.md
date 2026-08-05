@@ -281,7 +281,7 @@ Start the Windows home app, choose or create a named destination, and manage tha
 
 The app opens a friendly control panel and a notification-area icon. Enter the same room password once for the selected destination, then click `Connect` to start the local listeners and open Remote Desktop. The default RDP listener is `127.0.0.1:3390`, avoiding Windows' normal local RDP port `3389`. When a room credential is saved, the app also listens on `127.0.0.1:3391` for WinRM and opens one outbound WebSocket to the first reachable relay for each local connection.
 
-The **WinRM Commands** panel executes a PowerShell command on the work host using the same Windows username and password as RDP. Each named destination keeps its own username and optional shared login in Windows Credential Manager; **Save Windows Login** and **Forget Windows Login** affect both RDP and WinRM for that destination. Passwords are never written to the JSON profile. The work host must have WinRM enabled and allow the supplied account.
+The **WinRM Commands** panel executes a PowerShell command on the work host using the same Windows username and password as RDP. Each named destination keeps its own username and optional shared login in Windows Credential Manager; **Save Windows Login** and **Forget Windows Login** affect RDP, WinRM, and the installed SMB alias for that destination. Passwords are never written to the JSON profile. The work host must have WinRM enabled and allow the supplied account.
 
 Only one Windows home-app instance runs on the machine. Launching it again restores and focuses the existing control panel when it is in the same interactive session, instead of creating another tray icon, relay presence connection, or local listener.
 
@@ -453,7 +453,7 @@ It:
 
 - A polished control panel with an ordered relay room URL list, local RDP address, proxy mode, status tiles, room details, and activity log.
 - A notification-area icon with open, connect, stop, Remote Desktop, and quit actions.
-- Windows Credential Manager integration for one shared RDP and WinRM login per destination.
+- Windows Credential Manager integration for one shared RDP, WinRM, and SMB login per destination.
 - Persistent home-app presence on the relay dashboard.
 - Named work-destination profiles, each with its own primary/fallback relay URL list for presence, status, and RDP stream connections.
 - Destination add, rename, delete, and selection controls, plus relay URL add, update, delete, button reorder, and drag reorder controls.
@@ -505,7 +505,7 @@ Good free Android RDP client options include Microsoft's Remote Desktop/Windows 
 - The work agent only dials its configured RDP, WinRM, or SMB loopback target after a relay has paired an authenticated, same-room, same-service home connection.
 - WinRM is disabled unless the work configurator has both a room password and a WinRM target. Windows login credentials are supplied by the home user for each command and are not handled by the relay.
 - SMB is disabled unless the work configurator has both a room password and an SMB target. The Home SOCKS bridge rejects every destination except the configured synthetic work address on TCP port 445; it is not a general-purpose VPN or proxy.
-- SMB authentication and authorization remain Windows responsibilities. DeskFerry neither stores file-share passwords nor bypasses share or NTFS permissions.
+- SMB authentication and authorization remain Windows responsibilities. The Home app registers the selected destination's shared Windows login for the installed SMB alias in Windows Credential Manager; DeskFerry never places it in JSON or sends it through the relay, and it does not bypass share or NTFS permissions.
 - Home apps listen on loopback by default, so other LAN devices cannot connect to local RDP or WinRM listeners unless the user intentionally changes a listen address.
 
 Choose room names that are not obvious. For meaningful access control, also configure a strong room password and use TLS.
@@ -732,6 +732,7 @@ Check:
 - The `DeskFerryHomeNetwork` service is running and the `DeskFerry` adapter has address `198.18.0.1`.
 - `Test-NetConnection deskferry-work -Port 445` reaches `198.18.0.2` on the Home PC.
 - The named Windows share exists and the supplied Windows account has both share and NTFS permission.
+- **Save Windows Login** was used for the selected destination. This registers an explicit credential for the installed SMB alias so an off-domain Home PC does not need to contact the work domain controller before Explorer authenticates to the work host.
 - The work PC was restarted once after adding or changing the SMB server alias.
 
 If `\\deskferry-work\c$` opens the Home PC's own system drive, the adapter is targeting a room whose work agent runs on the Home PC. Reconfigure Home Setup with the remote work computer's room; also enable a password and SMB on that remote work agent before retrying.
@@ -755,9 +756,9 @@ The health timer restarts the relay when the local `/relay/health` endpoint fail
 
 ### Saved Windows Login
 
-The Windows home app can save one shared RDP and WinRM login per destination through Windows Credential Manager. Enter the work Windows username and password, then click **Save Windows Login**. DeskFerry stores the destination credential for WinRM, calls `cmdkey.exe` for the local RDP target, writes a password-free `%APPDATA%\DeskFerry\home-client.rdp` launch profile, and clears the password field after saving. The password is not written to `%APPDATA%\DeskFerry\home-client.json` or the `.rdp` profile. **Forget Windows Login** removes both saved uses of the credential.
+The Windows home app can save one shared RDP, WinRM, and SMB login per destination through Windows Credential Manager. Enter the work Windows username and password, then click **Save Windows Login**. DeskFerry stores the destination credential for WinRM, registers it for the local RDP target and the SMB alias selected by Home Setup, writes a password-free `%APPDATA%\DeskFerry\home-client.rdp` launch profile, and clears the password field after saving. The SMB registration uses the Windows domain-password credential type directly, so the password is not exposed on a `cmdkey.exe` command line. It is never written to `%APPDATA%\DeskFerry\home-client.json` or the `.rdp` profile. **Forget Windows Login** removes all saved uses of the credential.
 
-**Open Remote Desktop** and **Connect** launch MSTSC with that `.rdp` profile, so saved credentials are used automatically when Windows allows them. **Execute** in the WinRM Commands panel uses the same destination credential. Remote Desktop may still prompt if Windows policy blocks saved credential delegation. In that case, allow saved credentials for the `TERMSRV/*` target through Windows policy, or continue signing in manually.
+**Open Remote Desktop** and **Connect** launch MSTSC with that `.rdp` profile, so saved credentials are used automatically when Windows allows them. **Execute** in the WinRM Commands panel uses the same destination credential. Startup and destination selection or connection refresh the installed SMB alias credential, so Explorer can authenticate to paths such as `\\deskferry-work\c$` without requiring manual `cmdkey` or `net use` commands. Remote Desktop may still prompt if Windows policy blocks saved credential delegation. In that case, allow saved credentials for the `TERMSRV/*` target through Windows policy, or continue signing in manually.
 
 ### Azure Relay Status
 

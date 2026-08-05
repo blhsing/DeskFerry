@@ -1,5 +1,12 @@
 # Release Notes
 
+## 0.7.2 - 2026-08-05
+
+- Made the Windows Home app register the selected destination's saved Windows login for the installed SMB alias as well as RDP and WinRM.
+- Refresh the alias credential automatically at startup and when a destination is selected or connected, allowing Explorer to authenticate without contacting the work domain controller from the Home PC.
+- Remove the alias credential together with the destination login when **Forget Windows Login** is used.
+- Read customized SMB aliases from Home installer metadata and keep passwords exclusively in Windows Credential Manager.
+
 ## 0.7.1 - 2026-08-05
 
 - Fixed Windows PowerShell stdin adding one or more UTF-8 byte-order marks to room passwords supplied through the command-line configurators.
