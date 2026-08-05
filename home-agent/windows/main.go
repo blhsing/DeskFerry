@@ -2456,7 +2456,7 @@ func mstscTarget(listenAddr string) string {
 
 func saveRDPCredentialTargets(listenAddr, user, pass string) error {
 	for _, target := range rdpCredentialTargets(listenAddr) {
-		out, err := exec.Command("cmdkey.exe", "/generic:"+target, "/user:"+user, "/pass:"+pass).CombinedOutput()
+		out, err := hiddenCommand("cmdkey.exe", "/generic:"+target, "/user:"+user, "/pass:"+pass).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("save RDP credentials with cmdkey for %s: %w: %s", target, err, strings.TrimSpace(string(out)))
 		}
@@ -2682,7 +2682,7 @@ func selectedSMBAlias(cfg config) string {
 func deleteRDPCredentialTargets(listenAddr string) error {
 	var failures []string
 	for _, target := range rdpCredentialTargets(listenAddr) {
-		out, err := exec.Command("cmdkey.exe", "/delete:"+target).CombinedOutput()
+		out, err := hiddenCommand("cmdkey.exe", "/delete:"+target).CombinedOutput()
 		if err != nil {
 			failures = append(failures, fmt.Sprintf("%s: %s", target, strings.TrimSpace(string(out))))
 		}
@@ -2734,6 +2734,12 @@ func uniqueStrings(values []string) []string {
 
 func shellOpen(path string) error {
 	return shellExecute("open", path, "", "")
+}
+
+func hiddenCommand(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
+	return cmd
 }
 
 func shellExecute(verb, file, params, dir string) error {

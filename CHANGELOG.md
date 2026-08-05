@@ -7,6 +7,7 @@
 - Avoided automatically replaying commands after ambiguous session failures, preventing duplicate remote side effects.
 - Made the SMB alias a per-destination Home profile setting editable directly in the Home UI, and added elevated selected-profile synchronization for the restricted adapter service and managed hosts entry.
 - Removed the redundant Home **Refresh** button because relay and presence status already update automatically.
+- Suppressed transient console windows from background credential, WinRM, and elevated network-configuration helpers launched by the Windows Home GUI.
 
 ## 0.8.0 - 2026-08-05
 

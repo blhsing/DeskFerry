@@ -1451,7 +1451,7 @@ func removeManagedHostsBlock(text string) string {
 }
 
 func restrictConfigACL(path string) error {
-	out, err := exec.Command("icacls.exe", path, "/inheritance:r", "/grant:r", "SYSTEM:(F)", "Administrators:(F)").CombinedOutput()
+	out, err := hiddenCommand("icacls.exe", path, "/inheritance:r", "/grant:r", "SYSTEM:(F)", "Administrators:(F)").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("protect network configuration: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -1472,7 +1472,7 @@ func createShortcuts(installDir string) error {
 func createShortcut(shortcut, target, args, workDir, description string) error {
 	quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "''") + "'" }
 	script := "$w=New-Object -ComObject WScript.Shell;$s=$w.CreateShortcut(" + quote(shortcut) + ");$s.TargetPath=" + quote(target) + ";$s.Arguments=" + quote(args) + ";$s.WorkingDirectory=" + quote(workDir) + ";$s.Description=" + quote(description) + ";$s.IconLocation=" + quote(target+",0") + ";$s.Save()"
-	out, err := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script).CombinedOutput()
+	out, err := hiddenCommand("powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("create Start menu shortcut: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -1578,6 +1578,12 @@ func shellExecute(verb, file, params, dir string) error {
 	paramsPtr, _ := windows.UTF16PtrFromString(params)
 	dirPtr, _ := windows.UTF16PtrFromString(dir)
 	return windows.ShellExecute(0, verbPtr, filePtr, paramsPtr, dirPtr, windows.SW_SHOWNORMAL)
+}
+
+func hiddenCommand(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
+	return cmd
 }
 
 func isElevated() bool {

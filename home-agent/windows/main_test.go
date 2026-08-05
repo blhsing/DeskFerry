@@ -160,6 +160,13 @@ func TestAcquireNamedInstanceMutexRejectsSecondInstance(t *testing.T) {
 	}
 }
 
+func TestHiddenCommandSuppressesConsoleWindow(t *testing.T) {
+	cmd := hiddenCommand("cmdkey.exe", "/list")
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.HideWindow || cmd.SysProcAttr.CreationFlags&windows.CREATE_NO_WINDOW == 0 {
+		t.Fatalf("hidden command process attributes = %#v", cmd.SysProcAttr)
+	}
+}
+
 func TestEnsureDestinationsMigratesLegacyRelayList(t *testing.T) {
 	cfg := config{
 		RelayAddr: "https://primary.example/relay/office",

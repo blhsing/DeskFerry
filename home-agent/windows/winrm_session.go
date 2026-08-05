@@ -139,7 +139,7 @@ func (m *winRMSessionManager) ensureWorkerLocked() error {
 		return nil
 	}
 	encoded := encodePowerShellCommand(winRMSessionWorkerScript)
-	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded)
+	cmd := hiddenCommand("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("open persistent PowerShell worker input: %w", err)

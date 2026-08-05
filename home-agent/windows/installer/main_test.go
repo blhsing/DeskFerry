@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"deskferry/internal/homenetwork"
+	"golang.org/x/sys/windows"
 )
 
 func TestSelectedProfileSetupRequestRoundTrip(t *testing.T) {
@@ -40,6 +41,13 @@ func TestRemoveManagedHostsBlock(t *testing.T) {
 	got := removeManagedHostsBlock(input)
 	if strings.Contains(got, "old-name") || !strings.Contains(got, "localhost") || !strings.Contains(got, "intranet") {
 		t.Fatalf("unexpected cleaned hosts file: %q", got)
+	}
+}
+
+func TestHiddenCommandSuppressesConsoleWindow(t *testing.T) {
+	cmd := hiddenCommand("icacls.exe", "test")
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.HideWindow || cmd.SysProcAttr.CreationFlags&windows.CREATE_NO_WINDOW == 0 {
+		t.Fatalf("hidden command process attributes = %#v", cmd.SysProcAttr)
 	}
 }
 
