@@ -36,7 +36,7 @@ import (
 )
 
 const serviceName = "DeskFerryAgent"
-const defaultRelayURL = "https://test-officialwebsite.azurewebsites.net/relay/"
+const defaultRelayURL = "https://test-officialwebsite.azurewebsites.net/relay/workdesk;http://217.142.228.117/relay/workdesk"
 const agentIDHeader = "X-DeskFerry-Agent-Instance"
 const agentSlotHeader = "X-DeskFerry-Agent-Slot"
 
@@ -71,6 +71,8 @@ func (f *relayURLFlag) String() string {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	var relayURLs relayURLFlag
+	var relayBases relayURLFlag
+	var roomName string
 	var proxyFlag string
 	var rdpFlag string
 	var winrmFlag string
@@ -85,6 +87,8 @@ func main() {
 	var selfTestMode bool
 	var updateServiceTarget string
 	flag.Var(&relayURLs, "relay-url", "relay service URL; repeat to add more relay URLs")
+	flag.Var(&relayBases, "relay-base-url", "relay service base URL; repeat to add more relay services")
+	flag.StringVar(&roomName, "room", "workdesk", "room name appended to each relay service base URL")
 	flag.StringVar(&proxyFlag, "proxy", "", "HTTP proxy for Azure relay WebSocket, or direct/env/auto")
 	flag.StringVar(&rdpFlag, "rdp", "", "local RDP target")
 	flag.StringVar(&winrmFlag, "winrm", "", "local WinRM target; blank disables WinRM")
@@ -106,6 +110,20 @@ func main() {
 	}
 
 	relayURL := relayURLs.String()
+	if len(relayBases) > 0 {
+		if len(relayURLs) > 0 {
+			log.Fatal("use either -relay-url or -relay-base-url, not both")
+		}
+		var roomURLs []string
+		for _, base := range relayBases {
+			value, err := tunnel.RelayRoomURL(base, roomName)
+			if err != nil {
+				log.Fatal(err)
+			}
+			roomURLs = append(roomURLs, value)
+		}
+		relayURL = joinRelayURLs(roomURLs)
+	}
 	if relayURL == "" {
 		relayURL = defaultRelayURL
 	}

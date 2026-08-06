@@ -184,6 +184,12 @@ func TestEnsureDestinationsMigratesLegacyRelayList(t *testing.T) {
 	if !reflect.DeepEqual(cfg.Destinations[0].RelayAddrs, cfg.RelayAddrs) {
 		t.Fatalf("migrated relay URLs = %#v, want %#v", cfg.Destinations[0].RelayAddrs, cfg.RelayAddrs)
 	}
+	if got, want := cfg.Destinations[0].RelayBases, []string{"https://primary.example/relay", "http://fallback.example/relay"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("migrated relay bases = %#v, want %#v", got, want)
+	}
+	if cfg.Destinations[0].Room != "office" {
+		t.Fatalf("migrated room = %q, want office", cfg.Destinations[0].Room)
+	}
 }
 
 func TestEnsureDestinationsKeepsNonSelectedProfiles(t *testing.T) {

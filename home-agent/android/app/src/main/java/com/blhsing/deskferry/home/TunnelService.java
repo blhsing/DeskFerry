@@ -404,7 +404,7 @@ public class TunnelService extends Service {
                 .header("Authorization", "Bearer " + token)
                 .header("X-DeskFerry-Role", role)
                 .header("X-TunnelDesktop-Role", role)
-                .header("User-Agent", "DeskFerry-Android/0.9.3");
+                .header("User-Agent", "DeskFerry-Android/0.9.4");
         if (!roomProof.isEmpty() && !"dashboard".equals(role)) {
             request.header("X-DeskFerry-Room-Proof", roomProof);
         }

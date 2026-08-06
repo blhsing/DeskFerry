@@ -168,3 +168,24 @@ func TestHTTPRelayThroughHTTPSProxyUsesConnectTunnel(t *testing.T) {
 		t.Fatal("Proxy is set, want direct WebSocket handshake over CONNECT tunnel")
 	}
 }
+
+func TestRelayBaseAndRoomURLMigration(t *testing.T) {
+	legacy := []string{
+		"https://test-officialwebsite.azurewebsites.net/relay/workdesk",
+		"http://217.142.228.117/relay/workdesk",
+	}
+	bases, room, err := SplitRelayRoomURLs(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if room != "workdesk" || len(bases) != 2 || bases[0] != "https://test-officialwebsite.azurewebsites.net/relay" || bases[1] != "http://217.142.228.117/relay" {
+		t.Fatalf("bases=%v room=%q", bases, room)
+	}
+	got, err := RelayRoomURL(bases[0], room)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != legacy[0] {
+		t.Fatalf("room URL=%q", got)
+	}
+}

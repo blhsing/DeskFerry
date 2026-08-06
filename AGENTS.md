@@ -2,16 +2,16 @@
 
 ## Project Overview
 
-DeskFerry is a Go + .NET + Python + Android project for outbound-only RDP, WinRM, and SMB/UNC rendezvous tunnels. The normal relay is the Azure App Service at `https://test-officialwebsite.azurewebsites.net/relay/`, implemented by `relay/azure-dotnet/`. The OCI Always Free fallback relay is reachable under `http://217.142.228.117/relay/<room>` and is implemented by `relay/go/`. A protocol-compatible Python/FastAPI relay lives in `relay/python/` for alternate hosts and local testing. The work-side Windows service may connect to one or more relay room URLs at the same time, while the Windows, macOS, and Android home agents connect to ordered primary/fallback relay URL lists such as `https://test-officialwebsite.azurewebsites.net/relay/workdesk` and `http://217.142.228.117/relay/workdesk`.
+DeskFerry is a Go + .NET + Python + Android project for outbound-only RDP, WinRM, and SMB/UNC rendezvous tunnels. The normal relay is the Azure App Service at `https://test-officialwebsite.azurewebsites.net/relay/`, implemented by `relay/azure-dotnet/`. The OCI Always Free fallback relay is reachable under `http://217.142.228.117/relay/<room>` and is implemented by `relay/go/`. A protocol-compatible Python/FastAPI relay lives in `relay/python/` for alternate hosts and local testing. User-facing profiles store one room name plus ordered relay service base URLs; agents compose compatible room URLs such as `https://test-officialwebsite.azurewebsites.net/relay/workdesk` and `http://217.142.228.117/relay/workdesk` at runtime.
 
 ## Architecture Rules
 
 - The Azure App Service relay under `/relay/` is the normal broker.
 - The OCI Go relay is a compatible alternate broker, currently deployed as `deskferry-relay.service` on `217.142.228.117`.
-- A named room URL under `/relay/<room>` is the normal and only user-facing pairing configuration.
+- The normal user-facing pairing configuration is a room name plus one or more relay service base URLs; full `/relay/<room>` URLs remain runtime and legacy CLI compatibility inputs.
 - The work agent may be configured with multiple relay room URLs simultaneously when they use the same room name, so home apps can choose any reachable relay.
 - The work agent normally maintains one `agent-control` WebSocket per relay room URL and opens `agent-session` data sockets on demand. Legacy `agent` slots remain dual-protocol rollback compatibility only.
-- Graphical relay URL list UIs should use CRUD controls with inline or selected-row editing plus drag-to-reorder; avoid returning to semicolon-separated or multiline free-form entry for user-facing multi-value relay URLs.
+- Graphical relay base URL list UIs should use CRUD controls with inline or selected-row editing plus drag-to-reorder; avoid semicolon-separated or multiline free-form entry for user-facing multi-value relay bases.
 - Do not reintroduce generated client files or file-based pairing artifacts for the normal path.
 - The Azure relay WebSocket endpoint is `/relay/ws` for the overview room and `/relay/<room>/ws` for named rooms.
 - URL-only WebSocket clients should use standard proxy environment variables by default; explicit `http://` and `https://` proxy URLs are supported, and `-proxy direct` is the bypass path.
@@ -158,6 +158,6 @@ Android lint may need uncached artifacts from `dl.google.com`; if this host cann
 
 - Prefer existing package boundaries and helper APIs.
 - Keep `internal/tunnel` focused on current protocol primitives: WebSocket dialing, proxy URL handling, v2 control messages, role constants, resumption, and byte piping.
-- Keep the Windows home app URL-first; it should store a room URL and local UI settings, not implement the broker.
+- Keep the Windows home app relay-first; it should store relay service bases, a profile room name, and local UI settings, not implement the broker.
 - Use `apply_patch` for manual file edits.
 - Avoid committing generated private key material under `dist/` or elsewhere.

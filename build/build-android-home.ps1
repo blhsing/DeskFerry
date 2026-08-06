@@ -6,6 +6,18 @@ $dist = Join-Path $root 'dist/android'
 $apk = Join-Path $project 'app/build/outputs/apk/debug/app-debug.apk'
 $out = Join-Path $dist 'deskferry-home-android-debug.apk'
 
+if ($env:DESKFERRY_ANDROID_EXPECT_SIGNED -eq '1') {
+    foreach ($name in @('DESKFERRY_ANDROID_KEYSTORE', 'DESKFERRY_ANDROID_KEYSTORE_PASSWORD', 'DESKFERRY_ANDROID_KEY_ALIAS', 'DESKFERRY_ANDROID_KEY_PASSWORD')) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            throw "required Android signing variable is missing: $name"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $env:DESKFERRY_ANDROID_KEYSTORE -PathType Leaf)) {
+        throw "Android signing keystore is missing: $env:DESKFERRY_ANDROID_KEYSTORE"
+    }
+}
+
 if (-not $env:ANDROID_HOME) {
     if (Test-Path -LiteralPath 'D:\Android\Sdk') {
         $env:ANDROID_HOME = 'D:\Android\Sdk'

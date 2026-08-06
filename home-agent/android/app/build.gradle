@@ -1,5 +1,11 @@
 apply plugin: "com.android.application"
 
+def deskFerrySigningFile = System.getenv("DESKFERRY_ANDROID_KEYSTORE")
+def deskFerrySigningReady = deskFerrySigningFile &&
+        System.getenv("DESKFERRY_ANDROID_KEYSTORE_PASSWORD") &&
+        System.getenv("DESKFERRY_ANDROID_KEY_ALIAS") &&
+        System.getenv("DESKFERRY_ANDROID_KEY_PASSWORD")
+
 android {
     namespace "com.blhsing.deskferry.home"
     compileSdk 35
@@ -8,13 +14,32 @@ android {
         applicationId "com.blhsing.deskferry.home"
         minSdk 23
         targetSdk 35
-        versionCode 93
-        versionName "0.9.3"
+        versionCode 94
+        versionName "0.9.4"
     }
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
+    }
+
+    signingConfigs {
+        if (deskFerrySigningReady) {
+            deskferryRelease {
+                storeFile file(deskFerrySigningFile)
+                storePassword System.getenv("DESKFERRY_ANDROID_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("DESKFERRY_ANDROID_KEY_ALIAS")
+                keyPassword System.getenv("DESKFERRY_ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            if (deskFerrySigningReady) {
+                signingConfig signingConfigs.deskferryRelease
+            }
+        }
     }
 }
 

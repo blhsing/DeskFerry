@@ -116,6 +116,30 @@ func TestParseCLIInstall(t *testing.T) {
 	}
 }
 
+func TestParseCLIComposesRelayBasesWithRoom(t *testing.T) {
+	sourceDir := t.TempDir()
+	for _, name := range []string{"DeskFerryHomeSetup.exe", "DeskFerryHome.exe", "DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
+		if err := os.WriteFile(filepath.Join(sourceDir, name), []byte(name), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, opts, err := parseCLIArgs([]string{
+		"-cli-action", "configure",
+		"-source-dir", sourceDir,
+		"-room", "office",
+		"-relay-base-url", "https://primary.example/relay/",
+		"-relay-base-url", "http://fallback.example/relay",
+		"-enable-network=false",
+	}, strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"https://primary.example/relay/office", "http://fallback.example/relay/office"}
+	if !reflect.DeepEqual(opts.RelayAddrs, want) {
+		t.Fatalf("RelayAddrs = %#v, want %#v", opts.RelayAddrs, want)
+	}
+}
+
 func TestParseCLIRejectsInstallOptionsForStatus(t *testing.T) {
 	_, _, err := parseCLIArgs([]string{"-cli-action", "status", "-enable-network=true"}, strings.NewReader(""))
 	if err == nil || !strings.Contains(err.Error(), "only valid with install or configure") {
@@ -204,6 +228,9 @@ func TestConfigureHomeClientUpdatesSelectedDestination(t *testing.T) {
 	}
 	if len(got.Destinations) != 3 || got.Destinations[2].RoomProof != "room-b-proof" || got.Destinations[2].SMBAlias != "room-b-files" || got.Destinations[0].WindowsUser != `DOMAIN\user` {
 		t.Fatalf("destinations = %#v", got.Destinations)
+	}
+	if got.Destinations[2].Room != "b" || !reflect.DeepEqual(got.Destinations[2].RelayBases, []string{"https://relay.example/relay", "http://relay-backup.example/relay"}) {
+		t.Fatalf("destination relay parts = %#v", got.Destinations[2])
 	}
 }
 

@@ -38,6 +38,9 @@ import (
 
 const (
 	defaultRelayURL        = "https://test-officialwebsite.azurewebsites.net/relay/workdesk"
+	defaultAzureRelayBase  = "https://test-officialwebsite.azurewebsites.net/relay"
+	defaultOCIRelayBase    = "http://217.142.228.117/relay"
+	defaultRoomName        = "workdesk"
 	defaultListenAddr      = "127.0.0.1:3390"
 	defaultWinRMListenAddr = "127.0.0.1:3391"
 	singleInstanceName     = `Global\DeskFerryHomeAgent`
@@ -66,6 +69,8 @@ type config struct {
 type destinationProfile struct {
 	Name        string   `json:"name"`
 	RelayAddrs  []string `json:"relay_addrs"`
+	RelayBases  []string `json:"relay_bases,omitempty"`
+	Room        string   `json:"room,omitempty"`
 	RoomProof   string   `json:"room_proof,omitempty"`
 	WindowsUser string   `json:"windows_user,omitempty"`
 	SMBAlias    string   `json:"smb_alias,omitempty"`
@@ -93,6 +98,7 @@ type clientApp struct {
 	relayDelete        *walk.PushButton
 	relayUp            *walk.PushButton
 	relayDown          *walk.PushButton
+	roomName           *walk.LineEdit
 	destinationList    *walk.ComboBox
 	destinationEdit    *walk.LineEdit
 	destinationAdd     *walk.PushButton
@@ -354,7 +360,9 @@ func (a *clientApp) run(smokeTest bool) error {
 											PushButton{AssignTo: &a.destinationDelete, Text: "Delete", OnClicked: a.deleteDestination},
 										},
 									},
-									Label{Text: "Relay URLs"},
+									Label{Text: "Room name"},
+									LineEdit{AssignTo: &a.roomName, Text: defaultRoomName, CueBanner: defaultRoomName, ColumnSpan: 3},
+									Label{Text: "Relay service base URLs"},
 									Composite{
 										ColumnSpan: 3,
 										Layout:     VBox{Spacing: 6},
@@ -372,7 +380,7 @@ func (a *clientApp) run(smokeTest bool) error {
 												Layout: Grid{Columns: 4, Spacing: 6},
 												Children: []Widget{
 													Label{Text: "Selected URL"},
-													LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultRelayURL, ColumnSpan: 3},
+													LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultAzureRelayBase, ColumnSpan: 3},
 												},
 											},
 											Composite{
@@ -466,7 +474,7 @@ func (a *clientApp) run(smokeTest bool) error {
 		return err
 	}
 	a.setDestinations(a.cfg.Destinations, a.cfg.SelectedDestination)
-	a.setRelayURLList(a.cfg.relayAddresses(), 0)
+	a.setRelayURLList(a.destinations[a.selectedDestination].RelayBases, 0)
 	if err := a.setupNotifyIcon(); err != nil {
 		return err
 	}
@@ -560,9 +568,45 @@ func destinationNames(values []destinationProfile) []string {
 func cloneDestinations(values []destinationProfile) []destinationProfile {
 	out := make([]destinationProfile, len(values))
 	for i, value := range values {
-		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RoomProof: value.RoomProof, WindowsUser: value.WindowsUser, SMBAlias: value.SMBAlias}
+		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RelayBases: append([]string(nil), value.RelayBases...), Room: value.Room, RoomProof: value.RoomProof, WindowsUser: value.WindowsUser, SMBAlias: value.SMBAlias}
 	}
 	return out
+}
+
+func defaultRelayBases() []string {
+	return []string{defaultAzureRelayBase, defaultOCIRelayBase}
+}
+
+func defaultRelayRoomURLs() []string {
+	return relayRoomURLs(defaultRelayBases(), defaultRoomName)
+}
+
+func relayRoomURLs(bases []string, room string) []string {
+	out := make([]string, 0, len(bases))
+	for _, base := range bases {
+		if value, err := tunnel.RelayRoomURL(base, room); err == nil {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func (d *destinationProfile) rebuildRelayAddrs() error {
+	if strings.TrimSpace(d.Room) == "" {
+		return errors.New("room name is required")
+	}
+	d.RelayAddrs = nil
+	for _, base := range d.RelayBases {
+		value, err := tunnel.RelayRoomURL(base, d.Room)
+		if err != nil {
+			return err
+		}
+		d.RelayAddrs = append(d.RelayAddrs, value)
+	}
+	if len(d.RelayAddrs) == 0 {
+		return errors.New("at least one relay service base URL is required")
+	}
+	return nil
 }
 
 func (a *clientApp) setDestinations(values []destinationProfile, selectedName string) {
@@ -590,6 +634,9 @@ func (a *clientApp) updateDestinationEditor() {
 	}
 	if a.selectedDestination >= 0 && a.selectedDestination < len(a.destinations) {
 		_ = a.destinationEdit.SetText(a.destinations[a.selectedDestination].Name)
+		if a.roomName != nil {
+			_ = a.roomName.SetText(a.destinations[a.selectedDestination].Room)
+		}
 		if a.roomPass != nil {
 			_ = a.roomPass.SetText("")
 			if a.destinations[a.selectedDestination].RoomProof != "" {
@@ -637,7 +684,16 @@ func (a *clientApp) updateDestinationButtons() {
 
 func (a *clientApp) commitDestinationProfile() error {
 	if a.selectedDestination >= 0 && a.selectedDestination < len(a.destinations) {
-		a.destinations[a.selectedDestination].RelayAddrs = a.relayURLListValues()
+		destination := &a.destinations[a.selectedDestination]
+		oldRoom := destination.Room
+		destination.RelayBases = a.relayURLListValues()
+		destination.Room = strings.TrimSpace(a.roomName.Text())
+		if !strings.EqualFold(oldRoom, destination.Room) {
+			destination.RoomProof = ""
+		}
+		if err := destination.rebuildRelayAddrs(); err != nil {
+			return err
+		}
 		if a.rdpUser != nil {
 			a.destinations[a.selectedDestination].WindowsUser = strings.TrimSpace(a.rdpUser.Text())
 		}
@@ -675,7 +731,7 @@ func (a *clientApp) destinationSelectionChanged() {
 	}
 	a.closeWinRMSession()
 	a.selectedDestination = index
-	a.setRelayURLList(a.destinations[index].RelayAddrs, 0)
+	a.setRelayURLList(a.destinations[index].RelayBases, 0)
 	a.updateDestinationEditor()
 	a.persistDestinationSelection()
 }
@@ -717,11 +773,11 @@ func (a *clientApp) addDestination() {
 		return
 	}
 	a.destinations = append(a.destinations, destinationProfile{
-		Name: a.uniqueDestinationName(name, -1), RelayAddrs: []string{defaultRelayURL}, SMBAlias: homenetwork.DefaultAlias,
+		Name: a.uniqueDestinationName(name, -1), RelayBases: defaultRelayBases(), Room: defaultRoomName, RelayAddrs: defaultRelayRoomURLs(), SMBAlias: homenetwork.DefaultAlias,
 	})
 	a.selectedDestination = len(a.destinations) - 1
 	a.setDestinations(a.destinations, a.destinations[a.selectedDestination].Name)
-	a.setRelayURLList(a.destinations[a.selectedDestination].RelayAddrs, 0)
+	a.setRelayURLList(a.destinations[a.selectedDestination].RelayBases, 0)
 	a.persistDestinationSelection()
 }
 
@@ -751,7 +807,7 @@ func (a *clientApp) deleteDestination() {
 	}
 	selected := a.destinations[index].Name
 	a.setDestinations(a.destinations, selected)
-	a.setRelayURLList(a.destinations[a.selectedDestination].RelayAddrs, 0)
+	a.setRelayURLList(a.destinations[a.selectedDestination].RelayBases, 0)
 	a.persistDestinationSelection()
 }
 
@@ -848,9 +904,9 @@ func (a *clientApp) updateRelayButtons() {
 
 func (a *clientApp) relayURLFromEditor() (string, error) {
 	if a.relayEdit == nil {
-		return "", errors.New("relay URL editor is not available")
+		return "", errors.New("relay service base URL editor is not available")
 	}
-	return normalizeRelayURL(a.relayEdit.Text())
+	return tunnel.RelayServiceBaseURL(a.relayEdit.Text())
 }
 
 func (a *clientApp) addRelayURL() {
@@ -1132,10 +1188,10 @@ func (a *clientApp) saveFromUI(showMessage bool) error {
 }
 
 func (a *clientApp) configFromUI() (config, error) {
-	relayURLs := a.relayURLListValues()
 	if err := a.commitDestinationProfile(); err != nil {
 		return config{}, err
 	}
+	relayURLs := a.destinations[a.selectedDestination].RelayAddrs
 	cfg := config{
 		RelayAddrs:      relayURLs,
 		ListenAddr:      strings.TrimSpace(a.listenAddr.Text()),
@@ -1697,9 +1753,9 @@ func defaultConfig() config {
 		ListenAddr:          defaultListenAddr,
 		WinRMListenAddr:     defaultWinRMListenAddr,
 		RelayAddr:           defaultRelayURL,
-		RelayAddrs:          []string{defaultRelayURL},
+		RelayAddrs:          defaultRelayRoomURLs(),
 		Proxy:               "env",
-		Destinations:        []destinationProfile{{Name: "Work", RelayAddrs: []string{defaultRelayURL}, SMBAlias: homenetwork.DefaultAlias}},
+		Destinations:        []destinationProfile{{Name: "Work", RelayAddrs: defaultRelayRoomURLs(), RelayBases: defaultRelayBases(), Room: defaultRoomName, SMBAlias: homenetwork.DefaultAlias}},
 		SelectedDestination: "Work",
 	}
 }
@@ -1799,7 +1855,14 @@ func (c *config) ensureDestinations() error {
 	}
 	current := c.relayAddresses()
 	if len(c.Destinations) == 0 {
-		c.Destinations = []destinationProfile{{Name: "Work", RelayAddrs: current, RoomProof: c.RoomProof, WindowsUser: c.RDPUser, SMBAlias: homenetwork.DefaultAlias}}
+		bases, room, err := tunnel.SplitRelayRoomURLs(current)
+		if err != nil {
+			return err
+		}
+		if room == "" {
+			room = defaultRoomName
+		}
+		c.Destinations = []destinationProfile{{Name: "Work", RelayAddrs: current, RelayBases: bases, Room: room, RoomProof: c.RoomProof, WindowsUser: c.RDPUser, SMBAlias: homenetwork.DefaultAlias}}
 		c.SelectedDestination = "Work"
 		return nil
 	}
@@ -1815,7 +1878,18 @@ func (c *config) ensureDestinations() error {
 			name = fmt.Sprintf("%s %d", base, suffix)
 		}
 		seen[strings.ToLower(name)] = true
-		relays, err := normalizeRelayURLs("", destination.RelayAddrs)
+		relays := destination.RelayAddrs
+		if len(destination.RelayBases) > 0 {
+			destination.Room = strings.TrimSpace(destination.Room)
+			if destination.Room == "" {
+				destination.Room = defaultRoomName
+			}
+			if err := destination.rebuildRelayAddrs(); err != nil {
+				return fmt.Errorf("destination %q: %w", name, err)
+			}
+			relays = destination.RelayAddrs
+		}
+		relays, err := normalizeRelayURLs("", relays)
 		if err != nil {
 			return fmt.Errorf("destination %q: %w", name, err)
 		}
@@ -1828,6 +1902,17 @@ func (c *config) ensureDestinations() error {
 				return fmt.Errorf("destination %q relay URLs must use the same room name", name)
 			}
 		}
+		bases, splitRoom, err := tunnel.SplitRelayRoomURLs(relays)
+		if err != nil {
+			return fmt.Errorf("destination %q: %w", name, err)
+		}
+		if destination.Room == "" {
+			destination.Room = splitRoom
+		}
+		if destination.Room == "" {
+			destination.Room = defaultRoomName
+		}
+		destination.RelayBases = bases
 		alias := strings.TrimSpace(destination.SMBAlias)
 		if alias == "" {
 			alias = homenetwork.DefaultAlias
@@ -1835,7 +1920,7 @@ func (c *config) ensureDestinations() error {
 		if err := homenetwork.ValidateAlias(alias); err != nil {
 			return fmt.Errorf("destination %q: %w", name, err)
 		}
-		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RoomProof: destination.RoomProof, WindowsUser: destination.WindowsUser, SMBAlias: alias})
+		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RelayBases: destination.RelayBases, Room: destination.Room, RoomProof: destination.RoomProof, WindowsUser: destination.WindowsUser, SMBAlias: alias})
 	}
 	selected := 0
 	for i, destination := range normalized {
@@ -1845,6 +1930,9 @@ func (c *config) ensureDestinations() error {
 		}
 	}
 	normalized[selected].RelayAddrs = append([]string(nil), current...)
+	if bases, room, err := tunnel.SplitRelayRoomURLs(current); err == nil && len(bases) > 0 {
+		normalized[selected].RelayBases, normalized[selected].Room = bases, room
+	}
 	if c.RoomProof != "" && normalized[selected].RoomProof == "" {
 		normalized[selected].RoomProof = c.RoomProof
 	}
@@ -1874,7 +1962,8 @@ func (c *config) applyDefaults() {
 		c.ListenAddr = defaultListenAddr
 	}
 	if c.RelayAddr == "" && len(c.RelayAddrs) == 0 {
-		c.RelayAddr = defaultRelayURL
+		c.RelayAddrs = defaultRelayRoomURLs()
+		c.RelayAddr = c.RelayAddrs[0]
 	}
 	if c.Proxy == "" {
 		c.Proxy = "env"
@@ -2217,7 +2306,7 @@ func normalizeRelayURLs(value string, extra []string) ([]string, error) {
 		values = append(values, splitRelayURLs(relayAddr)...)
 	}
 	if len(values) == 0 {
-		values = []string{defaultRelayURL}
+		values = defaultRelayRoomURLs()
 	}
 	out := make([]string, 0, len(values))
 	for _, relayAddr := range values {

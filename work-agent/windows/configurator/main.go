@@ -27,15 +27,18 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
 
+	"deskferry/internal/tunnel"
 	"deskferry/internal/winsecret"
 )
 
 const (
-	serviceName        = "DeskFerryAgent"
-	serviceDisplayName = "DeskFerry Agent"
-	installedAgentName = "agent.exe"
-	defaultRelayURL    = "https://test-officialwebsite.azurewebsites.net/relay/"
-	defaultSMBAlias    = "deskferry-work"
+	serviceName           = "DeskFerryAgent"
+	serviceDisplayName    = "DeskFerry Agent"
+	installedAgentName    = "agent.exe"
+	defaultAzureRelayBase = "https://test-officialwebsite.azurewebsites.net/relay"
+	defaultOCIRelayBase   = "http://217.142.228.117/relay"
+	defaultRoomName       = "workdesk"
+	defaultSMBAlias       = "deskferry-work"
 )
 
 type app struct {
@@ -49,6 +52,7 @@ type app struct {
 	relayDelete     *walk.PushButton
 	relayUp         *walk.PushButton
 	relayDown       *walk.PushButton
+	roomName        *walk.LineEdit
 	roomPassword    *walk.LineEdit
 	clearPassword   *walk.CheckBox
 	winrmAddr       *walk.LineEdit
@@ -136,14 +140,17 @@ func (a *app) run(smokeTest bool) error {
 					LineEdit{AssignTo: &a.agentPath, Text: agentPath, ColumnSpan: 1},
 					PushButton{Text: "Browse", OnClicked: a.browseAgentPath},
 
-					Label{Text: "Relay URLs"},
+					Label{Text: "Room name"},
+					LineEdit{AssignTo: &a.roomName, Text: defaultRoomName, CueBanner: defaultRoomName, ColumnSpan: 2},
+
+					Label{Text: "Relay service base URLs"},
 					Composite{
 						ColumnSpan: 2,
 						Layout:     VBox{Spacing: 6},
 						Children: []Widget{
 							ListBox{
 								AssignTo:              &a.relayList,
-								Model:                 []string{defaultRelayURL},
+								Model:                 []string{defaultAzureRelayBase, defaultOCIRelayBase},
 								MinSize:               Size{Height: 74},
 								OnCurrentIndexChanged: a.relaySelectionChanged,
 								OnMouseDown:           a.relayListMouseDown,
@@ -154,7 +161,7 @@ func (a *app) run(smokeTest bool) error {
 								Layout: Grid{Columns: 3, Spacing: 6},
 								Children: []Widget{
 									Label{Text: "Selected URL"},
-									LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultRelayURL, ColumnSpan: 2},
+									LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultAzureRelayBase, ColumnSpan: 2},
 								},
 							},
 							Composite{
@@ -207,7 +214,7 @@ func (a *app) run(smokeTest bool) error {
 	if err := window.Create(); err != nil {
 		return err
 	}
-	a.setRelayURLList([]string{defaultRelayURL}, 0)
+	a.setRelayURLList([]string{defaultAzureRelayBase, defaultOCIRelayBase}, 0)
 	if smokeTest {
 		time.AfterFunc(250*time.Millisecond, func() {
 			a.mw.Synchronize(func() {
@@ -317,9 +324,9 @@ func (a *app) relayURLFromEditor() (string, error) {
 	}
 	value := strings.TrimSpace(a.relayEdit.Text())
 	if value == "" {
-		return "", errors.New("relay URL is required")
+		return "", errors.New("relay service base URL is required")
 	}
-	return value, nil
+	return tunnel.RelayServiceBaseURL(value)
 }
 
 func (a *app) addRelayURL() {
@@ -632,13 +639,23 @@ func (a *app) options() actionOptions {
 	return actionOptions{
 		InstallDir:        strings.TrimSpace(a.installDir.Text()),
 		AgentPath:         strings.TrimSpace(a.agentPath.Text()),
-		RelayURL:          joinRelayURLs(a.relayURLListValues()),
+		RelayURL:          joinRelayURLs(composeRelayRoomURLs(a.relayURLListValues(), strings.TrimSpace(a.roomName.Text()))),
 		RoomPassword:      a.roomPassword.Text(),
 		ClearRoomPassword: a.clearPassword.Checked(),
 		WinRMAddr:         strings.TrimSpace(a.winrmAddr.Text()),
 		SMBAddr:           strings.TrimSpace(a.smbAddr.Text()),
 		SMBAlias:          strings.TrimSpace(a.smbAlias.Text()),
 	}
+}
+
+func composeRelayRoomURLs(bases []string, room string) []string {
+	var out []string
+	for _, base := range bases {
+		if value, err := tunnel.RelayRoomURL(base, room); err == nil {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func (a *app) appendLog(format string, args ...any) {
@@ -739,12 +756,15 @@ func (values *relayURLFlags) Set(value string) error {
 func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error) {
 	var opts actionOptions
 	var relayURLs relayURLFlags
+	var relayBases relayURLFlags
 	fs := flag.NewFlagSet("deskferry-agent-configurator", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	action := fs.String("cli-action", "", "install, start, stop, restart, uninstall, or status")
 	fs.StringVar(&opts.InstallDir, "install-dir", defaultInstallDir(), "agent installation directory")
 	fs.StringVar(&opts.AgentPath, "agent", defaultAgentPath(), "work agent executable")
 	fs.Var(&relayURLs, "relay-url", "relay room URL; repeat to configure multiple relays in priority order")
+	fs.Var(&relayBases, "relay-base-url", "relay service base URL; repeat to configure multiple relays")
+	room := fs.String("room", defaultRoomName, "room name appended to each relay service base URL")
 	passwordStdin := fs.Bool("room-password-stdin", false, "read the room password from standard input")
 	fs.StringVar(&opts.RoomPasswordBlob, "room-password-blob", "", "machine-scope DPAPI password blob to consume")
 	fs.BoolVar(&opts.ClearRoomPassword, "clear-room-password", false, "remove the stored room password")
@@ -767,7 +787,7 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error)
 	}
 	if *action != "install" {
 		installOnly := map[string]bool{
-			"agent": true, "relay-url": true, "room-password-stdin": true,
+			"agent": true, "relay-url": true, "relay-base-url": true, "room": true, "room-password-stdin": true,
 			"room-password-blob": true, "clear-room-password": true,
 			"winrm": true, "smb": true, "smb-alias": true,
 		}
@@ -804,7 +824,22 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error)
 			return "", opts, errors.New("room password from standard input is empty")
 		}
 	}
-	opts.RelayURL = joinRelayURLs(relayURLs)
+	if len(relayBases) > 0 {
+		if len(relayURLs) > 0 {
+			return "", opts, errors.New("use either -relay-url or -relay-base-url, not both")
+		}
+		var composed []string
+		for _, base := range relayBases {
+			value, err := tunnel.RelayRoomURL(base, *room)
+			if err != nil {
+				return "", opts, err
+			}
+			composed = append(composed, value)
+		}
+		opts.RelayURL = joinRelayURLs(composed)
+	} else {
+		opts.RelayURL = joinRelayURLs(relayURLs)
+	}
 	if *action == "install" {
 		if err := validateInstallInputs(opts); err != nil {
 			return "", opts, err
@@ -859,6 +894,8 @@ func printCLIUsage(output io.Writer) {
 	fmt.Fprintln(output, "Install options:")
 	fmt.Fprintln(output, "  -install-dir PATH          Agent installation directory")
 	fmt.Fprintln(output, "  -agent PATH                Work agent executable")
+	fmt.Fprintln(output, "  -relay-base-url URL       Relay service base URL; repeat for multiple relays")
+	fmt.Fprintln(output, "  -room NAME                Room name appended to every relay service base URL")
 	fmt.Fprintln(output, "  -relay-url URL             Relay room URL; repeat for multiple relays")
 	fmt.Fprintln(output, "  -room-password-stdin       Read a new room password from standard input")
 	fmt.Fprintln(output, "  -room-password-blob PATH   Consume a machine-scope DPAPI password blob")

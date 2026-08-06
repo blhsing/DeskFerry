@@ -209,6 +209,106 @@ func RoomFromRelayPath(path string) string {
 	return parts[1]
 }
 
+// RelayServiceBaseURL returns the relay service URL without a named room.
+// It accepts both the new base-URL form and legacy room URLs.
+func RelayServiceBaseURL(relayAddr string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(relayAddr))
+	if err != nil {
+		return "", fmt.Errorf("parse relay URL: %w", err)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("relay URL must include a host")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "ws":
+		u.Scheme = "http"
+	case "wss":
+		u.Scheme = "https"
+	case "http", "https":
+	default:
+		return "", fmt.Errorf("unsupported relay URL scheme %q", u.Scheme)
+	}
+	path := strings.TrimRight(u.Path, "/")
+	if strings.HasSuffix(path, "/ws") {
+		path = strings.TrimSuffix(path, "/ws")
+	}
+	if room := RoomFromRelayPath(path); room != "" {
+		path = strings.TrimSuffix(path, "/"+room)
+	}
+	if path == "" || path == "/" {
+		path = "/relay"
+	}
+	u.Path = path
+	query := u.Query()
+	query.Del("room")
+	query.Del("token")
+	u.RawQuery = query.Encode()
+	u.Fragment = ""
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+// RelayRoomURL combines a relay service base URL with a profile room name.
+func RelayRoomURL(baseURL, room string) (string, error) {
+	base, err := RelayServiceBaseURL(baseURL)
+	if err != nil {
+		return "", err
+	}
+	room = strings.TrimSpace(room)
+	if room == "" {
+		return "", fmt.Errorf("room name is required")
+	}
+	if strings.ContainsAny(room, "/\\?#") || room == "." || room == ".." {
+		return "", fmt.Errorf("room name must not contain URL separators")
+	}
+	u, _ := url.Parse(base)
+	u.Path = strings.TrimRight(u.Path, "/") + "/" + url.PathEscape(room)
+	return u.String(), nil
+}
+
+// SplitRelayRoomURLs migrates legacy room URLs into service bases plus one
+// common room name.
+func SplitRelayRoomURLs(relayAddrs []string) ([]string, string, error) {
+	bases := make([]string, 0, len(relayAddrs))
+	room := ""
+	for _, relayAddr := range relayAddrs {
+		path := ""
+		if parsed, err := url.Parse(strings.TrimSpace(relayAddr)); err == nil {
+			path = parsed.Path
+		}
+		currentRoom := RoomFromRelayPath(path)
+		if currentRoom == "" {
+			if parsed, err := url.Parse(strings.TrimSpace(relayAddr)); err == nil {
+				currentRoom = strings.TrimSpace(parsed.Query().Get("room"))
+				if currentRoom == "" {
+					currentRoom = strings.TrimSpace(parsed.Query().Get("token"))
+				}
+			}
+		}
+		if currentRoom != "" {
+			if room == "" {
+				room = currentRoom
+			} else if !strings.EqualFold(room, currentRoom) {
+				return nil, "", fmt.Errorf("all relay URLs must use the same room name")
+			}
+		}
+		base, err := RelayServiceBaseURL(relayAddr)
+		if err != nil {
+			return nil, "", err
+		}
+		seen := false
+		for _, existing := range bases {
+			if strings.EqualFold(existing, base) {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			bases = append(bases, base)
+		}
+	}
+	return bases, room, nil
+}
+
 func DialWebSocketStream(ctx context.Context, relayAddr, proxySpec, role, token string) (net.Conn, error) {
 	c, err := DialWebSocket(ctx, relayAddr, proxySpec, role, token)
 	if err != nil {

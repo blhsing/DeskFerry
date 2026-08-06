@@ -51,7 +51,8 @@ final class HomePrefs {
 
     static final class Destination {
         String name;
-        String relayUrl;
+        String relayBases;
+        String room;
         String roomProof;
 
         Destination(String name, String relayUrl) {
@@ -60,8 +61,29 @@ final class HomePrefs {
 
         Destination(String name, String relayUrl, String roomProof) {
             this.name = sanitizeName(name);
-            this.relayUrl = relayUrl == null ? "" : relayUrl.trim();
+            String legacy = relayUrl == null ? "" : relayUrl.trim();
+            this.room = RelayUrls.roomFromRelayUrls(legacy);
+            try {
+                this.relayBases = RelayUrls.joinRelayUrls(RelayUrls.normalizeRelayBaseUrls(legacy));
+            } catch (Exception ignored) {
+                this.relayBases = RelayUrls.joinRelayUrls(RelayUrls.DEFAULT_RELAY_BASE_URLS);
+            }
             this.roomProof = roomProof == null ? "" : roomProof.trim();
+        }
+
+        Destination(String name, String relayBases, String room, String roomProof) {
+            this.name = sanitizeName(name);
+            this.relayBases = relayBases == null ? "" : relayBases.trim();
+            this.room = room == null || room.trim().isEmpty() ? RelayUrls.DEFAULT_ROOM : room.trim();
+            this.roomProof = roomProof == null ? "" : roomProof.trim();
+        }
+
+        String relayUrl() {
+            try {
+                return RelayUrls.joinRelayUrls(RelayUrls.relayRoomUrls(RelayUrls.normalizeRelayBaseUrls(relayBases), room));
+            } catch (Exception ignored) {
+                return RelayUrls.DEFAULT_RELAY_URL;
+            }
         }
     }
 
@@ -74,10 +96,14 @@ final class HomePrefs {
                 for (int i = 0; i < array.length(); i++) {
                     JSONObject item = array.getJSONObject(i);
                     String name = sanitizeName(item.optString("name", "Work"));
+                    String relayBases = item.optString("relay_bases", "").trim();
+                    String room = item.optString("room", "").trim();
                     String relayUrl = item.optString("relay_url", "").trim();
-                    if (!relayUrl.isEmpty()) {
-                        result.add(new Destination(uniqueName(result, name), relayUrl,
+                    if (!relayBases.isEmpty()) {
+                        result.add(new Destination(uniqueName(result, name), relayBases, room,
                                 item.optString("room_proof", "")));
+                    } else if (!relayUrl.isEmpty()) {
+                        result.add(new Destination(uniqueName(result, name), relayUrl, item.optString("room_proof", "")));
                     }
                 }
             } catch (JSONException ignored) {
@@ -85,7 +111,13 @@ final class HomePrefs {
             }
         }
         if (result.isEmpty()) {
-            result.add(new Destination("Work", loadRelayUrl(context)));
+            SharedPreferences preferences = prefs(context);
+            if (preferences.contains(PREF_RELAY_URL)) {
+                result.add(new Destination("Work", loadRelayUrl(context)));
+            } else {
+                result.add(new Destination("Work", RelayUrls.joinRelayUrls(RelayUrls.DEFAULT_RELAY_BASE_URLS),
+                        RelayUrls.DEFAULT_ROOM, ""));
+            }
         }
         return result;
     }
@@ -109,7 +141,8 @@ final class HomePrefs {
             JSONObject item = new JSONObject();
             try {
                 item.put("name", sanitizeName(destination.name));
-                item.put("relay_url", destination.relayUrl == null ? "" : destination.relayUrl.trim());
+                item.put("relay_bases", destination.relayBases == null ? "" : destination.relayBases.trim());
+                item.put("room", destination.room == null ? RelayUrls.DEFAULT_ROOM : destination.room.trim());
                 item.put("room_proof", destination.roomProof == null ? "" : destination.roomProof.trim());
             } catch (JSONException ignored) {
             }
@@ -117,7 +150,7 @@ final class HomePrefs {
         }
         String selectedRelay = destinations.isEmpty()
                 ? RelayUrls.DEFAULT_RELAY_URL
-                : destinations.get(Math.max(0, Math.min(selected, destinations.size() - 1))).relayUrl;
+                : destinations.get(Math.max(0, Math.min(selected, destinations.size() - 1))).relayUrl();
         prefs(context).edit()
                 .putString(PREF_DESTINATIONS, array.toString())
                 .putInt(PREF_SELECTED_DESTINATION, Math.max(0, selected))

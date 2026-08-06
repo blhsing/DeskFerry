@@ -4,14 +4,14 @@
 
 DeskFerry is an outbound-only RDP, WinRM, and SMB rendezvous tunnel for a work PC that cannot accept inbound connections. The current architecture uses an Azure App Service relay at `https://test-officialwebsite.azurewebsites.net/relay/` and an OCI Always Free fallback relay at `http://217.142.228.117/relay/`. The Azure relay implementation is .NET, the OCI relay implementation is a lightweight Go service, and a protocol-compatible Python/FastAPI relay is also available under `relay/python/`. The work-side Windows service and the Windows, macOS, and Android home agents connect out to relay web services over WebSockets.
 
-Home apps accept one or more relay room URLs in priority order. The first URL is the primary relay; later URLs are fallbacks used when the primary cannot connect or cannot pair an RDP stream. The Windows and Android home apps organize those same-room URL lists into named work-destination profiles, so a user can choose among multiple work PCs without mixing different rooms into one fallback list. Existing single-list settings migrate automatically to a `Work` destination. The Windows, Android, and work-agent configurator UIs manage relay URLs as ordered lists with add, edit, delete, and reorder controls. The work agent can connect to one or more relay room URLs at the same time, as long as they use the same room name. For example:
+Home and Work profiles accept a room name plus one or more relay service base URLs in priority order. The first service is primary; later services are fallbacks. The agents append the profile room to each base URL at runtime. Existing full room-URL settings migrate automatically. New profiles are pre-filled with these two known relay services:
 
 ```text
-https://test-officialwebsite.azurewebsites.net/relay/workdesk
-http://217.142.228.117/relay/workdesk
+https://test-officialwebsite.azurewebsites.net/relay
+http://217.142.228.117/relay
 ```
 
-The room name is the path segment after `/relay/`. The first work agent to use a room creates it in memory on that relay. Rooms may be left unprotected or protected with a password configured on the work agent; protected home clients must supply the same password.
+For example, room `workdesk` produces the compatible runtime URLs `https://test-officialwebsite.azurewebsites.net/relay/workdesk` and `http://217.142.228.117/relay/workdesk`. The first work agent to use a room creates it in memory on that relay. Rooms may be left unprotected or protected with a password configured on the work agent; protected home clients must supply the same password.
 
 The Android app is a home-agent client like the Windows and macOS home agents. It is not a phone-hosted relay service.
 
@@ -22,7 +22,7 @@ The Android app is a home-agent client like the Windows and macOS home agents. I
 - [Installation](#installation)
   - [1. Deploy Azure Relay](#1-deploy-azure-relay)
   - [2. Deploy Go Relay On OCI](#2-deploy-go-relay-on-oci)
-  - [3. Choose A Room URL](#3-choose-a-room-url)
+  - [3. Choose Relay Services And A Room](#3-choose-relay-services-and-a-room)
   - [4. Install Work Agent](#4-install-work-agent)
   - [5. Run Windows Home App](#5-run-windows-home-app)
   - [6. Run macOS Home Agent](#6-run-macos-home-agent)
@@ -167,23 +167,18 @@ Keep the proxy command on every OCI SSH/SCP operation from this network; the pro
 
 The current OCI host is hardened for a small Always Free VM: it uses a 2 GiB swap file, persistent journald, a five-minute systemd runtime watchdog through `softdog`, kernel panic recovery for hung tasks, and a local health timer named `deskferry-relay-healthcheck.timer`. The longer watchdog window avoids resetting a resource-constrained VM during short hypervisor stalls while still recovering sustained hangs. The timer checks `http://127.0.0.1/relay/health` every minute, restarts `deskferry-relay.service` when the relay process stops responding, and reboots the VM after three consecutive failed post-restart checks.
 
-### 3. Choose A Room URL
+### 3. Choose Relay Services And A Room
 
-Pick a room name that is easy for you to remember but not obvious to outsiders:
-
-```text
-https://test-officialwebsite.azurewebsites.net/relay/workdesk
-```
-
-For the OCI relay, the equivalent room URL is:
+Keep both pre-filled relay service base URLs unless one is intentionally unavailable:
 
 ```text
-http://217.142.228.117/relay/workdesk
+https://test-officialwebsite.azurewebsites.net/relay
+http://217.142.228.117/relay
 ```
 
-Keep the `http://` scheme for OCI room URLs. If a home or work log shows `https://217.142.228.117/...`, that client is trying port `443` and will fail before it reaches the relay.
+Pick a room name that is easy for you to remember but not obvious to outsiders, such as `workdesk`, and enter the same room name in the Home and Work profiles. Keep the `http://` scheme for the OCI service. If a home or work log shows `https://217.142.228.117/...`, that client is trying port `443` and will fail before it reaches the relay.
 
-Use the same room name everywhere. The work agent can use both URLs at the same time. Home apps can also use both URLs as an ordered primary/fallback list, with the first row treated as primary and later rows treated as fallbacks.
+The work agent uses both services at the same time. Home apps treat the first row as primary and later rows as fallbacks.
 
 ### 4. Install Work Agent
 
@@ -193,7 +188,7 @@ Run the configurator:
 deskferry-agent-configurator-windows-amd64.exe
 ```
 
-It defaults to `D:\DeskFerry\Agent` when `D:` exists. Select `deskferry-agent-windows-amd64.exe`, manage one or more relay room URLs in the ordered URL list, optionally enter a room password, then click `Install / Update`. One password protects every configured relay room. The configurator encrypts it with machine-scope Windows DPAPI, copies the work agent as `agent.exe`, installs or updates the automatic `DeskFerryAgent` Windows service, configures SCM restart recovery, and starts the service.
+It defaults to `D:\DeskFerry\Agent` when `D:` exists. Select `deskferry-agent-windows-amd64.exe`, enter the room name, manage the ordered relay service base URL list, optionally enter a room password, then click `Install / Update`. One password protects that room on every configured relay. The configurator encrypts it with machine-scope Windows DPAPI, copies the work agent as `agent.exe`, installs or updates the automatic `DeskFerryAgent` Windows service, configures SCM restart recovery, and starts the service.
 
 To enable remote command execution, set the WinRM target to `127.0.0.1:5985`. WinRM requires a non-empty room password. The target can be changed for an existing local WinRM configuration, but it must remain a `host:port` reachable by the work service.
 
@@ -206,8 +201,9 @@ Read-Host "Room password" -MaskInput | .\deskferry-agent-configurator-windows-am
   -cli-action install `
   -install-dir 'C:\Program Files\DeskFerry\Agent' `
   -agent .\deskferry-agent-windows-amd64.exe `
-  -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk `
-  -relay-url http://217.142.228.117/relay/workdesk `
+  -room workdesk `
+  -relay-base-url https://test-officialwebsite.azurewebsites.net/relay `
+  -relay-base-url http://217.142.228.117/relay `
   -room-password-stdin `
   -winrm 127.0.0.1:5985 `
   -smb 127.0.0.1:445 `
@@ -219,8 +215,8 @@ Omit all password flags during an update to preserve the installed DPAPI-protect
 The work agent's narrower command-line installer is also supported:
 
 ```powershell
-.\deskferry-agent-windows-amd64.exe -install -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk
-.\deskferry-agent-windows-amd64.exe -install -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk -relay-url http://217.142.228.117/relay/workdesk
+.\deskferry-agent-windows-amd64.exe -install -room workdesk -relay-base-url https://test-officialwebsite.azurewebsites.net/relay
+.\deskferry-agent-windows-amd64.exe -install -room workdesk -relay-base-url https://test-officialwebsite.azurewebsites.net/relay -relay-base-url http://217.142.228.117/relay
 ```
 
 Useful checks:
@@ -243,7 +239,7 @@ The preferred installation is the self-contained setup application:
 dist\windows-home-installer\DeskFerryHomeSetup.exe
 ```
 
-**Enable `\\deskferry-work\...` file access with the DeskFerry virtual network adapter** is selected by default and can be cleared for an app-only installation. When selected, enter the same relay room URL list and room password as the work agent. Setup installs the Home GUI, Start menu and Apps & Features entries, the automatic restricted network service, signed Wintun, and tun2socks. When it is cleared during an update, setup removes the network service, adapter helpers, and managed hostname while leaving the Home GUI installed.
+**Enable `\\deskferry-work\...` file access with the DeskFerry virtual network adapter** is selected by default and can be cleared for an app-only installation. When selected, enter the same room name, relay service bases, and room password as the work agent. Setup installs the Home GUI, Start menu and Apps & Features entries, the automatic restricted network service, signed Wintun, and tun2socks. When it is cleared during an update, setup removes the network service, adapter helpers, and managed hostname while leaving the Home GUI installed.
 
 Setup installs and removes the optional network component. After installation, each named destination in the Home app owns its own **SMB alias** alongside its relay URLs, room proof, and Windows login. Edit the alias directly in the Home UI and click **Save**; when the selected profile differs from the active network configuration, approve the elevation request that updates the restricted adapter service and managed hosts entry. Selecting another profile similarly offers to retarget SMB to that profile. Setup preserves the protected derived room proof during an elevated same-room update, so the password is not required again; changing rooms or enabling file access without an existing proof does require it. A complete non-interactive install or reconfiguration can be run from an elevated PowerShell session:
 
@@ -251,8 +247,9 @@ Setup installs and removes the optional network component. After installation, e
 Read-Host "Room password" -MaskInput | .\DeskFerryHomeSetup.exe `
   -cli-action configure `
   -destination 'Work desk' `
-  -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk `
-  -relay-url http://217.142.228.117/relay/workdesk `
+  -room workdesk `
+  -relay-base-url https://test-officialwebsite.azurewebsites.net/relay `
+  -relay-base-url http://217.142.228.117/relay `
   -proxy direct `
   -alias deskferry-work `
   -enable-network=true `
@@ -273,7 +270,7 @@ Use the Windows account that has permission to that share. A domain environment 
 
 The standalone Home binary remains available for portable/manual use:
 
-Start the Windows home app, choose or create a named destination, and manage that destination's relay room URLs in priority order. The first URL is primary; later URLs are fallbacks. Stop the tunnel before changing destinations:
+Start the Windows home app, choose or create a named destination, enter its room name, and manage its relay service base URLs in priority order. The first service is primary; later services are fallbacks. Stop the tunnel before changing destinations:
 
 ```powershell
 .\deskferry-home-windows-amd64.exe -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk
@@ -286,7 +283,7 @@ The **WinRM Commands** panel executes a PowerShell command on the work host usin
 
 Only one Windows home-app instance runs on the machine. Launching it again restores and focuses the existing control panel when it is in the same interactive session, instead of creating another tray icon, relay presence connection, or local listener.
 
-The home app stores its destination profiles, usernames, room URL lists, local listener addresses, and proxy mode in `%APPDATA%\DeskFerry\home-client.json`. Saved Windows passwords remain in Windows Credential Manager. Console debug mode is still available:
+The home app stores its destination profiles, usernames, room names, relay base URL lists, local listener addresses, and proxy mode in `%APPDATA%\DeskFerry\home-client.json`. Saved Windows passwords remain in Windows Credential Manager. Console debug mode is still available:
 
 ```powershell
 .\deskferry-home-windows-amd64.exe -console -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk
@@ -301,7 +298,7 @@ Choose the binary for your Mac:
 ```sh
 chmod +x ./deskferry-home-macos-arm64
 ./deskferry-home-macos-arm64 -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk -room-password 'strong password' -open-rdp
-./deskferry-home-macos-arm64 -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk -relay-url http://217.142.228.117/relay/workdesk -open-rdp
+./deskferry-home-macos-arm64 -room workdesk -relay-base-url https://test-officialwebsite.azurewebsites.net/relay -relay-base-url http://217.142.228.117/relay -open-rdp
 ```
 
 Use `deskferry-home-macos-amd64` on Intel Macs. The macOS home agent runs in the foreground, listens on `127.0.0.1:3389` by default, keeps the relay dashboard presence socket connected, and opens an `.rdp` profile when `-open-rdp` is supplied. If your RDP app does not open automatically, connect it manually to:
@@ -320,7 +317,9 @@ Install the debug-signed APK:
 dist\android\deskferry-home-android-debug.apk
 ```
 
-Open DeskFerry Home, keep the local RDP port at `3389`, and choose or create a named destination. Each destination stores the same relay room URLs and optional room credential as one work agent in its own ordered URL list. Enter the same room password before starting a protected destination. Stop the tunnel before changing destinations. In an Android RDP client, connect to:
+Release APKs from 0.9.4 onward use a stable DeskFerry signing identity and can upgrade one another in place. Releases through 0.9.3 used unrecoverable per-run CI debug keys, so installing 0.9.4 over one of those versions requires one final uninstall; that uninstall clears Android app data.
+
+Open DeskFerry Home, keep the local RDP port at `3389`, and choose or create a named destination. Each destination stores a room name, the same ordered relay service base URLs as its work agent, and an optional room credential. Enter the same room password before starting a protected destination. Stop the tunnel before changing destinations. In an Android RDP client, connect to:
 
 ```text
 127.0.0.1:3389
@@ -419,7 +418,8 @@ The build emits both the source-style zip and an Oracle Linux 9 / Python 3.9 ven
 
 Default behavior:
 
-- `agent.exe` with no args uses the default relay room URL.
+- `agent.exe` with no args uses room `workdesk` on both known relay services.
+- `-room <name>` plus repeatable `-relay-base-url <url>` configures the preferred pairing model.
 - `-relay-url <url>` selects a named room.
 - `-relay-url` can be repeated to add more relay URLs.
 - The service keeps one lightweight control WebSocket per configured relay URL and opens data sockets only for accepted requests.
@@ -446,10 +446,10 @@ It:
 
 - Prefers `D:\DeskFerry\Agent` as the install directory when `D:` exists.
 - Copies the selected agent binary to `agent.exe`.
-- Installs or updates the automatic `DeskFerryAgent` Windows service with the configured ordered relay URL list.
+- Installs or updates the automatic `DeskFerryAgent` Windows service with the configured room and ordered relay service list.
 - Protects every configured room with one optional DPAPI-encrypted password and enables an optional WinRM target when a password is present.
 - Enables an optional loopback SMB target, registers the selected Windows SMB server alias, and preserves unrelated server aliases.
-- Provides add, update, delete, button reorder, and drag reorder controls for relay URLs.
+- Provides a separate room field plus add, update, delete, button reorder, and drag reorder controls for relay service base URLs.
 - Configures SCM restart recovery.
 - Starts, stops, restarts, uninstalls, refreshes status, opens the install folder, and runs `agent.exe -self-test`.
 
@@ -457,12 +457,12 @@ It:
 
 `home-agent/windows/` is the secure home-side Windows path. It provides:
 
-- A polished control panel with an ordered relay room URL list, local RDP address, proxy mode, status tiles, room details, and activity log.
+- A polished control panel with a room field, ordered relay service base URL list, local RDP address, proxy mode, status tiles, room details, and activity log.
 - A notification-area icon with open, connect, stop, Remote Desktop, and quit actions.
 - Windows Credential Manager integration for one shared RDP, WinRM, and SMB login per destination.
 - Persistent home-app presence on the relay dashboard.
-- Named work-destination profiles, each with its own primary/fallback relay URL list for presence, status, and RDP stream connections.
-- Destination add, rename, delete, and selection controls, plus relay URL add, update, delete, button reorder, and drag reorder controls.
+- Named work-destination profiles, each with its own room and primary/fallback relay service base URL list for presence, status, and RDP stream connections.
+- Destination add, rename, delete, and selection controls, plus relay base URL add, update, delete, button reorder, and drag reorder controls.
 - A loopback RDP listener, normally `127.0.0.1:3390`.
 - A loopback WinRM listener, normally `127.0.0.1:3391`, plus an integrated PowerShell command panel.
 - Automatic Remote Desktop launch when the user clicks `Connect`.
@@ -480,7 +480,7 @@ The Windows package also includes:
 - A foreground local RDP listener, normally `127.0.0.1:3389`.
 - One outbound `client` WebSocket per local RDP connection.
 - A persistent `home-agent` presence WebSocket while it runs.
-- Primary/fallback relay URL lists for presence, status, and RDP stream connections.
+- A room name plus primary/fallback relay service base URLs for presence, status, and RDP stream connections.
 - `-status` for relay room status.
 - `-open-rdp` to write and open a local `.rdp` profile with the configured loopback target.
 
@@ -490,14 +490,14 @@ The Windows package also includes:
 
 It provides:
 
-- A native Android control panel with inline-editable relay URL rows, local RDP port, status tiles, activity log, copy, dashboard, and RDP launch actions.
+- A native Android control panel with a room field, inline-editable relay service base URL rows, local RDP port, status tiles, activity log, copy, dashboard, and RDP launch actions.
 - A foreground service so the tunnel can keep running while another app is active.
 - A loopback RDP listener, normally `127.0.0.1:3389`.
 - One outbound `client` WebSocket per local RDP connection.
 - A persistent `home-agent` presence WebSocket while the service is running.
 - A persistent `dashboard` WebSocket for real-time work-agent and stream status.
-- Named work-destination profiles, each with its own primary/fallback relay URL list for presence, status, and RDP stream connections.
-- Destination add, rename, delete, and selection controls, plus relay URL add, inline edit, delete, button reorder, and drag reorder controls.
+- Named work-destination profiles, each with its own room and primary/fallback relay service base URL list for presence, status, and RDP stream connections.
+- Destination add, rename, delete, and selection controls, plus relay base URL add, inline edit, delete, button reorder, and drag reorder controls.
 
 Good free Android RDP client options include Microsoft's Remote Desktop/Windows App client and the open-source FreeRDP-based aFreeRDP client. Configure the RDP client to connect to the DeskFerry local target shown in the Android app.
 
@@ -627,8 +627,8 @@ Rules:
 
 - `<room>` is created automatically on first use.
 - Reusing the same URL joins the same room.
-- The work agent may use multiple relay URLs at once when each URL uses the same `<room>`.
-- Home apps may use multiple relay URLs as an ordered primary/fallback list when each URL uses the same `<room>`; graphical apps treat the first row as primary and later rows as fallbacks.
+- Work and Home profiles accept one `<room>` plus multiple relay service base URLs; agents compose the full room URLs internally.
+- Full room URLs remain accepted by legacy CLI flags. Graphical apps treat the first relay service row as primary and later rows as fallbacks.
 - Relays accept work-agent identity headers and keep only the latest control connection per room and agent identity. Legacy instance/slot deduplication remains available during rollout.
 - The WebSocket endpoint is derived automatically as `/relay/<room>/ws`.
 - The base `/relay/` path is an overview dashboard.

@@ -59,6 +59,11 @@ jobs:
 
       - name: Build artifacts
         shell: pwsh
+        env:
+          DESKFERRY_ANDROID_KEYSTORE_BASE64: ${{ secrets.DESKFERRY_ANDROID_KEYSTORE_BASE64 }}
+          DESKFERRY_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.DESKFERRY_ANDROID_KEYSTORE_PASSWORD }}
+          DESKFERRY_ANDROID_KEY_ALIAS: ${{ secrets.DESKFERRY_ANDROID_KEY_ALIAS }}
+          DESKFERRY_ANDROID_KEY_PASSWORD: ${{ secrets.DESKFERRY_ANDROID_KEY_PASSWORD }}
         run: |
           .\build\build-go.ps1
           .\build\build-windows-home-installer.ps1 -SkipGoBuild
@@ -66,6 +71,10 @@ jobs:
           .\build\build-windows-home-installer.ps1 -DebugWindows -DebugArtifactSuffix -SkipGoBuild
           .\build\build-azure-relay.ps1
           .\build\build-python-relay.ps1
+          if ([string]::IsNullOrWhiteSpace($env:DESKFERRY_ANDROID_KEYSTORE_BASE64)) { throw 'Android release signing keystore secret is missing' }
+          $env:DESKFERRY_ANDROID_KEYSTORE = Join-Path $env:RUNNER_TEMP 'deskferry-android-release.jks'
+          [IO.File]::WriteAllBytes($env:DESKFERRY_ANDROID_KEYSTORE, [Convert]::FromBase64String($env:DESKFERRY_ANDROID_KEYSTORE_BASE64))
+          $env:DESKFERRY_ANDROID_EXPECT_SIGNED = '1'
           .\build\build-android-home.ps1
 
       - name: Write checksums

@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.9.4 - 2026-08-06
+
+- Split Home destination and Work agent pairing settings into one room name plus an ordered list of relay service base URLs.
+- Pre-filled new profiles with the Azure primary and OCI fallback relay services while migrating existing full room URLs automatically.
+- Added stable repository release signing for Android APKs so future releases can upgrade in place. Because releases through 0.9.3 used unrecoverable ephemeral CI debug keys, upgrading to 0.9.4 requires one final uninstall of the old app.
+
 ## 0.9.3 - 2026-08-06
 
 - Added authenticated, acknowledged diagnostic-log uploads from the Windows Work agent and Windows, macOS, and Android Home agents to every configured relay.

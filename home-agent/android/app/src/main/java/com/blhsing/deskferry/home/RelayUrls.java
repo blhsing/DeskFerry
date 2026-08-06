@@ -13,6 +13,10 @@ import java.util.Locale;
 
 final class RelayUrls {
     static final String DEFAULT_RELAY_URL = "https://test-officialwebsite.azurewebsites.net/relay/workdesk";
+    static final String DEFAULT_ROOM = "workdesk";
+    static final List<String> DEFAULT_RELAY_BASE_URLS = Collections.unmodifiableList(java.util.Arrays.asList(
+            "https://test-officialwebsite.azurewebsites.net/relay",
+            "http://217.142.228.117/relay"));
 
     private RelayUrls() {
     }
@@ -45,6 +49,45 @@ final class RelayUrls {
             }
         }
         return new URI(scheme, uri.getUserInfo(), uri.getHost(), uri.getPort(), path, uri.getRawQuery(), null).toString();
+    }
+
+    static String normalizeRelayBaseUrl(String value) throws URISyntaxException {
+        URI uri = new URI(normalizeRelayUrl(value));
+        String path = stripTrailingSlash(emptyAs(uri.getRawPath(), "/relay"));
+        String[] parts = path.replaceAll("^/+|/+$", "").split("/");
+        if (parts.length >= 2 && "relay".equals(parts[0]) && !isReservedRelayPart(parts[1])) {
+            path = "/relay";
+        }
+        return new URI(uri.getScheme(), uri.getUserInfo(), uri.getHost(), uri.getPort(), path, null, null).toString();
+    }
+
+    static List<String> normalizeRelayBaseUrls(String value) throws URISyntaxException {
+        List<String> raw = splitRelayUrls(value);
+        if (raw.isEmpty()) raw = DEFAULT_RELAY_BASE_URLS;
+        ArrayList<String> out = new ArrayList<>();
+        for (String item : raw) {
+            String normalized = normalizeRelayBaseUrl(item);
+            boolean seen = false;
+            for (String existing : out) if (existing.equalsIgnoreCase(normalized)) { seen = true; break; }
+            if (!seen) out.add(normalized);
+        }
+        return Collections.unmodifiableList(out);
+    }
+
+    static List<String> relayRoomUrls(List<String> bases, String room) throws URISyntaxException {
+        room = room == null ? "" : room.trim();
+        if (room.isEmpty() || room.matches(".*[/\\\\?#].*")) throw new URISyntaxException(room, "room name is required and must not contain URL separators");
+        ArrayList<String> out = new ArrayList<>();
+        for (String base : bases) out.add(normalizeRelayBaseUrl(base) + "/" + room);
+        return Collections.unmodifiableList(out);
+    }
+
+    static String roomFromRelayUrls(String value) {
+        for (String item : splitRelayUrls(value)) {
+            String room = roomToken(item, "");
+            if (!"default".equals(room)) return room;
+        }
+        return DEFAULT_ROOM;
     }
 
     static List<String> normalizeRelayUrls(String value) throws URISyntaxException {
@@ -214,5 +257,9 @@ final class RelayUrls {
 
     private static String lower(String value) {
         return value == null ? "" : value.toLowerCase(Locale.ROOT);
+    }
+
+    private static boolean isReservedRelayPart(String value) {
+        return "ws".equals(value) || "status".equals(value) || "health".equals(value) || "dashboard".equals(value);
     }
 }

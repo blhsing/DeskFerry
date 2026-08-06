@@ -68,4 +68,15 @@ jobs:
 
       - name: Build Android home APK
         shell: pwsh
-        run: .\build\build-android-home.ps1
+        env:
+          DESKFERRY_ANDROID_KEYSTORE_BASE64: ${{ secrets.DESKFERRY_ANDROID_KEYSTORE_BASE64 }}
+          DESKFERRY_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.DESKFERRY_ANDROID_KEYSTORE_PASSWORD }}
+          DESKFERRY_ANDROID_KEY_ALIAS: ${{ secrets.DESKFERRY_ANDROID_KEY_ALIAS }}
+          DESKFERRY_ANDROID_KEY_PASSWORD: ${{ secrets.DESKFERRY_ANDROID_KEY_PASSWORD }}
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:DESKFERRY_ANDROID_KEYSTORE_BASE64)) {
+            $env:DESKFERRY_ANDROID_KEYSTORE = Join-Path $env:RUNNER_TEMP 'deskferry-android-release.jks'
+            [IO.File]::WriteAllBytes($env:DESKFERRY_ANDROID_KEYSTORE, [Convert]::FromBase64String($env:DESKFERRY_ANDROID_KEYSTORE_BASE64))
+            $env:DESKFERRY_ANDROID_EXPECT_SIGNED = '1'
+          }
+          .\build\build-android-home.ps1

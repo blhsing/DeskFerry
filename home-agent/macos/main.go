@@ -28,8 +28,10 @@ import (
 )
 
 const (
-	defaultRelayURL   = "https://test-officialwebsite.azurewebsites.net/relay/workdesk"
-	defaultListenAddr = "127.0.0.1:3389"
+	defaultRelayURL       = "https://test-officialwebsite.azurewebsites.net/relay/workdesk"
+	defaultAzureRelayBase = "https://test-officialwebsite.azurewebsites.net/relay"
+	defaultOCIRelayBase   = "http://217.142.228.117/relay"
+	defaultListenAddr     = "127.0.0.1:3389"
 )
 
 var relayLogs = remotelog.New("home-agent-macos")
@@ -91,6 +93,8 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	var relayURLs relayURLFlag
+	var relayBases relayURLFlag
+	var roomName string
 	var listenAddr string
 	var proxyFlag string
 	var roomPassword string
@@ -98,6 +102,8 @@ func main() {
 	var openRDP bool
 	var statusOnly bool
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
+	flag.Var(&relayBases, "relay-base-url", "relay service base URL; repeat to add fallback relay services")
+	flag.StringVar(&roomName, "room", "workdesk", "room name appended to each relay service base URL")
 	flag.StringVar(&listenAddr, "listen", "", "local RDP listen address")
 	flag.StringVar(&proxyFlag, "proxy", "", "proxy: env, direct, or http(s)://host:port")
 	flag.StringVar(&roomPassword, "room-password", "", "optional room password")
@@ -111,7 +117,22 @@ func main() {
 		log.Printf("diagnostic log file: %s retention_days=%d", path, logRetentionDays)
 	}
 
-	cfg, err := loadConfig(relayURLs.String(), listenAddr, proxyFlag, roomPassword)
+	relayURLText := relayURLs.String()
+	if len(relayBases) > 0 {
+		if len(relayURLs) > 0 {
+			log.Fatal("use either -relay-url or -relay-base-url, not both")
+		}
+		var values []string
+		for _, base := range relayBases {
+			value, composeErr := tunnel.RelayRoomURL(base, roomName)
+			if composeErr != nil {
+				log.Fatal(composeErr)
+			}
+			values = append(values, value)
+		}
+		relayURLText = joinRelayURLs(values)
+	}
+	cfg, err := loadConfig(relayURLText, listenAddr, proxyFlag, roomPassword)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -169,7 +190,8 @@ func (c *config) applyDefaults() {
 		c.ListenAddr = defaultListenAddr
 	}
 	if c.RelayAddr == "" && len(c.RelayAddrs) == 0 {
-		c.RelayAddr = defaultRelayURL
+		c.RelayAddrs = []string{defaultRelayURL, defaultOCIRelayBase + "/workdesk"}
+		c.RelayAddr = c.RelayAddrs[0]
 	}
 	if c.Proxy == "" {
 		c.Proxy = "env"

@@ -35,7 +35,6 @@ import android.widget.Toast;
 
 import java.net.URISyntaxException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 
@@ -57,6 +56,7 @@ public class MainActivity extends Activity {
     private boolean updatingDestinationSpinner;
     private LinearLayout relayUrlList;
     private EditText relayUrlAddField;
+    private EditText roomNameField;
     private Button relayAddButton;
     private EditText localPortField;
     private EditText roomPasswordField;
@@ -169,6 +169,9 @@ public class MainActivity extends Activity {
         destinationRow.addView(destinationDeleteButton, iconButtonParams());
         configCard.addView(destinationRow, matchWrap());
 
+        roomNameField = field("Room name");
+        configCard.addView(roomNameField, matchWrap());
+
         relayUrlList = new LinearLayout(this);
         relayUrlList.setOrientation(LinearLayout.VERTICAL);
         relayUrlList.setOnDragListener((view, event) -> {
@@ -186,7 +189,7 @@ public class MainActivity extends Activity {
 
         LinearLayout addRelayRow = new LinearLayout(this);
         addRelayRow.setOrientation(LinearLayout.HORIZONTAL);
-        relayUrlAddField = field("Relay room URL");
+        relayUrlAddField = field("Relay service base URL");
         relayUrlAddField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         addRelayRow.addView(relayUrlAddField, weightedField());
         relayAddButton = secondaryButton("Add");
@@ -294,11 +297,12 @@ public class MainActivity extends Activity {
         refreshDestinationSpinner();
         List<String> relayUrls;
         try {
-            relayUrls = RelayUrls.normalizeRelayUrls(destinations.get(selectedDestination).relayUrl);
+            relayUrls = RelayUrls.normalizeRelayBaseUrls(destinations.get(selectedDestination).relayBases);
         } catch (URISyntaxException ex) {
-            relayUrls = Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL);
+            relayUrls = RelayUrls.DEFAULT_RELAY_BASE_URLS;
         }
         setRelayUrls(relayUrls);
+        roomNameField.setText(destinations.get(selectedDestination).room);
         roomPasswordField.setText("");
         localPortField.setText(String.valueOf(HomePrefs.loadLocalPort(this)));
         proxyField.setText(HomePrefs.loadProxy(this));
@@ -307,7 +311,11 @@ public class MainActivity extends Activity {
 
     private void savePreferences(String relayUrl, int port, String proxy) {
         if (!destinations.isEmpty()) {
-            destinations.get(selectedDestination).relayUrl = relayUrl;
+            HomePrefs.Destination destination = destinations.get(selectedDestination);
+            String room = roomNameField.getText().toString().trim();
+            if (!destination.room.equalsIgnoreCase(room)) destination.roomProof = "";
+            destination.relayBases = RelayUrls.joinRelayUrls(relayUrls);
+            destination.room = room;
             String password = roomPasswordField.getText().toString();
             if (!password.isEmpty()) {
                 destinations.get(selectedDestination).roomProof = RelayUrls.roomPasswordProof(
@@ -336,7 +344,11 @@ public class MainActivity extends Activity {
 
     private void commitSelectedDestination() {
         if (!destinations.isEmpty() && selectedDestination >= 0 && selectedDestination < destinations.size()) {
-            destinations.get(selectedDestination).relayUrl = RelayUrls.joinRelayUrls(relayUrls);
+            HomePrefs.Destination destination = destinations.get(selectedDestination);
+            String room = roomNameField.getText().toString().trim();
+            if (!destination.room.equalsIgnoreCase(room)) destination.roomProof = "";
+            destination.relayBases = RelayUrls.joinRelayUrls(relayUrls);
+            destination.room = room;
         }
     }
 
@@ -347,10 +359,11 @@ public class MainActivity extends Activity {
         commitSelectedDestination();
         selectedDestination = index;
         roomPasswordField.setText("");
+        roomNameField.setText(destinations.get(index).room);
         try {
-            setRelayUrls(RelayUrls.normalizeRelayUrls(destinations.get(index).relayUrl));
+            setRelayUrls(RelayUrls.normalizeRelayBaseUrls(destinations.get(index).relayBases));
         } catch (URISyntaxException ex) {
-            setRelayUrls(Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL));
+            setRelayUrls(RelayUrls.DEFAULT_RELAY_BASE_URLS);
         }
         HomePrefs.saveDestinations(this, destinations, selectedDestination,
                 parsePortOrDefault(localPortField.getText().toString()));
@@ -360,10 +373,11 @@ public class MainActivity extends Activity {
         promptDestinationName("Add destination", "", name -> {
             commitSelectedDestination();
             String unique = uniqueDestinationName(name, -1);
-            destinations.add(new HomePrefs.Destination(unique, RelayUrls.DEFAULT_RELAY_URL));
+            destinations.add(new HomePrefs.Destination(unique, RelayUrls.joinRelayUrls(RelayUrls.DEFAULT_RELAY_BASE_URLS), RelayUrls.DEFAULT_ROOM, ""));
             selectedDestination = destinations.size() - 1;
             roomPasswordField.setText("");
-            setRelayUrls(Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL));
+            roomNameField.setText(RelayUrls.DEFAULT_ROOM);
+            setRelayUrls(RelayUrls.DEFAULT_RELAY_BASE_URLS);
             refreshDestinationSpinner();
             HomePrefs.saveDestinations(this, destinations, selectedDestination,
                     parsePortOrDefault(localPortField.getText().toString()));
@@ -412,10 +426,11 @@ public class MainActivity extends Activity {
         destinations.remove(selectedDestination);
         selectedDestination = Math.min(selectedDestination, destinations.size() - 1);
         roomPasswordField.setText("");
+        roomNameField.setText(destinations.get(selectedDestination).room);
         try {
-            setRelayUrls(RelayUrls.normalizeRelayUrls(destinations.get(selectedDestination).relayUrl));
+            setRelayUrls(RelayUrls.normalizeRelayBaseUrls(destinations.get(selectedDestination).relayBases));
         } catch (URISyntaxException ex) {
-            setRelayUrls(Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL));
+            setRelayUrls(RelayUrls.DEFAULT_RELAY_BASE_URLS);
         }
         refreshDestinationSpinner();
         HomePrefs.saveDestinations(this, destinations, selectedDestination,
@@ -456,12 +471,13 @@ public class MainActivity extends Activity {
             return;
         }
         String relayUrl;
+        List<String> normalizedRelayBases;
         int port;
         String proxy;
         int logRetentionDays;
         try {
-            List<String> normalizedRelayUrls = normalizedRelayUrlsFromRows();
-            relayUrl = RelayUrls.joinRelayUrls(normalizedRelayUrls);
+            normalizedRelayBases = normalizedRelayUrlsFromRows();
+            relayUrl = RelayUrls.joinRelayUrls(RelayUrls.relayRoomUrls(normalizedRelayBases, roomNameField.getText().toString()));
             port = parsePort(localPortField.getText().toString());
             proxy = ProxySettings.normalize(proxyField.getText().toString());
             logRetentionDays = parseLogRetentionDays(logRetentionDaysField.getText().toString());
@@ -469,13 +485,7 @@ public class MainActivity extends Activity {
             Toast.makeText(this, ex.getMessage(), Toast.LENGTH_LONG).show();
             return;
         }
-        List<String> relayUrls;
-        try {
-            relayUrls = RelayUrls.normalizeRelayUrls(relayUrl);
-        } catch (URISyntaxException ex) {
-            relayUrls = Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL);
-        }
-        setRelayUrls(relayUrls);
+        setRelayUrls(normalizedRelayBases);
         localPortField.setText(String.valueOf(port));
         proxyField.setText(proxy);
         logRetentionDaysField.setText(String.valueOf(logRetentionDays));
@@ -531,6 +541,7 @@ public class MainActivity extends Activity {
         proxyField.setEnabled(!state.running);
         logRetentionDaysField.setEnabled(!state.running);
         roomPasswordField.setEnabled(!state.running);
+        roomNameField.setEnabled(!state.running);
         clearRoomPasswordButton.setEnabled(!state.running);
     }
 
@@ -554,7 +565,7 @@ public class MainActivity extends Activity {
     }
 
     private void openDashboard() {
-        String relayUrl = relayUrls.isEmpty() ? RelayUrls.DEFAULT_RELAY_URL : relayUrls.get(0);
+        String relayUrl = destinations.isEmpty() ? RelayUrls.DEFAULT_RELAY_URL : destinations.get(selectedDestination).relayUrl();
         try {
             relayUrl = RelayUrls.normalizeRelayUrl(relayUrl);
         } catch (URISyntaxException ignored) {
@@ -575,23 +586,14 @@ public class MainActivity extends Activity {
     }
 
     private List<String> normalizedRelayUrlsFromRows() throws URISyntaxException {
-        List<String> normalized = RelayUrls.normalizeRelayUrls(RelayUrls.joinRelayUrls(relayUrls));
-        String room = "";
-        for (String relayUrl : normalized) {
-            String current = RelayUrls.roomToken(relayUrl, "").toLowerCase(Locale.ROOT);
-            if (room.isEmpty()) {
-                room = current;
-            } else if (!room.equals(current)) {
-                throw new URISyntaxException(relayUrl, "all relay URLs for a destination must use the same room name");
-            }
-        }
+        List<String> normalized = RelayUrls.normalizeRelayBaseUrls(RelayUrls.joinRelayUrls(relayUrls));
         setRelayUrls(normalized);
         return normalized;
     }
 
     private void addRelayUrlFromField() {
         try {
-            String relayUrl = RelayUrls.normalizeRelayUrl(relayUrlAddField.getText().toString());
+            String relayUrl = RelayUrls.normalizeRelayBaseUrl(relayUrlAddField.getText().toString());
             for (String existing : relayUrls) {
                 if (existing.equalsIgnoreCase(relayUrl)) {
                     relayUrlAddField.setText("");
@@ -655,7 +657,7 @@ public class MainActivity extends Activity {
         role.setBackground(rounded("#E9F3F1", "#BFD7D3", 8));
         top.addView(role, roleParams());
 
-        EditText edit = field("Relay room URL");
+        EditText edit = field("Relay service base URL");
         edit.setText(relayUrls.get(rowIndex));
         edit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         edit.setEnabled(relayRowsEnabled);

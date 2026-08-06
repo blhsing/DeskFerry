@@ -61,6 +61,27 @@ func TestParseCLIInstall(t *testing.T) {
 	}
 }
 
+func TestParseCLIInstallComposesRelayBasesWithRoom(t *testing.T) {
+	exePath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, opts, err := parseCLIArgs([]string{
+		"-cli-action", "install",
+		"-agent", exePath,
+		"-room", "office",
+		"-relay-base-url", "https://primary.example/relay/",
+		"-relay-base-url", "http://fallback.example/relay",
+	}, strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://primary.example/relay/office;http://fallback.example/relay/office"
+	if opts.RelayURL != want {
+		t.Fatalf("RelayURL = %q, want %q", opts.RelayURL, want)
+	}
+}
+
 func TestParseCLIRejectsPasswordConflicts(t *testing.T) {
 	_, _, err := parseCLIArgs([]string{
 		"-cli-action", "install",
