@@ -565,17 +565,14 @@ On development PCs where SEP flags optimized unsigned Go PE files, retain symbol
 .\build\build-windows-home-installer.ps1 -DebugWindows
 ```
 
-To produce separate unoptimized Windows diagnostic builds, first run `build-go.ps1` so the Windows manifest resources are generated, then run:
+To produce separately named unoptimized Windows builds while retaining the normal artifacts, run:
 
 ```powershell
-$env:GOOS = 'windows'
-$env:GOARCH = 'amd64'
-$env:CGO_ENABLED = '0'
-go build -gcflags 'all=-N -l' -o dist\bin\deskferry-home-windows-amd64-debug.exe ./home-agent/windows
-go build -gcflags 'all=-N -l' -o dist\bin\deskferry-agent-windows-amd64-debug.exe ./work-agent/windows/service
+.\build\build-go.ps1 -DebugWindows -DebugArtifactSuffix
+.\build\build-windows-home-installer.ps1 -DebugWindows -DebugArtifactSuffix -SkipGoBuild
 ```
 
-These debug binaries are larger and slower and remain unsigned. They are useful for diagnostics or for testing an endpoint-protection false positive, but code signing and an administrator-approved allowlist are preferred for normal deployment.
+These debug binaries are larger and slower and remain unsigned. They are included in every release for hosts where SEP quarantines optimized unsigned Go PE files; code signing and an administrator-approved allowlist remain preferred where available.
 
 Build Android home APK:
 
@@ -601,11 +598,15 @@ dist\bin\deskferry-home-macos-amd64
 dist\android\deskferry-home-android-debug.apk
 ```
 
-The optional unoptimized commands above additionally produce:
+The unoptimized commands above additionally produce separately named versions of all Windows Go artifacts, including:
 
 ```text
-dist\bin\deskferry-home-windows-amd64-debug.exe
 dist\bin\deskferry-agent-windows-amd64-debug.exe
+dist\bin\deskferry-agent-configurator-windows-amd64-debug.exe
+dist\bin\deskferry-home-windows-amd64-debug.exe
+dist\bin\deskferry-home-network-windows-amd64-debug.exe
+dist\bin\deskferry-home-setup-windows-amd64-debug.exe
+dist\windows-home-installer\DeskFerryHomeSetup-debug.exe
 ```
 
 ## URL Configuration

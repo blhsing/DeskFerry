@@ -76,6 +76,19 @@ func TestNetworkConfigPreservesExistingProof(t *testing.T) {
 	}
 }
 
+func TestSetupPackagePathUsesRenamedRunningInstaller(t *testing.T) {
+	sourceDir := t.TempDir()
+	debugSetup := filepath.Join(sourceDir, "DeskFerryHomeSetup-debug.exe")
+	if got := setupPackagePathForExecutable(sourceDir, debugSetup); got != debugSetup {
+		t.Fatalf("setup path = %q, want %q", got, debugSetup)
+	}
+	otherDir := t.TempDir()
+	want := filepath.Join(sourceDir, "DeskFerryHomeSetup.exe")
+	if got := setupPackagePathForExecutable(sourceDir, filepath.Join(otherDir, "setup.exe")); got != want {
+		t.Fatalf("fallback setup path = %q, want %q", got, want)
+	}
+}
+
 func TestParseCLIInstall(t *testing.T) {
 	sourceDir := t.TempDir()
 	for _, name := range []string{"DeskFerryHomeSetup.exe", "DeskFerryHome.exe", "DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {

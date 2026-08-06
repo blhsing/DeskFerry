@@ -1,9 +1,14 @@
 param(
     [switch] $DebugWindows,
+    [switch] $DebugArtifactSuffix,
     [switch] $SkipGoBuild
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($DebugArtifactSuffix -and -not $DebugWindows) {
+    throw '-DebugArtifactSuffix requires -DebugWindows'
+}
 
 $root = Split-Path -Parent $PSScriptRoot
 $binDir = Join-Path $root 'dist/bin'
@@ -12,7 +17,8 @@ $extractDir = Join-Path $root 'dist/tmp/home-installer-dependencies'
 $outputDir = Join-Path $root 'dist/windows-home-installer'
 $payloadDir = Join-Path $root 'dist/tmp/home-installer-payload'
 $payloadZip = Join-Path $outputDir 'DeskFerryHomePayload.zip'
-$setupOutput = Join-Path $outputDir 'DeskFerryHomeSetup.exe'
+$setupOutputName = if ($DebugArtifactSuffix) { 'DeskFerryHomeSetup-debug.exe' } else { 'DeskFerryHomeSetup.exe' }
+$setupOutput = Join-Path $outputDir $setupOutputName
 
 $wintunVersion = '0.14.1'
 $wintunURL = "https://www.wintun.net/builds/wintun-$wintunVersion.zip"
@@ -52,6 +58,9 @@ if (-not $SkipGoBuild) {
     if ($DebugWindows) {
         $buildArgs += '-DebugWindows'
     }
+    if ($DebugArtifactSuffix) {
+        $buildArgs += '-DebugArtifactSuffix'
+    }
     & (Join-Path $PSScriptRoot 'build-go.ps1') @buildArgs
     if ($LASTEXITCODE -ne 0) { throw 'Go artifact build failed' }
 }
@@ -84,9 +93,10 @@ foreach ($name in $payloadNames) {
     }
 }
 
-$homeBinary = Join-Path $binDir 'deskferry-home-windows-amd64.exe'
-$networkBinary = Join-Path $binDir 'deskferry-home-network-windows-amd64.exe'
-$setupBase = Join-Path $binDir 'deskferry-home-setup-windows-amd64.exe'
+$debugSuffix = if ($DebugArtifactSuffix) { '-debug' } else { '' }
+$homeBinary = Join-Path $binDir "deskferry-home-windows-amd64$debugSuffix.exe"
+$networkBinary = Join-Path $binDir "deskferry-home-network-windows-amd64$debugSuffix.exe"
+$setupBase = Join-Path $binDir "deskferry-home-setup-windows-amd64$debugSuffix.exe"
 $wintunDLL = Join-Path $wintunExtract 'wintun/bin/amd64/wintun.dll'
 $wintunLicense = Join-Path $wintunExtract 'wintun/LICENSE.txt'
 $tun2socksBinary = Join-Path $tun2socksExtract 'tun2socks-windows-amd64.exe'

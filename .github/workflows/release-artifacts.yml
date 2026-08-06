@@ -62,6 +62,8 @@ jobs:
         run: |
           .\build\build-go.ps1
           .\build\build-windows-home-installer.ps1 -SkipGoBuild
+          .\build\build-go.ps1 -DebugWindows -DebugArtifactSuffix
+          .\build\build-windows-home-installer.ps1 -DebugWindows -DebugArtifactSuffix -SkipGoBuild
           .\build\build-azure-relay.ps1
           .\build\build-python-relay.ps1
           .\build\build-android-home.ps1
@@ -75,6 +77,12 @@ jobs:
             'dist\bin\deskferry-home-windows-amd64.exe',
             'dist\bin\deskferry-home-network-windows-amd64.exe',
             'dist\windows-home-installer\DeskFerryHomeSetup.exe',
+            'dist\bin\deskferry-agent-windows-amd64-debug.exe',
+            'dist\bin\deskferry-agent-configurator-windows-amd64-debug.exe',
+            'dist\bin\deskferry-home-windows-amd64-debug.exe',
+            'dist\bin\deskferry-home-network-windows-amd64-debug.exe',
+            'dist\bin\deskferry-home-setup-windows-amd64-debug.exe',
+            'dist\windows-home-installer\DeskFerryHomeSetup-debug.exe',
             'dist\bin\deskferry-home-macos-arm64',
             'dist\bin\deskferry-home-macos-amd64',
             'dist\azure-relay\deskferry-azure-relay.zip',
@@ -119,6 +127,12 @@ jobs:
             'dist\bin\deskferry-home-windows-amd64.exe' `
             'dist\bin\deskferry-home-network-windows-amd64.exe' `
             'dist\windows-home-installer\DeskFerryHomeSetup.exe' `
+            'dist\bin\deskferry-agent-windows-amd64-debug.exe' `
+            'dist\bin\deskferry-agent-configurator-windows-amd64-debug.exe' `
+            'dist\bin\deskferry-home-windows-amd64-debug.exe' `
+            'dist\bin\deskferry-home-network-windows-amd64-debug.exe' `
+            'dist\bin\deskferry-home-setup-windows-amd64-debug.exe' `
+            'dist\windows-home-installer\DeskFerryHomeSetup-debug.exe' `
             'dist\bin\deskferry-home-macos-arm64' `
             'dist\bin\deskferry-home-macos-amd64' `
             'dist\bin\SHA256SUMS.txt' `

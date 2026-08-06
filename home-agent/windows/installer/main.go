@@ -882,6 +882,19 @@ func mustExecutable() string {
 	return path
 }
 
+func setupPackagePath(sourceDir string) string {
+	return setupPackagePathForExecutable(sourceDir, mustExecutable())
+}
+
+func setupPackagePathForExecutable(sourceDir, executable string) string {
+	sourceAbs, sourceErr := filepath.Abs(sourceDir)
+	executableAbs, executableErr := filepath.Abs(executable)
+	if sourceErr == nil && executableErr == nil && strings.EqualFold(sourceAbs, filepath.Dir(executableAbs)) {
+		return executableAbs
+	}
+	return filepath.Join(sourceDir, "DeskFerryHomeSetup.exe")
+}
+
 func hasArg(args []string, name string) bool {
 	for _, arg := range args {
 		if arg == name || strings.HasPrefix(arg, name+"=") {
@@ -925,8 +938,9 @@ func validateOptions(opts setupOptions) error {
 	if strings.TrimSpace(opts.InstallDir) == "" {
 		return errors.New("install location is required")
 	}
-	if _, err := os.Stat(filepath.Join(opts.SourceDir, "DeskFerryHomeSetup.exe")); err != nil {
-		return errors.New("setup must be named DeskFerryHomeSetup.exe")
+	setupPath := setupPackagePath(opts.SourceDir)
+	if _, err := os.Stat(setupPath); err != nil {
+		return errors.New("DeskFerry Home setup package is unavailable")
 	}
 	required := []string{"DeskFerryHome.exe"}
 	if opts.EnableNetwork {
@@ -940,7 +954,7 @@ func validateOptions(opts setupOptions) error {
 		}
 	}
 	if missingSibling {
-		if err := validateEmbeddedPayload(filepath.Join(opts.SourceDir, "DeskFerryHomeSetup.exe"), required); err != nil {
+		if err := validateEmbeddedPayload(setupPath, required); err != nil {
 			return err
 		}
 	}
@@ -1198,7 +1212,7 @@ func materializePayload(sourceDir string, networkEnabled bool) (string, func(), 
 	if hasSiblings {
 		return sourceDir, func() {}, nil
 	}
-	setupPath := filepath.Join(sourceDir, "DeskFerryHomeSetup.exe")
+	setupPath := setupPackagePath(sourceDir)
 	archive, err := zip.OpenReader(setupPath)
 	if err != nil {
 		return "", func() {}, fmt.Errorf("open embedded setup payload: %w", err)

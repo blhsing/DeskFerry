@@ -1,8 +1,13 @@
 param(
-    [switch] $DebugWindows
+    [switch] $DebugWindows,
+    [switch] $DebugArtifactSuffix
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($DebugArtifactSuffix -and -not $DebugWindows) {
+    throw '-DebugArtifactSuffix requires -DebugWindows'
+}
 
 $root = Split-Path -Parent $PSScriptRoot
 $out = Join-Path $root 'dist/bin'
@@ -119,7 +124,11 @@ try {
         $env:GOOS = $target.GOOS
         $env:GOARCH = $target.GOARCH
         $env:CGO_ENABLED = '0'
-        $path = Join-Path $out $target.Name
+        $artifactName = $target.Name
+        if ($DebugArtifactSuffix -and $target.GOOS -eq 'windows') {
+            $artifactName = [IO.Path]::GetFileNameWithoutExtension($artifactName) + '-debug.exe'
+        }
+        $path = Join-Path $out $artifactName
         $ldflags = '-s -w'
         if ($target.ContainsKey('Ldflags')) {
             $ldflags = $target.Ldflags
