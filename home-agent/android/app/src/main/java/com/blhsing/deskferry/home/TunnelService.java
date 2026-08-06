@@ -388,7 +388,7 @@ public class TunnelService extends Service {
                 .header("Authorization", "Bearer " + token)
                 .header("X-DeskFerry-Role", role)
                 .header("X-TunnelDesktop-Role", role)
-                .header("User-Agent", "DeskFerry-Android/0.8.0");
+                .header("User-Agent", "DeskFerry-Android/0.9.2");
         if (!roomProof.isEmpty() && !"dashboard".equals(role)) {
             request.header("X-DeskFerry-Room-Proof", roomProof);
         }
@@ -717,37 +717,29 @@ public class TunnelService extends Service {
             try {
                 boolean connected = false;
                 String lastError = "";
-                long retryDeadline = SystemClock.elapsedRealtime() + RESUMABLE_WINDOW_MS;
-                long retryBackoff = 250;
-                while (!closed.get() && !connected && SystemClock.elapsedRealtime() < retryDeadline) {
-                    for (String candidate : relayUrlsSnapshot()) {
-                        if (closed.get()) {
-                            break;
-                        }
-                        try {
-                            long dialStarted = SystemClock.elapsedRealtime();
-                            connectRelay(candidate);
-                            selectedRelay = candidate;
-                            append("Relay attempt selected relay=" + candidate + " service=rdp protocol_v2=true elapsed_ms=" + elapsedMillis(dialStarted) + ".");
-                        } catch (Exception ex) {
-                            lastError = candidate + ": " + ex.getMessage();
-                            closeWebSocketOnly();
-                            if (!closed.get()) {
-                                append("Relay attempt failed relay=" + candidate + " service=rdp result=" + relayAttemptResult(ex) + " error=" + ex.getMessage() + ".");
-                            }
-                            if (ex instanceof SessionRejectedException && ((SessionRejectedException) ex).terminal()) {
-                                throw ex;
-                            }
-                            continue;
-                        }
-                        append("Bridging local RDP connection from " + remote + " through " + candidate + ".");
-                        connected = true;
+                for (String candidate : relayUrlsSnapshot()) {
+                    if (closed.get()) {
                         break;
                     }
-                    if (!connected && !closed.get()) {
-                        sleepQuietly(retryBackoff);
-                        retryBackoff = Math.min(5000, retryBackoff * 2);
+                    try {
+                        long dialStarted = SystemClock.elapsedRealtime();
+                        connectRelay(candidate);
+                        selectedRelay = candidate;
+                        append("Relay attempt selected relay=" + candidate + " service=rdp protocol_v2=true elapsed_ms=" + elapsedMillis(dialStarted) + ".");
+                    } catch (Exception ex) {
+                        lastError = candidate + ": " + ex.getMessage();
+                        closeWebSocketOnly();
+                        if (!closed.get()) {
+                            append("Relay attempt failed relay=" + candidate + " service=rdp result=" + relayAttemptResult(ex) + " error=" + ex.getMessage() + ".");
+                        }
+                        if (ex instanceof SessionRejectedException && ((SessionRejectedException) ex).terminal()) {
+                            throw ex;
+                        }
+                        continue;
                     }
+                    append("Bridging local RDP connection from " + remote + " through " + candidate + ".");
+                    connected = true;
+                    break;
                 }
                 if (connected) {
                     pipeLocalToRelay();
@@ -850,11 +842,14 @@ public class TunnelService extends Service {
 
                 @Override
                 public void onClosed(WebSocket socket, int code, String reason) {
-                    ready.countDown();
                     if (!started.get()) {
                         if (failure.get() == null) {
-                            failure.set(new IOException("relay closed before pairing code=" + code + " reason=" + reason));
+                            IOException error = !initial && (code == 1000 || code == 1008)
+                                    ? new TerminalResumeException("relay resume rejected code=" + code + " reason=" + reason)
+                                    : new IOException("relay closed before pairing code=" + code + " reason=" + reason);
+                            failure.set(error);
                         }
+                        ready.countDown();
                         return;
                     }
                     if (!sessionId.isEmpty() && code != 1000 && code != 1008 && !closed.get()) {
@@ -867,12 +862,15 @@ public class TunnelService extends Service {
 
                 @Override
                 public void onFailure(WebSocket socket, Throwable t, Response response) {
-                    failure.set(t);
+                    int status = response == null ? 0 : response.code();
+                    Throwable reported = !initial && (status == 401 || status == 403)
+                            ? new TerminalResumeException("relay resume authentication failed http_status=" + status, t)
+                            : t;
+                    failure.set(reported);
                     ready.countDown();
                     if (!started.get()) {
                         return;
                     }
-                    int status = response == null ? 0 : response.code();
                     if (!sessionId.isEmpty() && status != 401 && status != 403 && !closed.get()) {
                         markTransportLost(socket, "websocket_failure error=" + throwableText(t) + " http_status=" + responseStatus(response));
                     } else {
@@ -901,6 +899,16 @@ public class TunnelService extends Service {
 
             boolean terminal() {
                 return "authentication-failed".equals(result) || "service-disabled".equals(result) || "invalid-request".equals(result);
+            }
+        }
+
+        private final class TerminalResumeException extends IOException {
+            TerminalResumeException(String message) {
+                super(message);
+            }
+
+            TerminalResumeException(String message, Throwable cause) {
+                super(message, cause);
             }
         }
 
@@ -970,6 +978,13 @@ public class TunnelService extends Service {
                             }
                             pendingResumeSocket = null;
                             candidate.cancel();
+                            Throwable resumeFailure = failure.get();
+                            if (resumeFailure instanceof TerminalResumeException) {
+                                recordTermination("resume_rejected error=" + throwableText(resumeFailure));
+                                append("RDP relay session cannot resume; closing the stale local connection: " + throwableText(resumeFailure));
+                                close();
+                                return;
+                            }
                         } catch (Exception ignored) {
                             WebSocket candidate = pendingResumeSocket;
                             pendingResumeSocket = null;

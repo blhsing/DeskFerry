@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.9.2 - 2026-08-06
+
+- Made Android close stale local RDP sessions immediately when relay resumption receives a terminal normal-close, unknown-session, or authentication rejection.
+- Stopped newly accepted Android RDP sockets from retrying busy or unavailable relay rooms for five minutes, allowing Microsoft Windows App reconnect attempts to fail promptly instead of remaining on **Establishing connection**.
+
 ## 0.9.1 - 2026-08-05
 
 - Stopped new local RDP negotiation or retry sockets from forcibly closing an established desktop session in the Windows and macOS Home agents.
