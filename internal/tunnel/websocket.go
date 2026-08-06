@@ -81,18 +81,21 @@ func (d *dnsFallbackDialer) DialContext(ctx context.Context, network, address st
 }
 
 const (
-	RoleProbe     = "probe"
-	RoleHomeAgent = "home-agent"
-	RoleResume    = "resume"
+	RoleProbe         = "probe"
+	RoleHomeAgent     = "home-agent"
+	RoleResume        = "resume"
+	RoleDiagnosticLog = "diagnostic-log"
 
 	webSocketStartMessage  = "start"
 	webSocketResumeMessage = "resume"
 
-	HeaderResumable   = "X-DeskFerry-Resumable"
-	HeaderSessionID   = "X-DeskFerry-Session"
-	HeaderSessionSide = "X-DeskFerry-Session-Side"
-	HeaderRoomProof   = "X-DeskFerry-Room-Proof"
-	HeaderService     = "X-DeskFerry-Service"
+	HeaderResumable    = "X-DeskFerry-Resumable"
+	HeaderSessionID    = "X-DeskFerry-Session"
+	HeaderSessionSide  = "X-DeskFerry-Session-Side"
+	HeaderRoomProof    = "X-DeskFerry-Room-Proof"
+	HeaderService      = "X-DeskFerry-Service"
+	HeaderLogComponent = "X-DeskFerry-Log-Component"
+	HeaderLogInstance  = "X-DeskFerry-Log-Instance"
 
 	ServiceRDP   = "rdp"
 	ServiceWinRM = "winrm"
@@ -432,7 +435,7 @@ func proxyFunc(relayAddr, proxySpec string) func(*http.Request) (*url.URL, error
 
 func validateWebSocketRole(role string) error {
 	switch role {
-	case RoleAgent, RoleClient, RoleAgentControl, RoleAgentSession, RoleProbe, RoleHomeAgent, RoleResume:
+	case RoleAgent, RoleClient, RoleAgentControl, RoleAgentSession, RoleProbe, RoleHomeAgent, RoleResume, RoleDiagnosticLog:
 		return nil
 	default:
 		return fmt.Errorf("invalid websocket role %q", role)

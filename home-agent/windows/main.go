@@ -30,6 +30,7 @@ import (
 
 	"deskferry/internal/diaglog"
 	"deskferry/internal/homenetwork"
+	"deskferry/internal/remotelog"
 	"deskferry/internal/tunnel"
 	"deskferry/internal/wincred"
 	"deskferry/internal/winsecret"
@@ -44,6 +45,10 @@ const (
 	statusTileWidth        = 150
 	rdpStatusTileWidth     = 230
 )
+
+var relayLogs = remotelog.New("home-agent-windows")
+var relayLogsTargetMu sync.Mutex
+var relayLogsTargetCancel context.CancelFunc
 
 type config struct {
 	ListenAddr          string               `json:"listen_addr"`
@@ -191,7 +196,7 @@ func main() {
 	flag.BoolVar(&consoleMode, "console", false, "run in the foreground instead of the control panel")
 	flag.BoolVar(&smokeTest, "ui-smoke-test", false, "start and close the GUI")
 	flag.Parse()
-	if path, err := diaglog.Enable("home-agent", false, logRetentionDays); err != nil {
+	if path, err := diaglog.Enable("home-agent", false, logRetentionDays, relayLogs); err != nil {
 		log.Printf("persistent diagnostic logging unavailable: %v", err)
 	} else {
 		log.Printf("diagnostic log file: %s retention_days=%d", path, logRetentionDays)
@@ -216,6 +221,8 @@ func main() {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(1)
 	}
+	relayLogs.SetInstance(homeLogInstance())
+	setHomeLogTargets(cfg)
 	if err := activateWindowsProfileCredential(cfg); err != nil {
 		log.Printf("activate saved Windows login for RDP and SMB at startup: %v", err)
 	}
@@ -232,6 +239,27 @@ func main() {
 	if err := app.run(smokeTest); err != nil {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(1)
+	}
+}
+
+func homeLogInstance() string {
+	name, _ := os.Hostname()
+	if strings.TrimSpace(name) == "" {
+		return "windows-home"
+	}
+	return name
+}
+
+func setHomeLogTargets(cfg config) {
+	relayLogsTargetMu.Lock()
+	defer relayLogsTargetMu.Unlock()
+	if relayLogsTargetCancel != nil {
+		relayLogsTargetCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	relayLogsTargetCancel = cancel
+	for _, relayAddr := range cfg.relayAddresses() {
+		relayLogs.StartTarget(ctx, remotelog.Target{RelayAddr: relayAddr, Proxy: cfg.Proxy, RoomProof: cfg.roomProof()})
 	}
 }
 
@@ -748,6 +776,7 @@ func (a *clientApp) persistDestinationSelection() {
 		a.showError(err)
 		return
 	}
+	setHomeLogTargets(cfg)
 	if err := activateWindowsProfileCredential(cfg); err != nil {
 		a.appendLog("Could not activate the selected destination's Windows login: %v", err)
 	}
@@ -1074,6 +1103,7 @@ func (a *clientApp) saveFromUI(showMessage bool) error {
 		}
 		return err
 	}
+	setHomeLogTargets(cfg)
 	if err := activateWindowsProfileCredential(cfg); err != nil {
 		a.appendLog("Could not activate the selected destination's Windows login: %v", err)
 	}

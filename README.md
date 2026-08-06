@@ -653,13 +653,15 @@ Android home:  <app-specific files>/logs/home-agent-YYYY-MM-DD.log
 
 Windows and macOS accept `-log-retention-days <days>`. Android exposes the equivalent setting in its control panel. All three home implementations default to seven days, as does the Windows work agent.
 
+While an agent is running, it also keeps a bounded in-memory relay-upload queue (up to 2,000 lines or 1 MiB). Each configured relay receives authenticated batches through the room URL; batches are removed from that relay's pending stream only after acknowledgment. This includes messages generated before the diagnostics WebSocket connects. Relay entries use the `agent_log` marker and include the room, agent component, device instance, and remote address. The on-device files remain the complete retained source across process restarts; the upload queue is intentionally process-local and bounded so an unreachable relay cannot consume unbounded disk or memory.
+
 Relay diagnostics are written to standard output and retained by the hosting platform:
 
 - The Azure relay installs UTC, single-line console logging and also writes directly to `%HOME%\LogFiles\Application\deskferry-relay-<instance>-<pid>.log`. Direct file logging remains available when the App Service ANCM stdout capture file is empty. App Service application logging should remain enabled at `Information` level. The production service uses seven-day filesystem HTTP-log retention plus filesystem application-log size and file-count limits. Exact application-log retention by days requires Azure Blob Storage or another Azure Monitor destination because App Service filesystem application logs do not expose a day-retention property.
 - The OCI systemd host stores Go relay output in persistent journald. Its deployed journal policy uses `MaxRetentionSec=7day` together with a disk-usage cap. Inspect it with `journalctl -u deskferry-relay.service --since '7 days ago'`.
 - Python relay deployments also log connection, pairing, bridge, and disconnect lifecycle events through their ASGI server output; configure retention in the process supervisor or hosting platform.
 
-When investigating a disconnect, collect the home-agent and work-agent entries covering the same timestamp, then correlate them with Azure App Service logs or `journalctl` on the relay that was selected. Pair identifiers and close details distinguish a relay-side termination from a home-to-relay, work-to-relay, or local-RDP failure.
+When investigating a disconnect, start with the relay's `agent_log` entries and native relay lifecycle entries for the same timestamp, then use the on-device files if older or more complete history is needed. Pair identifiers and close details distinguish a relay-side termination from a home-to-relay, work-to-relay, or local-RDP failure.
 
 MSTSC may open a short negotiation socket, close it after exchanging only a few bytes, and continue the desktop on a second local socket. That first `end_initiator=local_rdp` entry is not a session disconnect when another RDP connection immediately follows and remains active. Home agents keep these local sockets independent; a negotiation or retry socket must not close an established desktop session.
 

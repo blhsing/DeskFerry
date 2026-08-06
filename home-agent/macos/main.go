@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"deskferry/internal/diaglog"
+	"deskferry/internal/remotelog"
 	"deskferry/internal/tunnel"
 	"nhooyr.io/websocket"
 )
@@ -30,6 +31,8 @@ const (
 	defaultRelayURL   = "https://test-officialwebsite.azurewebsites.net/relay/workdesk"
 	defaultListenAddr = "127.0.0.1:3389"
 )
+
+var relayLogs = remotelog.New("home-agent-macos")
 
 type config struct {
 	RelayAddr    string
@@ -102,7 +105,7 @@ func main() {
 	flag.BoolVar(&openRDP, "open-rdp", false, "open the local RDP profile after the tunnel starts")
 	flag.BoolVar(&statusOnly, "status", false, "print relay room status and exit")
 	flag.Parse()
-	if path, err := diaglog.Enable("home-agent", false, logRetentionDays); err != nil {
+	if path, err := diaglog.Enable("home-agent", false, logRetentionDays, relayLogs); err != nil {
 		log.Printf("persistent diagnostic logging unavailable: %v", err)
 	} else {
 		log.Printf("diagnostic log file: %s retention_days=%d", path, logRetentionDays)
@@ -126,9 +129,21 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	relayLogs.SetInstance(hostInstance())
+	for _, relayAddr := range cfg.relayAddresses() {
+		relayLogs.AddTarget(ctx, remotelog.Target{RelayAddr: relayAddr, Proxy: cfg.Proxy, RoomPassword: cfg.RoomPassword})
+	}
 	if err := run(ctx, cfg, openRDP); err != nil && ctx.Err() == nil {
 		log.Fatal(err)
 	}
+}
+
+func hostInstance() string {
+	name, _ := os.Hostname()
+	if strings.TrimSpace(name) == "" {
+		return "macos-home"
+	}
+	return name
 }
 
 func loadConfig(relayURL, listenAddr, proxyFlag string, roomPassword ...string) (config, error) {

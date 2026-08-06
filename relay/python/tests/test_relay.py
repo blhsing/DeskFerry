@@ -88,6 +88,18 @@ def test_home_agent_status_presence():
     assert status["rooms"][0]["home_agent_connected"] is False
 
 
+def test_diagnostic_log_batch_is_acknowledged():
+    client = TestClient(app)
+    headers = {
+        "X-DeskFerry-Role": "diagnostic-log",
+        "X-DeskFerry-Log-Component": "home-agent-test",
+        "X-DeskFerry-Log-Instance": "unit",
+    }
+    with client.websocket_connect("/relay/unit-logs/ws", headers=headers) as logs:
+        logs.send_json({"entries": ["queued before connect", "connected"]})
+        assert logs.receive_json() == {"accepted": 2}
+
+
 def test_legacy_role_header_is_still_accepted():
     client = TestClient(app)
     headers = {"X-TunnelDesktop-Role": "probe"}

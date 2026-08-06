@@ -106,6 +106,9 @@ async Task RelayWebSocketHandler(HttpContext context, RelayHub hub)
         case "home-agent":
             await hub.ServeHomeAgentAsync(token, socket, remote, ReadRoomProof(context.Request), context.RequestAborted);
             break;
+        case "diagnostic-log":
+            await hub.ServeDiagnosticLogAsync(token, socket, remote, ReadRoomProof(context.Request), context.Request.Headers["X-DeskFerry-Log-Component"].FirstOrDefault(), context.Request.Headers["X-DeskFerry-Log-Instance"].FirstOrDefault(), context.RequestAborted);
+            break;
         case "probe":
             await hub.ServeProbeAsync(token, socket, ReadRoomProof(context.Request));
             break;
@@ -123,7 +126,7 @@ static string? ReadRole(HttpRequest request)
         ?? request.Headers["X-TunnelDesktop-Role"].FirstOrDefault()
         ?? request.Query["role"].FirstOrDefault();
     role = role?.Trim().ToLowerInvariant();
-    return role is "agent" or "agent-control" or "agent-session" or "client" or "home-agent" or "probe" or "dashboard" or "resume" ? role : null;
+    return role is "agent" or "agent-control" or "agent-session" or "client" or "home-agent" or "probe" or "dashboard" or "resume" or "diagnostic-log" ? role : null;
 }
 
 static HashSet<string> ReadAgentServices(HttpRequest request)
@@ -594,6 +597,8 @@ sealed record ControlMessage(
     [property: JsonPropertyName("protocol_version")] int ProtocolVersion = 0,
     [property: JsonPropertyName("resumable")] bool Resumable = false,
     [property: JsonPropertyName("reason")] string? Reason = null);
+
+sealed record DiagnosticLogBatch([property: JsonPropertyName("entries")] string[]? Entries);
 
 sealed class AgentControl
 {
@@ -1178,6 +1183,58 @@ sealed class RelayHub
             return;
         }
         await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "probe ok", CancellationToken.None);
+    }
+
+    public async Task ServeDiagnosticLogAsync(string token, WebSocket socket, string remote, string proof, string? component, string? instance, CancellationToken abort)
+    {
+        var room = RoomFor(token);
+        if (!room.AuthorizeClient(proof))
+        {
+            await RelayRoom.CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "room authentication failed");
+            return;
+        }
+        component = CleanLogLabel(component, 64);
+        instance = CleanLogLabel(instance, 128);
+        var buffer = new byte[1 << 20];
+        while (!abort.IsCancellationRequested && socket.State == WebSocketState.Open)
+        {
+            using var payload = new MemoryStream();
+            WebSocketReceiveResult result;
+            do
+            {
+                result = await socket.ReceiveAsync(buffer, abort);
+                if (result.MessageType == WebSocketMessageType.Close) return;
+                if (payload.Length + result.Count > buffer.Length)
+                {
+                    await RelayRoom.CloseQuietlyAsync(socket, WebSocketCloseStatus.MessageTooBig, "diagnostic log batch too large");
+                    return;
+                }
+                payload.Write(buffer, 0, result.Count);
+            } while (!result.EndOfMessage);
+            if (result.MessageType != WebSocketMessageType.Text) continue;
+            DiagnosticLogBatch? batch;
+            try { batch = JsonSerializer.Deserialize<DiagnosticLogBatch>(payload.ToArray()); }
+            catch (JsonException) { batch = null; }
+            if (batch?.Entries is not { Length: > 0 and <= 100 })
+            {
+                await RelayRoom.CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "invalid diagnostic log batch");
+                return;
+            }
+            foreach (var raw in batch.Entries)
+            {
+                var entry = (raw ?? "").Replace('\r', ' ').Replace('\n', ' ');
+                if (entry.Length > 8192) entry = entry[..8192];
+                _log.LogInformation("agent_log room={Room} component={Component} instance={Instance} remote={Remote} message={Message}", room.Id, component, instance, remote, entry);
+            }
+            await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(new { accepted = batch.Entries.Length }), WebSocketMessageType.Text, true, abort);
+        }
+    }
+
+    private static string CleanLogLabel(string? value, int limit)
+    {
+        var cleaned = (value ?? "").Replace("\r", "").Replace("\n", "").Trim();
+        if (cleaned.Length == 0) return "unknown";
+        return cleaned.Length > limit ? cleaned[..limit] : cleaned;
     }
 
     public async Task ServeDashboardAsync(WebSocket socket, string remote, string? roomId, CancellationToken abort)

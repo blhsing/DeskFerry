@@ -21,7 +21,7 @@ RESUME_ROLE = "resume"
 STARTED = "started"
 AGENT_UNAVAILABLE = "agent-unavailable"
 CLIENT_UNAVAILABLE = "client-unavailable"
-VALID_ROLES = {"agent", "agent-control", "agent-session", "client", "home-agent", "probe", RESUME_ROLE, DASHBOARD_ROLE}
+VALID_ROLES = {"agent", "agent-control", "agent-session", "client", "home-agent", "probe", "diagnostic-log", RESUME_ROLE, DASHBOARD_ROLE}
 PROTOCOL_VERSION = 2
 SESSION_OFFER_SECONDS = 8
 
@@ -58,6 +58,11 @@ def room_id(token: str | None) -> str:
 
     normalized = "".join(out).strip("-.")
     return normalized or "default"
+
+
+def clean_log_label(value: str, limit: int) -> str:
+    cleaned = (value or "").replace("\r", "").replace("\n", "").strip()
+    return (cleaned[:limit] if cleaned else "unknown")
 
 
 def websocket_is_connected(websocket: WebSocket) -> bool:
@@ -1063,6 +1068,30 @@ class RelayHub:
             return
         await close_quietly(websocket, 1000, "probe ok")
 
+    async def serve_diagnostic_log(self, token: str, websocket: WebSocket, remote: str, proof: str, component: str, instance: str) -> None:
+        room = await self._room_for(token)
+        if not await room.authorize_client(proof):
+            await close_quietly(websocket, 1008, "room authentication failed")
+            return
+        component = clean_log_label(component, 64)
+        instance = clean_log_label(instance, 128)
+        while True:
+            try:
+                payload = await websocket.receive_text()
+            except WebSocketDisconnect:
+                return
+            try:
+                entries = json.loads(payload).get("entries")
+            except (json.JSONDecodeError, AttributeError):
+                entries = None
+            if not isinstance(entries, list) or not 1 <= len(entries) <= 100 or not all(isinstance(entry, str) for entry in entries):
+                await close_quietly(websocket, 1008, "invalid diagnostic log batch")
+                return
+            for entry in entries:
+                entry = entry.replace("\r", " ").replace("\n", " ")[:8192]
+                logger.info("agent_log room=%s component=%s instance=%s remote=%s message=%r", room.id, component, instance, remote, entry)
+            await websocket.send_json({"accepted": len(entries)})
+
     async def serve_dashboard(self, websocket: WebSocket, remote: str, room: str | None) -> None:
         client = DashboardClient(str(uuid.uuid4()), websocket, room_id(room) if room else None)
         self._dashboards[client.id] = client
@@ -1189,6 +1218,8 @@ async def relay_websocket(websocket: WebSocket, room: str | None) -> None:
         await hub.serve_resume(token, websocket, remote, websocket.headers.get("x-deskferry-session"), websocket.headers.get("x-deskferry-session-side"), read_room_proof(websocket), read_service(websocket))
     elif role == "home-agent":
         await hub.serve_home_agent(token, websocket, remote, read_room_proof(websocket))
+    elif role == "diagnostic-log":
+        await hub.serve_diagnostic_log(token, websocket, remote, read_room_proof(websocket), websocket.headers.get("x-deskferry-log-component", ""), websocket.headers.get("x-deskferry-log-instance", ""))
     elif role == "probe":
         await hub.serve_probe(token, websocket, read_room_proof(websocket))
     else:

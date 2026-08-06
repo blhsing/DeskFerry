@@ -28,6 +28,7 @@ import (
 const (
 	serviceName       = "DeskFerry.Relay"
 	dashboardRole     = "dashboard"
+	diagnosticLogRole = "diagnostic-log"
 	resumeRole        = "resume"
 	startMessage      = "start"
 	resumeMessage     = "resume"
@@ -47,14 +48,15 @@ const (
 )
 
 var validRoles = map[string]bool{
-	"agent":          true,
-	agentControlRole: true,
-	agentSessionRole: true,
-	"client":         true,
-	"home-agent":     true,
-	"probe":          true,
-	resumeRole:       true,
-	dashboardRole:    true,
+	"agent":           true,
+	agentControlRole:  true,
+	agentSessionRole:  true,
+	"client":          true,
+	"home-agent":      true,
+	"probe":           true,
+	resumeRole:        true,
+	dashboardRole:     true,
+	diagnosticLogRole: true,
 }
 
 func main() {
@@ -212,6 +214,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hub *RelayHub, room
 		hub.ServeResume(ctx, token, c, remote, r.Header.Get("X-DeskFerry-Session"), r.Header.Get("X-DeskFerry-Session-Side"), proof, service)
 	case "home-agent":
 		hub.ServeHomeAgent(ctx, token, c, remote, proof)
+	case diagnosticLogRole:
+		hub.ServeDiagnosticLog(ctx, token, c, remote, proof, r.Header.Get(tunnel.HeaderLogComponent), r.Header.Get(tunnel.HeaderLogInstance))
 	case "probe":
 		room := hub.roomFor(token)
 		if !room.AuthorizeClient(proof) {
@@ -222,6 +226,56 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hub *RelayHub, room
 	default:
 		closeQuietly(c, websocket.StatusPolicyViolation, "unsupported role")
 	}
+}
+
+type diagnosticLogBatch struct {
+	Entries []string `json:"entries"`
+}
+
+func (h *RelayHub) ServeDiagnosticLog(ctx context.Context, token string, c *websocket.Conn, remote, proof, component, instance string) {
+	room := h.roomFor(token)
+	if !room.AuthorizeClient(proof) {
+		closeQuietly(c, websocket.StatusPolicyViolation, "room authentication failed")
+		return
+	}
+	component = logLabel(component, 64)
+	instance = logLabel(instance, 128)
+	for {
+		typ, payload, err := c.Read(ctx)
+		if err != nil {
+			return
+		}
+		if typ != websocket.MessageText {
+			continue
+		}
+		var batch diagnosticLogBatch
+		if json.Unmarshal(payload, &batch) != nil || len(batch.Entries) == 0 || len(batch.Entries) > 100 {
+			closeQuietly(c, websocket.StatusPolicyViolation, "invalid diagnostic log batch")
+			return
+		}
+		for _, entry := range batch.Entries {
+			entry = strings.ReplaceAll(strings.ReplaceAll(entry, "\r", " "), "\n", " ")
+			if len(entry) > 8192 {
+				entry = entry[:8192]
+			}
+			log.Printf("agent_log room=%s component=%s instance=%s remote=%s message=%q", room.ID, component, instance, remote, entry)
+		}
+		ack, _ := json.Marshal(map[string]int{"accepted": len(batch.Entries)})
+		if err := c.Write(ctx, websocket.MessageText, ack); err != nil {
+			return
+		}
+	}
+}
+
+func logLabel(value string, limit int) string {
+	value = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(value, "\r", ""), "\n", ""))
+	if value == "" {
+		return "unknown"
+	}
+	if len(value) > limit {
+		value = value[:limit]
+	}
+	return value
 }
 
 func acceptWebSocket(w http.ResponseWriter, r *http.Request) (*websocket.Conn, error) {

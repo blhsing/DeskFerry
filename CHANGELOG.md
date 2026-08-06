@@ -1,5 +1,12 @@
 # Release Notes
 
+## 0.9.3 - 2026-08-06
+
+- Added authenticated, acknowledged diagnostic-log uploads from the Windows Work agent and Windows, macOS, and Android Home agents to every configured relay.
+- Queued logs generated before relay connectivity in bounded process-local backlogs while preserving the existing retained on-device diagnostic files.
+- Added consistent `agent_log` correlation fields across the Azure .NET, OCI Go, and Python relays, including room, component, device instance, and remote address.
+- Preserved active Windows Home destination isolation by switching diagnostic upload targets when the selected destination changes.
+
 ## 0.9.2 - 2026-08-06
 
 - Made Android close stale local RDP sessions immediately when relay resumption receives a terminal normal-close, unknown-session, or authentication rejection.

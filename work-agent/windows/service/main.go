@@ -30,6 +30,7 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 
 	"deskferry/internal/diaglog"
+	"deskferry/internal/remotelog"
 	"deskferry/internal/tunnel"
 	"deskferry/internal/winsecret"
 )
@@ -38,6 +39,8 @@ const serviceName = "DeskFerryAgent"
 const defaultRelayURL = "https://test-officialwebsite.azurewebsites.net/relay/"
 const agentIDHeader = "X-DeskFerry-Agent-Instance"
 const agentSlotHeader = "X-DeskFerry-Agent-Slot"
+
+var relayLogs = remotelog.New("work-agent")
 
 type config struct {
 	RelayAddr        string   `json:"relay_addr"`
@@ -96,7 +99,7 @@ func main() {
 	flag.BoolVar(&selfTestMode, "self-test", false, "test local RDP and relay WebSocket connectivity")
 	flag.StringVar(&updateServiceTarget, "update-service", "", "replace the installed service executable and restart it")
 	flag.Parse()
-	if path, err := diaglog.Enable("work-agent", true, logRetentionDays); err != nil {
+	if path, err := diaglog.Enable("work-agent", true, logRetentionDays, relayLogs); err != nil {
 		log.Printf("persistent diagnostic logging unavailable: %v", err)
 	} else {
 		log.Printf("diagnostic log file: %s retention_days=%d", path, logRetentionDays)
@@ -675,6 +678,10 @@ func runWebSocketPools(ctx context.Context, cfg config) error {
 	}
 	if agentID == "" {
 		agentID, _ = randomAgentID()
+	}
+	relayLogs.SetInstance(agentID)
+	for _, relayAddr := range relayAddrs {
+		relayLogs.AddTarget(ctx, remotelog.Target{RelayAddr: relayAddr, Proxy: cfg.Proxy, RoomPassword: cfg.RoomPassword})
 	}
 	limiter := make(chan struct{}, cfg.ConcurrencyLimit)
 	log.Printf("starting websocket agent controls for %d relay URL(s), %d service(s), concurrency=%d legacy=%t", len(relayAddrs), len(targets), cfg.ConcurrencyLimit, cfg.LegacyMode)

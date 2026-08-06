@@ -136,6 +136,34 @@ func TestHomeAgentStatusPresence(t *testing.T) {
 	t.Fatalf("home presence did not disconnect: %+v", status.Rooms)
 }
 
+func TestDiagnosticLogBatchIsAcknowledged(t *testing.T) {
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/relay/unit-logs/ws"
+	headers := http.Header{}
+	headers.Set("X-DeskFerry-Role", diagnosticLogRole)
+	headers.Set(tunnel.HeaderLogComponent, "home-agent-test")
+	headers.Set(tunnel.HeaderLogInstance, "unit")
+	conn, _, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPHeader: headers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"entries":["queued before connect","connected"]}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, payload, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ack map[string]int
+	if json.Unmarshal(payload, &ack) != nil || ack["accepted"] != 2 {
+		t.Fatalf("ack = %s", payload)
+	}
+}
+
 func TestAgentClientPairAndBridgeBytes(t *testing.T) {
 	server := httptest.NewServer(newServer())
 	defer server.Close()

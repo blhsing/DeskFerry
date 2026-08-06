@@ -10,6 +10,7 @@ import android.content.Intent;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.util.Log;
 
 import java.io.File;
@@ -28,12 +29,15 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Calendar;
 import java.util.Arrays;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -71,10 +75,17 @@ public class TunnelService extends Service {
     private static final SimpleDateFormat DIAGNOSTIC_DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT);
     private static final Object DIAGNOSTIC_LOG_LOCK = new Object();
     private static final Object STATE_LOCK = new Object();
+    private static final int MAX_REMOTE_LOG_LINES = 2000;
+    private static final int MAX_REMOTE_LOG_BYTES = 1024 * 1024;
     private static State currentState = State.initial();
 
     private final Object lock = new Object();
     private final Set<BridgeSession> sessions = ConcurrentHashMap.newKeySet();
+    private final Object remoteLogLock = new Object();
+    private final ArrayDeque<RemoteLogLine> remoteLogLines = new ArrayDeque<>();
+    private final List<DiagnosticUploader> diagnosticUploaders = new ArrayList<>();
+    private long nextRemoteLogSequence = 1;
+    private int remoteLogBytes;
     private OkHttpClient httpClient;
     private ServerSocket serverSocket;
     private Thread acceptThread;
@@ -175,6 +186,7 @@ public class TunnelService extends Service {
                 append("Relay primary: " + relayUrls.get(0) + (relayUrls.size() > 1 ? " (" + (relayUrls.size() - 1) + " fallback)" : "") + ".");
                 append("Proxy: " + ProxySettings.forLog(requestedProxy) + ".");
                 startAcceptLoop();
+                startDiagnosticUploaders();
                 startPresenceLoop();
                 startStatusLoop();
             } catch (Exception ex) {
@@ -198,6 +210,10 @@ public class TunnelService extends Service {
         running = false;
         closePresenceSocket();
         closeStatusSocket();
+        for (DiagnosticUploader uploader : diagnosticUploaders) {
+            uploader.close();
+        }
+        diagnosticUploaders.clear();
         closeQuietly(serverSocket);
         serverSocket = null;
         for (BridgeSession session : sessions) {
@@ -388,12 +404,17 @@ public class TunnelService extends Service {
                 .header("Authorization", "Bearer " + token)
                 .header("X-DeskFerry-Role", role)
                 .header("X-TunnelDesktop-Role", role)
-                .header("User-Agent", "DeskFerry-Android/0.9.2");
+                .header("User-Agent", "DeskFerry-Android/0.9.3");
         if (!roomProof.isEmpty() && !"dashboard".equals(role)) {
             request.header("X-DeskFerry-Room-Proof", roomProof);
         }
         if ("client".equals(role) || "resume".equals(role)) {
             request.header("X-DeskFerry-Service", "rdp");
+        }
+        if ("diagnostic-log".equals(role)) {
+            request.header("X-DeskFerry-Log-Component", "home-agent-android");
+            String instance = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+            request.header("X-DeskFerry-Log-Instance", emptyAs(instance, Build.MODEL));
         }
         return request.build();
     }
@@ -435,6 +456,7 @@ public class TunnelService extends Service {
         String diagnosticLine = diagnosticNow() + " " + message;
         Log.i(LOG_TAG, message);
         writeDiagnosticLog(diagnosticLine + System.lineSeparator());
+        queueRemoteLog(diagnosticLine);
         synchronized (STATE_LOCK) {
             State next = currentState.copy();
             next.lastMessage = message;
@@ -443,6 +465,109 @@ public class TunnelService extends Service {
         }
         sendBroadcast(new Intent(ACTION_STATE).setPackage(getPackageName()));
         updateNotification();
+    }
+
+    private void queueRemoteLog(String line) {
+        if (line.length() > 8192) {
+            line = line.substring(0, 8192);
+        }
+        synchronized (remoteLogLock) {
+            remoteLogLines.addLast(new RemoteLogLine(nextRemoteLogSequence++, line));
+            remoteLogBytes += line.length();
+            while (remoteLogLines.size() > MAX_REMOTE_LOG_LINES || remoteLogBytes > MAX_REMOTE_LOG_BYTES) {
+                remoteLogBytes -= remoteLogLines.removeFirst().text.length();
+            }
+            remoteLogLock.notifyAll();
+        }
+    }
+
+    private void startDiagnosticUploaders() {
+        for (String candidate : relayUrlsSnapshot()) {
+            DiagnosticUploader uploader = new DiagnosticUploader(candidate);
+            diagnosticUploaders.add(uploader);
+            new Thread(uploader, "DeskFerry-Android-Logs").start();
+        }
+    }
+
+    private static final class RemoteLogLine {
+        final long sequence;
+        final String text;
+        RemoteLogLine(long sequence, String text) { this.sequence = sequence; this.text = text; }
+    }
+
+    private final class DiagnosticUploader implements Runnable {
+        private final String target;
+        private final LinkedBlockingQueue<Integer> acknowledgements = new LinkedBlockingQueue<>();
+        private volatile WebSocket socket;
+        private volatile boolean closed;
+        private long cursor;
+
+        DiagnosticUploader(String target) {
+            this.target = target;
+            synchronized (remoteLogLock) {
+                cursor = remoteLogLines.isEmpty() ? nextRemoteLogSequence : remoteLogLines.getFirst().sequence;
+            }
+        }
+
+        @Override public void run() {
+            long backoff = 1000;
+            while (running && !closed) {
+                CountDownLatch opened = new CountDownLatch(1);
+                CountDownLatch ended = new CountDownLatch(1);
+                AtomicBoolean connected = new AtomicBoolean(false);
+                try {
+                    socket = httpClient.newWebSocket(webSocketRequest(target, "diagnostic-log"), new WebSocketListener() {
+                        @Override public void onOpen(WebSocket webSocket, Response response) { connected.set(true); opened.countDown(); }
+                        @Override public void onMessage(WebSocket webSocket, String text) {
+                            try { acknowledgements.offer(new JSONObject(text).optInt("accepted", -1)); } catch (Exception ignored) { acknowledgements.offer(-1); }
+                        }
+                        @Override public void onClosed(WebSocket webSocket, int code, String reason) { opened.countDown(); ended.countDown(); }
+                        @Override public void onFailure(WebSocket webSocket, Throwable t, Response response) { opened.countDown(); ended.countDown(); }
+                    });
+                    if (!opened.await(15, TimeUnit.SECONDS) || !connected.get()) throw new IOException("diagnostic WebSocket did not open");
+                    backoff = 1000;
+                    while (running && !closed && socket != null) {
+                        List<RemoteLogLine> batch = remoteBatch(cursor);
+                        if (batch.isEmpty()) {
+                            synchronized (remoteLogLock) { remoteLogLock.wait(30000); }
+                            continue;
+                        }
+                        JSONArray entries = new JSONArray();
+                        for (RemoteLogLine item : batch) entries.put(item.text);
+                        if (!socket.send(new JSONObject().put("entries", entries).toString())) break;
+                        Integer accepted = acknowledgements.poll(15, TimeUnit.SECONDS);
+                        if (accepted == null || accepted != batch.size()) break;
+                        cursor = batch.get(batch.size() - 1).sequence + 1;
+                    }
+                } catch (Exception ignored) {
+                } finally {
+                    WebSocket current = socket;
+                    socket = null;
+                    if (current != null) current.cancel();
+                }
+                sleepQuietly(backoff);
+                backoff = Math.min(30000, backoff * 2);
+            }
+        }
+
+        private List<RemoteLogLine> remoteBatch(long from) {
+            List<RemoteLogLine> batch = new ArrayList<>();
+            synchronized (remoteLogLock) {
+                if (!remoteLogLines.isEmpty() && from < remoteLogLines.getFirst().sequence) cursor = remoteLogLines.getFirst().sequence;
+                for (RemoteLogLine item : remoteLogLines) {
+                    if (item.sequence >= cursor) batch.add(item);
+                    if (batch.size() == 100) break;
+                }
+            }
+            return batch;
+        }
+
+        void close() {
+            closed = true;
+            WebSocket current = socket;
+            if (current != null) current.cancel();
+            synchronized (remoteLogLock) { remoteLogLock.notifyAll(); }
+        }
     }
 
     private void updateNotification() {

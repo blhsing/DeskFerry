@@ -18,7 +18,7 @@ const (
 
 // Enable adds daily, size-limited diagnostic logs alongside stderr. Files
 // older than retentionDays calendar days are removed automatically.
-func Enable(component string, systemWide bool, retentionDays int) (string, error) {
+func Enable(component string, systemWide bool, retentionDays int, additional ...io.Writer) (string, error) {
 	if retentionDays < 1 || retentionDays > 3650 {
 		return "", fmt.Errorf("log retention days must be between 1 and 3650")
 	}
@@ -41,7 +41,12 @@ func Enable(component string, systemWide bool, retentionDays int) (string, error
 	if err != nil {
 		return "", err
 	}
-	log.SetOutput(io.MultiWriter(w, os.Stderr))
+	// Windows services can have an invalid stderr handle. Keep best-effort
+	// stderr last so it cannot prevent local persistence or relay queueing.
+	writers := []io.Writer{w}
+	writers = append(writers, additional...)
+	writers = append(writers, os.Stderr)
+	log.SetOutput(io.MultiWriter(writers...))
 	return w.path, nil
 }
 
