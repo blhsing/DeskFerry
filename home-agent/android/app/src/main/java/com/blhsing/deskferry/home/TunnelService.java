@@ -7,6 +7,10 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.SystemClock;
@@ -38,6 +42,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -70,6 +75,7 @@ public class TunnelService extends Service {
     private static final int RESUMABLE_MAX_BUFFER = 8 * 1024 * 1024;
     private static final int RESUMABLE_CHUNK_SIZE = 64 * 1024;
     private static final long RESUMABLE_WINDOW_MS = 5L * 60L * 1000L;
+    private static final int MAX_CONCURRENT_RDP_BRIDGES = 2;
     private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss", Locale.ROOT);
     private static final SimpleDateFormat DIAGNOSTIC_TIME_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.ROOT);
     private static final SimpleDateFormat DIAGNOSTIC_DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT);
@@ -80,7 +86,9 @@ public class TunnelService extends Service {
     private static State currentState = State.initial();
 
     private final Object lock = new Object();
-    private final Set<BridgeSession> sessions = ConcurrentHashMap.newKeySet();
+    private final Set<BridgeSession> sessions = Collections.newSetFromMap(new ConcurrentHashMap<BridgeSession, Boolean>());
+    private final Semaphore bridgePermits = new Semaphore(MAX_CONCURRENT_RDP_BRIDGES, true);
+    private final Object networkLock = new Object();
     private final Object remoteLogLock = new Object();
     private final ArrayDeque<RemoteLogLine> remoteLogLines = new ArrayDeque<>();
     private final List<DiagnosticUploader> diagnosticUploaders = new ArrayList<>();
@@ -91,8 +99,12 @@ public class TunnelService extends Service {
     private Thread acceptThread;
     private Thread presenceThread;
     private Thread statusThread;
-    private WebSocket presenceSocket;
-    private WebSocket statusSocket;
+    private volatile WebSocket presenceSocket;
+    private volatile WebSocket statusSocket;
+    private ConnectivityManager connectivityManager;
+    private ConnectivityManager.NetworkCallback networkCallback;
+    private Network activeNetwork;
+    private boolean networkWasLost;
     private volatile boolean running;
     private volatile String relayUrl = RelayUrls.DEFAULT_RELAY_URL;
     private volatile List<String> relayUrls = Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL);
@@ -113,6 +125,7 @@ public class TunnelService extends Service {
     public void onCreate() {
         super.onCreate();
         createNotificationChannel();
+        registerNetworkObserver();
     }
 
     @Override
@@ -120,7 +133,11 @@ public class TunnelService extends Service {
         String action = intent == null ? ACTION_START : intent.getAction();
         if (ACTION_STOP.equals(action)) {
             stopTunnel();
-            stopForeground(STOP_FOREGROUND_REMOVE);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE);
+            } else {
+                stopForeground(true);
+            }
             stopSelf();
             return START_NOT_STICKY;
         }
@@ -148,6 +165,7 @@ public class TunnelService extends Service {
     @Override
     public void onDestroy() {
         stopTunnel();
+        unregisterNetworkObserver();
         if (httpClient != null) {
             httpClient.dispatcher().cancelAll();
         }
@@ -170,7 +188,7 @@ public class TunnelService extends Service {
                 roomProof = requestedRoomProof == null ? "" : requestedRoomProof.trim();
                 logRetentionDays = HomePrefs.sanitizeLogRetentionDays(requestedLogRetentionDays);
                 OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
-                        .pingInterval(25, TimeUnit.SECONDS)
+                        .pingInterval(10, TimeUnit.SECONDS)
                         .retryOnConnectionFailure(true);
                 ProxySettings.apply(clientBuilder, requestedProxy);
                 httpClient = clientBuilder.build();
@@ -195,6 +213,96 @@ public class TunnelService extends Service {
                 append("Start failed: " + ex.getMessage());
                 stopTunnelLocked();
             }
+        }
+    }
+
+    private void registerNetworkObserver() {
+        connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (connectivityManager == null) {
+            return;
+        }
+        synchronized (networkLock) {
+            activeNetwork = connectivityManager.getActiveNetwork();
+            networkWasLost = activeNetwork == null;
+        }
+        networkCallback = new ConnectivityManager.NetworkCallback() {
+            @Override
+            public void onAvailable(Network network) {
+                boolean changed;
+                synchronized (networkLock) {
+                    changed = networkWasLost || (activeNetwork != null && !activeNetwork.equals(network));
+                    activeNetwork = network;
+                    networkWasLost = false;
+                }
+                if (changed) {
+                    handleNetworkTransition("Android network became available or changed");
+                }
+            }
+
+            @Override
+            public void onLost(Network network) {
+                boolean changed = false;
+                synchronized (networkLock) {
+                    if (activeNetwork != null && activeNetwork.equals(network)) {
+                        activeNetwork = null;
+                        networkWasLost = true;
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    handleNetworkTransition("Android network was lost");
+                }
+            }
+
+            @Override
+            public void onUnavailable() {
+                boolean changed;
+                synchronized (networkLock) {
+                    changed = !networkWasLost;
+                    activeNetwork = null;
+                    networkWasLost = true;
+                }
+                if (changed) {
+                    handleNetworkTransition("Android network is unavailable");
+                }
+            }
+        };
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                connectivityManager.registerDefaultNetworkCallback(networkCallback);
+            } else {
+                NetworkRequest request = new NetworkRequest.Builder()
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        .build();
+                connectivityManager.registerNetworkCallback(request, networkCallback);
+            }
+        } catch (RuntimeException ex) {
+            Log.w(LOG_TAG, "Could not observe Android network changes", ex);
+            networkCallback = null;
+        }
+    }
+
+    private void unregisterNetworkObserver() {
+        ConnectivityManager manager = connectivityManager;
+        ConnectivityManager.NetworkCallback callback = networkCallback;
+        networkCallback = null;
+        if (manager != null && callback != null) {
+            try {
+                manager.unregisterNetworkCallback(callback);
+            } catch (RuntimeException ignored) {
+            }
+        }
+    }
+
+    private void handleNetworkTransition(String reason) {
+        if (!running) {
+            return;
+        }
+        append(reason + "; replacing relay transports immediately.");
+        cancelPresenceSocket();
+        cancelStatusSocket();
+        for (BridgeSession session : sessions) {
+            session.replaceTransportForNetworkChange(reason);
         }
     }
 
@@ -404,7 +512,7 @@ public class TunnelService extends Service {
                 .header("Authorization", "Bearer " + token)
                 .header("X-DeskFerry-Role", role)
                 .header("X-TunnelDesktop-Role", role)
-                .header("User-Agent", "DeskFerry-Android/0.9.4");
+                .header("User-Agent", "DeskFerry-Android/0.9.5");
         if (!roomProof.isEmpty() && !"dashboard".equals(role)) {
             request.header("X-DeskFerry-Room-Proof", roomProof);
         }
@@ -622,11 +730,27 @@ public class TunnelService extends Service {
         }
     }
 
+    private void cancelPresenceSocket() {
+        WebSocket socket = presenceSocket;
+        presenceSocket = null;
+        if (socket != null) {
+            socket.cancel();
+        }
+    }
+
     private void closeStatusSocket() {
         WebSocket socket = statusSocket;
         statusSocket = null;
         if (socket != null) {
             socket.close(1000, "stopped");
+        }
+    }
+
+    private void cancelStatusSocket() {
+        WebSocket socket = statusSocket;
+        statusSocket = null;
+        if (socket != null) {
+            socket.cancel();
         }
     }
 
@@ -835,11 +959,20 @@ public class TunnelService extends Service {
         @Override
         public void run() {
             String remote = String.valueOf(localSocket.getRemoteSocketAddress());
+            boolean permitAcquired = false;
             activeConnections++;
             totalConnections++;
             updateState("Running", null, null, null);
             append("RDP connection from " + remote + ".");
             try {
+                if (!bridgePermits.tryAcquire()) {
+                    append("RDP connection from " + remote + " queued behind active desktop/retry sockets.");
+                    bridgePermits.acquire();
+                }
+                permitAcquired = true;
+                if (closed.get()) {
+                    return;
+                }
                 boolean connected = false;
                 String lastError = "";
                 for (String candidate : relayUrlsSnapshot()) {
@@ -879,6 +1012,9 @@ public class TunnelService extends Service {
                     append("RDP bridge failed: " + ex.getMessage());
                 }
             } finally {
+                if (permitAcquired) {
+                    bridgePermits.release();
+                }
                 close();
                 append("RDP session remote=" + remote + " relay=" + selectedRelay + " ended duration_ms=" + elapsedMillis(startedAt) + " termination=" + termination.get() + " local_to_relay_bytes=" + localToRelayBytes.get() + " local_to_relay_messages=" + localToRelayMessages.get() + " relay_to_local_bytes=" + relayToLocalBytes.get() + " relay_to_local_messages=" + relayToLocalMessages.get() + ".");
             }
@@ -1074,6 +1210,31 @@ public class TunnelService extends Service {
             }
             append("RDP relay stream interrupted; retrying transparently: " + reason);
             startReconnectLoop();
+        }
+
+        private void replaceTransportForNetworkChange(String reason) {
+            WebSocket active;
+            WebSocket pending;
+            synchronized (resumeLock) {
+                if (closed.get()) {
+                    return;
+                }
+                active = webSocket;
+                webSocket = null;
+                pending = pendingResumeSocket;
+                pendingResumeSocket = null;
+                resumeLock.notifyAll();
+            }
+            if (active != null) {
+                active.cancel();
+            }
+            if (pending != null && pending != active) {
+                pending.cancel();
+            }
+            if (!sessionId.isEmpty()) {
+                append("RDP relay stream interrupted; retrying transparently: " + reason);
+                startReconnectLoop();
+            }
         }
 
         private void startReconnectLoop() {

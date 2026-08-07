@@ -1,5 +1,6 @@
 package com.blhsing.deskferry.home;
 
+import android.annotation.SuppressLint;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -85,6 +86,7 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     protected void onResume() {
         super.onResume();
         IntentFilter filter = new IntentFilter(TunnelService.ACTION_STATE);

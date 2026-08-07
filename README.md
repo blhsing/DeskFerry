@@ -327,6 +327,8 @@ Open DeskFerry Home, keep the local RDP port at `3389`, and choose or create a n
 
 The Android app keeps the tunnel alive through a foreground service while you switch to the RDP client. It maintains the same `home-agent` presence socket used by the relay dashboard and a `dashboard` WebSocket for live relay status updates. Its Proxy field accepts `system`, `direct`, `http://host:port`, or `https://host:port`; optional Basic credentials can be included in the proxy URL.
 
+The foreground service observes Android's active network. A Wi-Fi/mobile handoff immediately replaces the relay transports so a resumable RDP stream can reattach before the separate RDP client times out its loopback socket. At most two local RDP bridge sockets run concurrently; additional reconnect/probe sockets wait locally instead of consuming every Work-agent session slot.
+
 Android writes the same daily diagnostics to the app-specific external-files `logs` directory, falling back to internal app storage when necessary. Set **Diagnostic log retention days** in the control panel; the default is 7 and the accepted range is 1 through 3650. The activity log prints the resolved diagnostic-log path when the foreground service starts.
 
 ## Deliverables

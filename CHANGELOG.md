@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.9.5 - 2026-08-06
+
+- Made Android react immediately to mobile/Wi-Fi network loss and handoff by replacing active relay transports instead of waiting for a stale WebSocket failure.
+- Reduced Android WebSocket liveness detection to ten seconds and limited concurrent local RDP bridges to two, preventing reconnect probe storms from exhausting Work-agent concurrency before the real desktop reconnect arrives.
+- Fixed Android 6 compatibility checks found while validating the recovery build, and made the Android project pass its full debug lint task.
+
 ## 0.9.4 - 2026-08-06
 
 - Split Home destination and Work agent pairing settings into one room name plus an ordered list of relay service base URLs.

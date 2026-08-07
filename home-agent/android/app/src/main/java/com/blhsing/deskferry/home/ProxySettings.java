@@ -1,5 +1,7 @@
 package com.blhsing.deskferry.home;
 
+import android.os.Build;
+
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
@@ -108,9 +110,11 @@ final class ProxySettings {
         @Override
         public java.net.Socket createSocket() throws IOException {
             SSLSocket socket = (SSLSocket) delegate.createSocket();
-            SSLParameters parameters = socket.getSSLParameters();
-            parameters.setEndpointIdentificationAlgorithm("HTTPS");
-            socket.setSSLParameters(parameters);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                SSLParameters parameters = socket.getSSLParameters();
+                parameters.setEndpointIdentificationAlgorithm("HTTPS");
+                socket.setSSLParameters(parameters);
+            }
             return socket;
         }
 
