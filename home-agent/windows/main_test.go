@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -47,6 +48,36 @@ func TestWinRMSessionKeyChangesWithCredentialAndDestination(t *testing.T) {
 	}
 	if strings.Contains(base, "password-one") {
 		t.Fatal("session key contains the plaintext password")
+	}
+}
+
+func TestReadCLIWinRMCommand(t *testing.T) {
+	command, err := readCLIWinRMCommand("", "-", strings.NewReader("Get-Date\n"))
+	if err != nil || command != "Get-Date\n" {
+		t.Fatalf("command = %q, err=%v", command, err)
+	}
+	if _, err := readCLIWinRMCommand("Get-Date", "-", bytes.NewReader(nil)); err == nil {
+		t.Fatal("expected mutually exclusive command inputs to fail")
+	}
+}
+
+func TestSelectDestinationConfig(t *testing.T) {
+	cfg := config{
+		ListenAddr:      defaultListenAddr,
+		WinRMListenAddr: defaultWinRMListenAddr,
+		Proxy:           "direct",
+		Destinations: []destinationProfile{
+			{Name: "Office", RelayAddrs: []string{"https://one.example/relay/office"}, RoomProof: "office-proof", WindowsUser: `OFFICE\\owner`},
+			{Name: "Home", RelayAddrs: []string{"https://two.example/relay/home"}, RoomProof: "home-proof", WindowsUser: `HOME\\owner`},
+		},
+		SelectedDestination: "Office",
+	}
+	cfg.setRelayAddresses(cfg.Destinations[0].RelayAddrs)
+	if err := selectDestinationConfig(&cfg, "home"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SelectedDestination != "Home" || cfg.RDPUser != `HOME\\owner` || cfg.RoomProof != "home-proof" || cfg.primaryRelayAddress() != "https://two.example/relay/home" {
+		t.Fatalf("selected config = %#v", cfg)
 	}
 }
 

@@ -4,7 +4,24 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
+
+func TestOrderedActiveSessionIDsPrefersActiveConsoleThenRemoteSessions(t *testing.T) {
+	sessions := []windows.WTS_SESSION_INFO{
+		{SessionID: 1, State: windows.WTSDisconnected},
+		{SessionID: 4, State: windows.WTSActive},
+		{SessionID: 7, State: windows.WTSActive},
+	}
+	if got, want := orderedActiveSessionIDs(1, sessions), []uint32{4, 7}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("disconnected console ordering = %v, want %v", got, want)
+	}
+	sessions[0].State = windows.WTSActive
+	if got, want := orderedActiveSessionIDs(1, sessions), []uint32{1, 4, 7}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("active console ordering = %v, want %v", got, want)
+	}
+}
 
 func TestSplitRelayURLs(t *testing.T) {
 	got := splitRelayURLs(" https://test-officialwebsite.azurewebsites.net/relay/workdesk;\nhttp://217.142.228.117/relay/workdesk, ws://localhost:8000/relay/dev ")

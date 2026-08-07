@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -196,13 +197,28 @@ func main() {
 	var logRetentionDays int
 	var consoleMode bool
 	var smokeTest bool
+	var destinationFlag string
+	var winRMCommand string
+	var winRMCommandFile string
+	var winRMTimeout time.Duration
+	var syncSMBProfile bool
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.StringVar(&listenAddr, "listen", "", "local RDP listen address")
 	flag.StringVar(&proxyFlag, "proxy", "", "proxy: env, direct, or http(s)://host:port")
 	flag.IntVar(&logRetentionDays, "log-retention-days", diaglog.DefaultRetentionDays, "number of calendar days of diagnostic logs to retain")
 	flag.BoolVar(&consoleMode, "console", false, "run in the foreground instead of the control panel")
 	flag.BoolVar(&smokeTest, "ui-smoke-test", false, "start and close the GUI")
+	flag.StringVar(&destinationFlag, "destination", "", "saved destination profile to use")
+	flag.StringVar(&winRMCommand, "winrm-command", "", "run a PowerShell command through the selected destination's WinRM service")
+	flag.StringVar(&winRMCommandFile, "winrm-command-file", "", "read a WinRM PowerShell command from a file, or - for standard input")
+	flag.DurationVar(&winRMTimeout, "winrm-timeout", 2*time.Minute, "timeout for CLI WinRM command execution")
+	flag.BoolVar(&syncSMBProfile, "sync-smb-profile", false, "apply the selected destination to the elevated SMB network service")
 	flag.Parse()
+	winRMCommandMode := winRMCommand != "" || winRMCommandFile != ""
+	commandMode := winRMCommandMode || syncSMBProfile
+	if commandMode {
+		attachParentConsole()
+	}
 	if path, err := diaglog.Enable("home-agent", false, logRetentionDays, relayLogs); err != nil {
 		log.Printf("persistent diagnostic logging unavailable: %v", err)
 	} else {
@@ -210,7 +226,7 @@ func main() {
 	}
 	log.Printf("DeskFerry Home Agent version=%s platform=windows", buildinfo.Version)
 
-	if !smokeTest {
+	if !smokeTest && !commandMode {
 		instance, alreadyRunning, err := acquireNamedInstanceMutex(singleInstanceName)
 		if err != nil {
 			windowsMessageBox(appTitle(), "Check for an existing DeskFerry Home instance: "+err.Error(), windows.MB_OK|windows.MB_ICONERROR)
@@ -229,8 +245,37 @@ func main() {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(1)
 	}
+	if err := selectDestinationConfig(&cfg, destinationFlag); err != nil {
+		log.Fatal(err)
+	}
 	relayLogs.SetInstance(homeLogInstance())
 	setHomeLogTargets(cfg)
+	if syncSMBProfile {
+		if winRMCommandMode {
+			log.Fatal("use -sync-smb-profile separately from WinRM command options")
+		}
+		requested, err := requestSelectedSMBProfileSync(cfg, true)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if !requested {
+			log.Fatal("the optional DeskFerry Home network component is not installed")
+		}
+		fmt.Printf("Requested SMB network profile synchronization for %q.\n", cfg.SelectedDestination)
+		return
+	}
+	if winRMCommandMode {
+		command, err := readCLIWinRMCommand(winRMCommand, winRMCommandFile, os.Stdin)
+		if err != nil {
+			log.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), winRMTimeout)
+		defer cancel()
+		if err := executeCLIWinRM(ctx, cfg, command, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if err := activateWindowsProfileCredential(cfg); err != nil {
 		log.Printf("activate saved Windows login for RDP and SMB at startup: %v", err)
 	}
@@ -248,6 +293,106 @@ func main() {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(1)
 	}
+}
+
+func attachParentConsole() {
+	const attachParentProcess = ^uintptr(0)
+	proc := windows.NewLazySystemDLL("kernel32.dll").NewProc("AttachConsole")
+	attached, _, _ := proc.Call(attachParentProcess)
+	if attached == 0 {
+		return
+	}
+	if stdin, err := os.OpenFile("CONIN$", os.O_RDONLY, 0); err == nil {
+		os.Stdin = stdin
+	}
+	if stdout, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
+		os.Stdout = stdout
+	}
+	if stderr, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
+		os.Stderr = stderr
+		log.SetOutput(stderr)
+	}
+}
+
+func selectDestinationConfig(cfg *config, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	for _, profile := range cfg.Destinations {
+		if !strings.EqualFold(profile.Name, name) {
+			continue
+		}
+		cfg.SelectedDestination = profile.Name
+		cfg.RDPUser = profile.WindowsUser
+		cfg.RoomProof = profile.RoomProof
+		cfg.setRelayAddresses(profile.RelayAddrs)
+		return cfg.validate()
+	}
+	return fmt.Errorf("destination profile %q was not found", name)
+}
+
+func readCLIWinRMCommand(command, commandFile string, stdin io.Reader) (string, error) {
+	if command != "" && commandFile != "" {
+		return "", errors.New("use either -winrm-command or -winrm-command-file, not both")
+	}
+	if commandFile != "" {
+		var data []byte
+		var err error
+		if commandFile == "-" {
+			data, err = io.ReadAll(stdin)
+		} else {
+			data, err = os.ReadFile(commandFile)
+		}
+		if err != nil {
+			return "", fmt.Errorf("read WinRM command: %w", err)
+		}
+		command = string(data)
+	}
+	if strings.TrimSpace(command) == "" {
+		return "", errors.New("WinRM command is empty")
+	}
+	return command, nil
+}
+
+func executeCLIWinRM(ctx context.Context, cfg config, command string, output io.Writer) error {
+	user, password, err := readWindowsCredential(cfg)
+	if err != nil {
+		return err
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("open temporary local WinRM listener: %w", err)
+	}
+	listenerCtx, cancelListener := context.WithCancel(ctx)
+	defer cancelListener()
+	defer listener.Close()
+	go func() {
+		if err := serveWinRMListener(listenerCtx, cfg, listener, func(format string, args ...any) {
+			log.Printf(format, args...)
+		}); err != nil && listenerCtx.Err() == nil {
+			log.Printf("temporary WinRM listener stopped: %v", err)
+		}
+	}()
+
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		return fmt.Errorf("parse temporary local WinRM listener: %w", err)
+	}
+	manager := newWinRMSessionManager(defaultWinRMSessionIdleTimeout)
+	defer manager.Close()
+	started := time.Now()
+	response, err := manager.Execute(ctx, cfg.SelectedDestination, user, password, command, port)
+	log.Printf("CLI WinRM command completed destination=%q success=%t elapsed=%s", cfg.SelectedDestination, err == nil, time.Since(started).Round(time.Millisecond))
+	if response.Output != "" {
+		if _, writeErr := fmt.Fprint(output, response.Output); writeErr != nil && err == nil {
+			return writeErr
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("execute WinRM command for destination %q: %w", cfg.SelectedDestination, err)
+	}
+	return nil
 }
 
 func homeLogInstance() string {

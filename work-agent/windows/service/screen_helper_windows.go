@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"log"
 	"net"
 	"os"
 	"syscall"
@@ -18,15 +20,12 @@ type helperConn struct {
 }
 
 func launchScreenCaptureHelper() (net.Conn, error) {
-	sessionID := windows.WTSGetActiveConsoleSessionId()
-	if sessionID == 0xffffffff {
-		return nil, errors.New("no interactive Windows session is active")
-	}
-	var token windows.Token
-	if err := windows.WTSQueryUserToken(sessionID, &token); err != nil {
+	token, sessionID, err := activeInteractiveUserToken()
+	if err != nil {
 		return nil, err
 	}
 	defer token.Close()
+	log.Printf("launching screen capture helper in interactive session=%d", sessionID)
 
 	sa := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), InheritHandle: 1}
 	var childInput, parentInput windows.Handle
@@ -105,6 +104,56 @@ func launchScreenCaptureHelper() (net.Conn, error) {
 	parentOutput = 0
 	parentInput = 0
 	return &helperConn{reader: reader, writer: writer, process: process.Process}, nil
+}
+
+func activeInteractiveUserToken() (windows.Token, uint32, error) {
+	consoleSessionID := windows.WTSGetActiveConsoleSessionId()
+	var sessionInfo *windows.WTS_SESSION_INFO
+	var sessionCount uint32
+	enumerateErr := windows.WTSEnumerateSessions(0, 0, 1, &sessionInfo, &sessionCount)
+	var candidates []uint32
+	if enumerateErr == nil {
+		if sessionInfo != nil {
+			defer windows.WTSFreeMemory(uintptr(unsafe.Pointer(sessionInfo)))
+		}
+		candidates = orderedActiveSessionIDs(consoleSessionID, unsafe.Slice(sessionInfo, int(sessionCount)))
+	} else if consoleSessionID != 0xffffffff {
+		candidates = []uint32{consoleSessionID}
+	}
+	if len(candidates) == 0 {
+		if enumerateErr != nil {
+			return 0, 0, fmt.Errorf("enumerate interactive Windows sessions: %w", enumerateErr)
+		}
+		return 0, 0, errors.New("no active interactive Windows session is available")
+	}
+	var failures []error
+	for _, sessionID := range candidates {
+		var token windows.Token
+		if err := windows.WTSQueryUserToken(sessionID, &token); err == nil {
+			return token, sessionID, nil
+		} else {
+			failures = append(failures, fmt.Errorf("query user token for Windows session %d: %w", sessionID, err))
+		}
+	}
+	return 0, 0, errors.Join(failures...)
+}
+
+func orderedActiveSessionIDs(consoleSessionID uint32, sessions []windows.WTS_SESSION_INFO) []uint32 {
+	result := make([]uint32, 0, len(sessions))
+	if consoleSessionID != 0xffffffff {
+		for _, session := range sessions {
+			if session.SessionID == consoleSessionID && session.State == windows.WTSActive {
+				result = append(result, session.SessionID)
+				break
+			}
+		}
+	}
+	for _, session := range sessions {
+		if session.State == windows.WTSActive && session.SessionID != consoleSessionID {
+			result = append(result, session.SessionID)
+		}
+	}
+	return result
 }
 
 func (c *helperConn) Read(buffer []byte) (int, error)  { return c.reader.Read(buffer) }

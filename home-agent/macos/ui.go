@@ -28,10 +28,11 @@ import (
 )
 
 type macProfile struct {
-	Name       string   `json:"name"`
-	RelayBases []string `json:"relay_bases"`
-	Room       string   `json:"room"`
-	RoomProof  string   `json:"-"`
+	Name        string   `json:"name"`
+	RelayBases  []string `json:"relay_bases"`
+	Room        string   `json:"room"`
+	RoomProof   string   `json:"-"`
+	WindowsUser string   `json:"windows_user,omitempty"`
 }
 
 type macSettings struct {
@@ -42,10 +43,12 @@ type macSettings struct {
 }
 
 type apiProfile struct {
-	Name        string   `json:"name"`
-	RelayBases  []string `json:"relay_bases"`
-	Room        string   `json:"room"`
-	HasPassword bool     `json:"has_password"`
+	Name            string   `json:"name"`
+	RelayBases      []string `json:"relay_bases"`
+	Room            string   `json:"room"`
+	HasPassword     bool     `json:"has_password"`
+	WindowsUser     string   `json:"windows_user,omitempty"`
+	HasWindowsLogin bool     `json:"has_windows_login"`
 }
 
 type apiSettings struct {
@@ -56,9 +59,11 @@ type apiSettings struct {
 }
 
 type settingsRequest struct {
-	Settings      apiSettings `json:"settings"`
-	RoomPassword  string      `json:"room_password"`
-	ClearPassword bool        `json:"clear_password"`
+	Settings          apiSettings `json:"settings"`
+	RoomPassword      string      `json:"room_password"`
+	ClearPassword     bool        `json:"clear_password"`
+	WindowsPassword   string      `json:"windows_password"`
+	ClearWindowsLogin bool        `json:"clear_windows_login"`
 }
 
 type macUIController struct {
@@ -165,6 +170,38 @@ func (c *macUIController) handleUI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]bool{"ok": true})
+	case r.Method == http.MethodPost && r.URL.Path == "/api/winrm":
+		var request struct {
+			Command string `json:"command"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(request.Command) == "" {
+			http.Error(w, "PowerShell command is required", http.StatusBadRequest)
+			return
+		}
+		c.mu.Lock()
+		cfg := c.cfg
+		settings := c.settings
+		c.mu.Unlock()
+		if settings.Selected < 0 || settings.Selected >= len(settings.Profiles) {
+			http.Error(w, "selected destination profile is invalid", http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+		defer cancel()
+		var output bytes.Buffer
+		if err := executeMacWinRM(ctx, cfg, settings.Profiles[settings.Selected], request.Command, &output); err != nil {
+			message := strings.TrimSpace(output.String())
+			if message != "" {
+				message += "\n"
+			}
+			http.Error(w, message+err.Error(), http.StatusBadGateway)
+			return
+		}
+		writeJSON(w, map[string]string{"output": output.String()})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/state":
 		c.mu.Lock()
 		state := map[string]any{"running": c.running, "tunnel_status": c.tunnelStatus, "relay_details": c.relayDetails, "screen_status": c.screenStatus, "screen_seq": c.screenSeq}
@@ -242,6 +279,9 @@ func (c *macUIController) applySettings(request settingsRequest) error {
 	}
 	cfg, err := settingsConfig(settings)
 	if err != nil {
+		return err
+	}
+	if err := updateMacWindowsCredential(*selected, request.WindowsPassword, request.ClearWindowsLogin); err != nil {
 		return err
 	}
 	if err := saveMacSettings(settings); err != nil {
@@ -478,7 +518,7 @@ func settingsFromAPI(value apiSettings) (macSettings, error) {
 			}
 			bases = append(bases, base)
 		}
-		settings.Profiles = append(settings.Profiles, macProfile{Name: name, Room: room, RelayBases: bases})
+		settings.Profiles = append(settings.Profiles, macProfile{Name: name, Room: room, RelayBases: bases, WindowsUser: strings.TrimSpace(profile.WindowsUser)})
 	}
 	if settings.Selected < 0 || settings.Selected >= len(settings.Profiles) {
 		return settings, errors.New("selected profile is invalid")
@@ -489,16 +529,22 @@ func settingsFromAPI(value apiSettings) (macSettings, error) {
 func apiSettingsFrom(settings macSettings) apiSettings {
 	value := apiSettings{ListenAddr: settings.ListenAddr, Proxy: settings.Proxy, Selected: settings.Selected}
 	for _, profile := range settings.Profiles {
-		value.Profiles = append(value.Profiles, apiProfile{Name: profile.Name, Room: profile.Room, RelayBases: append([]string(nil), profile.RelayBases...), HasPassword: profile.RoomProof != ""})
+		credential, credentialErr := readMacWindowsCredential(profile)
+		windowsUser := profile.WindowsUser
+		if strings.TrimSpace(windowsUser) == "" && credentialErr == nil {
+			windowsUser = credential.User
+		}
+		value.Profiles = append(value.Profiles, apiProfile{Name: profile.Name, Room: profile.Room, RelayBases: append([]string(nil), profile.RelayBases...), HasPassword: profile.RoomProof != "", WindowsUser: windowsUser, HasWindowsLogin: credentialErr == nil})
 	}
 	return value
 }
 
 type persistedProfile struct {
-	Name       string   `json:"name"`
-	RelayBases []string `json:"relay_bases"`
-	Room       string   `json:"room"`
-	RoomProof  string   `json:"room_proof,omitempty"`
+	Name        string   `json:"name"`
+	RelayBases  []string `json:"relay_bases"`
+	Room        string   `json:"room"`
+	RoomProof   string   `json:"room_proof,omitempty"`
+	WindowsUser string   `json:"windows_user,omitempty"`
 }
 
 type persistedSettings struct {
@@ -526,7 +572,7 @@ func loadMacSettings(initial config) (macSettings, error) {
 	}
 	settings := macSettings{ListenAddr: stored.ListenAddr, Proxy: stored.Proxy, Selected: stored.Selected}
 	for _, profile := range stored.Profiles {
-		settings.Profiles = append(settings.Profiles, macProfile{Name: profile.Name, RelayBases: profile.RelayBases, Room: profile.Room, RoomProof: profile.RoomProof})
+		settings.Profiles = append(settings.Profiles, macProfile{Name: profile.Name, RelayBases: profile.RelayBases, Room: profile.Room, RoomProof: profile.RoomProof, WindowsUser: profile.WindowsUser})
 	}
 	if _, err := settingsConfig(settings); err != nil {
 		return macSettings{}, err
@@ -544,7 +590,7 @@ func saveMacSettings(settings macSettings) error {
 	}
 	stored := persistedSettings{ListenAddr: settings.ListenAddr, Proxy: settings.Proxy, Selected: settings.Selected}
 	for _, profile := range settings.Profiles {
-		stored.Profiles = append(stored.Profiles, persistedProfile{Name: profile.Name, RelayBases: profile.RelayBases, Room: profile.Room, RoomProof: profile.RoomProof})
+		stored.Profiles = append(stored.Profiles, persistedProfile{Name: profile.Name, RelayBases: profile.RelayBases, Room: profile.Room, RoomProof: profile.RoomProof, WindowsUser: profile.WindowsUser})
 	}
 	data, err := json.MarshalIndent(stored, "", "  ")
 	if err != nil {
@@ -586,10 +632,11 @@ func logUI(format string, args ...any) {
 }
 
 const macControlPanelHTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>DeskFerry Home {{VERSION}}</title><style>
-body{font:14px -apple-system,BlinkMacSystemFont,sans-serif;margin:0;background:#f4f5f7;color:#1f2937}main{max-width:1000px;margin:24px auto;padding:0 18px}.card{background:white;border:1px solid #d9dde5;border-radius:12px;padding:18px;margin:12px 0;box-shadow:0 2px 8px #0000000a}h1{font-size:24px}h2{font-size:17px;margin-top:0}.grid{display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center}input,select,button{font:inherit;padding:8px;border:1px solid #bcc3cf;border-radius:7px}button{background:#fff;cursor:pointer}button.primary{background:#1666d6;color:white;border-color:#1666d6}.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.relay{display:flex;gap:7px;margin:6px 0}.relay input{flex:1}pre{white-space:pre-wrap;background:#f7f8fa;padding:12px;border-radius:8px;min-height:70px}.good{color:#087a45}.bad{color:#b42318}</style></head><body><main><h1>DeskFerry Home for macOS <small>v{{VERSION}}</small></h1>
-<div class="card"><h2>Destination profile</h2><div class="grid"><label>Profile</label><select id="profile"></select><label>Profile name</label><input id="name"><label>Room name</label><input id="room"><label>Relay service bases</label><div><div id="relays"></div><div class="row"><input id="relayEdit" placeholder="https://host/relay" style="flex:1"><button onclick="addRelay()">Add</button></div></div><label>Local RDP address</label><input id="listen"><label>Proxy</label><input id="proxy" placeholder="env, direct, or http(s)://host:port"><label>Room password</label><input id="password" type="password" placeholder="blank keeps saved credential"><label>Password options</label><label><input id="clear" type="checkbox"> Clear saved room credential</label></div><div class="row"><button onclick="addProfile()">Add profile</button><button onclick="deleteProfile()">Delete profile</button><button class="primary" onclick="save()">Save</button></div><div id="saveStatus"></div></div>
+body{font:14px -apple-system,BlinkMacSystemFont,sans-serif;margin:0;background:#f4f5f7;color:#1f2937}main{max-width:1000px;margin:24px auto;padding:0 18px}.card{background:white;border:1px solid #d9dde5;border-radius:12px;padding:18px;margin:12px 0;box-shadow:0 2px 8px #0000000a}h1{font-size:24px}h2{font-size:17px;margin-top:0}.grid{display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center}input,select,button,textarea{font:inherit;padding:8px;border:1px solid #bcc3cf;border-radius:7px}textarea{width:100%;box-sizing:border-box;min-height:76px}button{background:#fff;cursor:pointer}button.primary{background:#1666d6;color:white;border-color:#1666d6}.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.relay{display:flex;gap:7px;margin:6px 0}.relay input{flex:1}pre{white-space:pre-wrap;background:#f7f8fa;padding:12px;border-radius:8px;min-height:70px}.good{color:#087a45}.bad{color:#b42318}</style></head><body><main><h1>DeskFerry Home for macOS <small>v{{VERSION}}</small></h1>
+<div class="card"><h2>Destination profile</h2><div class="grid"><label>Profile</label><select id="profile"></select><label>Profile name</label><input id="name"><label>Room name</label><input id="room"><label>Relay service bases</label><div><div id="relays"></div><div class="row"><input id="relayEdit" placeholder="https://host/relay" style="flex:1"><button onclick="addRelay()">Add</button></div></div><label>Local RDP address</label><input id="listen"><label>Proxy</label><input id="proxy" placeholder="env, direct, or http(s)://host:port"><label>Room password</label><input id="password" type="password" placeholder="blank keeps saved credential"><label>Room credential</label><label><input id="clear" type="checkbox"> Clear saved room credential</label><label>Windows username</label><input id="windowsUser" placeholder="DOMAIN\\user or local user"><label>Windows password</label><input id="windowsPassword" type="password" placeholder="blank keeps saved Keychain login"><label>Windows login</label><label><input id="clearWindows" type="checkbox"> Forget saved Windows login</label></div><div class="row"><button onclick="addProfile()">Add profile</button><button onclick="deleteProfile()">Delete profile</button><button class="primary" onclick="save()">Save</button></div><div id="saveStatus"></div></div>
 <div class="card"><h2>Connection</h2><div class="row"><button class="primary" onclick="post('api/connect')">Connect</button><button onclick="post('api/stop')">Stop</button><button onclick="post('api/open-rdp')">Open Remote Desktop</button><button onclick="window.open('screen','DeskFerryScreen','width=1100,height=760')">Screen Viewer</button></div><p id="tunnel"></p></div>
+<div class="card"><h2>WinRM Commands</h2><textarea id="winrmCommand">Get-ComputerInfo | Select-Object CsName, WindowsProductName, WindowsVersion</textarea><div class="row"><button class="primary" onclick="runWinRM()">Execute</button></div><pre id="winrmOutput">Ready</pre></div>
 <div class="card"><h2>Relay status</h2><pre id="relay">Checking...</pre></div></main><script>
-let s={profiles:[],selected:0};const $=id=>document.getElementById(id);async function load(){s=await (await fetch('api/settings')).json();render();state()}function commit(){if(!s.profiles.length)return;let p=s.profiles[s.selected];p.name=$('name').value;p.room=$('room').value}function render(){let q=$('profile');q.innerHTML='';s.profiles.forEach((p,i)=>{let o=new Option(p.name+(p.has_password?' 🔒':''),i,i===s.selected,i===s.selected);q.add(o)});let p=s.profiles[s.selected];if(!p)return;$('name').value=p.name;$('room').value=p.room;$('listen').value=s.listen_addr;$('proxy').value=s.proxy;renderRelays()}$('profile').onchange=()=>{commit();s.selected=+$('profile').value;render()};function renderRelays(){let d=$('relays');d.innerHTML='';s.profiles[s.selected].relay_bases.forEach((v,i)=>{let r=document.createElement('div');r.className='relay';r.innerHTML='<input><button>Update</button><button>↑</button><button>↓</button><button>Delete</button>';r.children[0].value=v;r.children[1].onclick=()=>{s.profiles[s.selected].relay_bases[i]=r.children[0].value};r.children[2].onclick=()=>move(i,-1);r.children[3].onclick=()=>move(i,1);r.children[4].onclick=()=>{s.profiles[s.selected].relay_bases.splice(i,1);renderRelays()};d.appendChild(r)})}function addRelay(){let v=$('relayEdit').value.trim();if(v){s.profiles[s.selected].relay_bases.push(v);$('relayEdit').value='';renderRelays()}}function move(i,n){let a=s.profiles[s.selected].relay_bases,j=i+n;if(j<0||j>=a.length)return;[a[i],a[j]]=[a[j],a[i]];renderRelays()}function addProfile(){commit();s.profiles.push({name:'Work '+(s.profiles.length+1),room:'workdesk',relay_bases:['https://test-officialwebsite.azurewebsites.net/relay','http://217.142.228.117/relay'],has_password:false});s.selected=s.profiles.length-1;render()}function deleteProfile(){if(s.profiles.length<=1)return alert('At least one profile is required.');s.profiles.splice(s.selected,1);s.selected=Math.max(0,s.selected-1);render()}async function save(){commit();s.listen_addr=$('listen').value;s.proxy=$('proxy').value;let res=await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({settings:s,room_password:$('password').value,clear_password:$('clear').checked})});let text=await res.text();$('saveStatus').textContent=res.ok?'Saved.':text;if(res.ok){$('password').value='';$('clear').checked=false;await load()}}async function post(path){let r=await fetch(path,{method:'POST'});if(!r.ok)alert(await r.text());state()}async function state(){let x=await (await fetch('api/state')).json();$('tunnel').textContent=x.tunnel_status;$('tunnel').className=x.running?'good':'bad';$('relay').textContent=x.relay_details||'Checking...'}setInterval(state,2000);load();</script></body></html>`
+let s={profiles:[],selected:0};const $=id=>document.getElementById(id);async function load(){s=await (await fetch('api/settings')).json();render();state()}function commit(){if(!s.profiles.length)return;let p=s.profiles[s.selected];p.name=$('name').value;p.room=$('room').value;p.windows_user=$('windowsUser').value}function render(){let q=$('profile');q.innerHTML='';s.profiles.forEach((p,i)=>{let marks=(p.has_password?' room-key':'')+(p.has_windows_login?' Windows-login':'');let o=new Option(p.name+marks,i,i===s.selected,i===s.selected);q.add(o)});let p=s.profiles[s.selected];if(!p)return;$('name').value=p.name;$('room').value=p.room;$('windowsUser').value=p.windows_user||'';$('listen').value=s.listen_addr;$('proxy').value=s.proxy;renderRelays()}$('profile').onchange=()=>{commit();s.selected=+$('profile').value;render()};function renderRelays(){let d=$('relays');d.innerHTML='';s.profiles[s.selected].relay_bases.forEach((v,i)=>{let r=document.createElement('div');r.className='relay';r.innerHTML='<input><button>Update</button><button>Up</button><button>Down</button><button>Delete</button>';r.children[0].value=v;r.children[1].onclick=()=>{s.profiles[s.selected].relay_bases[i]=r.children[0].value};r.children[2].onclick=()=>move(i,-1);r.children[3].onclick=()=>move(i,1);r.children[4].onclick=()=>{s.profiles[s.selected].relay_bases.splice(i,1);renderRelays()};d.appendChild(r)})}function addRelay(){let v=$('relayEdit').value.trim();if(v){s.profiles[s.selected].relay_bases.push(v);$('relayEdit').value='';renderRelays()}}function move(i,n){let a=s.profiles[s.selected].relay_bases,j=i+n;if(j<0||j>=a.length)return;[a[i],a[j]]=[a[j],a[i]];renderRelays()}function addProfile(){commit();s.profiles.push({name:'Work '+(s.profiles.length+1),room:'workdesk',relay_bases:['https://test-officialwebsite.azurewebsites.net/relay','http://217.142.228.117/relay'],has_password:false,windows_user:'',has_windows_login:false});s.selected=s.profiles.length-1;render()}function deleteProfile(){if(s.profiles.length<=1)return alert('At least one profile is required.');s.profiles.splice(s.selected,1);s.selected=Math.max(0,s.selected-1);render()}async function save(){commit();s.listen_addr=$('listen').value;s.proxy=$('proxy').value;let res=await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({settings:s,room_password:$('password').value,clear_password:$('clear').checked,windows_password:$('windowsPassword').value,clear_windows_login:$('clearWindows').checked})});let text=await res.text();$('saveStatus').textContent=res.ok?'Saved.':text;if(res.ok){$('password').value='';$('clear').checked=false;$('windowsPassword').value='';$('clearWindows').checked=false;await load()}}async function runWinRM(){let o=$('winrmOutput');o.textContent='Running...';let r=await fetch('api/winrm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:$('winrmCommand').value})});let text=await r.text();if(r.ok){try{text=JSON.parse(text).output}catch(e){}}o.textContent=text||'(no output)'}async function post(path){let r=await fetch(path,{method:'POST'});if(!r.ok)alert(await r.text());state()}async function state(){let x=await (await fetch('api/state')).json();$('tunnel').textContent=x.tunnel_status;$('tunnel').className=x.running?'good':'bad';$('relay').textContent=x.relay_details||'Checking...'}setInterval(state,2000);load();</script></body></html>`
 
 const macScreenViewerHTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>DeskFerry Screen Viewer</title><style>body{font:14px -apple-system,sans-serif;margin:0;background:#171a20;color:white}header{display:flex;gap:8px;align-items:center;padding:10px;background:#252a33;position:sticky;top:0}button,select{font:inherit;padding:7px 10px;border-radius:7px;border:1px solid #727987;background:#343a46;color:white}#view{display:flex;justify-content:center;align-items:center;height:calc(100vh - 58px)}img{max-width:100%;max-height:100%;object-fit:contain}</style></head><body><header><button onclick="start('single')">Capture Once</button><button onclick="start('stream')">Start Stream</button><button onclick="post('api/screen/stop')">Stop</button><label>Interval <select id="interval"><option value="500">0.5 s</option><option value="1000" selected>1 s</option><option value="2000">2 s</option><option value="5000">5 s</option></select></label><button onclick="document.documentElement.requestFullscreen()">Full Screen</button><a id="save" href="api/screen/frame.png" download="DeskFerry-Screenshot.png"><button>Save PNG</button></a><span id="status">Ready</span></header><div id="view"><img id="image" alt="Capture the Work computer screen"></div><script>let seq=0;async function start(mode){let r=await fetch('api/screen/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,interval_ms:+document.getElementById('interval').value})});if(!r.ok)alert(await r.text())}async function post(p){await fetch(p,{method:'POST'})}async function poll(){let s=await (await fetch('api/state')).json();document.getElementById('status').textContent=s.screen_status;if(s.screen_seq&&s.screen_seq!==seq){seq=s.screen_seq;document.getElementById('image').src='api/screen/frame.png?seq='+seq}}setInterval(poll,350);poll();start('single');</script></body></html>`

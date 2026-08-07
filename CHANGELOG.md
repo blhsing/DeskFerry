@@ -1,5 +1,12 @@
 # Release Notes
 
+## 0.10.1 - 2026-08-07
+
+- Fixed Work screen capture when the interactive user is in an RDP or other active terminal-services session: the service now enumerates active sessions instead of assuming the physical console owns a user token.
+- Added Windows and macOS Home command-line WinRM execution with saved destination selection, saved Windows credentials, self-contained temporary relay tunnels, command-file/stdin input, and configurable timeout.
+- Added matching macOS Keychain-backed Windows-login fields and WinRM command controls, plus a Windows Home CLI maintenance action for resynchronizing the selected profile to the optional SMB network service.
+- Updated agent WebSocket identification, startup records, control surfaces, relay dashboards, health responses, installers, and Android metadata to version 0.10.1.
+
 ## 0.10.0 - 2026-08-07
 
 - Added an authenticated, opt-in Work screen service that captures the interactive Windows desktop without opening RDP.

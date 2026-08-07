@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -104,6 +105,10 @@ func main() {
 	var openRDP bool
 	var statusOnly bool
 	var uiMode bool
+	var destinationFlag string
+	var winRMCommand string
+	var winRMCommandFile string
+	var winRMTimeout time.Duration
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.Var(&relayBases, "relay-base-url", "relay service base URL; repeat to add fallback relay services")
 	flag.StringVar(&roomName, "room", "workdesk", "room name appended to each relay service base URL")
@@ -114,6 +119,10 @@ func main() {
 	flag.BoolVar(&openRDP, "open-rdp", false, "open the local RDP profile after the tunnel starts")
 	flag.BoolVar(&statusOnly, "status", false, "print relay room status and exit")
 	flag.BoolVar(&uiMode, "ui", true, "open the macOS Home control panel")
+	flag.StringVar(&destinationFlag, "destination", "", "saved destination profile to use")
+	flag.StringVar(&winRMCommand, "winrm-command", "", "run a PowerShell command through the selected destination's WinRM service")
+	flag.StringVar(&winRMCommandFile, "winrm-command-file", "", "read a WinRM PowerShell command from a file, or - for standard input")
+	flag.DurationVar(&winRMTimeout, "winrm-timeout", 2*time.Minute, "timeout for CLI WinRM command execution")
 	flag.Parse()
 	if path, err := diaglog.Enable("home-agent", false, logRetentionDays, relayLogs); err != nil {
 		log.Printf("persistent diagnostic logging unavailable: %v", err)
@@ -141,6 +150,22 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	winRMCommandMode := winRMCommand != "" || winRMCommandFile != ""
+	var selectedProfile macProfile
+	if winRMCommandMode {
+		settings, err := loadMacSettings(cfg)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := selectMacDestination(&settings, destinationFlag); err != nil {
+			log.Fatal(err)
+		}
+		cfg, err = settingsConfig(settings)
+		if err != nil {
+			log.Fatal(err)
+		}
+		selectedProfile = settings.Profiles[settings.Selected]
+	}
 
 	if statusOnly {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -159,6 +184,18 @@ func main() {
 	for _, relayAddr := range cfg.relayAddresses() {
 		relayLogs.AddTarget(ctx, remotelog.Target{RelayAddr: relayAddr, Proxy: cfg.Proxy, RoomPassword: cfg.RoomPassword, RoomProof: cfg.RoomProof})
 	}
+	if winRMCommandMode {
+		command, err := readCLIWinRMCommand(winRMCommand, winRMCommandFile, os.Stdin)
+		if err != nil {
+			log.Fatal(err)
+		}
+		commandCtx, cancel := context.WithTimeout(ctx, winRMTimeout)
+		defer cancel()
+		if err := executeMacWinRM(commandCtx, cfg, selectedProfile, command, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if uiMode {
 		if err := runMacUI(ctx, cfg, openRDP); err != nil && ctx.Err() == nil {
 			log.Fatal(err)
@@ -168,6 +205,46 @@ func main() {
 	if err := run(ctx, cfg, openRDP); err != nil && ctx.Err() == nil {
 		log.Fatal(err)
 	}
+}
+
+func selectMacDestination(settings *macSettings, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		if settings.Selected < 0 || settings.Selected >= len(settings.Profiles) {
+			return errors.New("selected destination profile is invalid")
+		}
+		return nil
+	}
+	for index, profile := range settings.Profiles {
+		if strings.EqualFold(profile.Name, name) {
+			settings.Selected = index
+			return nil
+		}
+	}
+	return fmt.Errorf("destination profile %q was not found", name)
+}
+
+func readCLIWinRMCommand(command, commandFile string, stdin io.Reader) (string, error) {
+	if command != "" && commandFile != "" {
+		return "", errors.New("use either -winrm-command or -winrm-command-file, not both")
+	}
+	if commandFile != "" {
+		var data []byte
+		var err error
+		if commandFile == "-" {
+			data, err = io.ReadAll(stdin)
+		} else {
+			data, err = os.ReadFile(commandFile)
+		}
+		if err != nil {
+			return "", fmt.Errorf("read WinRM command: %w", err)
+		}
+		command = string(data)
+	}
+	if strings.TrimSpace(command) == "" {
+		return "", errors.New("WinRM command is empty")
+	}
+	return command, nil
 }
 
 func hostInstance() string {
