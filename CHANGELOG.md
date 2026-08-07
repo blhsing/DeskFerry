@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.10.3 - 2026-08-07
+
+- Fixed Windows Work screen capture on RDP and display drivers that reject GDI desktop copies by binding the capture thread to the active input desktop and falling back to DirectX Desktop Duplication.
+- Added automatic DirectX capture reinitialization after RDP reconnects, display-mode changes, lock/unlock transitions, and other desktop switches.
+- Expanded Work-side capture errors with the attempted desktop dimensions and Windows failure details so relay-queued logs can distinguish GDI, desktop-binding, and DirectX failures.
+
 ## 0.10.2 - 2026-08-07
 
 - Fixed Windows Work screen capture by using a top-down DIB section and retrying without `CAPTUREBLT` for RDP display drivers that reject layered-window capture.

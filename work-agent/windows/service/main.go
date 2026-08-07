@@ -112,6 +112,7 @@ func main() {
 	flag.Parse()
 	if screenCaptureHelper {
 		if err := screenview.RunCaptureHelper(); err != nil {
+			log.Printf("screen capture helper failed: %v", err)
 			os.Exit(1)
 		}
 		return

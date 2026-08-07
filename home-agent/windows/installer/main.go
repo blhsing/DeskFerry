@@ -39,7 +39,7 @@ const (
 	defaultAzureRelayBase = "https://test-officialwebsite.azurewebsites.net/relay"
 	defaultOCIRelayBase   = "http://217.142.228.117/relay"
 	defaultRoomName       = "workdesk"
-	productVersion        = "0.10.2"
+	productVersion        = "0.10.3"
 	hostsBeginMarker      = "# BEGIN DeskFerry Home managed alias"
 	hostsEndMarker        = "# END DeskFerry Home managed alias"
 )

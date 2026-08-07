@@ -80,6 +80,15 @@ func launchScreenCaptureHelper() (net.Conn, error) {
 	if err := windows.SetHandleInformation(parentOutput, windows.HANDLE_FLAG_INHERIT, 0); err != nil {
 		return nil, err
 	}
+	stderrFile, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open screen helper stderr sink: %w", err)
+	}
+	defer stderrFile.Close()
+	stderrHandle := windows.Handle(stderrFile.Fd())
+	if err := windows.SetHandleInformation(stderrHandle, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
+		return nil, fmt.Errorf("make screen helper stderr sink inheritable: %w", err)
+	}
 
 	executable, err := os.Executable()
 	if err != nil {
@@ -100,7 +109,7 @@ func launchScreenCaptureHelper() (net.Conn, error) {
 		Flags:     windows.STARTF_USESTDHANDLES,
 		StdInput:  childInput,
 		StdOutput: childOutput,
-		StdErr:    childOutput,
+		StdErr:    stderrHandle,
 	}
 	var environment *uint16
 	if err := windows.CreateEnvironmentBlock(&environment, token, false); err != nil {
