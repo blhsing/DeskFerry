@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"deskferry/internal/buildinfo"
 	"deskferry/internal/diaglog"
 	"deskferry/internal/remotelog"
 	"deskferry/internal/tunnel"
@@ -42,6 +43,7 @@ type config struct {
 	ListenAddr   string
 	Proxy        string
 	RoomPassword string
+	RoomProof    string
 }
 
 type relayURLFlag []string
@@ -101,6 +103,7 @@ func main() {
 	var logRetentionDays int
 	var openRDP bool
 	var statusOnly bool
+	var uiMode bool
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.Var(&relayBases, "relay-base-url", "relay service base URL; repeat to add fallback relay services")
 	flag.StringVar(&roomName, "room", "workdesk", "room name appended to each relay service base URL")
@@ -110,12 +113,14 @@ func main() {
 	flag.IntVar(&logRetentionDays, "log-retention-days", diaglog.DefaultRetentionDays, "number of calendar days of diagnostic logs to retain")
 	flag.BoolVar(&openRDP, "open-rdp", false, "open the local RDP profile after the tunnel starts")
 	flag.BoolVar(&statusOnly, "status", false, "print relay room status and exit")
+	flag.BoolVar(&uiMode, "ui", true, "open the macOS Home control panel")
 	flag.Parse()
 	if path, err := diaglog.Enable("home-agent", false, logRetentionDays, relayLogs); err != nil {
 		log.Printf("persistent diagnostic logging unavailable: %v", err)
 	} else {
 		log.Printf("diagnostic log file: %s retention_days=%d", path, logRetentionDays)
 	}
+	log.Printf("DeskFerry Home Agent version=%s platform=macos", buildinfo.Version)
 
 	relayURLText := relayURLs.String()
 	if len(relayBases) > 0 {
@@ -152,7 +157,13 @@ func main() {
 	defer stop()
 	relayLogs.SetInstance(hostInstance())
 	for _, relayAddr := range cfg.relayAddresses() {
-		relayLogs.AddTarget(ctx, remotelog.Target{RelayAddr: relayAddr, Proxy: cfg.Proxy, RoomPassword: cfg.RoomPassword})
+		relayLogs.AddTarget(ctx, remotelog.Target{RelayAddr: relayAddr, Proxy: cfg.Proxy, RoomPassword: cfg.RoomPassword, RoomProof: cfg.RoomProof})
+	}
+	if uiMode {
+		if err := runMacUI(ctx, cfg, openRDP); err != nil && ctx.Err() == nil {
+			log.Fatal(err)
+		}
+		return
 	}
 	if err := run(ctx, cfg, openRDP); err != nil && ctx.Err() == nil {
 		log.Fatal(err)
@@ -306,6 +317,10 @@ func homePresenceLoop(ctx context.Context, cfg config) {
 }
 
 func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
+	return dialRelayService(ctx, cfg, tunnel.ServiceRDP)
+}
+
+func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn, string, error) {
 	deadline := time.Now().Add(5 * time.Minute)
 	backoff := 250 * time.Millisecond
 	var errs []string
@@ -316,26 +331,32 @@ func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
 			attemptCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 			headers := http.Header{}
 			tunnel.AddProtocolV2Header(headers)
-			headers.Set(tunnel.HeaderResumable, "1")
-			tunnel.AddRoomPasswordHeader(headers, relayAddr, "", cfg.RoomPassword)
-			tunnel.AddServiceHeader(headers, tunnel.ServiceRDP)
+			if service != tunnel.ServiceScreen {
+				headers.Set(tunnel.HeaderResumable, "1")
+			}
+			addRoomCredentialHeader(headers, cfg, relayAddr)
+			tunnel.AddServiceHeader(headers, service)
 			ws, err := tunnel.DialWebSocketWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
 			sessionID := ""
 			v2 := false
 			if err == nil {
-				sessionID, v2, err = tunnel.AwaitSessionReadyCompatible(attemptCtx, ws)
+				if service == tunnel.ServiceScreen {
+					sessionID, v2, err = tunnel.AwaitSessionReadyCompatibleService(attemptCtx, ws, service)
+				} else {
+					sessionID, v2, err = tunnel.AwaitSessionReadyCompatible(attemptCtx, ws)
+				}
 			}
 			if err == nil {
 				cancel()
-				log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t via=%s elapsed=%s", relayAddr, tunnel.ServiceRDP, v2, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
-				if sessionID != "" {
+				log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t via=%s elapsed=%s", relayAddr, service, v2, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
+				if sessionID != "" && service != tunnel.ServiceScreen {
 					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{
 						RelayAddr: relayAddr,
 						Proxy:     cfg.Proxy,
 						SessionID: sessionID,
 						Side:      "client",
-						RoomProof: tunnel.RoomPasswordProof(relayAddr, "", cfg.RoomPassword),
-						Service:   tunnel.ServiceRDP,
+						RoomProof: roomProof(cfg, relayAddr),
+						Service:   service,
 					}), relayAddr, nil
 				}
 				return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil
@@ -343,11 +364,11 @@ func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
 			cancel()
 			tunnel.CloseWebSocket(ws)
 			elapsed := time.Since(attemptStarted).Round(time.Millisecond)
-			log.Printf("relay attempt failed relay=%s service=%s elapsed=%s result=%s error=%v", relayAddr, tunnel.ServiceRDP, elapsed, relayAttemptResult(err), err)
+			log.Printf("relay attempt failed relay=%s service=%s elapsed=%s result=%s error=%v", relayAddr, service, elapsed, relayAttemptResult(err), err)
 			errs = append(errs, fmt.Sprintf("%s after %s: %v", relayAddr, elapsed, err))
 			var rejected *tunnel.SessionResultError
 			if errors.As(err, &rejected) && (rejected.Result == tunnel.MessageAuthFailed || rejected.Result == tunnel.MessageServiceDisabled || rejected.Result == tunnel.MessageInvalidRequest) {
-				return nil, "", fmt.Errorf("relay rejected non-retryable RDP session: %w", err)
+				return nil, "", fmt.Errorf("relay rejected non-retryable %s session: %w", service, err)
 			}
 			if ctx.Err() != nil {
 				break
@@ -683,7 +704,7 @@ func dialWebSocketFallback(ctx context.Context, cfg config, role string) (*webso
 	var errs []string
 	for _, relayAddr := range cfg.relayAddresses() {
 		headers := http.Header{}
-		tunnel.AddRoomPasswordHeader(headers, relayAddr, "", cfg.RoomPassword)
+		addRoomCredentialHeader(headers, cfg, relayAddr)
 		conn, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, cfg.Proxy, role, "", headers)
 		if err == nil {
 			return conn, relayAddr, nil
@@ -694,6 +715,21 @@ func dialWebSocketFallback(ctx context.Context, cfg config, role string) (*webso
 		}
 	}
 	return nil, "", fmt.Errorf("all relay URLs failed: %s", strings.Join(errs, "; "))
+}
+
+func addRoomCredentialHeader(headers http.Header, cfg config, relayAddr string) {
+	if cfg.RoomProof != "" {
+		headers.Set(tunnel.HeaderRoomProof, cfg.RoomProof)
+		return
+	}
+	tunnel.AddRoomPasswordHeader(headers, relayAddr, "", cfg.RoomPassword)
+}
+
+func roomProof(cfg config, relayAddr string) string {
+	if cfg.RoomProof != "" {
+		return cfg.RoomProof
+	}
+	return tunnel.RoomPasswordProof(relayAddr, "", cfg.RoomPassword)
 }
 
 func relayStatusURL(relayAddr string) (string, string, error) {

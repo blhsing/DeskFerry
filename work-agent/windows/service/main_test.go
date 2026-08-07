@@ -33,7 +33,7 @@ func TestRelayURLFlagAccumulatesValues(t *testing.T) {
 }
 
 func TestLoadConfigAcceptsMultipleWebSocketRelayURLs(t *testing.T) {
-	cfg, err := loadConfig("https://test-officialwebsite.azurewebsites.net/relay/workdesk;http://217.142.228.117/relay/workdesk", "", "")
+	cfg, err := loadConfig("https://test-officialwebsite.azurewebsites.net/relay/workdesk;http://217.142.228.117/relay/workdesk", "", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

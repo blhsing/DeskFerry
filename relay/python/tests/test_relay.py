@@ -4,7 +4,7 @@ import asyncio
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketState
 
-from app import AgentIdentity, RelayHub, app, room_id
+from app import AgentIdentity, RELAY_VERSION, RelayHub, app, room_id
 
 
 class FakeWebSocket:
@@ -59,6 +59,11 @@ def test_health_and_empty_status():
     health = client.get("/relay/health")
     assert health.status_code == 200
     assert health.json()["service"] == "DeskFerry.Relay"
+    assert health.json()["version"] == RELAY_VERSION
+
+    dashboard = client.get("/relay/")
+    assert dashboard.status_code == 200
+    assert f"v{RELAY_VERSION}" in dashboard.text
 
     status = client.get("/relay/status?room=unit-empty")
     assert status.status_code == 200
@@ -338,7 +343,7 @@ def test_v2_on_demand_pairing_and_busy_rejection():
         home = FakeWebSocket()
         agent = FakeWebSocket()
         control_task = asyncio.create_task(
-            hub.serve_agent_control("unit-v2", control, "work", "unit-agent", {"rdp"}, 1)
+            hub.serve_agent_control("unit-v2", control, "work", "unit-agent", {"screen"}, 1)
         )
         for _ in range(50):
             if control.json_messages:
@@ -346,27 +351,34 @@ def test_v2_on_demand_pairing_and_busy_rejection():
             await asyncio.sleep(0.01)
         assert control.json_messages[0]["type"] == "control-ready"
 
-        home_task = asyncio.create_task(hub.serve_v2_client("unit-v2", home, "home", True))
+        home_task = asyncio.create_task(
+            hub.serve_v2_client("unit-v2", home, "home", True, "", "screen")
+        )
         for _ in range(50):
             if len(control.json_messages) > 1:
                 break
             await asyncio.sleep(0.01)
         offer = control.json_messages[1]
         assert offer["type"] == "session-offer"
-        assert offer["service"] == "rdp"
+        assert offer["service"] == "screen"
         await control._received.put({"type": "accept", "session_id": offer["session_id"]})
         agent_task = asyncio.create_task(
-            hub.serve_agent_session("unit-v2", agent, "work-data", "unit-agent", offer["session_id"], True, "", "rdp")
+            hub.serve_agent_session(
+                "unit-v2", agent, "work-data", "unit-agent",
+                offer["session_id"], True, "", "screen",
+            )
         )
         for _ in range(50):
             if home.json_messages and agent.json_messages:
                 break
             await asyncio.sleep(0.01)
         assert home.json_messages[-1]["type"] == "session-ready"
+        assert home.json_messages[-1]["service"] == "screen"
         assert agent.json_messages[-1]["session_id"] == offer["session_id"]
+        assert agent.json_messages[-1]["service"] == "screen"
 
         busy = FakeWebSocket()
-        await hub.serve_v2_client("unit-v2", busy, "home-2", True)
+        await hub.serve_v2_client("unit-v2", busy, "home-2", True, "", "screen")
         assert busy.json_messages[-1]["type"] == "busy"
         status = (await hub.snapshot("unit-v2"))["rooms"][0]
         assert status["control_connections"] == 1

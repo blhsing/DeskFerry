@@ -34,6 +34,7 @@ if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("WEBSITE_INSTA
 builder.Services.AddSingleton<RelayHub>();
 
 var app = builder.Build();
+app.Logger.LogInformation("DeskFerry Azure relay version={Version}", RelayBuildInfo.Version);
 app.UseWebSockets(new WebSocketOptions
 {
     KeepAliveInterval = TimeSpan.FromSeconds(20)
@@ -45,6 +46,7 @@ app.MapGet("/relay/health", () => Results.Json(new
 {
     status = "ok",
     service = "DeskFerry.Relay",
+    version = RelayBuildInfo.Version,
     time = DateTimeOffset.UtcNow
 }));
 app.MapGet("/relay/icon.svg", () => Results.Text(IconSvg(), "image/svg+xml; charset=utf-8"));
@@ -134,7 +136,7 @@ static HashSet<string> ReadAgentServices(HttpRequest request)
     return (request.Headers["X-DeskFerry-Agent-Services"].FirstOrDefault() ?? "")
         .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
         .Select(value => value.ToLowerInvariant())
-        .Where(value => value is "rdp" or "winrm" or "smb")
+        .Where(value => value is "rdp" or "winrm" or "smb" or "screen")
         .ToHashSet(StringComparer.Ordinal);
 }
 
@@ -153,7 +155,7 @@ static string ReadRoomProof(HttpRequest request) =>
 static string ReadService(HttpRequest request)
 {
     var service = (request.Headers["X-DeskFerry-Service"].FirstOrDefault() ?? "").Trim().ToLowerInvariant();
-    return service is "winrm" or "smb" ? service : "rdp";
+    return service is "winrm" or "smb" or "screen" ? service : "rdp";
 }
 
 static string? ReadToken(HttpRequest request)
@@ -423,7 +425,7 @@ static string DashboardHtml(string room = "")
       <img class="brand-icon" src="/relay/icon.svg" alt="">
       <div class="brand-text">
         <h1>DeskFerry Relay</h1>
-        <div class="subtle">Azure WebSocket relay at <code>/relay/ws</code>. Status updates stream live over WebSocket.</div>
+        <div class="subtle">DeskFerry Relay v{{RelayBuildInfo.Version}} · Azure WebSocket relay at <code>/relay/ws</code>. Status updates stream live over WebSocket.</div>
       </div>
     </div>
     <div class="toolbar">
@@ -898,7 +900,7 @@ sealed class RelayHub
             _pending.TryRemove(key, out _);
             room.PendingEnded(service);
             pendingOpen = false;
-            var ready = new ControlMessage("session-ready", pending.Id, ProtocolVersion: ProtocolVersion);
+            var ready = new ControlMessage("session-ready", pending.Id, Service: service, ProtocolVersion: ProtocolVersion);
             var clientReady = typed
                 ? await SendV2Async(socket, ready, CancellationToken.None)
                 : await TrySendControlAsync(socket, room.Id, remote, "legacy-client", $"start {pending.Id}", CancellationToken.None);
@@ -2069,6 +2071,11 @@ sealed class ResumeSession
             return false;
         }
     }
+}
+
+static class RelayBuildInfo
+{
+    public const string Version = "0.10.0";
 }
 
 sealed class WaitingAgent

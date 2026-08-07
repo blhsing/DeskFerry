@@ -64,6 +64,7 @@ public class TunnelService extends Service {
     static final String ACTION_STATE = "com.blhsing.deskferry.home.STATE";
     static final String EXTRA_RELAY_URL = "relay_url";
     static final String EXTRA_LOCAL_PORT = "local_port";
+	static final String EXTRA_LOCAL_SMB_PORT = "local_smb_port";
     static final String EXTRA_PROXY = "proxy";
     static final String EXTRA_LOG_RETENTION_DAYS = "log_retention_days";
     static final String EXTRA_ROOM_PROOF = "room_proof";
@@ -75,7 +76,7 @@ public class TunnelService extends Service {
     private static final int RESUMABLE_MAX_BUFFER = 8 * 1024 * 1024;
     private static final int RESUMABLE_CHUNK_SIZE = 64 * 1024;
     private static final long RESUMABLE_WINDOW_MS = 5L * 60L * 1000L;
-    private static final int MAX_CONCURRENT_RDP_BRIDGES = 2;
+	private static final int MAX_CONCURRENT_BRIDGES_PER_SERVICE = 2;
     private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss", Locale.ROOT);
     private static final SimpleDateFormat DIAGNOSTIC_TIME_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.ROOT);
     private static final SimpleDateFormat DIAGNOSTIC_DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT);
@@ -87,7 +88,8 @@ public class TunnelService extends Service {
 
     private final Object lock = new Object();
     private final Set<BridgeSession> sessions = Collections.newSetFromMap(new ConcurrentHashMap<BridgeSession, Boolean>());
-    private final Semaphore bridgePermits = new Semaphore(MAX_CONCURRENT_RDP_BRIDGES, true);
+	private final Semaphore rdpBridgePermits = new Semaphore(MAX_CONCURRENT_BRIDGES_PER_SERVICE, true);
+	private final Semaphore smbBridgePermits = new Semaphore(MAX_CONCURRENT_BRIDGES_PER_SERVICE, true);
     private final Object networkLock = new Object();
     private final Object remoteLogLock = new Object();
     private final ArrayDeque<RemoteLogLine> remoteLogLines = new ArrayDeque<>();
@@ -96,6 +98,7 @@ public class TunnelService extends Service {
     private int remoteLogBytes;
     private OkHttpClient httpClient;
     private ServerSocket serverSocket;
+	private ServerSocket smbServerSocket;
     private Thread acceptThread;
     private Thread presenceThread;
     private Thread statusThread;
@@ -109,6 +112,7 @@ public class TunnelService extends Service {
     private volatile String relayUrl = RelayUrls.DEFAULT_RELAY_URL;
     private volatile List<String> relayUrls = Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL);
     private volatile int localPort = HomePrefs.DEFAULT_LOCAL_PORT;
+	private volatile int localSMBPort = HomePrefs.DEFAULT_LOCAL_SMB_PORT;
     private volatile String roomProof = "";
     private volatile int logRetentionDays = HomePrefs.DEFAULT_LOG_RETENTION_DAYS;
     private volatile String lastPrunedLogDate = "";
@@ -148,6 +152,9 @@ public class TunnelService extends Service {
         int requestedPort = intent != null && intent.hasExtra(EXTRA_LOCAL_PORT)
                 ? intent.getIntExtra(EXTRA_LOCAL_PORT, HomePrefs.DEFAULT_LOCAL_PORT)
                 : HomePrefs.loadLocalPort(this);
+		int requestedSMBPort = intent != null && intent.hasExtra(EXTRA_LOCAL_SMB_PORT)
+				? intent.getIntExtra(EXTRA_LOCAL_SMB_PORT, HomePrefs.DEFAULT_LOCAL_SMB_PORT)
+				: HomePrefs.loadLocalSMBPort(this);
         String requestedProxy = intent != null && intent.hasExtra(EXTRA_PROXY)
                 ? intent.getStringExtra(EXTRA_PROXY)
                 : HomePrefs.loadProxy(this);
@@ -158,7 +165,7 @@ public class TunnelService extends Service {
                 ? intent.getStringExtra(EXTRA_ROOM_PROOF)
                 : HomePrefs.loadSelectedRoomProof(this);
         startForeground(NOTIFICATION_ID, buildNotification());
-        startTunnel(requestedRelay, requestedPort, requestedProxy, requestedLogRetentionDays, requestedRoomProof);
+		startTunnel(requestedRelay, requestedPort, requestedSMBPort, requestedProxy, requestedLogRetentionDays, requestedRoomProof);
         return START_STICKY;
     }
 
@@ -177,7 +184,7 @@ public class TunnelService extends Service {
         return null;
     }
 
-    private void startTunnel(String requestedRelay, int requestedPort, String requestedProxy, int requestedLogRetentionDays,
+	private void startTunnel(String requestedRelay, int requestedPort, int requestedSMBPort, String requestedProxy, int requestedLogRetentionDays,
                              String requestedRoomProof) {
         synchronized (lock) {
             stopTunnelLocked();
@@ -185,6 +192,10 @@ public class TunnelService extends Service {
                 relayUrls = RelayUrls.normalizeRelayUrls(requestedRelay);
                 relayUrl = RelayUrls.joinRelayUrls(relayUrls);
                 localPort = sanitizePort(requestedPort);
+				localSMBPort = HomePrefs.sanitizeSMBPort(requestedSMBPort);
+				if (localSMBPort == localPort) {
+					throw new IllegalArgumentException("local SMB and RDP ports must be different");
+				}
                 roomProof = requestedRoomProof == null ? "" : requestedRoomProof.trim();
                 logRetentionDays = HomePrefs.sanitizeLogRetentionDays(requestedLogRetentionDays);
                 OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
@@ -195,15 +206,29 @@ public class TunnelService extends Service {
                 serverSocket = new ServerSocket();
                 serverSocket.setReuseAddress(true);
                 serverSocket.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), localPort));
+				if (!roomProof.isEmpty()) {
+					smbServerSocket = new ServerSocket();
+					smbServerSocket.setReuseAddress(true);
+					smbServerSocket.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), localSMBPort));
+				}
                 running = true;
                 activeConnections = 0;
                 totalConnections = 0;
                 updateState("Running", "Connecting", "Checking", null);
+				append("DeskFerry Home Agent version=" + BuildConfig.VERSION_NAME + " platform=android.");
                 append("Listening on " + RelayUrls.rdpAddress(localPort) + ".");
+				if (smbServerSocket != null) {
+					append("SMB forward listening on " + RelayUrls.rdpAddress(localSMBPort) + " for CX File Explorer.");
+				} else {
+					append("SMB forward disabled because this profile has no saved room password.");
+				}
                 append("Diagnostic log file: " + diagnosticLogFile().getAbsolutePath() + " retention_days=" + logRetentionDays + ".");
                 append("Relay primary: " + relayUrls.get(0) + (relayUrls.size() > 1 ? " (" + (relayUrls.size() - 1) + " fallback)" : "") + ".");
                 append("Proxy: " + ProxySettings.forLog(requestedProxy) + ".");
-                startAcceptLoop();
+				startAcceptLoop(serverSocket, "rdp");
+				if (smbServerSocket != null) {
+					startAcceptLoop(smbServerSocket, "smb");
+				}
                 startDiagnosticUploaders();
                 startPresenceLoop();
                 startStatusLoop();
@@ -324,6 +349,8 @@ public class TunnelService extends Service {
         diagnosticUploaders.clear();
         closeQuietly(serverSocket);
         serverSocket = null;
+		closeQuietly(smbServerSocket);
+		smbServerSocket = null;
         for (BridgeSession session : sessions) {
             session.close();
         }
@@ -331,24 +358,25 @@ public class TunnelService extends Service {
         activeConnections = 0;
     }
 
-    private void startAcceptLoop() {
-        acceptThread = new Thread(() -> {
+	private void startAcceptLoop(ServerSocket listener, String service) {
+		Thread thread = new Thread(() -> {
             while (running) {
                 try {
-                    Socket local = serverSocket.accept();
+					Socket local = listener.accept();
                     local.setTcpNoDelay(true);
-                    BridgeSession session = new BridgeSession(local);
+					BridgeSession session = new BridgeSession(local, service);
                     sessions.add(session);
-                    new Thread(session, "DeskFerry-Android-Bridge").start();
+					new Thread(session, "DeskFerry-Android-" + service.toUpperCase(Locale.ROOT) + "-Bridge").start();
                 } catch (IOException ex) {
                     if (running) {
-                        append("Local listener stopped: " + ex.getMessage());
+						append(service.toUpperCase(Locale.ROOT) + " local listener stopped: " + ex.getMessage());
                     }
                     return;
                 }
             }
-        }, "DeskFerry-Android-Accept");
-        acceptThread.start();
+		}, "DeskFerry-Android-" + service.toUpperCase(Locale.ROOT) + "-Accept");
+		if ("rdp".equals(service)) acceptThread = thread;
+		thread.start();
     }
 
     private void startPresenceLoop() {
@@ -512,7 +540,7 @@ public class TunnelService extends Service {
                 .header("Authorization", "Bearer " + token)
                 .header("X-DeskFerry-Role", role)
                 .header("X-TunnelDesktop-Role", role)
-                .header("User-Agent", "DeskFerry-Android/0.9.5");
+				.header("User-Agent", "DeskFerry-Android/" + BuildConfig.VERSION_NAME);
         if (!roomProof.isEmpty() && !"dashboard".equals(role)) {
             request.header("X-DeskFerry-Room-Proof", roomProof);
         }
@@ -540,6 +568,8 @@ public class TunnelService extends Service {
             next.running = running;
             next.relayUrl = relayUrl;
             next.rdpAddress = RelayUrls.rdpAddress(localPort);
+			next.smbAddress = RelayUrls.rdpAddress(localSMBPort);
+			next.smbEnabled = smbServerSocket != null;
             next.activeConnections = activeConnections;
             next.totalConnections = totalConnections;
             if (tunnel != null) {
@@ -895,6 +925,8 @@ public class TunnelService extends Service {
         boolean running;
         String relayUrl;
         String rdpAddress;
+		String smbAddress;
+		boolean smbEnabled;
         String tunnelStatus;
         String homeStatus;
         String workStatus;
@@ -908,6 +940,8 @@ public class TunnelService extends Service {
             state.running = false;
             state.relayUrl = RelayUrls.DEFAULT_RELAY_URL;
             state.rdpAddress = RelayUrls.rdpAddress(HomePrefs.DEFAULT_LOCAL_PORT);
+			state.smbAddress = RelayUrls.rdpAddress(HomePrefs.DEFAULT_LOCAL_SMB_PORT);
+			state.smbEnabled = false;
             state.tunnelStatus = "Stopped";
             state.homeStatus = "Offline";
             state.workStatus = "Unknown";
@@ -921,6 +955,8 @@ public class TunnelService extends Service {
             state.running = running;
             state.relayUrl = relayUrl;
             state.rdpAddress = rdpAddress;
+			state.smbAddress = smbAddress;
+			state.smbEnabled = smbEnabled;
             state.tunnelStatus = tunnelStatus;
             state.homeStatus = homeStatus;
             state.workStatus = workStatus;
@@ -934,6 +970,9 @@ public class TunnelService extends Service {
 
     private final class BridgeSession implements Runnable {
         private final Socket localSocket;
+		private final String service;
+		private final String serviceLabel;
+		private final Semaphore permits;
         private final AtomicBoolean closed = new AtomicBoolean(false);
         private final AtomicLong localToRelayBytes = new AtomicLong();
         private final AtomicLong localToRelayMessages = new AtomicLong();
@@ -952,8 +991,11 @@ public class TunnelService extends Service {
         private long sendEnd;
         private long receiveOffset;
 
-        BridgeSession(Socket localSocket) {
+		BridgeSession(Socket localSocket, String service) {
             this.localSocket = localSocket;
+			this.service = "smb".equals(service) ? "smb" : "rdp";
+			this.serviceLabel = this.service.toUpperCase(Locale.ROOT);
+			this.permits = "smb".equals(this.service) ? smbBridgePermits : rdpBridgePermits;
         }
 
         @Override
@@ -963,11 +1005,11 @@ public class TunnelService extends Service {
             activeConnections++;
             totalConnections++;
             updateState("Running", null, null, null);
-            append("RDP connection from " + remote + ".");
+			append(serviceLabel + " connection from " + remote + ".");
             try {
-                if (!bridgePermits.tryAcquire()) {
-                    append("RDP connection from " + remote + " queued behind active desktop/retry sockets.");
-                    bridgePermits.acquire();
+				if (!permits.tryAcquire()) {
+					append(serviceLabel + " connection from " + remote + " queued behind active/retry sockets.");
+					permits.acquire();
                 }
                 permitAcquired = true;
                 if (closed.get()) {
@@ -983,19 +1025,19 @@ public class TunnelService extends Service {
                         long dialStarted = SystemClock.elapsedRealtime();
                         connectRelay(candidate);
                         selectedRelay = candidate;
-                        append("Relay attempt selected relay=" + candidate + " service=rdp protocol_v2=true elapsed_ms=" + elapsedMillis(dialStarted) + ".");
+						append("Relay attempt selected relay=" + candidate + " service=" + service + " protocol_v2=true elapsed_ms=" + elapsedMillis(dialStarted) + ".");
                     } catch (Exception ex) {
                         lastError = candidate + ": " + ex.getMessage();
                         closeWebSocketOnly();
                         if (!closed.get()) {
-                            append("Relay attempt failed relay=" + candidate + " service=rdp result=" + relayAttemptResult(ex) + " error=" + ex.getMessage() + ".");
+							append("Relay attempt failed relay=" + candidate + " service=" + service + " result=" + relayAttemptResult(ex) + " error=" + ex.getMessage() + ".");
                         }
                         if (ex instanceof SessionRejectedException && ((SessionRejectedException) ex).terminal()) {
                             throw ex;
                         }
                         continue;
                     }
-                    append("Bridging local RDP connection from " + remote + " through " + candidate + ".");
+					append("Bridging local " + serviceLabel + " connection from " + remote + " through " + candidate + ".");
                     connected = true;
                     break;
                 }
@@ -1004,19 +1046,19 @@ public class TunnelService extends Service {
                 }
                 if (!connected && !closed.get()) {
                     recordTermination("all_relay_urls_failed error=" + emptyAs(lastError, "unknown"));
-                    append("RDP bridge failed: " + emptyAs(lastError, "all relay URLs failed"));
+					append(serviceLabel + " bridge failed: " + emptyAs(lastError, "all relay URLs failed"));
                 }
             } catch (Exception ex) {
                 recordTermination("bridge_error=" + throwableText(ex));
                 if (!closed.get()) {
-                    append("RDP bridge failed: " + ex.getMessage());
+					append(serviceLabel + " bridge failed: " + ex.getMessage());
                 }
             } finally {
                 if (permitAcquired) {
-                    bridgePermits.release();
+					permits.release();
                 }
                 close();
-                append("RDP session remote=" + remote + " relay=" + selectedRelay + " ended duration_ms=" + elapsedMillis(startedAt) + " termination=" + termination.get() + " local_to_relay_bytes=" + localToRelayBytes.get() + " local_to_relay_messages=" + localToRelayMessages.get() + " relay_to_local_bytes=" + relayToLocalBytes.get() + " relay_to_local_messages=" + relayToLocalMessages.get() + ".");
+				append(serviceLabel + " session remote=" + remote + " relay=" + selectedRelay + " ended duration_ms=" + elapsedMillis(startedAt) + " termination=" + termination.get() + " local_to_relay_bytes=" + localToRelayBytes.get() + " local_to_relay_messages=" + localToRelayMessages.get() + " relay_to_local_bytes=" + relayToLocalBytes.get() + " relay_to_local_messages=" + relayToLocalMessages.get() + ".");
             }
         }
 
@@ -1025,6 +1067,7 @@ public class TunnelService extends Service {
             AtomicBoolean started = new AtomicBoolean(false);
             AtomicReference<Throwable> failure = new AtomicReference<>();
             Request request = webSocketRequest(candidate, "client").newBuilder()
+					.header("X-DeskFerry-Service", service)
                     .header("X-DeskFerry-Resumable", "1")
                     .header("X-DeskFerry-Protocol", "2")
                     .build();
@@ -1060,6 +1103,12 @@ public class TunnelService extends Service {
                                     ready.countDown();
                                     return;
                                 }
+								String confirmedService = message.optString("service", "").trim();
+								if (!confirmedService.isEmpty() && !service.equals(confirmedService)) {
+									failure.set(new IOException("relay confirmed " + confirmedService + " instead of " + service));
+									ready.countDown();
+									return;
+								}
                                 sessionId = message.optString("session_id", "").trim();
                                 if (sessionId.isEmpty()) {
                                     failure.set(new IOException("relay session-ready result omitted the session ID"));
@@ -1208,7 +1257,7 @@ public class TunnelService extends Service {
                 webSocket = null;
                 resumeLock.notifyAll();
             }
-            append("RDP relay stream interrupted; retrying transparently: " + reason);
+			append(serviceLabel + " relay stream interrupted; retrying transparently: " + reason);
             startReconnectLoop();
         }
 
@@ -1232,7 +1281,7 @@ public class TunnelService extends Service {
                 pending.cancel();
             }
             if (!sessionId.isEmpty()) {
-                append("RDP relay stream interrupted; retrying transparently: " + reason);
+				append(serviceLabel + " relay stream interrupted; retrying transparently: " + reason);
                 startReconnectLoop();
             }
         }
@@ -1251,6 +1300,7 @@ public class TunnelService extends Service {
                         AtomicReference<Throwable> failure = new AtomicReference<>();
                         try {
                             Request request = webSocketRequest(selectedRelay, "resume").newBuilder()
+									.header("X-DeskFerry-Service", service)
                                     .header("X-DeskFerry-Session", sessionId)
                                     .header("X-DeskFerry-Session-Side", "client")
                                     .build();
@@ -1259,7 +1309,7 @@ public class TunnelService extends Service {
                             long remaining = Math.max(1, deadline - SystemClock.elapsedRealtime());
                             if (ready.await(remaining, TimeUnit.MILLISECONDS) && started.get() && failure.get() == null) {
                                 pendingResumeSocket = null;
-                                append("RDP relay stream resumed through " + selectedRelay + ".");
+								append(serviceLabel + " relay stream resumed through " + selectedRelay + ".");
                                 return;
                             }
                             pendingResumeSocket = null;
@@ -1267,7 +1317,7 @@ public class TunnelService extends Service {
                             Throwable resumeFailure = failure.get();
                             if (resumeFailure instanceof TerminalResumeException) {
                                 recordTermination("resume_rejected error=" + throwableText(resumeFailure));
-                                append("RDP relay session cannot resume; closing the stale local connection: " + throwableText(resumeFailure));
+								append(serviceLabel + " relay session cannot resume; closing the stale local connection: " + throwableText(resumeFailure));
                                 close();
                                 return;
                             }
@@ -1291,7 +1341,7 @@ public class TunnelService extends Service {
                         resumeLock.notifyAll();
                     }
                 }
-            }, "DeskFerry-RDP-Resume").start();
+			}, "DeskFerry-" + serviceLabel + "-Resume").start();
         }
 
         private void handleRelayPayload(WebSocket socket, byte[] payload) throws IOException {
@@ -1449,7 +1499,7 @@ public class TunnelService extends Service {
                     }
                 }
                 if (closed.get()) {
-                    throw new IOException("RDP bridge closed");
+					throw new IOException(serviceLabel + " bridge closed");
                 }
                 offset = sendEnd;
                 byte[] combined = Arrays.copyOf(sendBuffer, sendBuffer.length + payload.length);
@@ -1478,7 +1528,7 @@ public class TunnelService extends Service {
                     markTransportLost(socket, "data send failed");
                 }
             }
-            throw new IOException("RDP bridge closed");
+			throw new IOException(serviceLabel + " bridge closed");
         }
 
         private void recordTermination(String cause) {

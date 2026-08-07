@@ -2,7 +2,7 @@
 
 # DeskFerry
 
-DeskFerry is an outbound-only RDP, WinRM, and SMB rendezvous tunnel for a work PC that cannot accept inbound connections. The current architecture uses an Azure App Service relay at `https://test-officialwebsite.azurewebsites.net/relay/` and an OCI Always Free fallback relay at `http://217.142.228.117/relay/`. The Azure relay implementation is .NET, the OCI relay implementation is a lightweight Go service, and a protocol-compatible Python/FastAPI relay is also available under `relay/python/`. The work-side Windows service and the Windows, macOS, and Android home agents connect out to relay web services over WebSockets.
+DeskFerry is an outbound-only RDP, WinRM, SMB, and authenticated screen-view rendezvous tunnel for a work PC that cannot accept inbound connections. The current architecture uses an Azure App Service relay at `https://test-officialwebsite.azurewebsites.net/relay/` and an OCI Always Free fallback relay at `http://217.142.228.117/relay/`. The Azure relay implementation is .NET, the OCI relay implementation is a lightweight Go service, and a protocol-compatible Python/FastAPI relay is also available under `relay/python/`. The work-side Windows service and the Windows, macOS, and Android home agents connect out to relay web services over WebSockets.
 
 Home and Work profiles accept a room name plus one or more relay service base URLs in priority order. The first service is primary; later services are fallbacks. The agents append the profile room to each base URL at runtime. Existing full room-URL settings migrate automatically. New profiles are pre-filled with these two known relay services:
 
@@ -63,7 +63,7 @@ Home PC, Mac, or Android device
         |
         v
 DeskFerry home agent
-  Windows GUI, macOS CLI, or Android foreground service
+  Windows GUI, macOS control panel/CLI, or Android foreground service
   outbound WebSocket over HTTPS
         |
         v
@@ -194,6 +194,8 @@ To enable remote command execution, set the WinRM target to `127.0.0.1:5985`. Wi
 
 To enable Windows file sharing, set the SMB target to `127.0.0.1:445`, leave the SMB server alias at `deskferry-work`, and use a non-empty room password. The configurator registers that specific alias with the Windows Server service; restart the work PC once if the alias is not accepted immediately. Create and permission shares with the normal Windows **Advanced Sharing** controls. DeskFerry does not create shares or weaken their NTFS/share permissions.
 
+To enable screenshots and screen streaming without RDP, select **Allow authenticated screenshots and delta streaming**. This option requires a non-empty room password and is disabled by default. Each request launches a visible capture helper in the currently active Windows session; closing its window stops that share. Streaming sends one initial full PNG and then only changed 64-by-64 PNG tiles, including a no-payload heartbeat when the desktop is unchanged.
+
 The configurator also exposes every setup field and service action through its CLI. Run it from an elevated PowerShell session when the caller must wait for completion; otherwise it requests UAC elevation and returns after launching the elevated action. Supply passwords over standard input so they do not appear in the process command line:
 
 ```powershell
@@ -279,6 +281,8 @@ Start the Windows home app, choose or create a named destination, enter its room
 
 The app opens a friendly control panel and a notification-area icon. Enter the same room password once for the selected destination, then click `Connect` to start the local listeners and open Remote Desktop. The default RDP listener is `127.0.0.1:3390`, avoiding Windows' normal local RDP port `3389`. When a room credential is saved, the app also listens on `127.0.0.1:3391` for WinRM and opens one outbound WebSocket to the first reachable relay for each local connection.
 
+Click **Screen Viewer** to capture the Work desktop without opening RDP. Its separate viewer supports one-shot capture, 0.5/1/2/5-second delta streams, stop, fullscreen, and saving the reconstructed image as PNG. The Work configurator must have screen viewing enabled for the same protected room.
+
 The **WinRM Commands** panel executes a PowerShell command on the work host using the same Windows username and password as RDP. The first command opens an authenticated PowerShell Remoting session; later commands reuse that session to avoid repeating WinRM authentication and shell startup. The Home app closes the session after five idle minutes and whenever the destination, Windows login, tunnel configuration, or app lifecycle changes. A failed session is discarded so the next command creates a clean one; DeskFerry does not automatically replay a command whose completion is uncertain. Each named destination keeps its own username and optional shared login in Windows Credential Manager; **Save Windows Login** and **Forget Windows Login** affect RDP, WinRM, and the installed SMB alias for that destination. Passwords are never written to the JSON profile or command line. The work host must have WinRM enabled and allow the supplied account.
 
 Only one Windows home-app instance runs on the machine. Launching it again restores and focuses the existing control panel when it is in the same interactive session, instead of creating another tray icon, relay presence connection, or local listener.
@@ -301,7 +305,7 @@ chmod +x ./deskferry-home-macos-arm64
 ./deskferry-home-macos-arm64 -room workdesk -relay-base-url https://test-officialwebsite.azurewebsites.net/relay -relay-base-url http://217.142.228.117/relay -open-rdp
 ```
 
-Use `deskferry-home-macos-amd64` on Intel Macs. The macOS home agent runs in the foreground, listens on `127.0.0.1:3389` by default, keeps the relay dashboard presence socket connected, and opens an `.rdp` profile when `-open-rdp` is supplied. If your RDP app does not open automatically, connect it manually to:
+Use `deskferry-home-macos-amd64` on Intel Macs. Normal launch opens a local profile-oriented control panel and runs the Home agent in the foreground. It manages named destinations, ordered relay service base URLs, room credentials, the local RDP listener, relay status, and the same screen-view workflow as Windows. The viewer opens in a separate window with capture, delta stream intervals, stop, fullscreen, and PNG download controls. Use `-ui=false` for the legacy command-line workflow. The listener defaults to `127.0.0.1:3389`, and `-open-rdp` opens an `.rdp` profile. If your RDP app does not open automatically, connect it manually to:
 
 ```text
 127.0.0.1:3389
@@ -325,7 +329,11 @@ Open DeskFerry Home, keep the local RDP port at `3389`, and choose or create a n
 127.0.0.1:3389
 ```
 
+For SMB file access, keep **Local SMB port for CX File Explorer** at the non-root default `1445`, start the tunnel, and add an SMB location in CX File Explorer using host `127.0.0.1`, port `1445`, the Work share name, and the Windows account that can access that share. The selected profile must have a saved room password and the Work agent must enable its SMB target, normally `127.0.0.1:445`. Android is only forwarding loopback TCP to that Work SMB service; it is not hosting shares on the phone.
+
 The Android app keeps the tunnel alive through a foreground service while you switch to the RDP client. It maintains the same `home-agent` presence socket used by the relay dashboard and a `dashboard` WebSocket for live relay status updates. Its Proxy field accepts `system`, `direct`, `http://host:port`, or `https://host:port`; optional Basic credentials can be included in the proxy URL.
+
+The Android **Screen Viewer** is independent of the RDP tunnel. It provides one-shot capture, 0.5/1/2/5-second tile-delta streams, stop, immersive fullscreen, and PNG saving under `Pictures/DeskFerry`. A saved room password and Work-side screen-view opt-in are required.
 
 The foreground service observes Android's active network. A Wi-Fi/mobile handoff immediately replaces the relay transports so a resumable RDP stream can reattach before the separate RDP client times out its loopback socket. At most two local RDP bridge sockets run concurrently; additional reconnect/probe sockets wait locally instead of consuming every Work-agent session slot.
 
@@ -355,7 +363,7 @@ Roles:
 
 - `agent-control`: persistent work-side offer channel; it never carries tunnel payload.
 - `agent-session`: work-side data socket for one accepted v2 session.
-- `client`: home-side data socket and v2 session request for RDP, WinRM, or SMB.
+- `client`: home-side data socket and v2 session request for RDP, WinRM, SMB, or authenticated screen viewing.
 - `resume`: reattaches one side of a genuinely interrupted active session.
 - `agent`: legacy rollback-mode work-side idle socket.
 - `home-agent`: Windows, macOS, or Android home-agent status presence.
@@ -451,6 +459,7 @@ It:
 - Installs or updates the automatic `DeskFerryAgent` Windows service with the configured room and ordered relay service list.
 - Protects every configured room with one optional DPAPI-encrypted password and enables an optional WinRM target when a password is present.
 - Enables an optional loopback SMB target, registers the selected Windows SMB server alias, and preserves unrelated server aliases.
+- Enables authenticated screen capture and tile-delta streaming only when the user selects the explicit Work-side opt-in and supplies a room password.
 - Provides a separate room field plus add, update, delete, button reorder, and drag reorder controls for relay service base URLs.
 - Configures SCM restart recovery.
 - Starts, stops, restarts, uninstalls, refreshes status, opens the install folder, and runs `agent.exe -self-test`.
@@ -467,6 +476,7 @@ It:
 - Destination add, rename, delete, and selection controls, plus relay base URL add, update, delete, button reorder, and drag reorder controls.
 - A loopback RDP listener, normally `127.0.0.1:3390`.
 - A loopback WinRM listener, normally `127.0.0.1:3391`, plus an integrated PowerShell command panel.
+- A separate screen viewer for one-shot screenshots and bandwidth-efficient delta streams, with fullscreen and PNG saving.
 - Automatic Remote Desktop launch when the user clicks `Connect`.
 
 The Windows package also includes:
@@ -477,14 +487,17 @@ The Windows package also includes:
 
 ### macOS Home Agent
 
-`home-agent/macos/` is the macOS home-side command-line agent. It provides:
+`home-agent/macos/` is the macOS home-side control-panel and command-line agent. It provides:
 
+- A profile-oriented local control panel with the same room, ordered relay-base, connection, status, and screen-view workflows as Windows.
 - A foreground local RDP listener, normally `127.0.0.1:3389`.
 - One outbound `client` WebSocket per local RDP connection.
 - A persistent `home-agent` presence WebSocket while it runs.
 - A room name plus primary/fallback relay service base URLs for presence, status, and RDP stream connections.
 - `-status` for relay room status.
 - `-open-rdp` to write and open a local `.rdp` profile with the configured loopback target.
+- `-ui=false` to retain foreground command-line-only operation.
+- A separate screenshot/delta-stream viewer with interval, stop, fullscreen, and PNG-download controls.
 
 ### Android Home App
 
@@ -495,11 +508,13 @@ It provides:
 - A native Android control panel with a room field, inline-editable relay service base URL rows, local RDP port, status tiles, activity log, copy, dashboard, and RDP launch actions.
 - A foreground service so the tunnel can keep running while another app is active.
 - A loopback RDP listener, normally `127.0.0.1:3389`.
+- A password-gated loopback SMB forward, normally `127.0.0.1:1445`, for Android file managers such as CX File Explorer that accept a custom SMB port.
 - One outbound `client` WebSocket per local RDP connection.
 - A persistent `home-agent` presence WebSocket while the service is running.
 - A persistent `dashboard` WebSocket for real-time work-agent and stream status.
 - Named work-destination profiles, each with its own room and primary/fallback relay service base URL list for presence, status, and RDP stream connections.
 - Destination add, rename, delete, and selection controls, plus relay base URL add, inline edit, delete, button reorder, and drag reorder controls.
+- A native screen-viewer activity with one-shot screenshots, selectable tile-delta stream intervals, immersive fullscreen, and PNG saving.
 
 Good free Android RDP client options include Microsoft's Remote Desktop/Windows App client and the open-source FreeRDP-based aFreeRDP client. Configure the RDP client to connect to the DeskFerry local target shown in the Android app.
 
@@ -510,7 +525,7 @@ Good free Android RDP client options include Microsoft's Remote Desktop/Windows 
 - Room passwords are not placed in URLs, service command lines, relay logs, or relay status. The work configurator stores the password as a machine-scope DPAPI blob; home profiles store only the derived proof.
 - A room proof is a bearer credential. Use a strong, unique room password and prefer `https://` relays. The plain-HTTP OCI fallback cannot protect a captured proof from interception and replay.
 - The relay never dials the work PC or home PC.
-- The work agent only dials its configured RDP, WinRM, or SMB loopback target after a relay has paired an authenticated, same-room, same-service home connection.
+- The work agent only dials its configured RDP, WinRM, or SMB loopback target after a relay has paired an authenticated, same-room, same-service home connection. Screen capture is separate, password-required, opt-in, and visibly launches in the active user session.
 - WinRM is disabled unless the work configurator has both a room password and a WinRM target. Windows login credentials are supplied by the home user for each command and are not handled by the relay.
 - SMB is disabled unless the work configurator has both a room password and an SMB target. The Home SOCKS bridge rejects every destination except the configured synthetic work address on TCP port 445; it is not a general-purpose VPN or proxy.
 - SMB authentication and authorization remain Windows responsibilities. The Home app registers the selected destination's shared Windows login for the installed SMB alias in Windows Credential Manager; DeskFerry never places it in JSON or sends it through the relay, and it does not bypass share or NTFS permissions.
@@ -826,7 +841,7 @@ home-agent/windows/installer
                          Self-contained Windows Home setup/configurator GUI and CLI
 home-agent/windows/network-service
                          Restricted Wintun/tun2socks SMB network service
-home-agent/macos         macOS foreground CLI home agent
+home-agent/macos         macOS control-panel and foreground CLI home agent
 home-agent/android       Android foreground-service home app
 internal/tunnel          WebSocket, proxy, pipe, and role helpers
 build/                   build scripts
@@ -845,7 +860,7 @@ This repo currently contains:
 - Windows configurator GUI for installing and managing the work agent service.
 - Windows home app implemented as a friendly control-panel and tray deliverable.
 - Optional Windows Home virtual network adapter and self-contained installer for `\\deskferry-work\<share>` access.
-- macOS home agent implemented as a foreground CLI tunnel endpoint.
+- macOS home agent implemented as a profile control panel plus foreground CLI tunnel endpoint.
 - Android home app implemented as a foreground-service loopback tunnel endpoint.
 - Build scripts for Go binaries, the Windows Home installer, relay packages, and the Android APK.
 

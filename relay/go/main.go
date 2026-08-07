@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"deskferry/internal/buildinfo"
 	"deskferry/internal/tunnel"
 
 	"nhooyr.io/websocket"
@@ -38,6 +39,7 @@ const (
 	serviceRDP        = "rdp"
 	serviceWinRM      = "winrm"
 	serviceSMB        = "smb"
+	serviceScreen     = "screen"
 	agentControlRole  = "agent-control"
 	agentSessionRole  = "agent-session"
 	protocolV2        = "2"
@@ -68,7 +70,7 @@ func main() {
 		Handler:           newServer(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("DeskFerry Go relay listening on %s", *listen)
+	log.Printf("DeskFerry Go relay version=%s listening on %s", buildinfo.Version, *listen)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
@@ -107,6 +109,7 @@ func handleRelay(w http.ResponseWriter, r *http.Request, hub *RelayHub) {
 		writeJSON(w, map[string]any{
 			"status":  "ok",
 			"service": serviceName,
+			"version": buildinfo.Version,
 			"time":    time.Now().UTC(),
 		})
 	case rest == "/icon.svg":
@@ -351,7 +354,7 @@ func readAgentServices(r *http.Request) map[string]bool {
 	services := make(map[string]bool)
 	for _, value := range strings.Split(r.Header.Get(tunnel.HeaderAgentServices), ",") {
 		value = strings.ToLower(strings.TrimSpace(value))
-		if value == serviceRDP || value == serviceWinRM || value == serviceSMB {
+		if value == serviceRDP || value == serviceWinRM || value == serviceSMB || value == serviceScreen {
 			services[value] = true
 		}
 	}
@@ -384,7 +387,7 @@ func readService(r *http.Request) string {
 	if value == "" {
 		return serviceRDP
 	}
-	if value == serviceRDP || value == serviceWinRM || value == serviceSMB {
+	if value == serviceRDP || value == serviceWinRM || value == serviceSMB || value == serviceScreen {
 		return value
 	}
 	return ""
@@ -699,11 +702,11 @@ func (h *RelayHub) serveOnDemandClient(ctx context.Context, room *RelayRoom, c *
 	cleanupPending()
 	clientReady := false
 	if typed {
-		clientReady = sendV2Result(c, tunnel.MessageSessionReady, pending.ID, "")
+		clientReady = sendV2ServiceResult(c, tunnel.MessageSessionReady, pending.ID, service, "")
 	} else {
 		clientReady = sendControl(c, room.ID, remote, "legacy-client", startMessage+" "+pending.ID)
 	}
-	if !sendV2Result(agent.Conn, tunnel.MessageSessionReady, pending.ID, "") || !clientReady {
+	if !sendV2ServiceResult(agent.Conn, tunnel.MessageSessionReady, pending.ID, service, "") || !clientReady {
 		closeQuietly(agent.Conn, websocket.StatusNormalClosure, "peer unavailable")
 		return
 	}
@@ -773,9 +776,13 @@ func sortedServices(services map[string]bool) []string {
 }
 
 func sendV2Result(c *websocket.Conn, result, sessionID, reason string) bool {
+	return sendV2ServiceResult(c, result, sessionID, "", reason)
+}
+
+func sendV2ServiceResult(c *websocket.Conn, result, sessionID, service, reason string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return tunnel.WriteControlMessage(ctx, c, tunnel.ControlMessage{Type: result, SessionID: sessionID, ProtocolVersion: tunnel.ProtocolVersion2, Reason: reason}) == nil
+	return tunnel.WriteControlMessage(ctx, c, tunnel.ControlMessage{Type: result, SessionID: sessionID, Service: service, ProtocolVersion: tunnel.ProtocolVersion2, Reason: reason}) == nil
 }
 
 func rejectSessionClient(c *websocket.Conn, typed bool, result, sessionID, reason string) {
@@ -1856,7 +1863,7 @@ func dashboardHTML(room string) string {
       <img class="brand-icon" src="/relay/icon.svg" alt="">
       <div class="brand-text">
         <h1>DeskFerry Relay</h1>
-        <div class="subtle">Go WebSocket relay at <code>/relay/ws</code>. Status updates stream live over WebSocket.</div>
+        <div class="subtle">DeskFerry Relay v` + buildinfo.Version + ` · Go WebSocket relay at <code>/relay/ws</code>. Status updates stream live over WebSocket.</div>
       </div>
     </div>
     <div class="toolbar"><input id="roomUrl" readonly aria-label="Relay room URL"><button id="copyRoom" type="button">Copy</button></div>

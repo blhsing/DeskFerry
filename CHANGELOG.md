@@ -1,5 +1,17 @@
 # Release Notes
 
+## 0.10.0 - 2026-08-07
+
+- Added an authenticated, opt-in Work screen service that captures the interactive Windows desktop without opening RDP.
+- Added screenshot and periodic-stream viewers to the Windows, macOS, and Android Home agents, with popup/viewer windows, fullscreen display, and PNG saving.
+- Made streaming bandwidth-efficient: the Work agent sends one initial PNG and then only changed 64-by-64 image tiles, with empty heartbeats when the screen is unchanged.
+- Added a profile-oriented macOS Home control panel with the same relay-base, room, connection, status, and screen-view workflows as the Windows Home app while preserving `-ui=false` command-line operation.
+- Added an Android loopback SMB forward on configurable unprivileged port `1445` by default, allowing CX File Explorer to reach Work SMB shares without rooting the phone.
+- Extended the Go, Azure .NET, and Python relays with strict `screen` service routing and service confirmation, preventing older relays from silently treating screen requests as RDP.
+- Bumped the Android package to version code 1000 under the stable release signing path so it upgrades 0.9.4 and newer installations in place; the SemVer code scheme (`major * 10000 + minor * 100 + patch`) reserves code 10000 for a future 1.0.0 without collision.
+- Displayed version 0.10.0 in every Work/Home control surface and recorded it explicitly at each Work/Home agent startup for device and relay-side diagnostics.
+- Displayed version 0.10.0 on the Go, Azure .NET, and Python relay web dashboards and exposed it through each relay health response.
+
 ## 0.9.5 - 2026-08-06
 
 - Made Android react immediately to mobile/Wi-Fi network loss and handoff by replacing active relay transports instead of waiting for a stale WebSocket failure.

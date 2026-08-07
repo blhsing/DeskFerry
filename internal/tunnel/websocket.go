@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 
+	"deskferry/internal/buildinfo"
+
 	"nhooyr.io/websocket"
 )
 
@@ -97,9 +99,10 @@ const (
 	HeaderLogComponent = "X-DeskFerry-Log-Component"
 	HeaderLogInstance  = "X-DeskFerry-Log-Instance"
 
-	ServiceRDP   = "rdp"
-	ServiceWinRM = "winrm"
-	ServiceSMB   = "smb"
+	ServiceRDP    = "rdp"
+	ServiceWinRM  = "winrm"
+	ServiceSMB    = "smb"
+	ServiceScreen = "screen"
 
 	// Resumable data messages contain a 64 KiB payload plus framing. Keep a
 	// bounded amount of headroom above that protocol maximum.
@@ -344,7 +347,7 @@ func DialWebSocketWithHeaders(ctx context.Context, relayAddr, proxySpec, role, t
 	header.Set("Authorization", "Bearer "+token)
 	header.Set("X-DeskFerry-Role", role)
 	header.Set("X-TunnelDesktop-Role", role)
-	header.Set("User-Agent", "DeskFerry/0.2")
+	header.Set("User-Agent", "DeskFerry/"+buildinfo.Version)
 	for name, values := range extraHeaders {
 		for _, value := range values {
 			if strings.TrimSpace(value) != "" {
@@ -490,7 +493,7 @@ func writeProxyConnect(conn net.Conn, proxyURL *url.URL, address string) error {
 	builder.WriteString(address)
 	builder.WriteString(" HTTP/1.1\r\nHost: ")
 	builder.WriteString(address)
-	builder.WriteString("\r\nUser-Agent: DeskFerry/0.2\r\nProxy-Connection: Keep-Alive\r\n")
+	builder.WriteString("\r\nUser-Agent: DeskFerry/" + buildinfo.Version + "\r\nProxy-Connection: Keep-Alive\r\n")
 	if proxyURL.User != nil {
 		username := proxyURL.User.Username()
 		password, _ := proxyURL.User.Password()

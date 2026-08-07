@@ -14,11 +14,13 @@ final class HomePrefs {
     static final String PREFS = "deskferry_home";
     static final String PREF_RELAY_URL = "relay_url";
     static final String PREF_LOCAL_PORT = "local_port";
+	static final String PREF_LOCAL_SMB_PORT = "local_smb_port";
     static final String PREF_PROXY = "proxy";
     static final String PREF_LOG_RETENTION_DAYS = "log_retention_days";
     static final String PREF_DESTINATIONS = "destinations";
     static final String PREF_SELECTED_DESTINATION = "selected_destination";
     static final int DEFAULT_LOCAL_PORT = 3389;
+	static final int DEFAULT_LOCAL_SMB_PORT = 1445;
     static final int DEFAULT_LOG_RETENTION_DAYS = 7;
 
     private HomePrefs() {
@@ -31,6 +33,10 @@ final class HomePrefs {
     static int loadLocalPort(Context context) {
         return sanitizePort(prefs(context).getInt(PREF_LOCAL_PORT, DEFAULT_LOCAL_PORT));
     }
+
+	static int loadLocalSMBPort(Context context) {
+		return sanitizeSMBPort(prefs(context).getInt(PREF_LOCAL_SMB_PORT, DEFAULT_LOCAL_SMB_PORT));
+	}
 
     static String loadProxy(Context context) {
         return prefs(context).getString(PREF_PROXY, ProxySettings.DEFAULT);
@@ -136,6 +142,10 @@ final class HomePrefs {
     }
 
     static void saveDestinations(Context context, List<Destination> destinations, int selected, int port, String proxy, int logRetentionDays) {
+		saveDestinations(context, destinations, selected, port, proxy, logRetentionDays, loadLocalSMBPort(context));
+	}
+
+	static void saveDestinations(Context context, List<Destination> destinations, int selected, int port, String proxy, int logRetentionDays, int smbPort) {
         JSONArray array = new JSONArray();
         for (Destination destination : destinations) {
             JSONObject item = new JSONObject();
@@ -156,6 +166,7 @@ final class HomePrefs {
                 .putInt(PREF_SELECTED_DESTINATION, Math.max(0, selected))
                 .putString(PREF_RELAY_URL, selectedRelay)
                 .putInt(PREF_LOCAL_PORT, sanitizePort(port))
+				.putInt(PREF_LOCAL_SMB_PORT, sanitizeSMBPort(smbPort))
                 .putString(PREF_PROXY, proxy)
                 .putInt(PREF_LOG_RETENTION_DAYS, sanitizeLogRetentionDays(logRetentionDays))
                 .apply();
@@ -196,6 +207,10 @@ final class HomePrefs {
     static int sanitizePort(int port) {
         return port > 0 && port < 65536 ? port : DEFAULT_LOCAL_PORT;
     }
+
+	static int sanitizeSMBPort(int port) {
+		return port >= 1024 && port < 65536 ? port : DEFAULT_LOCAL_SMB_PORT;
+	}
 
     static int sanitizeLogRetentionDays(int days) {
         return days >= 1 && days <= 3650 ? days : DEFAULT_LOG_RETENTION_DAYS;

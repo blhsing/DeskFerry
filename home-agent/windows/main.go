@@ -28,6 +28,7 @@ import (
 	"golang.org/x/sys/windows"
 	"nhooyr.io/websocket"
 
+	"deskferry/internal/buildinfo"
 	"deskferry/internal/diaglog"
 	"deskferry/internal/homenetwork"
 	"deskferry/internal/remotelog"
@@ -207,6 +208,7 @@ func main() {
 	} else {
 		log.Printf("diagnostic log file: %s retention_days=%d", path, logRetentionDays)
 	}
+	log.Printf("DeskFerry Home Agent version=%s platform=windows", buildinfo.Version)
 
 	if !smokeTest {
 		instance, alreadyRunning, err := acquireNamedInstanceMutex(singleInstanceName)
@@ -270,7 +272,7 @@ func setHomeLogTargets(cfg config) {
 }
 
 func appTitle() string {
-	return "DeskFerry Home"
+	return "DeskFerry Home " + buildinfo.Version
 }
 
 func acquireNamedInstanceMutex(name string) (windows.Handle, bool, error) {
@@ -428,6 +430,7 @@ func (a *clientApp) run(smokeTest bool) error {
 											PushButton{Text: "Save Windows Login", MinSize: Size{Height: 30}, OnClicked: a.saveWindowsCredentials},
 											PushButton{Text: "Forget Windows Login", MinSize: Size{Height: 30}, OnClicked: a.forgetWindowsCredentials},
 											PushButton{Text: "Relay Dashboard", MinSize: Size{Height: 30}, OnClicked: a.openDashboard},
+											PushButton{Text: "Screen Viewer", MinSize: Size{Height: 30}, OnClicked: a.openScreenViewer},
 										},
 									},
 								},
@@ -2094,7 +2097,9 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 			attemptCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 			headers := http.Header{}
 			tunnel.AddProtocolV2Header(headers)
-			headers.Set(tunnel.HeaderResumable, "1")
+			if service != tunnel.ServiceScreen {
+				headers.Set(tunnel.HeaderResumable, "1")
+			}
 			if proof := cfg.roomProof(); proof != "" {
 				headers.Set(tunnel.HeaderRoomProof, proof)
 			}
@@ -2103,12 +2108,16 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 			sessionID := ""
 			v2 := false
 			if err == nil {
-				sessionID, v2, err = tunnel.AwaitSessionReadyCompatible(attemptCtx, ws)
+				if service == tunnel.ServiceScreen {
+					sessionID, v2, err = tunnel.AwaitSessionReadyCompatibleService(attemptCtx, ws, service)
+				} else {
+					sessionID, v2, err = tunnel.AwaitSessionReadyCompatible(attemptCtx, ws)
+				}
 			}
 			if err == nil {
 				cancel()
 				log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t via=%s elapsed=%s", relayAddr, service, v2, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
-				if sessionID != "" {
+				if sessionID != "" && service != tunnel.ServiceScreen {
 					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: sessionID, Side: "client", RoomProof: cfg.roomProof(), Service: service}), relayAddr, nil
 				}
 				return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil

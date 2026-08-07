@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"deskferry/internal/buildinfo"
 	"deskferry/internal/tunnel"
 	"nhooyr.io/websocket"
 )
@@ -85,6 +86,22 @@ func TestHealthAndEmptyStatus(t *testing.T) {
 	}
 	if health["service"] != serviceName {
 		t.Fatalf("service = %v", health["service"])
+	}
+	if health["version"] != buildinfo.Version {
+		t.Fatalf("version = %v", health["version"])
+	}
+
+	dashboard, err := http.Get(server.URL + "/relay/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dashboard.Body.Close()
+	dashboardBody, err := io.ReadAll(dashboard.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(dashboardBody, []byte("v"+buildinfo.Version)) {
+		t.Fatalf("dashboard does not display version %s", buildinfo.Version)
 	}
 
 	resp, err = http.Get(server.URL + "/relay/status?room=unit-empty")
@@ -219,7 +236,7 @@ func TestV2OnDemandSessionPairingAndBusyRejection(t *testing.T) {
 	controlHeaders := http.Header{}
 	tunnel.AddProtocolV2Header(controlHeaders)
 	controlHeaders.Set(tunnel.HeaderAgentInstance, "unit-agent")
-	controlHeaders.Set(tunnel.HeaderAgentServices, tunnel.ServiceRDP)
+	controlHeaders.Set(tunnel.HeaderAgentServices, tunnel.ServiceScreen)
 	controlHeaders.Set(tunnel.HeaderConcurrency, "1")
 	control, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleAgentControl, "", controlHeaders)
 	if err != nil {
@@ -233,7 +250,7 @@ func TestV2OnDemandSessionPairingAndBusyRejection(t *testing.T) {
 	clientHeaders := http.Header{}
 	tunnel.AddProtocolV2Header(clientHeaders)
 	clientHeaders.Set(tunnel.HeaderResumable, "1")
-	tunnel.AddServiceHeader(clientHeaders, tunnel.ServiceRDP)
+	tunnel.AddServiceHeader(clientHeaders, tunnel.ServiceScreen)
 	client, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleClient, "", clientHeaders)
 	if err != nil {
 		t.Fatal(err)
@@ -255,16 +272,17 @@ func TestV2OnDemandSessionPairingAndBusyRejection(t *testing.T) {
 	agentHeaders.Set(tunnel.HeaderAgentInstance, "unit-agent")
 	agentHeaders.Set(tunnel.HeaderSessionID, offer.SessionID)
 	agentHeaders.Set(tunnel.HeaderResumable, "1")
-	tunnel.AddServiceHeader(agentHeaders, tunnel.ServiceRDP)
+	tunnel.AddServiceHeader(agentHeaders, tunnel.ServiceScreen)
 	agent, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleAgentSession, "", agentHeaders)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tunnel.CloseWebSocket(agent)
-	if id, err := tunnel.AwaitSessionReady(ctx, agent); err != nil || id != offer.SessionID {
-		t.Fatalf("agent ready id=%q error=%v", id, err)
+	agentReady, err := tunnel.ReadControlMessage(ctx, agent)
+	if err != nil || agentReady.SessionID != offer.SessionID || agentReady.Service != tunnel.ServiceScreen {
+		t.Fatalf("agent ready=%#v error=%v", agentReady, err)
 	}
-	if id, v2, err := tunnel.AwaitSessionReadyCompatible(ctx, client); err != nil || !v2 || id != offer.SessionID {
+	if id, v2, err := tunnel.AwaitSessionReadyCompatibleService(ctx, client, tunnel.ServiceScreen); err != nil || !v2 || id != offer.SessionID {
 		t.Fatalf("client ready id=%q v2=%t error=%v", id, v2, err)
 	}
 

@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
+RELAY_VERSION = "0.10.0"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -27,6 +28,7 @@ SESSION_OFFER_SECONDS = 8
 
 logger = logging.getLogger("deskferry.relay")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger.info("DeskFerry Python relay version=%s", RELAY_VERSION)
 
 app = FastAPI(title="DeskFerry Python Relay", docs_url=None, redoc_url=None)
 
@@ -141,7 +143,7 @@ def read_agent_services(websocket: WebSocket) -> set[str]:
     return {
         value.strip().lower()
         for value in websocket.headers.get("x-deskferry-agent-services", "").split(",")
-        if value.strip().lower() in {"rdp", "winrm", "smb"}
+        if value.strip().lower() in {"rdp", "winrm", "smb", "screen"}
     }
 
 
@@ -159,7 +161,7 @@ def read_room_proof(websocket: WebSocket) -> str:
 
 def read_service(websocket: WebSocket) -> str:
     service = websocket.headers.get("x-deskferry-service", "").strip().lower()
-    return service if service in {"winrm", "smb"} else "rdp"
+    return service if service in {"winrm", "smb", "screen"} else "rdp"
 
 
 def clean_session_value(value: str | None) -> str:
@@ -867,7 +869,7 @@ class RelayHub:
             self._pending.pop(key, None)
             await room.pending_ended(service)
             pending_open = False
-            ready = {"type": "session-ready", "session_id": pending.id}
+            ready = {"type": "session-ready", "session_id": pending.id, "service": service}
             client_ready = await send_v2(websocket, ready) if typed else await send_control(websocket, f"start {pending.id}", "legacy-client", room.id, remote)
             if not await send_v2(agent.websocket, ready) or not client_ready:
                 await close_quietly(agent.websocket)
@@ -1161,7 +1163,7 @@ async def dashboard() -> HTMLResponse:
 
 @app.get("/relay/health")
 async def health() -> JSONResponse:
-    return JSONResponse({"status": "ok", "service": SERVICE_NAME, "time": json_time(utc_now())})
+    return JSONResponse({"status": "ok", "service": SERVICE_NAME, "version": RELAY_VERSION, "time": json_time(utc_now())})
 
 
 @app.get("/relay/icon.svg", include_in_schema=False)
@@ -1428,7 +1430,7 @@ def dashboard_html(room: str) -> str:
       <img class="brand-icon" src="/relay/icon.svg" alt="">
       <div class="brand-text">
         <h1>DeskFerry Relay</h1>
-        <div class="subtle">Python WebSocket relay at <code>/relay/ws</code>. Status updates stream live over WebSocket.</div>
+        <div class="subtle">DeskFerry Relay v{RELAY_VERSION} · Python WebSocket relay at <code>/relay/ws</code>. Status updates stream live over WebSocket.</div>
       </div>
     </div>
     <div class="toolbar">

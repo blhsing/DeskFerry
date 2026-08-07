@@ -60,6 +60,7 @@ public class MainActivity extends Activity {
     private EditText roomNameField;
     private Button relayAddButton;
     private EditText localPortField;
+	private EditText localSMBPortField;
     private EditText roomPasswordField;
     private Button clearRoomPasswordButton;
     private EditText proxyField;
@@ -68,11 +69,13 @@ public class MainActivity extends Activity {
     private TextView workStatus;
     private TextView homeStatus;
     private TextView rdpAddress;
+	private TextView smbAddress;
     private TextView activeStatus;
     private TextView messageView;
     private TextView logView;
     private Button startButton;
     private String latestRdpAddress = RelayUrls.rdpAddress(HomePrefs.DEFAULT_LOCAL_PORT);
+	private String latestSMBAddress = RelayUrls.rdpAddress(HomePrefs.DEFAULT_LOCAL_SMB_PORT);
     private int draggedRelayIndex = -1;
     private boolean relayRowsEnabled = true;
 
@@ -124,7 +127,7 @@ public class MainActivity extends Activity {
         TextView title = label("DeskFerry Home", 28, "#1F2933", true);
         title.setLetterSpacing(0);
         header.addView(title);
-        TextView subtitle = label("Android RDP tunnel endpoint", 14, "#65717D", false);
+		TextView subtitle = label("Android RDP/SMB Home agent - v" + BuildConfig.VERSION_NAME, 14, "#65717D", false);
         subtitle.setPadding(0, dp(3), 0, 0);
         header.addView(subtitle);
 
@@ -203,6 +206,10 @@ public class MainActivity extends Activity {
         localPortField.setInputType(InputType.TYPE_CLASS_NUMBER);
         configCard.addView(localPortField, matchWrap());
 
+		localSMBPortField = field("Local SMB port for CX File Explorer");
+		localSMBPortField.setInputType(InputType.TYPE_CLASS_NUMBER);
+		configCard.addView(localSMBPortField, matchWrap());
+
         LinearLayout passwordRow = new LinearLayout(this);
         passwordRow.setOrientation(LinearLayout.HORIZONTAL);
         roomPasswordField = field("Room password (blank keeps saved credential)");
@@ -232,6 +239,9 @@ public class MainActivity extends Activity {
         rdpAddress = label(RelayUrls.rdpAddress(HomePrefs.DEFAULT_LOCAL_PORT), 20, "#1F2933", true);
         rdpAddress.setPadding(0, dp(10), 0, 0);
         configCard.addView(rdpAddress);
+		smbAddress = label("SMB: " + RelayUrls.rdpAddress(HomePrefs.DEFAULT_LOCAL_SMB_PORT), 16, "#44515C", true);
+		smbAddress.setPadding(0, dp(5), 0, 0);
+		configCard.addView(smbAddress);
 
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.VERTICAL);
@@ -255,6 +265,15 @@ public class MainActivity extends Activity {
         dashboard.setOnClickListener(v -> openDashboard());
         row2.addView(dashboard, weightedButton());
         actions.addView(row2);
+
+		LinearLayout row3 = actionRow();
+		Button screenViewer = secondaryButton("Screen Viewer");
+		screenViewer.setOnClickListener(v -> openScreenViewer());
+		row3.addView(screenViewer, weightedButton());
+		Button copySMB = secondaryButton("Copy SMB Target");
+		copySMB.setOnClickListener(v -> copySMBTarget());
+		row3.addView(copySMB, weightedButton());
+		actions.addView(row3);
 
         LinearLayout statusCard = card();
         statusCard.setOrientation(LinearLayout.VERTICAL);
@@ -307,6 +326,7 @@ public class MainActivity extends Activity {
         roomNameField.setText(destinations.get(selectedDestination).room);
         roomPasswordField.setText("");
         localPortField.setText(String.valueOf(HomePrefs.loadLocalPort(this)));
+		localSMBPortField.setText(String.valueOf(HomePrefs.loadLocalSMBPort(this)));
         proxyField.setText(HomePrefs.loadProxy(this));
         logRetentionDaysField.setText(String.valueOf(HomePrefs.loadLogRetentionDays(this)));
     }
@@ -325,8 +345,9 @@ public class MainActivity extends Activity {
                 roomPasswordField.setText("");
             }
         }
-        HomePrefs.saveDestinations(this, destinations, selectedDestination, port, proxy,
-                parseLogRetentionDays(logRetentionDaysField.getText().toString()));
+		HomePrefs.saveDestinations(this, destinations, selectedDestination, port, proxy,
+				parseLogRetentionDays(logRetentionDaysField.getText().toString()),
+				parseSMBPort(localSMBPortField.getText().toString()));
     }
 
     private void refreshDestinationSpinner() {
@@ -477,12 +498,14 @@ public class MainActivity extends Activity {
         int port;
         String proxy;
         int logRetentionDays;
+		int smbPort;
         try {
             normalizedRelayBases = normalizedRelayUrlsFromRows();
             relayUrl = RelayUrls.joinRelayUrls(RelayUrls.relayRoomUrls(normalizedRelayBases, roomNameField.getText().toString()));
             port = parsePort(localPortField.getText().toString());
             proxy = ProxySettings.normalize(proxyField.getText().toString());
             logRetentionDays = parseLogRetentionDays(logRetentionDaysField.getText().toString());
+			smbPort = parseSMBPort(localSMBPortField.getText().toString());
         } catch (Exception ex) {
             Toast.makeText(this, ex.getMessage(), Toast.LENGTH_LONG).show();
             return;
@@ -491,6 +514,7 @@ public class MainActivity extends Activity {
         localPortField.setText(String.valueOf(port));
         proxyField.setText(proxy);
         logRetentionDaysField.setText(String.valueOf(logRetentionDays));
+		localSMBPortField.setText(String.valueOf(smbPort));
         savePreferences(relayUrl, port, proxy);
         String roomProof = destinations.isEmpty() ? "" : destinations.get(selectedDestination).roomProof;
 
@@ -498,6 +522,7 @@ public class MainActivity extends Activity {
                 .setAction(TunnelService.ACTION_START)
                 .putExtra(TunnelService.EXTRA_RELAY_URL, relayUrl)
                 .putExtra(TunnelService.EXTRA_LOCAL_PORT, port)
+				.putExtra(TunnelService.EXTRA_LOCAL_SMB_PORT, smbPort)
                 .putExtra(TunnelService.EXTRA_PROXY, proxy)
                 .putExtra(TunnelService.EXTRA_ROOM_PROOF, roomProof)
                 .putExtra(TunnelService.EXTRA_LOG_RETENTION_DAYS, logRetentionDays);
@@ -524,13 +549,26 @@ public class MainActivity extends Activity {
         return days;
     }
 
+	private int parseSMBPort(String value) {
+		int port = Integer.parseInt(value.trim());
+		if (port < 1024 || port > 65535) {
+			throw new IllegalArgumentException("Local SMB port must be 1024-65535 so it works without root.");
+		}
+		if (port == parsePortOrDefault(localPortField.getText().toString())) {
+			throw new IllegalArgumentException("Local SMB and RDP ports must be different.");
+		}
+		return port;
+	}
+
     private void renderState(TunnelService.State state) {
         latestRdpAddress = state.rdpAddress;
+		latestSMBAddress = state.smbAddress;
         tunnelStatus.setText(state.tunnelStatus);
         workStatus.setText(state.workStatus);
         homeStatus.setText(state.homeStatus);
         activeStatus.setText(state.activeConnections + " active");
         rdpAddress.setText(state.rdpAddress);
+		smbAddress.setText("SMB: " + state.smbAddress + (state.smbEnabled ? "" : " (save a room password to enable)"));
         messageView.setText(state.lastMessage);
         logView.setText(state.log);
         startButton.setText(state.running ? "Stop Tunnel" : "Start Tunnel");
@@ -540,6 +578,7 @@ public class MainActivity extends Activity {
         destinationRenameButton.setEnabled(!state.running);
         destinationDeleteButton.setEnabled(!state.running && destinations.size() > 1);
         localPortField.setEnabled(!state.running);
+		localSMBPortField.setEnabled(!state.running);
         proxyField.setEnabled(!state.running);
         logRetentionDaysField.setEnabled(!state.running);
         roomPasswordField.setEnabled(!state.running);
@@ -552,6 +591,12 @@ public class MainActivity extends Activity {
         clipboard.setPrimaryClip(ClipData.newPlainText("DeskFerry RDP target", latestRdpAddress));
         Toast.makeText(this, "Copied " + latestRdpAddress, Toast.LENGTH_SHORT).show();
     }
+
+	private void copySMBTarget() {
+		ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+		clipboard.setPrimaryClip(ClipData.newPlainText("DeskFerry SMB target", latestSMBAddress));
+		Toast.makeText(this, "Copied " + latestSMBAddress, Toast.LENGTH_SHORT).show();
+	}
 
     private void openRdpApp() {
         Uri uri = Uri.parse("rdp://" + latestRdpAddress);
@@ -574,6 +619,31 @@ public class MainActivity extends Activity {
         }
         startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(RelayUrls.dashboardUrl(relayUrl))));
     }
+
+	private void openScreenViewer() {
+		try {
+			List<String> normalizedRelayBases = normalizedRelayUrlsFromRows();
+			String relayUrl = RelayUrls.joinRelayUrls(RelayUrls.relayRoomUrls(
+					normalizedRelayBases, roomNameField.getText().toString()));
+			String proxy = ProxySettings.normalize(proxyField.getText().toString());
+			int port = parsePort(localPortField.getText().toString());
+			setRelayUrls(normalizedRelayBases);
+			proxyField.setText(proxy);
+			savePreferences(relayUrl, port, proxy);
+			String proof = destinations.get(selectedDestination).roomProof;
+			if (proof == null || proof.isEmpty()) {
+				throw new IllegalArgumentException("Save a room password for this destination before viewing its screen.");
+			}
+			Intent intent = new Intent(this, ScreenViewerActivity.class)
+					.putExtra(ScreenViewerActivity.EXTRA_RELAY_URLS, relayUrl)
+					.putExtra(ScreenViewerActivity.EXTRA_PROXY, proxy)
+					.putExtra(ScreenViewerActivity.EXTRA_ROOM_PROOF, proof)
+					.putExtra(ScreenViewerActivity.EXTRA_DESTINATION, destinations.get(selectedDestination).name);
+			startActivity(intent);
+		} catch (Exception ex) {
+			Toast.makeText(this, ex.getMessage(), Toast.LENGTH_LONG).show();
+		}
+	}
 
     private void setRelayUrls(List<String> values) {
         relayUrls.clear();

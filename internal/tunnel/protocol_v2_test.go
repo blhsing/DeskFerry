@@ -14,7 +14,7 @@ func TestValidateSessionOffer(t *testing.T) {
 		Type:            MessageSessionOffer,
 		SessionID:       "0123456789abcdef0123456789abcdef",
 		Room:            "workdesk",
-		Service:         ServiceWinRM,
+		Service:         ServiceScreen,
 		AgentID:         "agent-1",
 		CreatedAt:       now,
 		ExpiresAt:       now.Add(8 * time.Second),

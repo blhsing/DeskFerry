@@ -123,6 +123,17 @@ func AwaitSessionReady(ctx context.Context, c *websocket.Conn) (string, error) {
 // "start" control frame. It allows upgraded Home clients to operate through a
 // relay that is still paired with rollback-mode work-agent slots.
 func AwaitSessionReadyCompatible(ctx context.Context, c *websocket.Conn) (string, bool, error) {
+	return awaitSessionReadyCompatibleService(ctx, c, "")
+}
+
+// AwaitSessionReadyCompatibleService additionally requires a protocol-v2
+// relay to echo the requested service. New services use this to avoid being
+// silently mapped to RDP by an older relay.
+func AwaitSessionReadyCompatibleService(ctx context.Context, c *websocket.Conn, expectedService string) (string, bool, error) {
+	return awaitSessionReadyCompatibleService(ctx, c, strings.ToLower(strings.TrimSpace(expectedService)))
+}
+
+func awaitSessionReadyCompatibleService(ctx context.Context, c *websocket.Conn, expectedService string) (string, bool, error) {
 	for {
 		typ, payload, err := c.Read(ctx)
 		if err != nil {
@@ -133,6 +144,9 @@ func AwaitSessionReadyCompatible(ctx context.Context, c *websocket.Conn) (string
 		}
 		fields := strings.Fields(string(payload))
 		if len(fields) > 0 && fields[0] == webSocketStartMessage {
+			if expectedService != "" {
+				return "", false, fmt.Errorf("relay does not confirm support for service %q", expectedService)
+			}
 			if len(fields) > 1 {
 				return cleanProtocolSessionID(fields[1]), false, nil
 			}
@@ -144,6 +158,10 @@ func AwaitSessionReadyCompatible(ctx context.Context, c *websocket.Conn) (string
 		}
 		message.Type = strings.ToLower(strings.TrimSpace(message.Type))
 		message.SessionID = strings.ToLower(strings.TrimSpace(message.SessionID))
+		message.Service = strings.ToLower(strings.TrimSpace(message.Service))
+		if message.Type == MessageSessionReady && expectedService != "" && message.Service != expectedService {
+			return "", true, fmt.Errorf("relay confirmed service %q instead of %q", message.Service, expectedService)
+		}
 		return sessionResult(message)
 	}
 }
@@ -174,7 +192,7 @@ func ValidateSessionOffer(message ControlMessage, room, agentID string, now time
 	if message.AgentID != "" && message.AgentID != agentID {
 		return errors.New("session offer agent identity does not match")
 	}
-	if message.Service != ServiceRDP && message.Service != ServiceWinRM && message.Service != ServiceSMB {
+	if message.Service != ServiceRDP && message.Service != ServiceWinRM && message.Service != ServiceSMB && message.Service != ServiceScreen {
 		return fmt.Errorf("session offer has unsupported service %q", message.Service)
 	}
 	if message.ExpiresAt.IsZero() || !now.Before(message.ExpiresAt) {

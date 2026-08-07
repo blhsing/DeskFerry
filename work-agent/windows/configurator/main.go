@@ -27,6 +27,7 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
 
+	"deskferry/internal/buildinfo"
 	"deskferry/internal/tunnel"
 	"deskferry/internal/winsecret"
 )
@@ -55,6 +56,7 @@ type app struct {
 	roomName        *walk.LineEdit
 	roomPassword    *walk.LineEdit
 	clearPassword   *walk.CheckBox
+	screenView      *walk.CheckBox
 	winrmAddr       *walk.LineEdit
 	smbAddr         *walk.LineEdit
 	smbAlias        *walk.LineEdit
@@ -76,6 +78,7 @@ type actionOptions struct {
 	WinRMAddr         string
 	SMBAddr           string
 	SMBAlias          string
+	ScreenView        bool
 }
 
 type serviceInfo struct {
@@ -123,8 +126,8 @@ func (a *app) run(smokeTest bool) error {
 	window := MainWindow{
 		AssignTo: &a.mw,
 		Title:    appTitle(),
-		MinSize:  Size{Width: 760, Height: 520},
-		Size:     Size{Width: 860, Height: 620},
+		MinSize:  Size{Width: 760, Height: 560},
+		Size:     Size{Width: 860, Height: 680},
 		Layout:   VBox{Margins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10}, Spacing: 8},
 		Visible:  !smokeTest,
 		Children: []Widget{
@@ -179,7 +182,9 @@ func (a *app) run(smokeTest bool) error {
 					Label{Text: "Room password"},
 					LineEdit{AssignTo: &a.roomPassword, PasswordMode: true, CueBanner: "blank keeps the current password", ColumnSpan: 2},
 					Label{Text: "Password options"},
-					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM and SMB)", ColumnSpan: 2},
+					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM, SMB, and screen viewing)", ColumnSpan: 2},
+					Label{Text: "Screen viewing"},
+					CheckBox{AssignTo: &a.screenView, Text: "Allow authenticated screenshots and delta streaming", ColumnSpan: 2},
 					Label{Text: "WinRM target"},
 					LineEdit{AssignTo: &a.winrmAddr, Text: "127.0.0.1:5985", CueBanner: "blank disables WinRM", ColumnSpan: 2},
 					Label{Text: "SMB target"},
@@ -231,7 +236,7 @@ func (a *app) run(smokeTest bool) error {
 }
 
 func appTitle() string {
-	return "DeskFerry Agent Configurator"
+	return "DeskFerry Agent Configurator " + buildinfo.Version
 }
 
 func (a *app) browseInstallDir() {
@@ -531,6 +536,9 @@ func (a *app) runSelfTest() {
 		if opts.SMBAddr != "" {
 			args = append(args, "-smb", opts.SMBAddr)
 		}
+		if opts.ScreenView {
+			args = append(args, "-screen-view")
+		}
 		cmd := exec.Command(exePath, args...)
 		var output bytes.Buffer
 		cmd.Stdout = &output
@@ -645,6 +653,7 @@ func (a *app) options() actionOptions {
 		WinRMAddr:         strings.TrimSpace(a.winrmAddr.Text()),
 		SMBAddr:           strings.TrimSpace(a.smbAddr.Text()),
 		SMBAlias:          strings.TrimSpace(a.smbAlias.Text()),
+		ScreenView:        a.screenView.Checked(),
 	}
 }
 
@@ -700,6 +709,7 @@ func runElevatedAction(args []string) {
 	winrmAddr := fs.String("winrm", "", "WinRM target")
 	smbAddr := fs.String("smb", "", "SMB target")
 	smbAlias := fs.String("smb-alias", defaultSMBAlias, "SMB server alias")
+	screenView := fs.Bool("screen-view", false, "allow authenticated screen viewing")
 	noDialog := fs.Bool("no-dialog", false, "write the result to the console instead of displaying a dialog")
 	if err := fs.Parse(args); err != nil {
 		reportElevatedResult(*noDialog, "", err)
@@ -714,6 +724,7 @@ func runElevatedAction(args []string) {
 		WinRMAddr:         *winrmAddr,
 		SMBAddr:           *smbAddr,
 		SMBAlias:          *smbAlias,
+		ScreenView:        *screenView,
 	})
 	if err != nil {
 		reportElevatedResult(*noDialog, "", err)
@@ -771,6 +782,7 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error)
 	fs.StringVar(&opts.WinRMAddr, "winrm", "", "WinRM target in host:port form")
 	fs.StringVar(&opts.SMBAddr, "smb", "", "SMB target in host:port form")
 	fs.StringVar(&opts.SMBAlias, "smb-alias", defaultSMBAlias, "SMB server alias")
+	fs.BoolVar(&opts.ScreenView, "screen-view", false, "allow authenticated screen viewing")
 	if err := fs.Parse(args); err != nil {
 		return "", opts, err
 	}
@@ -789,7 +801,7 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error)
 		installOnly := map[string]bool{
 			"agent": true, "relay-url": true, "relay-base-url": true, "room": true, "room-password-stdin": true,
 			"room-password-blob": true, "clear-room-password": true,
-			"winrm": true, "smb": true, "smb-alias": true,
+			"winrm": true, "smb": true, "smb-alias": true, "screen-view": true,
 		}
 		if *action != "uninstall" {
 			installOnly["install-dir"] = true
@@ -903,6 +915,7 @@ func printCLIUsage(output io.Writer) {
 	fmt.Fprintln(output, "  -winrm HOST:PORT           WinRM target")
 	fmt.Fprintln(output, "  -smb HOST:PORT             SMB target")
 	fmt.Fprintln(output, "  -smb-alias NAME            SMB server alias (default deskferry-work)")
+	fmt.Fprintln(output, "  -screen-view               Allow authenticated screenshots and delta streaming")
 	fmt.Fprintln(output, "Omitting all password flags preserves the installed credential.")
 }
 
@@ -969,8 +982,8 @@ func installOrUpdate(opts actionOptions) (string, error) {
 	} else if opts.ClearRoomPassword {
 		_ = os.Remove(passwordDest)
 	}
-	if (opts.WinRMAddr != "" || opts.SMBAddr != "") && !fileExists(passwordDest) {
-		return "", errors.New("WinRM and SMB require a room password")
+	if (opts.WinRMAddr != "" || opts.SMBAddr != "" || opts.ScreenView) && !fileExists(passwordDest) {
+		return "", errors.New("WinRM, SMB, and screen viewing require a room password")
 	}
 	args := []string{"-service", "-relay-url", opts.RelayURL}
 	if fileExists(passwordDest) {
@@ -981,6 +994,9 @@ func installOrUpdate(opts actionOptions) (string, error) {
 	}
 	if opts.SMBAddr != "" {
 		args = append(args, "-smb", opts.SMBAddr)
+	}
+	if opts.ScreenView {
+		args = append(args, "-screen-view")
 	}
 	if err := configureSMBAlias(installDir, opts.SMBAlias, opts.SMBAddr != ""); err != nil {
 		return "", err
@@ -1123,7 +1139,7 @@ func serviceConfig(exePath string, args []string) mgr.Config {
 		ErrorControl:   mgr.ErrorNormal,
 		BinaryPathName: serviceBinaryPath(exePath, args),
 		DisplayName:    serviceDisplayName,
-		Description:    "Work-side RDP, WinRM, and SMB backend for DeskFerry.",
+		Description:    "Work-side RDP, WinRM, SMB, and optional screen-view backend for DeskFerry.",
 	}
 }
 
@@ -1240,6 +1256,9 @@ func relaunchElevatedAction(action string, opts actionOptions, noDialog bool) er
 	}
 	if opts.SMBAlias != "" {
 		args = append(args, "-smb-alias", opts.SMBAlias)
+	}
+	if opts.ScreenView {
+		args = append(args, "-screen-view")
 	}
 	temporaryPasswordBlob := ""
 	if opts.ClearRoomPassword {
