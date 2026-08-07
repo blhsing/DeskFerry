@@ -19,6 +19,24 @@ type helperConn struct {
 	process windows.Handle
 }
 
+const screenResponseDrainTimeout = 30 * time.Second
+
+// screenRelayConn keeps the relay read side open after the capture helper has
+// finished writing. The Home app closes its socket after consuming a single
+// screenshot or an error frame. Closing the WebSocket immediately on helper
+// EOF can cancel a just-written final frame before the relay forwards it.
+type screenRelayConn struct {
+	net.Conn
+}
+
+func (c *screenRelayConn) CloseWrite() error {
+	return c.SetReadDeadline(time.Now().Add(screenResponseDrainTimeout))
+}
+
+func drainScreenResponse(conn net.Conn) net.Conn {
+	return &screenRelayConn{Conn: conn}
+}
+
 func launchScreenCaptureHelper() (net.Conn, error) {
 	token, sessionID, err := activeInteractiveUserToken()
 	if err != nil {

@@ -8,16 +8,24 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Matrix;
+import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
+import android.text.InputType;
 import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
+import android.view.inputmethod.EditorInfo;
+import android.widget.AdapterView;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.Spinner;
@@ -53,9 +61,12 @@ public class ScreenViewerActivity extends Activity {
     private static final int REQUEST_WRITE_IMAGES = 2001;
     private final Object lock = new Object();
     private final Buffer wire = new Buffer();
-    private ImageView imageView;
+    private ZoomImageView imageView;
     private TextView status;
     private Spinner interval;
+    private Spinner zoomPreset;
+    private EditText zoomInput;
+    private TextView zoomValue;
     private OkHttpClient client;
     private WebSocket socket;
     private Bitmap current;
@@ -72,6 +83,7 @@ public class ScreenViewerActivity extends Activity {
     private int payloadLength;
     private boolean fullscreen;
     private int generation;
+    private boolean updatingZoomControls;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -132,14 +144,59 @@ public class ScreenViewerActivity extends Activity {
         addButton(controls, "Save", v -> savePNG());
         root.addView(controls, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
+        LinearLayout zoomControls = new LinearLayout(this);
+        zoomControls.setOrientation(LinearLayout.HORIZONTAL);
+        zoomControls.setGravity(Gravity.CENTER_VERTICAL);
+        zoomControls.setPadding(dp(8), 0, dp(8), dp(6));
+        zoomControls.setBackgroundColor(Color.rgb(38, 43, 52));
+        TextView zoomLabel = new TextView(this);
+        zoomLabel.setText("Zoom ");
+        zoomLabel.setTextColor(Color.WHITE);
+        zoomControls.addView(zoomLabel);
+        zoomPreset = new Spinner(this);
+        zoomPreset.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
+                new String[]{"Auto Fit", "50%", "75%", "100%", "125%", "150%", "200%", "300%", "400%", "Custom"}));
+        zoomPreset.setSelection(0);
+        zoomPreset.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (updatingZoomControls || imageView == null || position == 9) return;
+                float[] values = new float[]{0, 50, 75, 100, 125, 150, 200, 300, 400};
+                if (position == 0) imageView.setAutoFit(); else imageView.setZoomPercent(values[position]);
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) { }
+        });
+        zoomControls.addView(zoomPreset, new LinearLayout.LayoutParams(dp(112), dp(48)));
+        zoomInput = new EditText(this);
+        zoomInput.setSingleLine(true);
+        zoomInput.setHint("10-1600%");
+        zoomInput.setTextColor(Color.WHITE);
+        zoomInput.setHintTextColor(Color.LTGRAY);
+        zoomInput.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        zoomInput.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        zoomInput.setOnEditorActionListener((view, action, event) -> {
+            if (action == EditorInfo.IME_ACTION_DONE) {
+                applyCustomZoom();
+                return true;
+            }
+            return false;
+        });
+        zoomControls.addView(zoomInput, new LinearLayout.LayoutParams(dp(104), dp(48)));
+        addButton(zoomControls, "Apply", v -> applyCustomZoom());
+        zoomValue = new TextView(this);
+        zoomValue.setText("Auto Fit");
+        zoomValue.setTextColor(Color.WHITE);
+        zoomValue.setPadding(dp(10), 0, 0, 0);
+        zoomControls.addView(zoomValue);
+        root.addView(zoomControls, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
         status = new TextView(this);
         status.setTextColor(Color.WHITE);
         status.setPadding(dp(10), dp(7), dp(10), dp(7));
         status.setText("Ready");
         root.addView(status, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        imageView = new ImageView(this);
-        imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        imageView = new ZoomImageView(this);
+        imageView.setZoomListener(this::showZoomValue);
         imageView.setBackgroundColor(Color.BLACK);
         root.addView(imageView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         setContentView(root);
@@ -155,6 +212,38 @@ public class ScreenViewerActivity extends Activity {
 
     private int selectedInterval() {
         return new int[]{500, 1000, 2000, 5000}[Math.max(0, Math.min(3, interval.getSelectedItemPosition()))];
+    }
+
+    private void applyCustomZoom() {
+        String text = zoomInput.getText().toString().trim().replace("%", "");
+        try {
+            float value = Float.parseFloat(text);
+            if (value < 10 || value > 1600) throw new NumberFormatException();
+            imageView.setZoomPercent(value);
+            zoomInput.clearFocus();
+        } catch (NumberFormatException ex) {
+            Toast.makeText(this, "Zoom must be from 10% through 1600%.", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void showZoomValue(float percent, boolean autoFit) {
+        runOnUiThread(() -> {
+            if (zoomValue == null || zoomPreset == null) return;
+            zoomValue.setText(autoFit ? "Auto Fit" : String.format(java.util.Locale.US, "%.1f%%", percent));
+            int position = zoomPresetPosition(percent, autoFit);
+            updatingZoomControls = true;
+            zoomPreset.setSelection(position);
+            updatingZoomControls = false;
+        });
+    }
+
+    private int zoomPresetPosition(float percent, boolean autoFit) {
+        if (autoFit) return 0;
+        float[] values = new float[]{50, 75, 100, 125, 150, 200, 300, 400};
+        for (int i = 0; i < values.length; i++) {
+            if (Math.abs(percent - values[i]) < 0.05f) return i + 1;
+        }
+        return 9;
     }
 
     private void startCapture(String mode) {
@@ -330,6 +419,7 @@ public class ScreenViewerActivity extends Activity {
         current = next;
         runOnUiThread(() -> {
             imageView.setImageBitmap(next);
+            if (previous != null && previous != next && !previous.isRecycled()) previous.recycle();
             status.setText("stream".equals(requestedMode)
                     ? "Streaming frame " + frame.optLong("seq") + " (" + changed + " changed tiles)."
                     : "Screenshot captured.");
@@ -400,6 +490,166 @@ public class ScreenViewerActivity extends Activity {
 
     private void setStatus(String value) {
         runOnUiThread(() -> status.setText(value == null ? "Unknown screen error" : value));
+    }
+
+    private static final class ZoomImageView extends ImageView {
+        interface ZoomListener { void onZoomChanged(float percent, boolean autoFit); }
+
+        private final Matrix transform = new Matrix();
+        private final float[] matrixValues = new float[9];
+        private final ScaleGestureDetector scaleDetector;
+        private ZoomListener zoomListener;
+        private float scale = 1f;
+        private float requestedScale;
+        private float lastX;
+        private float lastY;
+        private boolean dragging;
+
+        ZoomImageView(android.content.Context context) {
+            super(context);
+            setScaleType(ScaleType.MATRIX);
+            scaleDetector = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                @Override public boolean onScaleBegin(ScaleGestureDetector detector) {
+                    if (getDrawable() == null) return false;
+                    if (requestedScale == 0) requestedScale = scale;
+                    return true;
+                }
+
+                @Override public boolean onScale(ScaleGestureDetector detector) {
+                    float next = clampScale(scale * detector.getScaleFactor());
+                    if (Float.isNaN(next) || Float.isInfinite(next) || next == scale) return false;
+                    float factor = next / scale;
+                    transform.postScale(factor, factor, detector.getFocusX(), detector.getFocusY());
+                    scale = next;
+                    requestedScale = next;
+                    clampTranslation();
+                    setImageMatrix(transform);
+                    notifyZoom();
+                    return true;
+                }
+            });
+        }
+
+        void setZoomListener(ZoomListener listener) {
+            zoomListener = listener;
+        }
+
+        void setAutoFit() {
+            requestedScale = 0;
+            rebuildTransform();
+        }
+
+        void setZoomPercent(float percent) {
+            requestedScale = clampScale(percent / 100f);
+            rebuildTransform();
+        }
+
+        @Override
+        public void setImageBitmap(Bitmap bitmap) {
+            Drawable old = getDrawable();
+            int oldWidth = old == null ? 0 : old.getIntrinsicWidth();
+            int oldHeight = old == null ? 0 : old.getIntrinsicHeight();
+            super.setImageBitmap(bitmap);
+            post(() -> {
+                Drawable next = getDrawable();
+                boolean dimensionsChanged = next == null || oldWidth != next.getIntrinsicWidth() || oldHeight != next.getIntrinsicHeight();
+                if (requestedScale == 0 || dimensionsChanged) rebuildTransform();
+                else {
+                    clampTranslation();
+                    setImageMatrix(transform);
+                }
+            });
+        }
+
+        @Override
+        protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
+            super.onSizeChanged(width, height, oldWidth, oldHeight);
+            if (requestedScale == 0) rebuildTransform();
+            else {
+                clampTranslation();
+                setImageMatrix(transform);
+            }
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(true);
+            scaleDetector.onTouchEvent(event);
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    lastX = event.getX();
+                    lastY = event.getY();
+                    dragging = true;
+                    break;
+                case MotionEvent.ACTION_MOVE:
+                    if (dragging && event.getPointerCount() == 1 && !scaleDetector.isInProgress()) {
+                        float x = event.getX();
+                        float y = event.getY();
+                        transform.postTranslate(x - lastX, y - lastY);
+                        lastX = x;
+                        lastY = y;
+                        clampTranslation();
+                        setImageMatrix(transform);
+                    }
+                    break;
+                case MotionEvent.ACTION_UP:
+                    performClick();
+                    dragging = false;
+                    break;
+                case MotionEvent.ACTION_CANCEL:
+                    dragging = false;
+                    break;
+                case MotionEvent.ACTION_POINTER_UP:
+                    if (event.getPointerCount() > 1) {
+                        int remaining = event.getActionIndex() == 0 ? 1 : 0;
+                        lastX = event.getX(remaining);
+                        lastY = event.getY(remaining);
+                    }
+                    break;
+                default:
+                    break;
+            }
+            return true;
+        }
+
+        @Override public boolean performClick() {
+            super.performClick();
+            return true;
+        }
+
+        private void rebuildTransform() {
+            Drawable drawable = getDrawable();
+            if (drawable == null || getWidth() <= 0 || getHeight() <= 0 || drawable.getIntrinsicWidth() <= 0 || drawable.getIntrinsicHeight() <= 0) return;
+            float fit = Math.min((float) getWidth() / drawable.getIntrinsicWidth(), (float) getHeight() / drawable.getIntrinsicHeight());
+            scale = requestedScale == 0 ? fit : requestedScale;
+            transform.reset();
+            transform.postScale(scale, scale);
+            transform.postTranslate((getWidth() - drawable.getIntrinsicWidth() * scale) / 2f,
+                    (getHeight() - drawable.getIntrinsicHeight() * scale) / 2f);
+            setImageMatrix(transform);
+            notifyZoom();
+        }
+
+        private void clampTranslation() {
+            Drawable drawable = getDrawable();
+            if (drawable == null) return;
+            transform.getValues(matrixValues);
+            float width = drawable.getIntrinsicWidth() * scale;
+            float height = drawable.getIntrinsicHeight() * scale;
+            float x = matrixValues[Matrix.MTRANS_X];
+            float y = matrixValues[Matrix.MTRANS_Y];
+            float wantedX = width <= getWidth() ? (getWidth() - width) / 2f : Math.max(getWidth() - width, Math.min(0, x));
+            float wantedY = height <= getHeight() ? (getHeight() - height) / 2f : Math.max(getHeight() - height, Math.min(0, y));
+            transform.postTranslate(wantedX - x, wantedY - y);
+        }
+
+        private void notifyZoom() {
+            if (zoomListener != null) zoomListener.onZoomChanged(scale * 100f, requestedScale == 0);
+        }
+
+        private static float clampScale(float value) {
+            return Math.max(.1f, Math.min(16f, value));
+        }
     }
 
     private static String empty(String value) { return value == null ? "" : value.trim(); }

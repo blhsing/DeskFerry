@@ -915,7 +915,11 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 		stream = tunnel.NewResumableWebSocketConn(parent, ws, tunnel.ResumableWebSocketOptions{RelayAddr: cfg.RelayAddr, Proxy: cfg.Proxy, SessionID: offer.SessionID, Side: "agent", RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword), Service: target.Service})
 	}
 	log.Printf("session ready relay=%s session=%s service=%s target=%s setup_duration=%s", cfg.RelayAddr, offer.SessionID, target.Service, target.Address, time.Since(started).Round(time.Millisecond))
-	result := tunnel.PipeWithResult(stream, localConn)
+	pipeStream := stream
+	if target.Interactive {
+		pipeStream = drainScreenResponse(stream)
+	}
+	result := tunnel.PipeWithResult(pipeStream, localConn)
 	_ = writer.send(parent, tunnel.ControlMessage{Type: tunnel.MessageSessionClosed, SessionID: offer.SessionID, Service: target.Service, Reason: result.EndInitiator("relay", "local_"+target.Service)})
 	log.Printf("session closed relay=%s session=%s service=%s duration=%s end_initiator=%s relay_to_local_bytes=%d local_to_relay_bytes=%d", cfg.RelayAddr, offer.SessionID, target.Service, result.Duration.Round(time.Millisecond), result.EndInitiator("relay", "local_"+target.Service), result.AToB.Bytes, result.BToA.Bytes)
 }

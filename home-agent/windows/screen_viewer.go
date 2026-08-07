@@ -10,13 +10,19 @@ import (
 	"image/draw"
 	"image/png"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
+	"github.com/lxn/win"
+	"golang.org/x/sys/windows"
 
 	"deskferry/internal/buildinfo"
 	"deskferry/internal/screenview"
@@ -26,16 +32,93 @@ import (
 type screenViewer struct {
 	owner    *clientApp
 	mw       *walk.MainWindow
-	image    *walk.ImageView
+	viewport *walk.ScrollView
+	canvas   *walk.CustomWidget
 	status   *walk.Label
 	interval *walk.ComboBox
+	zoomBox  *walk.ComboBox
 
-	mu        sync.Mutex
-	cancel    context.CancelFunc
-	frame     *image.RGBA
-	bitmap    *walk.Bitmap
-	closed    bool
-	streaming bool
+	mu                   sync.Mutex
+	cancel               context.CancelFunc
+	frame                *image.RGBA
+	bitmap               *walk.Bitmap
+	closed               bool
+	streaming            bool
+	zoom                 float64
+	zoomControlUpdating  bool
+	renderWidth          int
+	renderHeight         int
+	gestureStartDistance uint64
+	gestureStartZoom     float64
+	panActive            bool
+	panStart             win.POINT
+	panStartX            int
+	panStartY            int
+}
+
+const (
+	minScreenZoom = 0.10
+	maxScreenZoom = 16.0
+	wmGesture     = 0x0119
+	gidZoom       = 3
+	gfBegin       = 1
+)
+
+var (
+	user32ScreenViewer     = windows.NewLazySystemDLL("user32.dll")
+	getGestureInfoScreen   = user32ScreenViewer.NewProc("GetGestureInfo")
+	closeGestureInfoScreen = user32ScreenViewer.NewProc("CloseGestureInfoHandle")
+	setGestureConfigScreen = user32ScreenViewer.NewProc("SetGestureConfig")
+)
+
+type screenGesturePoint struct {
+	X int16
+	Y int16
+}
+
+type screenGestureInfo struct {
+	Size       uint32
+	Flags      uint32
+	ID         uint32
+	Target     uintptr
+	Location   screenGesturePoint
+	InstanceID uint32
+	SequenceID uint32
+	Arguments  uint64
+	ExtraSize  uint32
+}
+
+type screenGestureConfig struct {
+	ID    uint32
+	Want  uint32
+	Block uint32
+}
+
+type screenZoomCanvas struct {
+	*walk.CustomWidget
+	viewer *screenViewer
+}
+
+func (w *screenZoomCanvas) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
+	if w.viewer.handlePanMessage(hwnd, msg, wParam) {
+		return 0
+	}
+	if w.viewer.handleZoomMessage(msg, wParam, lParam) {
+		return 0
+	}
+	return w.CustomWidget.WndProc(hwnd, msg, wParam, lParam)
+}
+
+type screenZoomScrollView struct {
+	*walk.ScrollView
+	viewer *screenViewer
+}
+
+func (w *screenZoomScrollView) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
+	if w.viewer.handleZoomMessage(msg, wParam, lParam) {
+		return 0
+	}
+	return w.ScrollView.WndProc(hwnd, msg, wParam, lParam)
 }
 
 func (a *clientApp) openScreenViewer() {
@@ -62,17 +145,57 @@ func (a *clientApp) openScreenViewer() {
 				PushButton{Text: "Stop", OnClicked: viewer.stop},
 				Label{Text: "Interval"},
 				ComboBox{AssignTo: &viewer.interval, Model: []string{"0.5 seconds", "1 second", "2 seconds", "5 seconds"}, CurrentIndex: 1},
+				Label{Text: "Zoom"},
+				ComboBox{
+					AssignTo:              &viewer.zoomBox,
+					Editable:              true,
+					Model:                 []string{"Auto Fit", "25%", "50%", "75%", "100%", "125%", "150%", "200%", "300%", "400%"},
+					CurrentIndex:          0,
+					MinSize:               Size{Width: 95},
+					OnCurrentIndexChanged: viewer.applyZoomSelection,
+					OnEditingFinished:     viewer.applyZoomSelection,
+				},
 				PushButton{Text: "Full Screen", OnClicked: viewer.toggleFullscreen},
 				PushButton{Text: "Save PNG", OnClicked: viewer.savePNG},
 			}},
 			Label{AssignTo: &viewer.status, Text: "Ready. Work-side screen viewing must be enabled."},
-			ImageView{AssignTo: &viewer.image, Mode: ImageViewModeShrink, StretchFactor: 1},
+			ScrollView{
+				AssignTo:      &viewer.viewport,
+				StretchFactor: 1,
+				Background:    SolidColorBrush{Color: walk.RGB(0, 0, 0)},
+				Layout:        Grid{Margins: Margins{}},
+				OnSizeChanged: viewer.layoutScreen,
+				Children: []Widget{
+					CustomWidget{
+						AssignTo:            &viewer.canvas,
+						Alignment:           AlignHCenterVCenter,
+						Background:          SolidColorBrush{Color: walk.RGB(0, 0, 0)},
+						MinSize:             Size{Width: 1, Height: 1},
+						PaintPixels:         viewer.paintScreen,
+						InvalidatesOnResize: true,
+					},
+				},
+			},
 		},
 	}
 	if err := window.Create(); err != nil {
 		a.showError(err)
 		return
 	}
+	zoomCanvas := &screenZoomCanvas{CustomWidget: viewer.canvas, viewer: viewer}
+	if err := walk.InitWrapperWindow(zoomCanvas); err != nil {
+		viewer.mw.Dispose()
+		a.showError(err)
+		return
+	}
+	zoomViewport := &screenZoomScrollView{ScrollView: viewer.viewport, viewer: viewer}
+	if err := walk.InitWrapperWindow(zoomViewport); err != nil {
+		viewer.mw.Dispose()
+		a.showError(err)
+		return
+	}
+	enableScreenZoomGesture(viewer.canvas.Handle())
+	enableScreenZoomGesture(viewer.viewport.Handle())
 	viewer.mw.Closing().Attach(func(_ *bool, _ walk.CloseReason) {
 		viewer.mu.Lock()
 		viewer.closed = true
@@ -99,6 +222,246 @@ func (v *screenViewer) selectedInterval() int {
 		return screenview.DefaultIntervalMS
 	}
 	return values[index]
+}
+
+func enableScreenZoomGesture(hwnd win.HWND) {
+	config := screenGestureConfig{ID: gidZoom, Want: 1}
+	_, _, _ = setGestureConfigScreen.Call(
+		uintptr(hwnd),
+		0,
+		1,
+		uintptr(unsafe.Pointer(&config)),
+		unsafe.Sizeof(config),
+	)
+}
+
+func (v *screenViewer) handlePanMessage(hwnd win.HWND, msg uint32, wParam uintptr) bool {
+	switch msg {
+	case win.WM_LBUTTONDOWN:
+		if !v.screenCanPan() {
+			return false
+		}
+		var point win.POINT
+		if !win.GetCursorPos(&point) {
+			return false
+		}
+		v.panActive = true
+		v.panStart = point
+		v.panStartX = screenScrollPosition(v.viewport.Handle(), win.SB_HORZ)
+		v.panStartY = screenScrollPosition(v.viewport.Handle(), win.SB_VERT)
+		win.SetCapture(hwnd)
+		return true
+
+	case win.WM_MOUSEMOVE:
+		if !v.panActive || wParam&win.MK_LBUTTON == 0 {
+			return false
+		}
+		var point win.POINT
+		if win.GetCursorPos(&point) {
+			v.setScreenPan(v.panStartX-int(point.X-v.panStart.X), v.panStartY-int(point.Y-v.panStart.Y))
+		}
+		return true
+
+	case win.WM_LBUTTONUP:
+		if !v.panActive {
+			return false
+		}
+		v.panActive = false
+		win.ReleaseCapture()
+		return true
+
+	case win.WM_CAPTURECHANGED:
+		v.panActive = false
+	}
+	return false
+}
+
+func (v *screenViewer) screenCanPan() bool {
+	if v.viewport == nil {
+		return false
+	}
+	bounds := v.viewport.ClientBoundsPixels()
+	return v.renderWidth > bounds.Width || v.renderHeight > bounds.Height
+}
+
+func screenScrollPosition(hwnd win.HWND, bar int32) int {
+	info := win.SCROLLINFO{CbSize: uint32(unsafe.Sizeof(win.SCROLLINFO{})), FMask: win.SIF_POS}
+	if !win.GetScrollInfo(hwnd, bar, &info) {
+		return 0
+	}
+	return int(info.NPos)
+}
+
+func screenScrollLimit(hwnd win.HWND, bar int32) int {
+	info := win.SCROLLINFO{CbSize: uint32(unsafe.Sizeof(win.SCROLLINFO{})), FMask: win.SIF_PAGE | win.SIF_RANGE}
+	if !win.GetScrollInfo(hwnd, bar, &info) {
+		return 0
+	}
+	return max(0, int(info.NMax+1-int32(info.NPage)))
+}
+
+func (v *screenViewer) setScreenPan(x, y int) {
+	if v.viewport == nil || v.canvas == nil {
+		return
+	}
+	hwnd := v.viewport.Handle()
+	x = max(0, min(screenScrollLimit(hwnd, win.SB_HORZ), x))
+	y = max(0, min(screenScrollLimit(hwnd, win.SB_VERT), y))
+	for _, value := range []struct {
+		bar int32
+		pos int
+	}{{win.SB_HORZ, x}, {win.SB_VERT, y}} {
+		info := win.SCROLLINFO{CbSize: uint32(unsafe.Sizeof(win.SCROLLINFO{})), FMask: win.SIF_POS, NPos: int32(value.pos)}
+		win.SetScrollInfo(hwnd, value.bar, &info, true)
+	}
+	content := win.GetParent(v.canvas.Handle())
+	win.SetWindowPos(content, 0, int32(-x), int32(-y), 0, 0, win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE)
+}
+
+func (v *screenViewer) handleZoomMessage(msg uint32, wParam, lParam uintptr) bool {
+	switch msg {
+	case win.WM_MOUSEWHEEL:
+		delta := int16(uint16(wParam >> 16))
+		if delta == 0 {
+			return false
+		}
+		v.zoomBy(math.Pow(1.1, float64(delta)/120.0))
+		return true
+
+	case wmGesture:
+		info := screenGestureInfo{Size: uint32(unsafe.Sizeof(screenGestureInfo{}))}
+		ok, _, _ := getGestureInfoScreen.Call(lParam, uintptr(unsafe.Pointer(&info)))
+		if ok == 0 || info.ID != gidZoom {
+			return false
+		}
+		_, _, _ = closeGestureInfoScreen.Call(lParam)
+		if info.Flags&gfBegin != 0 || v.gestureStartDistance == 0 {
+			v.gestureStartDistance = info.Arguments
+			v.gestureStartZoom = v.effectiveZoom()
+			return true
+		}
+		if info.Arguments > 0 && v.gestureStartDistance > 0 {
+			v.setZoom(v.gestureStartZoom*float64(info.Arguments)/float64(v.gestureStartDistance), true)
+		}
+		return true
+	}
+	return false
+}
+
+func (v *screenViewer) applyZoomSelection() {
+	if v.zoomBox == nil || v.zoomControlUpdating {
+		return
+	}
+	value, ok := parseScreenZoom(v.zoomBox.Text())
+	if !ok {
+		v.setStatus("Zoom must be Auto Fit or a value from 10% through 1600%.")
+		return
+	}
+	v.setZoom(value, false)
+}
+
+func parseScreenZoom(text string) (float64, bool) {
+	text = strings.TrimSpace(text)
+	if strings.EqualFold(text, "Auto Fit") || strings.EqualFold(text, "Auto") || strings.EqualFold(text, "Fit") {
+		return 0, true
+	}
+	text = strings.TrimSpace(strings.TrimSuffix(text, "%"))
+	value, err := strconv.ParseFloat(text, 64)
+	if err != nil || value < minScreenZoom*100 || value > maxScreenZoom*100 {
+		return 0, false
+	}
+	return value / 100, true
+}
+
+func (v *screenViewer) zoomBy(factor float64) {
+	if factor <= 0 {
+		return
+	}
+	v.setZoom(v.effectiveZoom()*factor, true)
+}
+
+func (v *screenViewer) setZoom(value float64, updateControl bool) {
+	if value != 0 {
+		value = math.Max(minScreenZoom, math.Min(maxScreenZoom, value))
+	}
+	v.mu.Lock()
+	v.zoom = value
+	v.mu.Unlock()
+	if updateControl && v.zoomBox != nil {
+		label := "Auto Fit"
+		if value > 0 {
+			label = strconv.FormatFloat(value*100, 'f', 1, 64)
+			label = strings.TrimSuffix(strings.TrimSuffix(label, "0"), ".") + "%"
+		}
+		v.zoomControlUpdating = true
+		_ = v.zoomBox.SetText(label)
+		v.zoomControlUpdating = false
+	}
+	v.layoutScreen()
+}
+
+func (v *screenViewer) effectiveZoom() float64 {
+	v.mu.Lock()
+	zoom := v.zoom
+	frame := v.frame
+	v.mu.Unlock()
+	if zoom > 0 {
+		return zoom
+	}
+	if frame == nil || v.viewport == nil {
+		return 1
+	}
+	bounds := v.viewport.ClientBoundsPixels()
+	if bounds.Width <= 0 || bounds.Height <= 0 {
+		return 1
+	}
+	return math.Min(float64(bounds.Width)/float64(frame.Bounds().Dx()), float64(bounds.Height)/float64(frame.Bounds().Dy()))
+}
+
+func (v *screenViewer) layoutScreen() {
+	if v.viewport == nil || v.canvas == nil {
+		return
+	}
+	v.mu.Lock()
+	frame := v.frame
+	zoom := v.zoom
+	v.mu.Unlock()
+	if frame == nil {
+		return
+	}
+	sourceWidth := frame.Bounds().Dx()
+	sourceHeight := frame.Bounds().Dy()
+	if zoom == 0 {
+		bounds := v.viewport.ClientBoundsPixels()
+		if bounds.Width <= 0 || bounds.Height <= 0 {
+			return
+		}
+		zoom = math.Min(float64(bounds.Width)/float64(sourceWidth), float64(bounds.Height)/float64(sourceHeight))
+	}
+	width := max(1, int(math.Round(float64(sourceWidth)*zoom)))
+	height := max(1, int(math.Round(float64(sourceHeight)*zoom)))
+	if width == v.renderWidth && height == v.renderHeight {
+		_ = v.canvas.Invalidate()
+		return
+	}
+	v.renderWidth = width
+	v.renderHeight = height
+	size := walk.Size{Width: width, Height: height}
+	_ = v.canvas.SetMinMaxSizePixels(size, size)
+	_ = v.canvas.SetSizePixels(size)
+	v.viewport.RequestLayout()
+	_ = v.canvas.Invalidate()
+}
+
+func (v *screenViewer) paintScreen(canvas *walk.Canvas, _ walk.Rectangle) error {
+	v.mu.Lock()
+	bitmap := v.bitmap
+	v.mu.Unlock()
+	if bitmap == nil || v.canvas == nil {
+		return nil
+	}
+	bounds := v.canvas.ClientBoundsPixels()
+	return canvas.DrawImageStretchedPixels(bitmap, walk.Rectangle{Width: bounds.Width, Height: bounds.Height})
 }
 
 func (v *screenViewer) start(stream bool) {
@@ -185,7 +548,8 @@ func (v *screenViewer) showFrame(source *image.RGBA, sequence uint64, changedTil
 		previous := v.bitmap
 		v.bitmap = bitmap
 		v.mu.Unlock()
-		_ = v.image.SetImage(bitmap)
+		v.layoutScreen()
+		_ = v.canvas.Invalidate()
 		if previous != nil {
 			previous.Dispose()
 		}

@@ -33,8 +33,17 @@ func CaptureDesktop() (*image.RGBA, error) {
 		return nil, errors.New("create desktop capture context failed")
 	}
 	defer win.DeleteDC(memoryDC)
-	bitmap := win.CreateCompatibleBitmap(screenDC, width, height)
-	if bitmap == 0 {
+	header := win.BITMAPINFOHEADER{
+		BiSize:        uint32(unsafe.Sizeof(win.BITMAPINFOHEADER{})),
+		BiWidth:       width,
+		BiHeight:      -height,
+		BiPlanes:      1,
+		BiBitCount:    32,
+		BiCompression: win.BI_RGB,
+	}
+	var pixels unsafe.Pointer
+	bitmap := win.CreateDIBSection(screenDC, &header, win.DIB_RGB_COLORS, &pixels, 0, 0)
+	if bitmap == 0 || pixels == nil {
 		return nil, errors.New("create desktop capture bitmap failed")
 	}
 	defer win.DeleteObject(win.HGDIOBJ(bitmap))
@@ -42,22 +51,25 @@ func CaptureDesktop() (*image.RGBA, error) {
 	if previous == 0 {
 		return nil, errors.New("select desktop capture bitmap failed")
 	}
-	defer win.SelectObject(memoryDC, previous)
-	if !win.BitBlt(memoryDC, 0, 0, width, height, screenDC, x, y, win.SRCCOPY|win.CAPTUREBLT) {
+	selected := true
+	defer func() {
+		if selected {
+			win.SelectObject(memoryDC, previous)
+		}
+	}()
+	// CAPTUREBLT includes layered windows, but some RDP display drivers reject
+	// it. Retry the same copy without CAPTUREBLT before reporting the desktop as
+	// unavailable.
+	if !win.BitBlt(memoryDC, 0, 0, width, height, screenDC, x, y, win.SRCCOPY|win.CAPTUREBLT) &&
+		!win.BitBlt(memoryDC, 0, 0, width, height, screenDC, x, y, win.SRCCOPY) {
 		return nil, errors.New("copy desktop pixels failed")
 	}
-	bgra := make([]byte, int(width*height*4))
-	info := win.BITMAPINFO{BmiHeader: win.BITMAPINFOHEADER{
-		BiSize:        uint32(unsafe.Sizeof(win.BITMAPINFOHEADER{})),
-		BiWidth:       width,
-		BiHeight:      -height,
-		BiPlanes:      1,
-		BiBitCount:    32,
-		BiCompression: win.BI_RGB,
-	}}
-	if lines := win.GetDIBits(memoryDC, bitmap, 0, uint32(height), &bgra[0], &info, win.DIB_RGB_COLORS); lines != height {
-		return nil, fmt.Errorf("read desktop pixels returned %d of %d lines", lines, height)
+	// Restore the original object before deleting the capture bitmap.
+	if restored := win.SelectObject(memoryDC, previous); restored == 0 {
+		return nil, errors.New("restore desktop capture bitmap failed")
 	}
+	selected = false
+	bgra := unsafe.Slice((*byte)(pixels), int(width*height*4))
 	result := image.NewRGBA(image.Rect(0, 0, int(width), int(height)))
 	for offset := 0; offset < len(bgra); offset += 4 {
 		result.Pix[offset] = bgra[offset+2]

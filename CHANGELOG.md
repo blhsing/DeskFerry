@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.10.2 - 2026-08-07
+
+- Fixed Windows Work screen capture by using a top-down DIB section and retrying without `CAPTUREBLT` for RDP display drivers that reject layered-window capture.
+- Kept screen relay sessions open until Home consumes the helper's final image or error frame, preventing a successful helper write from surfacing as a frame-header EOF.
+- Added Auto Fit, preset and arbitrary zoom levels, and drag-to-pan to every Home screen viewer; Windows and macOS also support wheel/trackpad zoom, while Android supports native pinch-to-zoom.
+
 ## 0.10.1 - 2026-08-07
 
 - Fixed Work screen capture when the interactive user is in an RDP or other active terminal-services session: the service now enumerates active sessions instead of assuming the physical console owns a user token.
