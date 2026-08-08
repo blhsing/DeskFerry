@@ -2075,7 +2075,7 @@ sealed class ResumeSession
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.10.4";
+    public const string Version = "0.10.5";
 }
 
 sealed class WaitingAgent

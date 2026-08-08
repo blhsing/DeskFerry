@@ -406,29 +406,11 @@ func (c *macUIController) receiveScreen(ctx context.Context, cfg config, request
 		return
 	}
 	defer conn.Close()
-	if err := screenview.WriteRequest(conn, request); err != nil {
-		c.setScreenStatus("Could not start screen capture: " + err.Error())
-		return
-	}
 	c.setScreenStatus("Connected through " + relayAddr)
-	var canvas *image.RGBA
-	for {
-		frame, payloads, err := screenview.ReadFrame(conn)
-		if err != nil {
-			if ctx.Err() == nil {
-				c.setScreenStatus("Screen stream ended: " + err.Error())
-			}
-			return
-		}
-		canvas, err = screenview.ApplyFrame(canvas, frame, payloads)
-		if err != nil {
-			c.setScreenStatus("Screen frame failed: " + err.Error())
-			return
-		}
+	err = screenview.Receive(conn, request, func(frame screenview.Frame, canvas *image.RGBA) error {
 		var output bytes.Buffer
 		if err := png.Encode(&output, canvas); err != nil {
-			c.setScreenStatus(err.Error())
-			return
+			return err
 		}
 		c.mu.Lock()
 		c.screenPNG = output.Bytes()
@@ -439,9 +421,10 @@ func (c *macUIController) receiveScreen(ctx context.Context, cfg config, request
 			c.screenStatus = "Screenshot captured"
 		}
 		c.mu.Unlock()
-		if request.Mode == screenview.ModeSingle {
-			return
-		}
+		return nil
+	})
+	if err != nil && ctx.Err() == nil {
+		c.setScreenStatus("Screen stream ended: " + err.Error())
 	}
 }
 

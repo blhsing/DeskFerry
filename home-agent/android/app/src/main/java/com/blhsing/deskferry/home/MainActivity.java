@@ -124,10 +124,10 @@ public class MainActivity extends Activity {
         header.setPadding(0, 0, 0, dp(12));
         root.addView(header);
 
-        TextView title = label("DeskFerry Home", 28, "#1F2933", true);
+        TextView title = label("DeskFerry Home v" + BuildConfig.VERSION_NAME, 28, "#1F2933", true);
         title.setLetterSpacing(0);
         header.addView(title);
-		TextView subtitle = label("Android RDP/SMB Home agent - v" + BuildConfig.VERSION_NAME, 14, "#65717D", false);
+		TextView subtitle = label("Android RDP/SMB Home agent", 14, "#65717D", false);
         subtitle.setPadding(0, dp(3), 0, 0);
         header.addView(subtitle);
 

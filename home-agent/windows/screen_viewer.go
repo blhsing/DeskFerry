@@ -9,7 +9,6 @@ import (
 	"image"
 	"image/draw"
 	"image/png"
-	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -496,35 +495,20 @@ func (v *screenViewer) receive(ctx context.Context, request screenview.Request) 
 		return
 	}
 	defer conn.Close()
-	if err := screenview.WriteRequest(conn, request); err != nil {
-		v.setStatus("Could not start screen capture: " + err.Error())
+	v.setStatus(fmt.Sprintf("Connected through %s; waiting for the first frame...", relayAddr))
+	err = screenview.Receive(conn, request, func(frame screenview.Frame, canvas *image.RGBA) error {
+		v.showFrame(canvas, frame.Seq, len(frame.Rects), request.Mode == screenview.ModeStream)
+		return nil
+	})
+	if ctx.Err() != nil {
 		return
 	}
-	v.setStatus(fmt.Sprintf("Connected through %s; waiting for the first frame...", relayAddr))
-	var canvas *image.RGBA
-	for {
-		frame, payloads, err := screenview.ReadFrame(conn)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if errors.Is(err, io.EOF) && request.Mode == screenview.ModeSingle && canvas != nil {
-				v.setStatus("Screenshot captured.")
-				return
-			}
-			v.setStatus("Screen stream ended: " + err.Error())
-			return
-		}
-		canvas, err = screenview.ApplyFrame(canvas, frame, payloads)
-		if err != nil {
-			v.setStatus("Screen frame failed: " + err.Error())
-			return
-		}
-		v.showFrame(canvas, frame.Seq, len(frame.Rects), request.Mode == screenview.ModeStream)
-		if request.Mode == screenview.ModeSingle {
-			v.setStatus("Screenshot captured.")
-			return
-		}
+	if err != nil {
+		v.setStatus("Screen stream ended: " + err.Error())
+		return
+	}
+	if request.Mode == screenview.ModeSingle {
+		v.setStatus("Screenshot captured.")
 	}
 }
 

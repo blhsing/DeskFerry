@@ -47,10 +47,10 @@ $env:Path = (Join-Path $env:JAVA_HOME 'bin') + ';' + $env:Path
 $gradlew = Join-Path $project 'gradlew.bat'
 if (Test-Path -LiteralPath $gradlew) {
     $gradleCommand = $gradlew
-    $gradleArgs = @('--no-daemon', ':app:assembleDebug')
+    $gradleArgs = @('--no-daemon', ':app:testDebugUnitTest', ':app:assembleDebug')
 } else {
     $gradleCommand = 'gradle'
-    $gradleArgs = @('--no-daemon', ':app:assembleDebug')
+    $gradleArgs = @('--no-daemon', ':app:testDebugUnitTest', ':app:assembleDebug')
 }
 
 Push-Location $project

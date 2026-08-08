@@ -23,6 +23,21 @@ func TestOrderedActiveSessionIDsPrefersActiveConsoleThenRemoteSessions(t *testin
 	}
 }
 
+func TestOrderedDisconnectedSessionIDsPrefersConsoleThenRemoteSessions(t *testing.T) {
+	sessions := []windows.WTS_SESSION_INFO{
+		{SessionID: 7, State: windows.WTSDisconnected},
+		{SessionID: 4, State: windows.WTSActive},
+		{SessionID: 1, State: windows.WTSDisconnected},
+		{SessionID: 9, State: windows.WTSListen},
+	}
+	if got, want := orderedDisconnectedSessionIDs(1, sessions), []uint32{1, 7}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("disconnected session ordering = %v, want %v", got, want)
+	}
+	if got, want := orderedDisconnectedSessionIDs(0xffffffff, sessions), []uint32{7, 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("disconnected ordering without a console = %v, want %v", got, want)
+	}
+}
+
 func TestSplitRelayURLs(t *testing.T) {
 	got := splitRelayURLs(" https://test-officialwebsite.azurewebsites.net/relay/workdesk;\nhttp://217.142.228.117/relay/workdesk, ws://localhost:8000/relay/dev ")
 	want := []string{

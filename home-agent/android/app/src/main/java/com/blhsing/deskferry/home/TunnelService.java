@@ -76,6 +76,7 @@ public class TunnelService extends Service {
     private static final int RESUMABLE_MAX_BUFFER = 8 * 1024 * 1024;
     private static final int RESUMABLE_CHUNK_SIZE = 64 * 1024;
     private static final long RESUMABLE_WINDOW_MS = 5L * 60L * 1000L;
+	private static final long RESUME_ATTEMPT_TIMEOUT_MS = 20L * 1000L;
 	private static final int MAX_CONCURRENT_BRIDGES_PER_SERVICE = 2;
     private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss", Locale.ROOT);
     private static final SimpleDateFormat DIAGNOSTIC_TIME_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.ROOT);
@@ -984,6 +985,7 @@ public class TunnelService extends Service {
         private final long startedAt = SystemClock.elapsedRealtime();
         private volatile WebSocket webSocket;
         private volatile WebSocket pendingResumeSocket;
+		private volatile CountDownLatch pendingResumeReady;
         private volatile String selectedRelay = "none";
         private volatile String sessionId = "";
         private byte[] sendBuffer = new byte[0];
@@ -1264,6 +1266,7 @@ public class TunnelService extends Service {
         private void replaceTransportForNetworkChange(String reason) {
             WebSocket active;
             WebSocket pending;
+			CountDownLatch pendingReady;
             synchronized (resumeLock) {
                 if (closed.get()) {
                     return;
@@ -1272,6 +1275,8 @@ public class TunnelService extends Service {
                 webSocket = null;
                 pending = pendingResumeSocket;
                 pendingResumeSocket = null;
+				pendingReady = pendingResumeReady;
+				pendingResumeReady = null;
                 resumeLock.notifyAll();
             }
             if (active != null) {
@@ -1280,6 +1285,12 @@ public class TunnelService extends Service {
             if (pending != null && pending != active) {
                 pending.cancel();
             }
+			// OkHttp may not deliver the cancellation callback until the obsolete
+			// network finishes failing. Wake the resume worker immediately so its
+			// next attempt is created on the newly available Android network.
+			if (pendingReady != null) {
+				pendingReady.countDown();
+			}
             if (!sessionId.isEmpty()) {
 				append(serviceLabel + " relay stream interrupted; retrying transparently: " + reason);
                 startReconnectLoop();
@@ -1298,6 +1309,7 @@ public class TunnelService extends Service {
                         CountDownLatch ready = new CountDownLatch(1);
                         AtomicBoolean started = new AtomicBoolean(false);
                         AtomicReference<Throwable> failure = new AtomicReference<>();
+						long attemptStarted = SystemClock.elapsedRealtime();
                         try {
                             Request request = webSocketRequest(selectedRelay, "resume").newBuilder()
 									.header("X-DeskFerry-Service", service)
@@ -1305,14 +1317,19 @@ public class TunnelService extends Service {
                                     .header("X-DeskFerry-Session-Side", "client")
                                     .build();
                             WebSocket candidate = httpClient.newWebSocket(request, bridgeListener(ready, started, failure, false));
-                            pendingResumeSocket = candidate;
+							synchronized (resumeLock) {
+								pendingResumeSocket = candidate;
+								pendingResumeReady = ready;
+							}
                             long remaining = Math.max(1, deadline - SystemClock.elapsedRealtime());
-                            if (ready.await(remaining, TimeUnit.MILLISECONDS) && started.get() && failure.get() == null) {
-                                pendingResumeSocket = null;
+							long attemptWait = resumeAttemptWaitMillis(remaining);
+							boolean signaled = ready.await(attemptWait, TimeUnit.MILLISECONDS);
+							if (signaled && started.get() && failure.get() == null) {
+								clearPendingResume(candidate, ready);
 								append(serviceLabel + " relay stream resumed through " + selectedRelay + ".");
                                 return;
                             }
-                            pendingResumeSocket = null;
+							clearPendingResume(candidate, ready);
                             candidate.cancel();
                             Throwable resumeFailure = failure.get();
                             if (resumeFailure instanceof TerminalResumeException) {
@@ -1321,12 +1338,28 @@ public class TunnelService extends Service {
                                 close();
                                 return;
                             }
-                        } catch (Exception ignored) {
+							if (!closed.get()) {
+								String result = !signaled ? "attempt_timeout" : "transport_failure";
+								append(serviceLabel + " relay resume attempt failed relay=" + selectedRelay
+										+ " result=" + result + " elapsed_ms=" + elapsedMillis(attemptStarted)
+										+ (resumeFailure == null ? "" : " error=" + throwableText(resumeFailure)) + ".");
+							}
+                        } catch (Exception ex) {
                             WebSocket candidate = pendingResumeSocket;
                             pendingResumeSocket = null;
+							CountDownLatch pendingReady = pendingResumeReady;
+							pendingResumeReady = null;
                             if (candidate != null) {
                                 candidate.cancel();
                             }
+							if (pendingReady != null) {
+								pendingReady.countDown();
+							}
+							if (!closed.get()) {
+								append(serviceLabel + " relay resume attempt failed relay=" + selectedRelay
+										+ " result=exception elapsed_ms=" + elapsedMillis(attemptStarted)
+										+ " error=" + throwableText(ex) + ".");
+							}
                         }
                         sleepQuietly(backoff);
                         backoff = Math.min(5000, backoff * 2);
@@ -1341,8 +1374,19 @@ public class TunnelService extends Service {
                         resumeLock.notifyAll();
                     }
                 }
-			}, "DeskFerry-" + serviceLabel + "-Resume").start();
+		}, "DeskFerry-" + serviceLabel + "-Resume").start();
         }
+
+		private void clearPendingResume(WebSocket candidate, CountDownLatch ready) {
+			synchronized (resumeLock) {
+				if (pendingResumeSocket == candidate) {
+					pendingResumeSocket = null;
+				}
+				if (pendingResumeReady == ready) {
+					pendingResumeReady = null;
+				}
+			}
+		}
 
         private void handleRelayPayload(WebSocket socket, byte[] payload) throws IOException {
             if (sessionId.isEmpty()) {
@@ -1437,13 +1481,18 @@ public class TunnelService extends Service {
             }
             WebSocket socket = webSocket;
             WebSocket pending = pendingResumeSocket;
+			CountDownLatch pendingReady = pendingResumeReady;
             pendingResumeSocket = null;
+			pendingResumeReady = null;
             if (socket != null) {
                 socket.close(1000, "closed");
             }
             if (pending != null && pending != socket) {
                 pending.cancel();
             }
+			if (pendingReady != null) {
+				pendingReady.countDown();
+			}
             synchronized (resumeLock) {
                 webSocket = null;
                 resumeLock.notifyAll();
@@ -1535,4 +1584,8 @@ public class TunnelService extends Service {
             termination.compareAndSet("running", cause);
         }
     }
+
+	static long resumeAttemptWaitMillis(long remainingMillis) {
+		return Math.max(1L, Math.min(RESUME_ATTEMPT_TIMEOUT_MS, remainingMillis));
+	}
 }

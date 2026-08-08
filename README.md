@@ -194,7 +194,7 @@ To enable remote command execution, set the WinRM target to `127.0.0.1:5985`. Wi
 
 To enable Windows file sharing, set the SMB target to `127.0.0.1:445`, leave the SMB server alias at `deskferry-work`, and use a non-empty room password. The configurator registers that specific alias with the Windows Server service; restart the work PC once if the alias is not accepted immediately. Create and permission shares with the normal Windows **Advanced Sharing** controls. DeskFerry does not create shares or weaken their NTFS/share permissions.
 
-To enable screenshots and screen streaming without RDP, select **Allow authenticated screenshots and delta streaming**. This option requires a non-empty room password and is disabled by default. Each request launches a visible capture helper in the currently active Windows session; closing its window stops that share. Streaming sends one initial full PNG and then only changed 64-by-64 PNG tiles, including a no-payload heartbeat when the desktop is unchanged.
+To enable screenshots and screen streaming without RDP, select **Allow authenticated screenshots and delta streaming**. This option requires a non-empty room password and is disabled by default. Each request launches a visible capture helper in the currently active Windows session; closing its window stops that share. If the logged-on session was disconnected, the Work service reattaches it to the physical console before capture so Windows exposes a capturable input desktop. Streaming sends one initial full PNG and then only changed 64-by-64 PNG tiles, including a no-payload heartbeat when the desktop is unchanged.
 
 The configurator also exposes every setup field and service action through its CLI. Run it from an elevated PowerShell session when the caller must wait for completion; otherwise it requests UAC elevation and returns after launching the elevated action. Supply passwords over standard input so they do not appear in the process command line:
 
@@ -283,6 +283,15 @@ The app opens a friendly control panel and a notification-area icon. Enter the s
 
 Click **Screen Viewer** to capture the Work desktop without opening RDP. Its separate viewer supports one-shot capture, 0.5/1/2/5-second delta streams, stop, fullscreen, and saving the reconstructed image as PNG. The Work configurator must have screen viewing enabled for the same protected room.
 
+The installed Home executable also exposes the same authenticated screen service without opening the UI. Select a saved destination and either capture one PNG or write reconstructed stream frames into a directory:
+
+```powershell
+& "$env:ProgramFiles\DeskFerry Home\DeskFerryHome.exe" -destination 'Room b' -screenshot "$env:USERPROFILE\Pictures\Room-b.png"
+& "$env:ProgramFiles\DeskFerry Home\DeskFerryHome.exe" -destination 'Room b' -screenshot-stream "$env:USERPROFILE\Pictures\Room-b-stream" -screen-interval 500ms -screen-count 20
+```
+
+Omit `-screen-count` (or use `0`) to stream until Ctrl+C. `-screenshot -` writes one raw PNG to standard output for pipelines. Progress and saved filenames go to standard error, so they do not corrupt piped image data.
+
 The **WinRM Commands** panel executes a PowerShell command on the work host using the same Windows username and password as RDP. The first command opens an authenticated PowerShell Remoting session; later commands reuse that session to avoid repeating WinRM authentication and shell startup. The Home app closes the session after five idle minutes and whenever the destination, Windows login, tunnel configuration, or app lifecycle changes. A failed session is discarded so the next command creates a clean one; DeskFerry does not automatically replay a command whose completion is uncertain. Each named destination keeps its own username and optional shared login in Windows Credential Manager; **Save Windows Login** and **Forget Windows Login** affect RDP, WinRM, and the installed SMB alias for that destination. Passwords are never written to the JSON profile or command line. The work host must have WinRM enabled and allow the supplied account.
 
 Only one Windows home-app instance runs on the machine. Launching it again restores and focuses the existing control panel when it is in the same interactive session, instead of creating another tray icon, relay presence connection, or local listener.
@@ -311,6 +320,13 @@ Use `deskferry-home-macos-amd64` on Intel Macs. Normal launch opens a local prof
 127.0.0.1:3389
 ```
 
+The macOS executable supports the same non-UI screenshot commands and saved destination selection; screenshot commands imply CLI mode, so `-ui=false` is not required:
+
+```bash
+./deskferry-home-macos-arm64 -destination 'Room b' -screenshot "$HOME/Pictures/Room-b.png"
+./deskferry-home-macos-arm64 -destination 'Room b' -screenshot-stream "$HOME/Pictures/Room-b-stream" -screen-interval 500ms -screen-count 20
+```
+
 The macOS agent has the same persistent daily diagnostics and `-log-retention-days <days>` option as the Windows home agent. Logs are stored in the user's DeskFerry configuration directory, normally `~/Library/Application Support/DeskFerry`.
 
 ### 7. Run Android Home App
@@ -335,7 +351,7 @@ The Android app keeps the tunnel alive through a foreground service while you sw
 
 The Android **Screen Viewer** is independent of the RDP tunnel. It provides one-shot capture, 0.5/1/2/5-second tile-delta streams, stop, immersive fullscreen, and PNG saving under `Pictures/DeskFerry`. A saved room password and Work-side screen-view opt-in are required.
 
-The foreground service observes Android's active network. A Wi-Fi/mobile handoff immediately replaces the relay transports so a resumable RDP stream can reattach before the separate RDP client times out its loopback socket. At most two local RDP bridge sockets run concurrently; additional reconnect/probe sockets wait locally instead of consuming every Work-agent session slot.
+The foreground service observes Android's active network. A Wi-Fi/mobile handoff immediately replaces the relay transports so a resumable RDP stream can reattach before the separate RDP client times out its loopback socket. Resume handshakes use bounded attempts within the five-minute logical-session window; a dead mobile path therefore cannot consume the whole window, and a network-change notification wakes an attempt that is still waiting on the obsolete path. At most two local RDP bridge sockets run concurrently; additional reconnect/probe sockets wait locally instead of consuming every Work-agent session slot.
 
 Android writes the same daily diagnostics to the app-specific external-files `logs` directory, falling back to internal app storage when necessary. Set **Diagnostic log retention days** in the control panel; the default is 7 and the accepted range is 1 through 3650. The activity log prints the resolved diagnostic-log path when the foreground service starts.
 
@@ -687,6 +703,8 @@ MSTSC may open a short negotiation socket, close it after exchanging only a few 
 Some corporate proxies expire outbound WebSockets on a fixed interval even while the local RDP session remains active. A reconnect or `replaced waiting agent` message roughly every 15 minutes points to that network path rather than an RDP authentication failure.
 
 For resumable pairs, the relay must release the interrupted bridge before it waits for replacement `resume` sockets. Current Azure and Go relays abort obsolete transports immediately and bound graceful WebSocket closes so a missing close handshake cannot hold the resume path for several minutes. Relay logs include `resume rejected`, `resume attachment waiting`, and `resume attachment released` events for correlation with the agent logs.
+
+Android additionally bounds the transport-establishment phase of each resume attempt to 20 seconds. If Android presence and dashboard sockets reconnect after a network handoff but an RDP session later ends with `termination=resume_window_expired`, verify that the installed Android version is 0.10.5 or newer; earlier versions could leave the RDP resume worker waiting on the pre-handoff socket for the full recovery window.
 
 After a relay change, verify the deployed resume behavior with:
 

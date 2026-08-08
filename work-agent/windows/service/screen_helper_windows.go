@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -20,6 +25,10 @@ type helperConn struct {
 }
 
 const screenResponseDrainTimeout = 30 * time.Second
+
+const sessionReconnectTimeout = 15 * time.Second
+
+const sessionDesktopReadyDelay = 500 * time.Millisecond
 
 // screenRelayConn keeps the relay read side open after the capture helper has
 // finished writing. The Home app closes its socket after consuming a single
@@ -138,23 +147,26 @@ func activeInteractiveUserToken() (windows.Token, uint32, error) {
 	var sessionInfo *windows.WTS_SESSION_INFO
 	var sessionCount uint32
 	enumerateErr := windows.WTSEnumerateSessions(0, 0, 1, &sessionInfo, &sessionCount)
-	var candidates []uint32
+	var activeCandidates []uint32
+	var disconnectedCandidates []uint32
 	if enumerateErr == nil {
 		if sessionInfo != nil {
 			defer windows.WTSFreeMemory(uintptr(unsafe.Pointer(sessionInfo)))
 		}
-		candidates = orderedActiveSessionIDs(consoleSessionID, unsafe.Slice(sessionInfo, int(sessionCount)))
+		sessions := unsafe.Slice(sessionInfo, int(sessionCount))
+		activeCandidates = orderedActiveSessionIDs(consoleSessionID, sessions)
+		disconnectedCandidates = orderedDisconnectedSessionIDs(consoleSessionID, sessions)
 	} else if consoleSessionID != 0xffffffff {
-		candidates = []uint32{consoleSessionID}
+		activeCandidates = []uint32{consoleSessionID}
 	}
-	if len(candidates) == 0 {
+	if len(activeCandidates) == 0 && len(disconnectedCandidates) == 0 {
 		if enumerateErr != nil {
 			return 0, 0, fmt.Errorf("enumerate interactive Windows sessions: %w", enumerateErr)
 		}
 		return 0, 0, errors.New("no active interactive Windows session is available")
 	}
 	var failures []error
-	for _, sessionID := range candidates {
+	for _, sessionID := range activeCandidates {
 		var token windows.Token
 		if err := windows.WTSQueryUserToken(sessionID, &token); err == nil {
 			return token, sessionID, nil
@@ -162,7 +174,72 @@ func activeInteractiveUserToken() (windows.Token, uint32, error) {
 			failures = append(failures, fmt.Errorf("query user token for Windows session %d: %w", sessionID, err))
 		}
 	}
+	for _, sessionID := range disconnectedCandidates {
+		var token windows.Token
+		if err := windows.WTSQueryUserToken(sessionID, &token); err != nil {
+			failures = append(failures, fmt.Errorf("query disconnected user token for Windows session %d: %w", sessionID, err))
+			continue
+		}
+		log.Printf("reattaching disconnected Windows session=%d to the console for screen capture", sessionID)
+		if err := reconnectSessionToConsole(sessionID); err != nil {
+			token.Close()
+			failures = append(failures, fmt.Errorf("reattach Windows session %d to the console: %w", sessionID, err))
+			continue
+		}
+		token.Close()
+		freshToken, err := waitForActiveSessionToken(sessionID, sessionReconnectTimeout)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("refresh user token after reattaching Windows session %d: %w", sessionID, err))
+			continue
+		}
+		return freshToken, sessionID, nil
+	}
 	return 0, 0, errors.Join(failures...)
+}
+
+func waitForActiveSessionToken(sessionID uint32, timeout time.Duration) (windows.Token, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		state, found, err := windowsSessionState(sessionID)
+		if err != nil {
+			lastErr = err
+		} else if found && state == windows.WTSActive {
+			time.Sleep(sessionDesktopReadyDelay)
+			var token windows.Token
+			if err := windows.WTSQueryUserToken(sessionID, &token); err == nil {
+				return token, nil
+			} else {
+				lastErr = err
+			}
+		} else if !found {
+			lastErr = errors.New("session disappeared while reconnecting")
+		}
+		if time.Now().After(deadline) {
+			if lastErr == nil {
+				lastErr = errors.New("session did not become active")
+			}
+			return 0, lastErr
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func windowsSessionState(sessionID uint32) (uint32, bool, error) {
+	var sessionInfo *windows.WTS_SESSION_INFO
+	var sessionCount uint32
+	if err := windows.WTSEnumerateSessions(0, 0, 1, &sessionInfo, &sessionCount); err != nil {
+		return 0, false, err
+	}
+	if sessionInfo != nil {
+		defer windows.WTSFreeMemory(uintptr(unsafe.Pointer(sessionInfo)))
+	}
+	for _, session := range unsafe.Slice(sessionInfo, int(sessionCount)) {
+		if session.SessionID == sessionID {
+			return session.State, true, nil
+		}
+	}
+	return 0, false, nil
 }
 
 func orderedActiveSessionIDs(consoleSessionID uint32, sessions []windows.WTS_SESSION_INFO) []uint32 {
@@ -181,6 +258,51 @@ func orderedActiveSessionIDs(consoleSessionID uint32, sessions []windows.WTS_SES
 		}
 	}
 	return result
+}
+
+func orderedDisconnectedSessionIDs(consoleSessionID uint32, sessions []windows.WTS_SESSION_INFO) []uint32 {
+	result := make([]uint32, 0, len(sessions))
+	if consoleSessionID != 0xffffffff {
+		for _, session := range sessions {
+			if session.SessionID == consoleSessionID && session.State == windows.WTSDisconnected {
+				result = append(result, session.SessionID)
+				break
+			}
+		}
+	}
+	for _, session := range sessions {
+		if session.State == windows.WTSDisconnected && session.SessionID != consoleSessionID {
+			result = append(result, session.SessionID)
+		}
+	}
+	return result
+}
+
+// reconnectSessionToConsole runs tscon as the Work service account. The normal
+// LocalSystem service has permission to reconnect the existing user session,
+// so DeskFerry does not need to store or receive the user's Windows password.
+func reconnectSessionToConsole(sessionID uint32) error {
+	systemRoot := strings.TrimSpace(os.Getenv("SystemRoot"))
+	if systemRoot == "" {
+		systemRoot = `C:\Windows`
+	}
+	executable := filepath.Join(systemRoot, "System32", "tscon.exe")
+	ctx, cancel := context.WithTimeout(context.Background(), sessionReconnectTimeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, executable, strconv.FormatUint(uint64(sessionID), 10), "/dest:console")
+	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
+	output, err := command.CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("tscon did not finish within %s", sessionReconnectTimeout)
+	}
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			return fmt.Errorf("tscon failed: %w", err)
+		}
+		return fmt.Errorf("tscon failed: %w: %s", err, message)
+	}
+	return nil
 }
 
 func (c *helperConn) Read(buffer []byte) (int, error)  { return c.reader.Read(buffer) }

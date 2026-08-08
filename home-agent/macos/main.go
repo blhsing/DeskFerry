@@ -25,6 +25,7 @@ import (
 	"deskferry/internal/buildinfo"
 	"deskferry/internal/diaglog"
 	"deskferry/internal/remotelog"
+	"deskferry/internal/screenview"
 	"deskferry/internal/tunnel"
 	"nhooyr.io/websocket"
 )
@@ -109,6 +110,10 @@ func main() {
 	var winRMCommand string
 	var winRMCommandFile string
 	var winRMTimeout time.Duration
+	var screenshot string
+	var screenshotStream string
+	var screenInterval time.Duration
+	var screenCount int
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.Var(&relayBases, "relay-base-url", "relay service base URL; repeat to add fallback relay services")
 	flag.StringVar(&roomName, "room", "workdesk", "room name appended to each relay service base URL")
@@ -123,6 +128,10 @@ func main() {
 	flag.StringVar(&winRMCommand, "winrm-command", "", "run a PowerShell command through the selected destination's WinRM service")
 	flag.StringVar(&winRMCommandFile, "winrm-command-file", "", "read a WinRM PowerShell command from a file, or - for standard input")
 	flag.DurationVar(&winRMTimeout, "winrm-timeout", 2*time.Minute, "timeout for CLI WinRM command execution")
+	flag.StringVar(&screenshot, "screenshot", "", "capture one Work screen PNG to this file, or - for standard output")
+	flag.StringVar(&screenshotStream, "screenshot-stream", "", "stream complete Work screen PNGs into this directory")
+	flag.DurationVar(&screenInterval, "screen-interval", time.Second, "screenshot stream interval")
+	flag.IntVar(&screenCount, "screen-count", 0, "number of streamed screenshots to save; 0 runs until interrupted")
 	flag.Parse()
 	if path, err := diaglog.Enable("home-agent", false, logRetentionDays, relayLogs); err != nil {
 		log.Printf("persistent diagnostic logging unavailable: %v", err)
@@ -151,8 +160,16 @@ func main() {
 		log.Fatal(err)
 	}
 	winRMCommandMode := winRMCommand != "" || winRMCommandFile != ""
+	screenOptions := screenview.CLIOptions{Screenshot: screenshot, StreamDirectory: screenshotStream, Interval: screenInterval, Count: screenCount}
+	screenCommandMode := screenOptions.Active()
+	flag.Visit(func(option *flag.Flag) {
+		if strings.HasPrefix(option.Name, "screen-") {
+			screenCommandMode = true
+		}
+	})
 	var selectedProfile macProfile
-	if winRMCommandMode {
+	useSavedScreenProfile := screenCommandMode && (destinationFlag != "" || (len(relayURLs) == 0 && len(relayBases) == 0 && strings.TrimSpace(roomPassword) == ""))
+	if winRMCommandMode || useSavedScreenProfile {
 		settings, err := loadMacSettings(cfg)
 		if err != nil {
 			log.Fatal(err)
@@ -168,6 +185,9 @@ func main() {
 	}
 
 	if statusOnly {
+		if screenCommandMode {
+			log.Fatal("use screenshot options separately from -status")
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
 		summary, err := queryRelaySummary(ctx, cfg)
@@ -192,6 +212,24 @@ func main() {
 		commandCtx, cancel := context.WithTimeout(ctx, winRMTimeout)
 		defer cancel()
 		if err := executeMacWinRM(commandCtx, cfg, selectedProfile, command, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if screenCommandMode {
+		if winRMCommandMode {
+			log.Fatal("use screenshot options separately from WinRM command options")
+		}
+		if err := screenOptions.Validate(); err != nil {
+			log.Fatal(err)
+		}
+		conn, relayAddr, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer conn.Close()
+		fmt.Fprintf(os.Stderr, "Connected to the Work screen service through %s.\n", relayAddr)
+		if err := screenview.RunCLI(ctx, conn, screenOptions); err != nil && !errors.Is(err, context.Canceled) {
 			log.Fatal(err)
 		}
 		return

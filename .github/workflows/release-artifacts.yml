@@ -94,6 +94,7 @@ jobs:
             'dist\windows-home-installer\DeskFerryHomeSetup-debug.exe',
             'dist\bin\deskferry-home-macos-arm64',
             'dist\bin\deskferry-home-macos-amd64',
+            'dist\bin\deskferry-relay-linux-amd64',
             'dist\azure-relay\deskferry-azure-relay.zip',
             'dist\python-relay\deskferry-python-relay.zip',
             'dist\python-relay\deskferry-python-relay-linux-cp39-vendored.zip',
@@ -144,5 +145,6 @@ jobs:
             'dist\windows-home-installer\DeskFerryHomeSetup-debug.exe' `
             'dist\bin\deskferry-home-macos-arm64' `
             'dist\bin\deskferry-home-macos-amd64' `
+            'dist\bin\deskferry-relay-linux-amd64' `
             'dist\bin\SHA256SUMS.txt' `
             --clobber

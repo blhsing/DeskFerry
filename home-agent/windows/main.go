@@ -33,6 +33,7 @@ import (
 	"deskferry/internal/diaglog"
 	"deskferry/internal/homenetwork"
 	"deskferry/internal/remotelog"
+	"deskferry/internal/screenview"
 	"deskferry/internal/tunnel"
 	"deskferry/internal/wincred"
 	"deskferry/internal/winsecret"
@@ -202,6 +203,10 @@ func main() {
 	var winRMCommandFile string
 	var winRMTimeout time.Duration
 	var syncSMBProfile bool
+	var screenshot string
+	var screenshotStream string
+	var screenInterval time.Duration
+	var screenCount int
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.StringVar(&listenAddr, "listen", "", "local RDP listen address")
 	flag.StringVar(&proxyFlag, "proxy", "", "proxy: env, direct, or http(s)://host:port")
@@ -213,9 +218,20 @@ func main() {
 	flag.StringVar(&winRMCommandFile, "winrm-command-file", "", "read a WinRM PowerShell command from a file, or - for standard input")
 	flag.DurationVar(&winRMTimeout, "winrm-timeout", 2*time.Minute, "timeout for CLI WinRM command execution")
 	flag.BoolVar(&syncSMBProfile, "sync-smb-profile", false, "apply the selected destination to the elevated SMB network service")
+	flag.StringVar(&screenshot, "screenshot", "", "capture one Work screen PNG to this file, or - for standard output")
+	flag.StringVar(&screenshotStream, "screenshot-stream", "", "stream complete Work screen PNGs into this directory")
+	flag.DurationVar(&screenInterval, "screen-interval", time.Second, "screenshot stream interval")
+	flag.IntVar(&screenCount, "screen-count", 0, "number of streamed screenshots to save; 0 runs until interrupted")
 	flag.Parse()
 	winRMCommandMode := winRMCommand != "" || winRMCommandFile != ""
-	commandMode := winRMCommandMode || syncSMBProfile
+	screenOptions := screenview.CLIOptions{Screenshot: screenshot, StreamDirectory: screenshotStream, Interval: screenInterval, Count: screenCount}
+	screenCommandMode := screenOptions.Active()
+	flag.Visit(func(option *flag.Flag) {
+		if strings.HasPrefix(option.Name, "screen-") {
+			screenCommandMode = true
+		}
+	})
+	commandMode := winRMCommandMode || syncSMBProfile || screenCommandMode
 	if commandMode {
 		attachParentConsole()
 	}
@@ -250,6 +266,26 @@ func main() {
 	}
 	relayLogs.SetInstance(homeLogInstance())
 	setHomeLogTargets(cfg)
+	if screenCommandMode {
+		if winRMCommandMode || syncSMBProfile {
+			log.Fatal("use screenshot options separately from WinRM and SMB command options")
+		}
+		if err := screenOptions.Validate(); err != nil {
+			log.Fatal(err)
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		conn, relayAddr, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer conn.Close()
+		fmt.Fprintf(os.Stderr, "Connected to the Work screen service through %s.\n", relayAddr)
+		if err := screenview.RunCLI(ctx, conn, screenOptions); err != nil && !errors.Is(err, context.Canceled) {
+			log.Fatal(err)
+		}
+		return
+	}
 	if syncSMBProfile {
 		if winRMCommandMode {
 			log.Fatal("use -sync-smb-profile separately from WinRM command options")
@@ -302,16 +338,22 @@ func attachParentConsole() {
 	if attached == 0 {
 		return
 	}
-	if stdin, err := os.OpenFile("CONIN$", os.O_RDONLY, 0); err == nil {
-		os.Stdin = stdin
+	if _, err := os.Stdin.Stat(); err != nil {
+		if stdin, openErr := os.OpenFile("CONIN$", os.O_RDONLY, 0); openErr == nil {
+			os.Stdin = stdin
+		}
 	}
-	if stdout, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
-		os.Stdout = stdout
+	if _, err := os.Stdout.Stat(); err != nil {
+		if stdout, openErr := os.OpenFile("CONOUT$", os.O_WRONLY, 0); openErr == nil {
+			os.Stdout = stdout
+		}
 	}
-	if stderr, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
-		os.Stderr = stderr
-		log.SetOutput(stderr)
+	if _, err := os.Stderr.Stat(); err != nil {
+		if stderr, openErr := os.OpenFile("CONOUT$", os.O_WRONLY, 0); openErr == nil {
+			os.Stderr = stderr
+		}
 	}
+	log.SetOutput(os.Stderr)
 }
 
 func selectDestinationConfig(cfg *config, name string) error {

@@ -1,5 +1,12 @@
 # Release Notes
 
+## 0.10.5 - 2026-08-08
+
+- Made authenticated Work screen capture recover a logged-on but disconnected Windows session by reattaching it to the physical console, waiting for the interactive desktop, and launching the helper with a fresh user token.
+- Added Windows and macOS Home CLI commands for one-shot screenshots and reconstructed screenshot streams using saved destinations, without opening either graphical control panel.
+- Fixed Android RDP recovery after mobile/Wi-Fi disruption by bounding each resume handshake and waking the resume worker immediately when Android replaces an obsolete network transport.
+- Added Android resume timing tests to the normal APK build and made the Android version prominently visible in the control-panel title.
+
 ## 0.10.4 - 2026-08-07
 
 - Fixed direct Work screen capture on RDP and indirect-display desktops by probing every attached DXGI adapter/output and creating each capture device on the adapter that owns the output, including software-backed remote display adapters.
