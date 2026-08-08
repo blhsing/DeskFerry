@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lxn/walk"
 	"golang.org/x/sys/windows"
 )
 
@@ -355,5 +356,40 @@ func TestSMBCredentialTargetFromMetadata(t *testing.T) {
 				t.Fatalf("target = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestScreenViewerStartupBoundsMaximizesLargeRemoteScreen(t *testing.T) {
+	work := walk.Rectangle{X: 100, Y: 50, Width: 1920, Height: 1040}
+	bounds, maximize := screenViewerStartupBounds(
+		3840, 1080,
+		walk.Rectangle{Width: 1920, Height: 1040},
+		walk.Rectangle{Width: 1900, Height: 950},
+		work,
+		walk.Size{Width: 720, Height: 500},
+	)
+	if !maximize {
+		t.Fatal("large remote screen should maximize the viewer")
+	}
+	if bounds != work {
+		t.Fatalf("bounds = %#v, want work area %#v", bounds, work)
+	}
+}
+
+func TestScreenViewerStartupBoundsFitsAndCentersSmallRemoteScreen(t *testing.T) {
+	work := walk.Rectangle{X: 100, Y: 50, Width: 1920, Height: 1040}
+	bounds, maximize := screenViewerStartupBounds(
+		1280, 720,
+		walk.Rectangle{Width: 1920, Height: 1040},
+		walk.Rectangle{Width: 1900, Height: 950},
+		work,
+		walk.Size{Width: 720, Height: 500},
+	)
+	if maximize {
+		t.Fatal("small remote screen should use a fitted viewer window")
+	}
+	want := walk.Rectangle{X: 410, Y: 165, Width: 1300, Height: 810}
+	if bounds != want {
+		t.Fatalf("bounds = %#v, want %#v", bounds, want)
 	}
 }

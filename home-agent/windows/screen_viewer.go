@@ -45,6 +45,7 @@ type screenViewer struct {
 	streaming            bool
 	zoom                 float64
 	zoomControlUpdating  bool
+	startupSized         bool
 	renderWidth          int
 	renderHeight         int
 	gestureStartDistance uint64
@@ -138,7 +139,7 @@ func (a *clientApp) openScreenViewer() {
 		Size:     Size{Width: 1100, Height: 760},
 		Layout:   VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 7},
 		Children: []Widget{
-			Composite{Layout: Flow{Spacing: 7}, Children: []Widget{
+			Composite{MaxSize: Size{Height: 30}, Layout: HBox{MarginsZero: true, Spacing: 7}, Children: []Widget{
 				PushButton{Text: "Capture Once", OnClicked: func() { viewer.start(false) }},
 				PushButton{Text: "Start Stream", OnClicked: func() { viewer.start(true) }},
 				PushButton{Text: "Stop", OnClicked: viewer.stop},
@@ -151,6 +152,7 @@ func (a *clientApp) openScreenViewer() {
 					Model:                 []string{"Auto Fit", "25%", "50%", "75%", "100%", "125%", "150%", "200%", "300%", "400%"},
 					CurrentIndex:          0,
 					MinSize:               Size{Width: 95},
+					StretchFactor:         1,
 					OnCurrentIndexChanged: viewer.applyZoomSelection,
 					OnEditingFinished:     viewer.applyZoomSelection,
 				},
@@ -162,7 +164,7 @@ func (a *clientApp) openScreenViewer() {
 				AssignTo:      &viewer.viewport,
 				StretchFactor: 1,
 				Background:    SolidColorBrush{Color: walk.RGB(0, 0, 0)},
-				Layout:        Grid{Margins: Margins{}},
+				Layout:        Grid{MarginsZero: true},
 				OnSizeChanged: viewer.layoutScreen,
 				Children: []Widget{
 					CustomWidget{
@@ -181,6 +183,7 @@ func (a *clientApp) openScreenViewer() {
 		a.showError(err)
 		return
 	}
+	win.SetWindowLongPtr(viewer.mw.Handle(), win.GWLP_HWNDPARENT, uintptr(a.mw.Handle()))
 	zoomCanvas := &screenZoomCanvas{CustomWidget: viewer.canvas, viewer: viewer}
 	if err := walk.InitWrapperWindow(zoomCanvas); err != nil {
 		viewer.mw.Dispose()
@@ -195,6 +198,7 @@ func (a *clientApp) openScreenViewer() {
 	}
 	enableScreenZoomGesture(viewer.canvas.Handle())
 	enableScreenZoomGesture(viewer.viewport.Handle())
+	win.EnableWindow(a.mw.Handle(), false)
 	viewer.mw.Closing().Attach(func(_ *bool, _ walk.CloseReason) {
 		viewer.mu.Lock()
 		viewer.closed = true
@@ -209,8 +213,12 @@ func (a *clientApp) openScreenViewer() {
 		if bitmap != nil {
 			bitmap.Dispose()
 		}
+		win.EnableWindow(a.mw.Handle(), true)
+		win.SetForegroundWindow(a.mw.Handle())
 	})
 	viewer.mw.Show()
+	win.ShowWindow(viewer.mw.Handle(), win.SW_MAXIMIZE)
+	viewer.activateWindow()
 	viewer.start(false)
 }
 
@@ -430,7 +438,8 @@ func (v *screenViewer) layoutScreen() {
 	}
 	sourceWidth := frame.Bounds().Dx()
 	sourceHeight := frame.Bounds().Dy()
-	if zoom == 0 {
+	autoFit := zoom == 0
+	if autoFit {
 		bounds := v.viewport.ClientBoundsPixels()
 		if bounds.Width <= 0 || bounds.Height <= 0 {
 			return
@@ -440,6 +449,9 @@ func (v *screenViewer) layoutScreen() {
 	width := max(1, int(math.Round(float64(sourceWidth)*zoom)))
 	height := max(1, int(math.Round(float64(sourceHeight)*zoom)))
 	if width == v.renderWidth && height == v.renderHeight {
+		if autoFit {
+			v.setScreenPan(0, 0)
+		}
 		_ = v.canvas.Invalidate()
 		return
 	}
@@ -449,6 +461,9 @@ func (v *screenViewer) layoutScreen() {
 	_ = v.canvas.SetMinMaxSizePixels(size, size)
 	_ = v.canvas.SetSizePixels(size)
 	v.viewport.RequestLayout()
+	if autoFit {
+		v.setScreenPan(0, 0)
+	}
 	_ = v.canvas.Invalidate()
 }
 
@@ -532,6 +547,7 @@ func (v *screenViewer) showFrame(source *image.RGBA, sequence uint64, changedTil
 		previous := v.bitmap
 		v.bitmap = bitmap
 		v.mu.Unlock()
+		v.sizeWindowForFirstFrame(copyImage.Bounds().Dx(), copyImage.Bounds().Dy())
 		v.layoutScreen()
 		_ = v.canvas.Invalidate()
 		if previous != nil {
@@ -541,6 +557,74 @@ func (v *screenViewer) showFrame(source *image.RGBA, sequence uint64, changedTil
 			_ = v.status.SetText(fmt.Sprintf("Streaming frame %d (%d changed tiles).", sequence, changedTiles))
 		}
 	})
+}
+
+func (v *screenViewer) sizeWindowForFirstFrame(frameWidth, frameHeight int) {
+	v.mu.Lock()
+	if v.startupSized {
+		v.mu.Unlock()
+		return
+	}
+	v.startupSized = true
+	v.mu.Unlock()
+	if v.mw == nil || v.viewport == nil || frameWidth <= 0 || frameHeight <= 0 {
+		return
+	}
+	var monitor win.MONITORINFO
+	monitor.CbSize = uint32(unsafe.Sizeof(monitor))
+	if !win.GetMonitorInfo(win.MonitorFromWindow(v.mw.Handle(), win.MONITOR_DEFAULTTONEAREST), &monitor) {
+		return
+	}
+	work := walk.Rectangle{
+		X:      int(monitor.RcWork.Left),
+		Y:      int(monitor.RcWork.Top),
+		Width:  int(monitor.RcWork.Right - monitor.RcWork.Left),
+		Height: int(monitor.RcWork.Bottom - monitor.RcWork.Top),
+	}
+	bounds, maximize := screenViewerStartupBounds(
+		frameWidth,
+		frameHeight,
+		v.mw.BoundsPixels(),
+		v.viewport.ClientBoundsPixels(),
+		work,
+		walk.Size{Width: 720, Height: 500},
+	)
+	if maximize {
+		win.ShowWindow(v.mw.Handle(), win.SW_MAXIMIZE)
+		v.activateWindow()
+		return
+	}
+	win.ShowWindow(v.mw.Handle(), win.SW_RESTORE)
+	_ = v.mw.SetBoundsPixels(bounds)
+	v.activateWindow()
+}
+
+func (v *screenViewer) activateWindow() {
+	if v.mw == nil {
+		return
+	}
+	win.BringWindowToTop(v.mw.Handle())
+	win.SetForegroundWindow(v.mw.Handle())
+	win.SetActiveWindow(v.mw.Handle())
+	if v.zoomBox != nil {
+		_ = v.zoomBox.SetFocus()
+	}
+}
+
+func screenViewerStartupBounds(frameWidth, frameHeight int, window, viewport, work walk.Rectangle, minimum walk.Size) (walk.Rectangle, bool) {
+	chromeWidth := max(0, window.Width-viewport.Width)
+	chromeHeight := max(0, window.Height-viewport.Height)
+	desiredWidth := max(minimum.Width, frameWidth+chromeWidth)
+	desiredHeight := max(minimum.Height, frameHeight+chromeHeight)
+	if desiredWidth >= work.Width || desiredHeight >= work.Height {
+		return work, true
+	}
+	return walk.Rectangle{
+		X:      work.X + (work.Width-desiredWidth)/2,
+		Y:      work.Y + (work.Height-desiredHeight)/2,
+		Width:  desiredWidth,
+		Height: desiredHeight,
+	}, false
 }
 
 func (v *screenViewer) stop() {

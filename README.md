@@ -281,7 +281,7 @@ Start the Windows home app, choose or create a named destination, enter its room
 
 The app opens a friendly control panel and a notification-area icon. Enter the same room password once for the selected destination, then click `Connect` to start the local listeners and open Remote Desktop. The default RDP listener is `127.0.0.1:3390`, avoiding Windows' normal local RDP port `3389`. When a room credential is saved, the app also listens on `127.0.0.1:3391` for WinRM and opens one outbound WebSocket to the first reachable relay for each local connection.
 
-Click **Screen Viewer** to capture the Work desktop without opening RDP. Its separate viewer supports one-shot capture, 0.5/1/2/5-second delta streams, stop, fullscreen, and saving the reconstructed image as PNG. The Work configurator must have screen viewing enabled for the same protected room.
+Click **Screen Viewer** to capture the Work computer's primary display without opening RDP. Capturing one display avoids presenting inactive or lock-screen-black secondary monitors as unused viewer space. The separate viewer supports one-shot capture, 0.5/1/2/5-second delta streams, stop, fullscreen, Auto Fit without scrollbars, manual zoom/pan, and saving the reconstructed image as PNG. On Windows it opens maximized for a large remote display, uses a fitted window for a smaller display, and remains focused until closed. The Work configurator must have screen viewing enabled for the same protected room.
 
 The installed Home executable also exposes the same authenticated screen service without opening the UI. Select a saved destination and either capture one PNG or write reconstructed stream frames into a directory:
 
@@ -349,7 +349,7 @@ For SMB file access, keep **Local SMB port for CX File Explorer** at the non-roo
 
 The Android app keeps the tunnel alive through a foreground service while you switch to the RDP client. It maintains the same `home-agent` presence socket used by the relay dashboard and a `dashboard` WebSocket for live relay status updates. Its Proxy field accepts `system`, `direct`, `http://host:port`, or `https://host:port`; optional Basic credentials can be included in the proxy URL.
 
-The Android **Screen Viewer** is independent of the RDP tunnel. It provides one-shot capture, 0.5/1/2/5-second tile-delta streams, stop, immersive fullscreen, and PNG saving under `Pictures/DeskFerry`. A saved room password and Work-side screen-view opt-in are required.
+The Android **Screen Viewer** is independent of the RDP tunnel. It receives the same primary-display capture as Windows and macOS, Auto Fits it to the available image area, and provides one-shot capture, 0.5/1/2/5-second tile-delta streams, stop, immersive fullscreen, manual zoom/pan, and PNG saving under `Pictures/DeskFerry`. A saved room password and Work-side screen-view opt-in are required.
 
 The foreground service observes Android's active network. A Wi-Fi/mobile handoff immediately replaces the relay transports so a resumable RDP stream can reattach before the separate RDP client times out its loopback socket. Resume handshakes use bounded attempts within the five-minute logical-session window; a dead mobile path therefore cannot consume the whole window, and a network-change notification wakes an attempt that is still waiting on the obsolete path. At most two local RDP bridge sockets run concurrently; additional reconnect/probe sockets wait locally instead of consuming every Work-agent session slot.
 

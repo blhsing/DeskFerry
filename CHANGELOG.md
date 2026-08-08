@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.10.6 - 2026-08-08
+
+- Changed Work screen sharing to capture the primary display instead of composing the complete virtual desktop, eliminating black secondary-display regions on Windows lock screens for Windows, macOS, and Android Home viewers.
+- Fixed the Windows Screen Viewer layout so its toolbar remains compact, Auto Fit receives the full viewport, and large remote screens open maximized while low-resolution screens use a fitted window.
+- Kept focus on the Windows Screen Viewer after it opens and after its first captured frame determines the final window size.
+
 ## 0.10.5 - 2026-08-08
 
 - Made authenticated Work screen capture recover a logged-on but disconnected Windows session by reattaching it to the physical console, waiting for the interactive desktop, and launching the helper with a fresh user token.

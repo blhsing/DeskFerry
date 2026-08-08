@@ -16,19 +16,25 @@ import (
 )
 
 var (
-	user32                 = windows.NewLazySystemDLL("user32.dll")
-	kernel32               = windows.NewLazySystemDLL("kernel32.dll")
-	procOpenInputDesktop   = user32.NewProc("OpenInputDesktop")
-	procSetThreadDesktop   = user32.NewProc("SetThreadDesktop")
-	procGetThreadDesktop   = user32.NewProc("GetThreadDesktop")
-	procCloseDesktop       = user32.NewProc("CloseDesktop")
-	procGetCurrentThreadID = kernel32.NewProc("GetCurrentThreadId")
+	user32                   = windows.NewLazySystemDLL("user32.dll")
+	kernel32                 = windows.NewLazySystemDLL("kernel32.dll")
+	procOpenInputDesktop     = user32.NewProc("OpenInputDesktop")
+	procSetThreadDesktop     = user32.NewProc("SetThreadDesktop")
+	procGetThreadDesktop     = user32.NewProc("GetThreadDesktop")
+	procCloseDesktop         = user32.NewProc("CloseDesktop")
+	procGetCurrentThreadID   = kernel32.NewProc("GetCurrentThreadId")
+	procSetProcessDPIAware   = user32.NewProc("SetProcessDPIAware")
+	procSetProcessDPIContext = user32.NewProc("SetProcessDpiAwarenessContext")
 )
 
 const (
 	desktopReadObjects   = 0x0001
 	desktopWriteObjects  = 0x0080
 	desktopSwitchDesktop = 0x0100
+	// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2. Capturing with a DPI-unaware
+	// helper can combine physical virtual-screen metrics with a DPI-virtualized
+	// GDI device context, producing a frame whose unused right side is black.
+	perMonitorAwareV2 = ^uintptr(3)
 )
 
 type desktopCapturer struct {
@@ -84,8 +90,10 @@ func (c *desktopCapturer) captureDXGI(gdiErr error, previousErrors ...error) (*i
 	return nil, errors.Join(gdiErr, errors.Join(dxgiErrors...))
 }
 
-// CaptureDesktop captures the complete Windows virtual desktop from the
-// interactive session in which the process is running.
+// CaptureDesktop captures the primary Windows display from the interactive
+// session in which the process is running. A whole-virtual-desktop capture can
+// contain large black secondary-display regions on the lock screen and cannot
+// be fitted usefully by Home viewers that show one screen at a time.
 func CaptureDesktop() (*image.RGBA, error) {
 	capturer := &desktopCapturer{}
 	defer capturer.Close()
@@ -93,10 +101,10 @@ func CaptureDesktop() (*image.RGBA, error) {
 }
 
 func captureDesktopGDI() (*image.RGBA, error) {
-	x := win.GetSystemMetrics(win.SM_XVIRTUALSCREEN)
-	y := win.GetSystemMetrics(win.SM_YVIRTUALSCREEN)
-	width := win.GetSystemMetrics(win.SM_CXVIRTUALSCREEN)
-	height := win.GetSystemMetrics(win.SM_CYVIRTUALSCREEN)
+	x := int32(0)
+	y := int32(0)
+	width := win.GetSystemMetrics(win.SM_CXSCREEN)
+	height := win.GetSystemMetrics(win.SM_CYSCREEN)
 	if width <= 0 || height <= 0 {
 		return nil, errors.New("the interactive desktop is not available")
 	}
@@ -230,6 +238,7 @@ func bindThreadToInputDesktop() (func(), error) {
 // RunCaptureHelper is the interactive-session side of the Work agent screen
 // service. Its stdout is reserved for the binary frame stream.
 func RunCaptureHelper() error {
+	enablePhysicalDesktopCoordinates()
 	request, err := ReadRequest(os.Stdin)
 	if err != nil {
 		return err
@@ -281,5 +290,16 @@ func RunCaptureHelper() error {
 			return err
 		}
 		previous = current
+	}
+}
+
+func enablePhysicalDesktopCoordinates() {
+	if procSetProcessDPIContext.Find() == nil {
+		if ok, _, _ := procSetProcessDPIContext.Call(perMonitorAwareV2); ok != 0 {
+			return
+		}
+	}
+	if procSetProcessDPIAware.Find() == nil {
+		_, _, _ = procSetProcessDPIAware.Call()
 	}
 }

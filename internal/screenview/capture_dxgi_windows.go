@@ -88,18 +88,20 @@ func newDXGICapturer() (*dxgiCapturer, error) {
 				}
 				continue
 			}
+			if !primaryDisplayBounds(bounds) {
+				duplicator.Release()
+				continue
+			}
 			duplicator.UpdatePointerInfo = true
 			duplicator.DrawPointer = true
 			capturer.outputs = append(capturer.outputs, dxgiOutput{duplicator: duplicator, bounds: bounds})
-			if len(capturer.outputs) == 1 {
-				capturer.bounds = bounds
-			} else {
-				capturer.bounds = capturer.bounds.Union(bounds)
-			}
+			capturer.bounds = bounds
 			deviceUsed = true
+			break
 		}
 		if deviceUsed {
 			capturer.devices = append(capturer.devices, dxgiDevice{device: device, context: context})
+			break
 		} else {
 			context.Release()
 			device.Release()
@@ -113,6 +115,10 @@ func newDXGICapturer() (*dxgiCapturer, error) {
 		return nil, fmt.Errorf("DirectX found no capturable desktop outputs: %w", errors.Join(attempts...))
 	}
 	return capturer, nil
+}
+
+func primaryDisplayBounds(bounds image.Rectangle) bool {
+	return image.Pt(0, 0).In(bounds)
 }
 
 // newD3D11DeviceForAdapter creates the capture device on the adapter that owns
