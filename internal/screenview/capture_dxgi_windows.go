@@ -5,16 +5,25 @@ import (
 	"fmt"
 	"image"
 	"image/draw"
+	"syscall"
+	"unsafe"
 
+	"github.com/kirides/go-d3d"
 	"github.com/kirides/go-d3d/d3d11"
+	"github.com/kirides/go-d3d/dxgi"
 	"github.com/kirides/go-d3d/outputduplication"
+	"golang.org/x/sys/windows"
 )
 
 const (
+	maxDXGIAdapters     = 16
 	maxDXGIOutputs      = 16
 	dxgiFrameTimeoutMS  = 250
 	initialDXGIAttempts = 4
+	d3d11SDKVersion     = 7
 )
+
+var procD3D11CreateDevice = windows.NewLazySystemDLL("d3d11.dll").NewProc("D3D11CreateDevice")
 
 type dxgiOutput struct {
 	duplicator *outputduplication.OutputDuplicator
@@ -23,50 +32,124 @@ type dxgiOutput struct {
 }
 
 type dxgiCapturer struct {
-	device  *d3d11.ID3D11Device
-	context *d3d11.ID3D11DeviceContext
+	devices []dxgiDevice
 	outputs []dxgiOutput
 	bounds  image.Rectangle
 }
 
+type dxgiDevice struct {
+	device  *d3d11.ID3D11Device
+	context *d3d11.ID3D11DeviceContext
+}
+
 func newDXGICapturer() (*dxgiCapturer, error) {
-	device, context, err := d3d11.NewD3D11Device()
-	if err != nil {
-		return nil, err
+	var factory *dxgi.IDXGIFactory1
+	if err := dxgi.CreateDXGIFactory1(&factory); err != nil {
+		return nil, fmt.Errorf("create DirectX adapter factory: %w", err)
 	}
-	capturer := &dxgiCapturer{device: device, context: context}
-	for index := 0; index < maxDXGIOutputs; index++ {
-		duplicator, duplicateErr := outputduplication.NewIDXGIOutputDuplication(device, context, uint(index))
-		if duplicateErr != nil {
-			if index == 0 {
-				capturer.Close()
-				return nil, duplicateErr
-			}
+	defer factory.Release()
+
+	capturer := &dxgiCapturer{}
+	var attempts []error
+	for adapterIndex := 0; adapterIndex < maxDXGIAdapters; adapterIndex++ {
+		var adapter *dxgi.IDXGIAdapter1
+		hr := factory.EnumAdapters1(uint32(adapterIndex), &adapter)
+		if d3d.HRESULT(hr).Failed() {
 			break
 		}
-		bounds, boundsErr := duplicator.GetBounds()
-		if boundsErr != nil || bounds.Empty() {
-			duplicator.Release()
-			capturer.Close()
-			if boundsErr != nil {
-				return nil, boundsErr
-			}
-			return nil, errors.New("DirectX output has empty desktop bounds")
+		var desc dxgi.DXGI_ADAPTER_DESC1
+		name := fmt.Sprintf("adapter %d", adapterIndex)
+		if descHR := adapter.GetDesc1(&desc); !d3d.HRESULT(descHR).Failed() {
+			name = fmt.Sprintf("adapter %d %q flags=%s", adapterIndex, desc.DescriptionString(), desc.Flags)
 		}
-		duplicator.UpdatePointerInfo = true
-		duplicator.DrawPointer = true
-		capturer.outputs = append(capturer.outputs, dxgiOutput{duplicator: duplicator, bounds: bounds})
-		if len(capturer.outputs) == 1 {
-			capturer.bounds = bounds
+		device, context, deviceErr := newD3D11DeviceForAdapter(adapter)
+		adapter.Release()
+		if deviceErr != nil {
+			attempts = append(attempts, fmt.Errorf("%s: create device: %w", name, deviceErr))
+			continue
+		}
+
+		deviceUsed := false
+		for outputIndex := 0; outputIndex < maxDXGIOutputs; outputIndex++ {
+			duplicator, duplicateErr := outputduplication.NewIDXGIOutputDuplication(device, context, uint(outputIndex))
+			if duplicateErr != nil {
+				if outputIndex == 0 {
+					attempts = append(attempts, fmt.Errorf("%s output 0: %w", name, duplicateErr))
+				}
+				break
+			}
+			bounds, boundsErr := duplicator.GetBounds()
+			if boundsErr != nil || bounds.Empty() {
+				duplicator.Release()
+				if boundsErr != nil {
+					attempts = append(attempts, fmt.Errorf("%s output %d bounds: %w", name, outputIndex, boundsErr))
+				} else {
+					attempts = append(attempts, fmt.Errorf("%s output %d has empty desktop bounds", name, outputIndex))
+				}
+				continue
+			}
+			duplicator.UpdatePointerInfo = true
+			duplicator.DrawPointer = true
+			capturer.outputs = append(capturer.outputs, dxgiOutput{duplicator: duplicator, bounds: bounds})
+			if len(capturer.outputs) == 1 {
+				capturer.bounds = bounds
+			} else {
+				capturer.bounds = capturer.bounds.Union(bounds)
+			}
+			deviceUsed = true
+		}
+		if deviceUsed {
+			capturer.devices = append(capturer.devices, dxgiDevice{device: device, context: context})
 		} else {
-			capturer.bounds = capturer.bounds.Union(bounds)
+			context.Release()
+			device.Release()
 		}
 	}
 	if len(capturer.outputs) == 0 || capturer.bounds.Empty() {
 		capturer.Close()
-		return nil, errors.New("DirectX found no attached desktop outputs")
+		if len(attempts) == 0 {
+			return nil, errors.New("DirectX found no attached desktop outputs")
+		}
+		return nil, fmt.Errorf("DirectX found no capturable desktop outputs: %w", errors.Join(attempts...))
 	}
 	return capturer, nil
+}
+
+// newD3D11DeviceForAdapter creates the capture device on the adapter that owns
+// the output. In an RDP or indirect-display session that adapter can be marked
+// as software, so selecting the first hardware adapter is not sufficient.
+func newD3D11DeviceForAdapter(adapter *dxgi.IDXGIAdapter1) (*d3d11.ID3D11Device, *d3d11.ID3D11DeviceContext, error) {
+	featureLevels := [...]uint32{0xc100, 0xc000, 0xb100, 0xb000, 0xa100, 0xa000}
+	selectedFeatureLevel := uint32(0)
+	var device *d3d11.ID3D11Device
+	var context *d3d11.ID3D11DeviceContext
+	const d3dDriverTypeUnknown = 0
+	result, _, _ := syscall.SyscallN(
+		procD3D11CreateDevice.Addr(),
+		uintptr(unsafe.Pointer(adapter)),
+		uintptr(d3dDriverTypeUnknown),
+		0,
+		0,
+		uintptr(unsafe.Pointer(&featureLevels[0])),
+		uintptr(len(featureLevels)),
+		uintptr(d3d11SDKVersion),
+		uintptr(unsafe.Pointer(&device)),
+		uintptr(unsafe.Pointer(&selectedFeatureLevel)),
+		uintptr(unsafe.Pointer(&context)),
+	)
+	if d3d.HRESULT(result).Failed() {
+		return nil, nil, d3d.HRESULT(result)
+	}
+	if device == nil || context == nil {
+		if context != nil {
+			context.Release()
+		}
+		if device != nil {
+			device.Release()
+		}
+		return nil, nil, errors.New("D3D11CreateDevice returned an empty device or context")
+	}
+	return device, context, nil
 }
 
 func (c *dxgiCapturer) Close() {
@@ -77,14 +160,15 @@ func (c *dxgiCapturer) Close() {
 		}
 	}
 	c.outputs = nil
-	if c.context != nil {
-		c.context.Release()
-		c.context = nil
+	for index := range c.devices {
+		if c.devices[index].context != nil {
+			c.devices[index].context.Release()
+		}
+		if c.devices[index].device != nil {
+			c.devices[index].device.Release()
+		}
 	}
-	if c.device != nil {
-		c.device.Release()
-		c.device = nil
-	}
+	c.devices = nil
 }
 
 func (c *dxgiCapturer) Capture() (*image.RGBA, error) {

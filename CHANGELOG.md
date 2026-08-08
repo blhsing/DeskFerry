@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.10.4 - 2026-08-07
+
+- Fixed direct Work screen capture on RDP and indirect-display desktops by probing every attached DXGI adapter/output and creating each capture device on the adapter that owns the output, including software-backed remote display adapters.
+- Fixed `-update-service` precedence so a one-shot LocalSystem service can transactionally upgrade a saturated remote Work agent without being mistaken for the normal agent service.
+- Verified Room b end to end through the authenticated DeskFerry `screen` protocol after deployment, with no RDP pixel transport or retained rollback binary.
+
 ## 0.10.3 - 2026-08-07
 
 - Fixed Windows Work screen capture on RDP and display drivers that reject GDI desktop copies by binding the capture thread to the active input desktop and falling back to DirectX Desktop Duplication.

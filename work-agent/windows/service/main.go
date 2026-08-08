@@ -142,6 +142,17 @@ func main() {
 	if relayURL == "" {
 		relayURL = defaultRelayURL
 	}
+	// Maintenance actions must take precedence over service-context detection.
+	// A remote administrator may intentionally launch the updater through a
+	// one-shot LocalSystem service so replacement does not depend on the agent's
+	// own WinRM tunnel. Treating that process as the normal agent service would
+	// ignore -update-service and leave the installed binary unchanged.
+	if updateServiceTarget != "" {
+		if err := updateServiceBinary(updateServiceTarget); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	runningAsService := serviceMode
 	if !runningAsService {
 		var err error
@@ -152,12 +163,6 @@ func main() {
 	}
 	if runningAsService {
 		if err := runService(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile, screenView); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-	if updateServiceTarget != "" {
-		if err := updateServiceBinary(updateServiceTarget); err != nil {
 			log.Fatal(err)
 		}
 		return
