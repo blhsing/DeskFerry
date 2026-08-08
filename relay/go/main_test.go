@@ -188,6 +188,7 @@ func TestAgentClientPairAndBridgeBytes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	agent := dialRole(t, ctx, server.URL, "/relay/unit-bridge/ws", "agent")
+	waitForWaitingAgents(t, server.URL, "unit-bridge", 1)
 	home := dialRole(t, ctx, server.URL, "/relay/unit-bridge/ws", "client")
 	defer agent.Close(websocket.StatusNormalClosure, "")
 	defer home.Close(websocket.StatusNormalClosure, "")
@@ -400,14 +401,7 @@ func TestResumablePairReattachesAfterWebSocketDrop(t *testing.T) {
 	defer cancel()
 	capability := http.Header{"X-DeskFerry-Resumable": []string{"1"}}
 	agent := dialRoleHeaders(t, ctx, server.URL, "/relay/unit-resume/ws", "agent", capability)
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		status := getStatus(t, server.URL, "unit-resume")
-		if len(status.Rooms) == 1 && status.Rooms[0].WaitingAgents == 1 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitForWaitingAgents(t, server.URL, "unit-resume", 1)
 	home := dialRoleHeaders(t, ctx, server.URL, "/relay/unit-resume/ws", "client", capability)
 
 	agentStart := expectTextPrefix(t, ctx, agent, startMessage+" ")
@@ -464,14 +458,7 @@ func TestResumableStreamsSurviveForcedRelayTransportLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		status := getStatus(t, server.URL, "unit-resume-stream")
-		if len(status.Rooms) == 1 && status.Rooms[0].WaitingAgents == 1 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitForWaitingAgents(t, server.URL, "unit-resume-stream", 1)
 	clientWS, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleClient, "", headers)
 	if err != nil {
 		t.Fatal(err)
@@ -605,6 +592,20 @@ func getStatus(t *testing.T, baseURL, room string) StatusSnapshot {
 		t.Fatal(err)
 	}
 	return status
+}
+
+func waitForWaitingAgents(t *testing.T, baseURL, room string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var status StatusSnapshot
+	for time.Now().Before(deadline) {
+		status = getStatus(t, baseURL, room)
+		if len(status.Rooms) == 1 && status.Rooms[0].WaitingAgents == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("room %q waiting agents did not reach %d before timeout: %+v", room, want, status.Rooms)
 }
 
 func expectText(t *testing.T, ctx context.Context, c *websocket.Conn, want string) {
