@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.10.8 - 2026-08-10
+
+- Raise the Work agent's default live-session concurrency limit from 4 to 32 so WinRM can open its supporting connections while RDP, SMB, and screen sessions are active.
+- Retain the bounded `DESKFERRY_MAX_SESSIONS` override, which accepts values from 1 through 256.
+
 ## 0.10.7 - 2026-08-10
 
 - Allow Windows and macOS Home agents to save and use Windows logins with intentionally blank passwords for WinRM when the Work computer permits blank-password network logons.

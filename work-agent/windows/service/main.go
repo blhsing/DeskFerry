@@ -385,7 +385,7 @@ func (c *config) applyDefaults() {
 		c.MaxBackoff = "60s"
 	}
 	if c.ConcurrencyLimit == 0 {
-		c.ConcurrencyLimit = envPositiveInt("DESKFERRY_MAX_SESSIONS", 4)
+		c.ConcurrencyLimit = envPositiveInt("DESKFERRY_MAX_SESSIONS", 32)
 	}
 	if envBool("DESKFERRY_FORCE_LEGACY") {
 		c.LegacyMode = true

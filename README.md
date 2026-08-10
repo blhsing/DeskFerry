@@ -450,7 +450,7 @@ Default behavior:
 - `-relay-url` can be repeated to add more relay URLs.
 - The service keeps one lightweight control WebSocket per configured relay URL and opens data sockets only for accepted requests.
 - A persistent local agent identity lets each relay replace stale control connections after reconnects or service restarts.
-- Live-session concurrency defaults to four and can be changed with the service environment variable `DESKFERRY_MAX_SESSIONS`.
+- Live-session concurrency defaults to 32 and can be changed from 1 through 256 with the service environment variable `DESKFERRY_MAX_SESSIONS`.
 - `DESKFERRY_FORCE_LEGACY=1` temporarily restores four legacy slots per enabled service and relay for rollback.
 - When any configured relay offers a session, the agent validates its room, service, identity, protocol version, and deadline before dialing the configured local target.
 

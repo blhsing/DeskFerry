@@ -65,6 +65,7 @@ func TestRelayURLFlagAccumulatesValues(t *testing.T) {
 }
 
 func TestLoadConfigAcceptsMultipleWebSocketRelayURLs(t *testing.T) {
+	t.Setenv("DESKFERRY_MAX_SESSIONS", "")
 	cfg, err := loadConfig("https://test-officialwebsite.azurewebsites.net/relay/workdesk;http://217.142.228.117/relay/workdesk", "", "", false)
 	if err != nil {
 		t.Fatal(err)
@@ -78,6 +79,9 @@ func TestLoadConfigAcceptsMultipleWebSocketRelayURLs(t *testing.T) {
 	}
 	if cfg.RelayAddr != want[0] {
 		t.Fatalf("RelayAddr = %q, want first relay %q", cfg.RelayAddr, want[0])
+	}
+	if cfg.ConcurrencyLimit != 32 {
+		t.Fatalf("ConcurrencyLimit = %d, want 32", cfg.ConcurrencyLimit)
 	}
 }
 
