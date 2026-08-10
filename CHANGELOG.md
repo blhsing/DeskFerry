@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.10.7 - 2026-08-10
+
+- Allow Windows and macOS Home agents to save and use Windows logins with intentionally blank passwords for WinRM when the Work computer permits blank-password network logons.
+- Add an explicit macOS Save Windows Login action so a blank password is distinguishable from keeping an existing Keychain credential.
+
 ## 0.10.6 - 2026-08-08
 
 - Changed Work screen sharing to capture the primary display instead of composing the complete virtual desktop, eliminating black secondary-display regions on Windows lock screens for Windows, macOS, and Android Home viewers.

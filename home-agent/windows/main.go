@@ -1671,8 +1671,8 @@ func (a *clientApp) executeWinRM() {
 		user, password = savedUser, savedPassword
 		_ = a.rdpUser.SetText(user)
 	}
-	if user == "" || password == "" || command == "" {
-		a.showError(errors.New("Windows username, password, and PowerShell command are required"))
+	if user == "" || command == "" {
+		a.showError(errors.New("Windows username and PowerShell command are required"))
 		return
 	}
 	_, port, err := net.SplitHostPort(cfg.WinRMListenAddr)
@@ -1733,10 +1733,6 @@ func (a *clientApp) saveWindowsCredentials() {
 	pass := a.rdpPass.Text()
 	if user == "" {
 		a.showError(errors.New("Windows username is required"))
-		return
-	}
-	if pass == "" {
-		a.showError(errors.New("Windows password is required"))
 		return
 	}
 	if err := saveWindowsCredential(cfg, user, pass); err != nil {
@@ -2799,13 +2795,13 @@ func saveWindowsCredential(cfg config, user, pass string) error {
 
 func readWindowsCredential(cfg config) (user, pass string, err error) {
 	user, pass, err = wincred.Read(profileCredentialTarget(cfg), wincred.TypeGeneric)
-	if err == nil && user != "" && pass != "" {
+	if err == nil && user != "" {
 		return user, pass, nil
 	}
 	for _, target := range rdpCredentialTargets(cfg.ListenAddr) {
 		for _, credentialType := range []uint32{wincred.TypeDomainPassword, wincred.TypeGeneric} {
 			user, pass, err = wincred.Read(target, credentialType)
-			if err == nil && user != "" && pass != "" {
+			if err == nil && user != "" {
 				return user, pass, nil
 			}
 		}
@@ -2818,7 +2814,7 @@ func activateWindowsProfileCredential(cfg config) error {
 	if err != nil {
 		return nil
 	}
-	if user == "" || pass == "" {
+	if user == "" {
 		return nil
 	}
 	if err := saveRDPCredentialTargets(cfg.ListenAddr, user, pass); err != nil {

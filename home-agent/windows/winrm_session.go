@@ -234,7 +234,12 @@ try {
             $canReuse = $session -ne $null -and $sessionKey -eq [string]$request.key -and $session.State -eq 'Opened'
             if (-not $canReuse) {
                 if ($session -ne $null) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
-                $secure = ConvertTo-SecureString ([string]$request.password) -AsPlainText -Force
+				$passwordText = [string]$request.password
+				if ($passwordText.Length -eq 0) {
+					$secure = [Security.SecureString]::new()
+				} else {
+					$secure = ConvertTo-SecureString $passwordText -AsPlainText -Force
+				}
                 $credential = [Management.Automation.PSCredential]::new([string]$request.user, $secure)
                 $session = New-PSSession -ComputerName localhost -Port ([int]$request.port) -Authentication Negotiate -Credential $credential
                 $sessionKey = [string]$request.key

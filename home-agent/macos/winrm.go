@@ -37,8 +37,8 @@ func macCredentialService(profile macProfile) string {
 
 func saveMacWindowsCredential(profile macProfile, user, password string) error {
 	user = strings.TrimSpace(user)
-	if user == "" || password == "" {
-		return errors.New("Windows username and password are required")
+	if user == "" {
+		return errors.New("Windows username is required")
 	}
 	payload, err := json.Marshal(macWindowsCredential{User: user, Password: password})
 	if err != nil {
@@ -60,7 +60,7 @@ func readMacWindowsCredential(profile macProfile) (macWindowsCredential, error) 
 	if err := json.Unmarshal([]byte(strings.TrimSpace(string(output))), &credential); err != nil {
 		return macWindowsCredential{}, errors.New("the saved Windows login is invalid")
 	}
-	if strings.TrimSpace(credential.User) == "" || credential.Password == "" {
+	if strings.TrimSpace(credential.User) == "" {
 		return macWindowsCredential{}, errors.New("the saved Windows login is incomplete")
 	}
 	return credential, nil
@@ -74,9 +74,12 @@ func deleteMacWindowsCredential(profile macProfile) error {
 	return nil
 }
 
-func updateMacWindowsCredential(profile macProfile, password string, clear bool) error {
+func updateMacWindowsCredential(profile macProfile, password string, save, clear bool) error {
 	if clear {
 		return deleteMacWindowsCredential(profile)
+	}
+	if save {
+		return saveMacWindowsCredential(profile, profile.WindowsUser, password)
 	}
 	if password != "" {
 		return saveMacWindowsCredential(profile, profile.WindowsUser, password)

@@ -126,6 +126,21 @@ func TestWinRMSessionWorkerProtocol(t *testing.T) {
 	}
 }
 
+func TestWinRMSessionWorkerAcceptsBlankPassword(t *testing.T) {
+	manager := newWinRMSessionManager(time.Minute)
+	defer manager.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := manager.Execute(ctx, "blank-password-test", "Owner", "", "$env:COMPUTERNAME", "1")
+	if err == nil {
+		t.Fatal("WinRM connection to closed test port unexpectedly succeeded")
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "converttosecurestring") || strings.Contains(message, "empty string") {
+		t.Fatalf("blank password was rejected before WinRM authentication: %v", err)
+	}
+}
+
 func BenchmarkLiveWinRMSession(b *testing.B) {
 	if os.Getenv("DESKFERRY_LIVE_WINRM_BENCHMARK") != "1" {
 		b.Skip("set DESKFERRY_LIVE_WINRM_BENCHMARK=1 to benchmark the configured live WinRM tunnel")
