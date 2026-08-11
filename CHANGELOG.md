@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.10.9 - 2026-08-11
+
+- Retry transient Windows desktop-capture failures caused by RDP attach/detach, unlock, display-mode, and input-desktop transitions before the Work agent returns an error frame.
+- Make the Android Screen Viewer automatically rebuild a failed paired screen session with bounded retries, reset partial frame state between attempts, and retain the final Work-side error when recovery is exhausted.
+
 ## 0.10.8 - 2026-08-10
 
 - Raise the Work agent's default live-session concurrency limit from 4 to 32 so WinRM can open its supporting connections while RDP, SMB, and screen sessions are active.

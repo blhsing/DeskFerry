@@ -35,6 +35,12 @@ const (
 	// helper can combine physical virtual-screen metrics with a DPI-virtualized
 	// GDI device context, producing a frame whose unused right side is black.
 	perMonitorAwareV2 = ^uintptr(3)
+	// An RDP attach/detach, unlock, or input-desktop switch can leave both GDI
+	// and Desktop Duplication temporarily unavailable.  A viewer request should
+	// ride through that short transition instead of returning an error frame on
+	// the first failed sample.
+	initialCaptureAttempts = 12
+	captureRetryDelay      = 250 * time.Millisecond
 )
 
 type desktopCapturer struct {
@@ -66,6 +72,24 @@ func (c *desktopCapturer) Capture() (*image.RGBA, error) {
 		return result, nil
 	}
 	return c.captureDXGI(gdiErr)
+}
+
+func captureWithRetry(capture func() (*image.RGBA, error), attempts int, delay time.Duration) (*image.RGBA, error) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		result, err := capture()
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if attempt < attempts && delay > 0 {
+			time.Sleep(delay)
+		}
+	}
+	return nil, fmt.Errorf("capture remained unavailable after %d attempts: %w", attempts, lastErr)
 }
 
 func (c *desktopCapturer) captureDXGI(gdiErr error, previousErrors ...error) (*image.RGBA, error) {
@@ -253,7 +277,7 @@ func RunCaptureHelper() error {
 	}
 	capturer := &desktopCapturer{}
 	defer capturer.Close()
-	first, err := capturer.Capture()
+	first, err := captureWithRetry(capturer.Capture, initialCaptureAttempts, captureRetryDelay)
 	if err != nil {
 		if desktopErr != nil {
 			err = errors.Join(fmt.Errorf("bind capture helper to input desktop: %w", desktopErr), err)
@@ -276,7 +300,7 @@ func RunCaptureHelper() error {
 	defer ticker.Stop()
 	for sequence := uint64(2); ; sequence++ {
 		<-ticker.C
-		current, err := capturer.Capture()
+		current, err := captureWithRetry(capturer.Capture, initialCaptureAttempts, captureRetryDelay)
 		if err != nil {
 			_ = WriteFrame(os.Stdout, Frame{Type: FrameError, Seq: sequence, Error: err.Error()}, nil)
 			return err

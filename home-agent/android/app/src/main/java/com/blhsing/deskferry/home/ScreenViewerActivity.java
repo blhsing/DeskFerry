@@ -14,8 +14,11 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.MediaStore;
 import android.text.InputType;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
@@ -53,6 +56,9 @@ import okio.Buffer;
 import okio.ByteString;
 
 public class ScreenViewerActivity extends Activity {
+    private static final String LOG_TAG = "DeskFerryScreen";
+    private static final int MAX_RECOVERY_RETRIES = 2;
+    private static final long RECOVERY_DELAY_MS = 600;
     static final String EXTRA_RELAY_URLS = "relay_urls";
     static final String EXTRA_PROXY = "proxy";
     static final String EXTRA_ROOM_PROOF = "room_proof";
@@ -61,6 +67,7 @@ public class ScreenViewerActivity extends Activity {
     private static final int REQUEST_WRITE_IMAGES = 2001;
     private final Object lock = new Object();
     private final Buffer wire = new Buffer();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private ZoomImageView imageView;
     private TextView status;
     private Spinner interval;
@@ -83,6 +90,7 @@ public class ScreenViewerActivity extends Activity {
     private int payloadLength;
     private boolean fullscreen;
     private int generation;
+    private int recoveryAttempts;
     private boolean updatingZoomControls;
 
     @Override
@@ -252,6 +260,7 @@ public class ScreenViewerActivity extends Activity {
         requestedMode = mode;
         requestedInterval = selectedInterval();
         candidateIndex = 0;
+        recoveryAttempts = 0;
         paired = false;
         closing = false;
         synchronized (lock) {
@@ -312,11 +321,17 @@ public class ScreenViewerActivity extends Activity {
                         .put("mode", requestedMode)
                         .put("interval_ms", requestedInterval)
                         .put("tile_size", 64);
-                webSocket.send(ByteString.encodeUtf8(request.toString() + "\n"));
+                if (!webSocket.send(ByteString.encodeUtf8(request.toString() + "\n"))) {
+                    throw new IllegalStateException("could not send the screen capture request");
+                }
                 setStatus("Connected through " + relay + "; waiting for the first frame...");
             } catch (Exception ex) {
-                webSocket.cancel();
-                if (!paired) connectNext(run, ex); else setStatus(ex.getMessage());
+                if (!paired) {
+                    webSocket.cancel();
+                    connectNext(run, ex);
+                } else {
+                    recoverScreenSession(run, webSocket, "Screen request failed", ex);
+                }
             }
         }
 
@@ -329,21 +344,53 @@ public class ScreenViewerActivity extends Activity {
                     parseFrames();
                 }
             } catch (Exception ex) {
-                webSocket.cancel();
-                setStatus("Screen frame failed: " + ex.getMessage());
+                recoverScreenSession(run, webSocket, "Screen frame failed", ex);
             }
         }
 
         @Override
         public void onFailure(WebSocket webSocket, Throwable error, Response response) {
             if (run != generation || closing || webSocket != socket) return;
-            if (!paired) connectNext(run, error); else setStatus("Screen stream ended: " + error.getMessage());
+            if (!paired) connectNext(run, error); else recoverScreenSession(run, webSocket, "Screen stream ended", error);
         }
 
         @Override
         public void onClosed(WebSocket webSocket, int code, String reason) {
-            if (run == generation && webSocket == socket && !closing && !"single".equals(requestedMode)) setStatus("Screen stream stopped.");
+            if (run == generation && webSocket == socket && !closing && !"single".equals(requestedMode)) {
+                recoverScreenSession(run, webSocket, "Screen stream ended",
+                        new IllegalStateException("relay closed code=" + code + (reason.isEmpty() ? "" : " reason=" + reason)));
+            }
         }
+    }
+
+    private void recoverScreenSession(int run, WebSocket failedSocket, String label, Throwable failure) {
+        if (run != generation || closing || failedSocket != socket) return;
+        String detail = failure == null || empty(failure.getMessage()).isEmpty()
+                ? "unknown screen error" : failure.getMessage();
+        recoveryAttempts++;
+        Log.w(LOG_TAG, label + ": " + detail + " recovery_attempt=" + recoveryAttempts, failure);
+        socket = null;
+        failedSocket.cancel();
+        paired = false;
+        synchronized (lock) {
+            wire.clear();
+            metadataLength = -1;
+            metadata = null;
+            payloadLength = 0;
+        }
+        if (!canRetryScreenSession(recoveryAttempts)) {
+            setStatus(label + " after recovery attempts: " + detail);
+            return;
+        }
+        candidateIndex = 0;
+        setStatus(label + ": " + detail + ". Retrying (" + recoveryAttempts + "/" + MAX_RECOVERY_RETRIES + ")...");
+        mainHandler.postDelayed(() -> {
+            if (run == generation && !closing && socket == null) connectNext(run, failure);
+        }, RECOVERY_DELAY_MS * recoveryAttempts);
+    }
+
+    static boolean canRetryScreenSession(int failedSessions) {
+        return failedSessions <= MAX_RECOVERY_RETRIES;
     }
 
     private void parseFrames() throws Exception {
