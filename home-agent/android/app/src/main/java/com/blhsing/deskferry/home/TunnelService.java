@@ -1164,7 +1164,7 @@ public class TunnelService extends Service {
                         ready.countDown();
                         return;
                     }
-                    if (!sessionId.isEmpty() && code != 1000 && code != 1008 && !closed.get()) {
+                    if (!sessionId.isEmpty() && code != 1008 && !isLogicalSessionClose(code, reason) && !closed.get()) {
                         markTransportLost(socket, "websocket_closed code=" + code + " reason=" + quoted(reason));
                     } else {
                         recordTermination("websocket_closed code=" + code + " reason=" + quoted(reason));
@@ -1485,7 +1485,7 @@ public class TunnelService extends Service {
             pendingResumeSocket = null;
 			pendingResumeReady = null;
             if (socket != null) {
-                socket.close(1000, "closed");
+                socket.close(1000, "session closed");
             }
             if (pending != null && pending != socket) {
                 pending.cancel();
@@ -1587,5 +1587,9 @@ public class TunnelService extends Service {
 
 	static long resumeAttemptWaitMillis(long remainingMillis) {
 		return Math.max(1L, Math.min(RESUME_ATTEMPT_TIMEOUT_MS, remainingMillis));
+	}
+
+	static boolean isLogicalSessionClose(int code, String reason) {
+		return code == 1000 && "session closed".equals(reason);
 	}
 }

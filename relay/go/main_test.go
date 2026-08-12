@@ -415,7 +415,9 @@ func TestResumablePairReattachesAfterWebSocketDrop(t *testing.T) {
 		t.Fatal(err)
 	}
 	expectBinary(t, ctx, agent, "before-drop")
-	_ = home.CloseNow()
+	// A proxy can report a transport failure as code 1000 without DeskFerry's
+	// logical-close marker. The session must remain available for resumption.
+	_ = home.Close(websocket.StatusNormalClosure, "")
 	if _, _, err := agent.Read(ctx); err == nil {
 		t.Fatal("agent socket remained open after paired client drop")
 	}

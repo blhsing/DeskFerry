@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.10.9"
+RELAY_VERSION = "0.10.10"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -603,7 +603,7 @@ class ResumeSession:
         try:
             while True:
                 first, second = await bridge_once(agent, client)
-                if first.close_code == 1000 or second.close_code == 1000:
+                if is_session_close(first) or is_session_close(second):
                     await close_quietly(agent, 1000, "session closed")
                     await close_quietly(client, 1000, "session closed")
                     if agent_attachment is not None:
@@ -653,6 +653,10 @@ class ResumeSession:
             return
         self._done.set()
         self._on_finish(self)
+
+
+def is_session_close(result: PumpResult) -> bool:
+    return result.close_code == 1000 and result.close_reason == "session closed"
 
 
 async def bridge_once(agent: WebSocket, client: WebSocket) -> tuple[PumpResult, PumpResult]:

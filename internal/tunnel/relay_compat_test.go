@@ -56,6 +56,9 @@ func TestExternalRelayResumption(t *testing.T) {
 	defer agentConn.Close()
 	defer clientConn.Close()
 	compatTransfer(t, ctx, clientConn, agentConn, bytes.Repeat([]byte{0xa5}, resumableChunkSize+resumableHeaderLen))
+	// Interrupt the underlying transport without closing the logical stream.
+	// Code-1000 handling is covered by the implementation-specific tests; using
+	// Close here would race the resumable connection's WebSocket reader.
 	_ = clientWS.CloseNow()
 	compatTransfer(t, ctx, agentConn, clientConn, []byte("after-resume"))
 }

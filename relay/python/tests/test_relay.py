@@ -153,7 +153,9 @@ def test_resumable_pair_reattaches_after_websocket_drop():
             await asyncio.sleep(0.01)
         assert agent.byte_messages == [b"before-drop"]
 
-        await home._received.put({"type": "websocket.disconnect", "code": 1012, "reason": "test drop"})
+        # Some proxies terminate a transport with a normal close code but no
+        # DeskFerry logical-close marker. The logical session must still resume.
+        await home._received.put({"type": "websocket.disconnect", "code": 1000, "reason": ""})
         resumed_agent = FakeWebSocket()
         resumed_home = FakeWebSocket()
         agent_attach = asyncio.create_task(session.attach("agent", resumed_agent, "work-2"))
@@ -172,7 +174,7 @@ def test_resumable_pair_reattaches_after_websocket_drop():
             await asyncio.sleep(0.01)
         assert resumed_home.byte_messages == [b"after-resume"]
 
-        await resumed_home._received.put({"type": "websocket.disconnect", "code": 1000, "reason": "closed"})
+        await resumed_home._received.put({"type": "websocket.disconnect", "code": 1000, "reason": "session closed"})
         await asyncio.wait_for(session_task, timeout=2)
         await asyncio.gather(agent_attach, home_attach)
         status = await room.snapshot()

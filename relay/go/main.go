@@ -1569,7 +1569,7 @@ func (s *ResumeSession) Run(agent, client *websocket.Conn, clientDone chan struc
 	var agentAttachment, clientAttachment *ResumeAttachment
 	for {
 		first, second := bridgeSockets(agent, client)
-		if websocket.CloseStatus(first.Err) == websocket.StatusNormalClosure || websocket.CloseStatus(second.Err) == websocket.StatusNormalClosure {
+		if isSessionClose(first.Err) || isSessionClose(second.Err) {
 			closeQuietly(agent, websocket.StatusNormalClosure, "session closed")
 			closeQuietly(client, websocket.StatusNormalClosure, "session closed")
 			if agentAttachment != nil {
@@ -1607,6 +1607,11 @@ func (s *ResumeSession) Run(agent, client *websocket.Conn, clientDone chan struc
 		}
 		log.Printf("resumable bridge resumed room=%s pair=%d session=%s agent=%s client=%s", s.Room.ID, pairID, s.ID, agentAttachment.Remote, clientAttachment.Remote)
 	}
+}
+
+func isSessionClose(err error) bool {
+	var closeErr websocket.CloseError
+	return errors.As(err, &closeErr) && closeErr.Code == websocket.StatusNormalClosure && closeErr.Reason == "session closed"
 }
 
 func (s *ResumeSession) waitForAttachments() (*ResumeAttachment, *ResumeAttachment, bool) {

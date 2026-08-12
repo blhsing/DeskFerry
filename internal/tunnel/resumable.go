@@ -332,7 +332,7 @@ func (c *resumableWebSocketConn) readTransport(ws *websocket.Conn, generation ui
 	for {
 		typ, payload, err := ws.Read(c.ctx)
 		if err != nil {
-			if websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+			if isLogicalSessionClose(err) {
 				c.setTerminal(io.EOF)
 			} else {
 				c.dropTransport(ws, generation)
@@ -368,6 +368,11 @@ func (c *resumableWebSocketConn) readTransport(ws *websocket.Conn, generation ui
 			return
 		}
 	}
+}
+
+func isLogicalSessionClose(err error) bool {
+	var closeErr websocket.CloseError
+	return errors.As(err, &closeErr) && closeErr.Code == websocket.StatusNormalClosure && closeErr.Reason == "session closed"
 }
 
 func (c *resumableWebSocketConn) applyAck(offset uint64) bool {

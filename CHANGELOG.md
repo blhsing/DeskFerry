@@ -1,5 +1,12 @@
 # Release Notes
 
+## 0.10.10 - 2026-08-12
+
+- Keep resumable RDP sessions alive when a proxy or hosting layer reports a transport interruption as WebSocket close code 1000 without DeskFerry's explicit `session closed` marker.
+- Make the shared Work, Windows Home, and macOS Home transport automatically resume after the same normal-code interruption.
+- Apply the logical-close distinction consistently to the Azure .NET, OCI Go, and Python relays, and make Azure immediately wake both endpoints by aborting obsolete transports.
+- Make the Android Home agent automatically resume an active RDP or SMB stream after the same normal-code transport interruption, while reserving `session closed` for intentional local shutdown.
+
 ## 0.10.9 - 2026-08-11
 
 - Retry transient Windows desktop-capture failures caused by RDP attach/detach, unlock, display-mode, and input-desktop transitions before the Work agent returns an error frame.

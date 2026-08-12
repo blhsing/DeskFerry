@@ -1980,7 +1980,7 @@ sealed class ResumeSession
             while (true)
             {
                 var (first, second) = await BridgeOnceAsync(agent, client);
-                if (first.CloseStatus == WebSocketCloseStatus.NormalClosure || second.CloseStatus == WebSocketCloseStatus.NormalClosure)
+                if (IsSessionClose(first) || IsSessionClose(second))
                 {
                     await Task.WhenAll(
                         RelayRoom.CloseQuietlyAsync(agent, WebSocketCloseStatus.NormalClosure, "session closed"),
@@ -1991,9 +1991,11 @@ sealed class ResumeSession
                 }
 
                 _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} trigger_direction={TriggerDirection} trigger_error={TriggerError} other_direction={OtherDirection} other_error={OtherError}", Room.Id, pairId, Id, first.Direction, first.Error, second.Direction, second.Error);
-                await Task.WhenAll(
-                    RelayRoom.CloseQuietlyAsync(agent, ResumeCloseStatus, "resume session"),
-                    RelayRoom.CloseQuietlyAsync(client, ResumeCloseStatus, "resume session"));
+                // A canceled receive can leave the server-side WebSocket aborted
+                // without delivering a close frame to the peer. Discard both
+                // obsolete transports so both resumable endpoints wake at once.
+                AbortQuietly(agent);
+                AbortQuietly(client);
                 agentAttachment?.Done.TrySetResult();
                 clientAttachment?.Done.TrySetResult();
 
@@ -2021,6 +2023,10 @@ sealed class ResumeSession
                 }
                 _log.LogInformation("resumable bridge resumed room={Room} pair={PairId} session={Session} agent={AgentRemote} client={ClientRemote}", Room.Id, pairId, Id, agentAttachment.Remote, clientAttachment.Remote);
             }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "resumable bridge failed room={Room} pair={PairId} session={Session}", Room.Id, pairId, Id);
         }
         finally
         {
@@ -2058,6 +2064,23 @@ sealed class ResumeSession
         return (first, second);
     }
 
+    private static bool IsSessionClose(PumpResult result)
+    {
+        return result.CloseStatus == WebSocketCloseStatus.NormalClosure &&
+            string.Equals(result.CloseReason, "session closed", StringComparison.Ordinal);
+    }
+
+    private static void AbortQuietly(WebSocket socket)
+    {
+        try
+        {
+            socket.Abort();
+        }
+        catch
+        {
+        }
+    }
+
     private static async Task<bool> TrySendControlAsync(WebSocket socket, string message)
     {
         try
@@ -2075,7 +2098,7 @@ sealed class ResumeSession
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.10.9";
+    public const string Version = "0.10.10";
 }
 
 sealed class WaitingAgent

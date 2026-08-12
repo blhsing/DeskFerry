@@ -46,7 +46,9 @@ func TestResumableWebSocketConnReplaysUnacknowledgedData(t *testing.T) {
 				serverErrors <- formatTestFrameError(frameType, offset, payload, err)
 				return
 			}
-			_ = ws.CloseNow() // lose the frame before acknowledging it
+			// A hosting layer may use a normal close code for a transport loss.
+			// Without DeskFerry's logical-close marker, the stream must resume.
+			_ = ws.Close(websocket.StatusNormalClosure, "")
 			return
 		}
 
@@ -127,6 +129,15 @@ func TestResumableWebSocketConnReplaysUnacknowledgedData(t *testing.T) {
 	case err := <-serverErrors:
 		t.Fatal(err)
 	default:
+	}
+}
+
+func TestLogicalSessionCloseRequiresExplicitReason(t *testing.T) {
+	if isLogicalSessionClose(websocket.CloseError{Code: websocket.StatusNormalClosure}) {
+		t.Fatal("normal transport close without marker ended the logical session")
+	}
+	if !isLogicalSessionClose(websocket.CloseError{Code: websocket.StatusNormalClosure, Reason: "session closed"}) {
+		t.Fatal("explicit logical session close was not recognized")
 	}
 }
 
