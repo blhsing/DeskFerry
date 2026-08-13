@@ -39,7 +39,7 @@ const (
 	defaultAzureRelayBase = "https://test-officialwebsite.azurewebsites.net/relay"
 	defaultOCIRelayBase   = "http://217.142.228.117/relay"
 	defaultRoomName       = "workdesk"
-	productVersion        = "0.10.10"
+	productVersion        = "0.10.11"
 	hostsBeginMarker      = "# BEGIN DeskFerry Home managed alias"
 	hostsEndMarker        = "# END DeskFerry Home managed alias"
 )
@@ -830,13 +830,14 @@ type homeClientSettings struct {
 }
 
 type homeClientDestination struct {
-	Name        string   `json:"name"`
-	RelayAddrs  []string `json:"relay_addrs"`
-	RelayBases  []string `json:"relay_bases,omitempty"`
-	Room        string   `json:"room,omitempty"`
-	RoomProof   string   `json:"room_proof"`
-	WindowsUser string   `json:"windows_user,omitempty"`
-	SMBAlias    string   `json:"smb_alias,omitempty"`
+	Name            string   `json:"name"`
+	RelayAddrs      []string `json:"relay_addrs"`
+	RelayBases      []string `json:"relay_bases,omitempty"`
+	Room            string   `json:"room,omitempty"`
+	RoomProof       string   `json:"room_proof"`
+	WindowsUser     string   `json:"windows_user,omitempty"`
+	PasswordlessRDP bool     `json:"passwordless_rdp,omitempty"`
+	SMBAlias        string   `json:"smb_alias,omitempty"`
 }
 
 type installMetadata struct {

@@ -70,13 +70,14 @@ type config struct {
 }
 
 type destinationProfile struct {
-	Name        string   `json:"name"`
-	RelayAddrs  []string `json:"relay_addrs"`
-	RelayBases  []string `json:"relay_bases,omitempty"`
-	Room        string   `json:"room,omitempty"`
-	RoomProof   string   `json:"room_proof,omitempty"`
-	WindowsUser string   `json:"windows_user,omitempty"`
-	SMBAlias    string   `json:"smb_alias,omitempty"`
+	Name            string   `json:"name"`
+	RelayAddrs      []string `json:"relay_addrs"`
+	RelayBases      []string `json:"relay_bases,omitempty"`
+	Room            string   `json:"room,omitempty"`
+	RoomProof       string   `json:"room_proof,omitempty"`
+	WindowsUser     string   `json:"windows_user,omitempty"`
+	PasswordlessRDP bool     `json:"passwordless_rdp,omitempty"`
+	SMBAlias        string   `json:"smb_alias,omitempty"`
 }
 
 type relayURLFlag []string
@@ -119,6 +120,7 @@ type clientApp struct {
 	winrmCommand       *walk.TextEdit
 	winrmOutput        *walk.TextEdit
 	executeWinRMButton *walk.PushButton
+	saveWindowsButton  *walk.PushButton
 
 	tunnelStatus *walk.Label
 	workStatus   *walk.Label
@@ -614,7 +616,7 @@ func (a *clientApp) run(smokeTest bool) error {
 											PushButton{AssignTo: &a.openRDPButton, Text: "Open Remote Desktop", MinSize: Size{Height: 30}, OnClicked: a.openRemoteDesktop},
 											PushButton{Text: "Save", MinSize: Size{Height: 30}, OnClicked: func() { a.saveFromUI(true) }},
 											PushButton{Text: "Copy RDP Address", MinSize: Size{Height: 30}, OnClicked: a.copyRDPAddress},
-											PushButton{Text: "Save Windows Login", MinSize: Size{Height: 30}, OnClicked: a.saveWindowsCredentials},
+											PushButton{AssignTo: &a.saveWindowsButton, Text: "Save Windows Login", MinSize: Size{Height: 30}, OnClicked: a.saveWindowsCredentials},
 											PushButton{Text: "Forget Windows Login", MinSize: Size{Height: 30}, OnClicked: a.forgetWindowsCredentials},
 											PushButton{Text: "Relay Dashboard", MinSize: Size{Height: 30}, OnClicked: a.openDashboard},
 											PushButton{Text: "Screen Viewer", MinSize: Size{Height: 30}, OnClicked: a.openScreenViewer},
@@ -758,7 +760,7 @@ func destinationNames(values []destinationProfile) []string {
 func cloneDestinations(values []destinationProfile) []destinationProfile {
 	out := make([]destinationProfile, len(values))
 	for i, value := range values {
-		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RelayBases: append([]string(nil), value.RelayBases...), Room: value.Room, RoomProof: value.RoomProof, WindowsUser: value.WindowsUser, SMBAlias: value.SMBAlias}
+		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RelayBases: append([]string(nil), value.RelayBases...), Room: value.Room, RoomProof: value.RoomProof, WindowsUser: value.WindowsUser, PasswordlessRDP: value.PasswordlessRDP, SMBAlias: value.SMBAlias}
 	}
 	return out
 }
@@ -1735,16 +1737,121 @@ func (a *clientApp) saveWindowsCredentials() {
 		a.showError(errors.New("Windows username is required"))
 		return
 	}
+	needsQualification := windowsUserNeedsQualification(user)
+	passwordlessWasEnabled := false
+	if profile := cfg.selectedProfile(); profile != nil {
+		passwordlessWasEnabled = profile.PasswordlessRDP
+	}
+	if needsQualification || pass == "" || passwordlessWasEnabled {
+		if cfg.roomProof() == "" {
+			if pass == "" {
+				a.showError(errors.New("a saved room password is required to configure passwordless Remote Desktop on the Work computer"))
+				return
+			}
+		} else {
+			if !a.isTunnelRunning() {
+				if err := a.startTunnel(false); err != nil {
+					a.showError(err)
+					return
+				}
+			}
+			_, port, err := net.SplitHostPort(cfg.WinRMListenAddr)
+			if err != nil {
+				a.showError(err)
+				return
+			}
+			a.saveWindowsButton.SetEnabled(false)
+			a.appendLog("Preparing Windows login %s on the Work computer before saving it.", user)
+			go a.prepareWindowsCredentialSave(cfg, user, pass, port, needsQualification, passwordlessWasEnabled)
+			return
+		}
+	}
+	a.finishWindowsCredentialSave(cfg, user, pass)
+}
+
+func (a *clientApp) prepareWindowsCredentialSave(cfg config, user, pass, port string, needsQualification, passwordlessWasEnabled bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	manager := a.winRMSession
+	if manager == nil {
+		manager = newWinRMSessionManager(defaultWinRMSessionIdleTimeout)
+		a.winRMSession = manager
+	}
+	var err error
+	if needsQualification {
+		var response winRMResponse
+		response, err = manager.Execute(ctx, cfg.SelectedDestination, user, pass, "[Environment]::MachineName", port)
+		if err == nil {
+			qualifiedUser, qualifyErr := qualifyLocalWindowsUser(response.Output, user)
+			if qualifyErr == nil {
+				user = qualifiedUser
+			}
+			err = qualifyErr
+		}
+	}
+	if err == nil && pass == "" {
+		const configurePasswordlessRDP = `$path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'; Set-ItemProperty -LiteralPath $path -Name UserAuthentication -Type DWord -Value 0; Set-ItemProperty -LiteralPath $path -Name SecurityLayer -Type DWord -Value 0`
+		_, err = manager.Execute(ctx, cfg.SelectedDestination, user, pass, configurePasswordlessRDP, port)
+	} else if err == nil && passwordlessWasEnabled {
+		const configureNLARDP = `$path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'; Set-ItemProperty -LiteralPath $path -Name UserAuthentication -Type DWord -Value 1; Set-ItemProperty -LiteralPath $path -Name SecurityLayer -Type DWord -Value 2`
+		_, err = manager.Execute(ctx, cfg.SelectedDestination, user, pass, configureNLARDP, port)
+	}
+	if err != nil {
+		a.onUI(func() {
+			a.saveWindowsButton.SetEnabled(true)
+			if pass == "" || passwordlessWasEnabled {
+				a.showError(fmt.Errorf("update Remote Desktop security on the Work computer: %w", err))
+				return
+			}
+			a.appendLog("Could not qualify local Windows username %s; saving it as entered: %v", user, err)
+			a.finishWindowsCredentialSave(cfg, user, pass)
+		})
+		return
+	}
+	a.onUI(func() {
+		a.saveWindowsButton.SetEnabled(true)
+		a.finishWindowsCredentialSave(cfg, user, pass)
+	})
+}
+
+func (a *clientApp) finishWindowsCredentialSave(cfg config, user, pass string) {
 	if err := saveWindowsCredential(cfg, user, pass); err != nil {
 		a.showError(err)
 		return
 	}
+	cfg.RDPUser = user
+	if profile := cfg.selectedProfile(); profile != nil {
+		profile.WindowsUser = user
+		profile.PasswordlessRDP = pass == ""
+	}
+	if err := saveSettingsConfig(cfg); err != nil {
+		a.showError(err)
+		return
+	}
+	a.setConfig(cfg)
 	a.closeWinRMSession()
 	if _, err := writeMSTSCRDPFile(cfg); err != nil {
 		a.appendLog("Saved Windows login, but could not update the Remote Desktop profile: %v", err)
 	}
 	_ = a.rdpPass.SetText("")
 	a.appendLog("Saved shared RDP, WinRM, and SMB login in Windows Credential Manager for destination %s.", cfg.SelectedDestination)
+}
+
+func windowsUserNeedsQualification(user string) bool {
+	user = strings.TrimSpace(user)
+	return user != "" && !strings.Contains(user, `\`) && !strings.Contains(user, "@")
+}
+
+func qualifyLocalWindowsUser(host, user string) (string, error) {
+	host = strings.TrimSpace(host)
+	user = strings.TrimSpace(user)
+	if !windowsUserNeedsQualification(user) {
+		return user, nil
+	}
+	if host == "" || strings.ContainsAny(host, `\/@ \t\r\n`) {
+		return "", fmt.Errorf("Work computer returned invalid name %q", host)
+	}
+	return host + `\` + user, nil
 }
 
 func (a *clientApp) forgetWindowsCredentials() {
@@ -2106,7 +2213,7 @@ func (c *config) ensureDestinations() error {
 		if err := homenetwork.ValidateAlias(alias); err != nil {
 			return fmt.Errorf("destination %q: %w", name, err)
 		}
-		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RelayBases: destination.RelayBases, Room: destination.Room, RoomProof: destination.RoomProof, WindowsUser: destination.WindowsUser, SMBAlias: alias})
+		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RelayBases: destination.RelayBases, Room: destination.Room, RoomProof: destination.RoomProof, WindowsUser: destination.WindowsUser, PasswordlessRDP: destination.PasswordlessRDP, SMBAlias: alias})
 	}
 	selected := 0
 	for i, destination := range normalized {
@@ -2722,6 +2829,12 @@ func mstscProfilePath() (string, error) {
 
 func mstscProfileContent(cfg config) string {
 	target := sanitizeRDPValue(mstscTarget(cfg.ListenAddr))
+	authenticationLevel := "2"
+	credSSPSupport := "1"
+	if profile := cfg.selectedProfile(); profile != nil && profile.PasswordlessRDP {
+		authenticationLevel = "0"
+		credSSPSupport = "0"
+	}
 	lines := []string{
 		"screen mode id:i:2",
 		"use multimon:i:0",
@@ -2729,8 +2842,8 @@ func mstscProfileContent(cfg config) string {
 		"full address:s:" + target,
 		"prompt for credentials:i:0",
 		"promptcredentialonce:i:1",
-		"authentication level:i:2",
-		"enablecredsspsupport:i:1",
+		"authentication level:i:" + authenticationLevel,
+		"enablecredsspsupport:i:" + credSSPSupport,
 		"negotiate security layer:i:1",
 		"redirectclipboard:i:1",
 		"redirectprinters:i:0",
@@ -2764,6 +2877,9 @@ func mstscTarget(listenAddr string) string {
 
 func saveRDPCredentialTargets(listenAddr, user, pass string) error {
 	for _, target := range rdpCredentialTargets(listenAddr) {
+		if err := wincred.Delete(target, wincred.TypeDomainPassword); err != nil {
+			return fmt.Errorf("remove stale RDP domain credential for %s: %w", target, err)
+		}
 		out, err := hiddenCommand("cmdkey.exe", "/generic:"+target, "/user:"+user, "/pass:"+pass).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("save RDP credentials with cmdkey for %s: %w: %s", target, err, strings.TrimSpace(string(out)))

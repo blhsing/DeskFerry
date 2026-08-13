@@ -214,6 +214,53 @@ func TestHiddenCommandSuppressesConsoleWindow(t *testing.T) {
 	}
 }
 
+func TestQualifyLocalWindowsUser(t *testing.T) {
+	got, err := qualifyLocalWindowsUser(" DESKTOP-G2EEM1V\r\n", "Owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != `DESKTOP-G2EEM1V\Owner` {
+		t.Fatalf("qualified user = %q", got)
+	}
+	for _, alreadyQualified := range []string{`DOMAIN\Owner`, `owner@example.com`} {
+		got, err = qualifyLocalWindowsUser("ignored", alreadyQualified)
+		if err != nil || got != alreadyQualified {
+			t.Fatalf("qualified user %q = %q, %v", alreadyQualified, got, err)
+		}
+	}
+	if _, err := qualifyLocalWindowsUser("bad host", "Owner"); err == nil {
+		t.Fatal("invalid computer name was accepted")
+	}
+}
+
+func TestMSTSCProfileContentPasswordlessRDP(t *testing.T) {
+	cfg := config{
+		ListenAddr:          "127.0.0.1:3390",
+		RDPUser:             `DESKTOP-G2EEM1V\Owner`,
+		SelectedDestination: "Work",
+		Destinations: []destinationProfile{{
+			Name: "Work", PasswordlessRDP: true,
+		}},
+	}
+	content := mstscProfileContent(cfg)
+	for _, expected := range []string{
+		"authentication level:i:0",
+		"enablecredsspsupport:i:0",
+		`username:s:DESKTOP-G2EEM1V\Owner`,
+	} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("passwordless RDP profile missing %q:\n%s", expected, content)
+		}
+	}
+	cfg.Destinations[0].PasswordlessRDP = false
+	content = mstscProfileContent(cfg)
+	for _, expected := range []string{"authentication level:i:2", "enablecredsspsupport:i:1"} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("NLA RDP profile missing %q:\n%s", expected, content)
+		}
+	}
+}
+
 func TestEnsureDestinationsMigratesLegacyRelayList(t *testing.T) {
 	cfg := config{
 		RelayAddr: "https://primary.example/relay/office",

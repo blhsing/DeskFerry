@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.10.11 - 2026-08-13
+
+- Fix passwordless local-account RDP authentication by resolving a bare username such as `Owner` through WinRM and saving it as the Work computer-qualified identity, such as `DESKTOP-G2EEM1V\Owner`.
+- Configure the Work computer and generated RDP profile to use classic RDP security for an explicitly passwordless profile, because CredSSP/NLA rejects blank passwords even when Windows permits other blank-password network logons.
+- Remove stale domain-password entries before saving loopback RDP credentials, preserve explicitly qualified domain, computer, and UPN usernames, and explain when a passwordless profile has no saved room credential.
+
 ## 0.10.10 - 2026-08-12
 
 - Keep resumable RDP sessions alive when a proxy or hosting layer reports a transport interruption as WebSocket close code 1000 without DeskFerry's explicit `session closed` marker.

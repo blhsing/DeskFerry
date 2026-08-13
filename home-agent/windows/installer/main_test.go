@@ -192,7 +192,7 @@ func TestConfigureHomeClientUpdatesSelectedDestination(t *testing.T) {
 		WinRMUser:           `DOMAIN\legacy`,
 		SelectedDestination: "Room a",
 		Destinations: []homeClientDestination{
-			{Name: "Room a", RelayAddrs: []string{"https://relay.example/relay/a"}, RoomProof: "old-proof", WindowsUser: `DOMAIN\user`},
+			{Name: "Room a", RelayAddrs: []string{"https://relay.example/relay/a"}, RoomProof: "old-proof", WindowsUser: `DOMAIN\user`, PasswordlessRDP: true},
 			{Name: "Other", RelayAddrs: []string{"https://relay.example/relay/other"}, RoomProof: "other-proof"},
 		},
 	}
@@ -226,7 +226,7 @@ func TestConfigureHomeClientUpdatesSelectedDestination(t *testing.T) {
 	if got.SelectedDestination != "Room b" || got.RoomProof != "room-b-proof" || got.Proxy != "direct" || got.WinRMUser != settings.WinRMUser {
 		t.Fatalf("settings = %#v", got)
 	}
-	if len(got.Destinations) != 3 || got.Destinations[2].RoomProof != "room-b-proof" || got.Destinations[2].SMBAlias != "room-b-files" || got.Destinations[0].WindowsUser != `DOMAIN\user` {
+	if len(got.Destinations) != 3 || got.Destinations[2].RoomProof != "room-b-proof" || got.Destinations[2].SMBAlias != "room-b-files" || got.Destinations[0].WindowsUser != `DOMAIN\user` || !got.Destinations[0].PasswordlessRDP {
 		t.Fatalf("destinations = %#v", got.Destinations)
 	}
 	if got.Destinations[2].Room != "b" || !reflect.DeepEqual(got.Destinations[2].RelayBases, []string{"https://relay.example/relay", "http://relay-backup.example/relay"}) {
