@@ -49,6 +49,9 @@ func TestPipeEndInitiator(t *testing.T) {
 		{name: "relay", result: PipeResult{BToA: CopyResult{CopyErr: errors.New("relay closed")}}, want: "relay"},
 		{name: "both", result: PipeResult{AToB: CopyResult{CopyErr: errors.New("a")}, BToA: CopyResult{CopyErr: errors.New("b")}}, want: "both"},
 		{name: "clean", result: PipeResult{}, want: "clean_or_unknown"},
+		{name: "clean local EOF first", result: PipeResult{FirstCompleted: "a"}, want: "local_rdp"},
+		{name: "clean relay EOF first", result: PipeResult{FirstCompleted: "b"}, want: "relay"},
+		{name: "relay EOF before secondary local error", result: PipeResult{FirstCompleted: "b", AToB: CopyResult{CopyErr: errors.New("local reset")}}, want: "relay"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

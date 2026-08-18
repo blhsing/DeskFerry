@@ -23,17 +23,27 @@ type CopyResult struct {
 }
 
 type PipeResult struct {
-	AToB      CopyResult
-	BToA      CopyResult
-	ACloseErr error
-	BCloseErr error
-	Duration  time.Duration
+	AToB CopyResult
+	BToA CopyResult
+	// FirstCompleted records the source side whose copy loop ended first. An
+	// orderly EOF is still an end signal, so error presence alone cannot
+	// reliably identify which endpoint initiated a shutdown.
+	FirstCompleted string
+	ACloseErr      error
+	BCloseErr      error
+	Duration       time.Duration
 }
 
-// EndInitiator identifies which source side reported the copy error that
-// ended a bidirectional stream. It makes a local RDP socket closure visibly
-// different from a relay transport failure in agent diagnostics.
+// EndInitiator identifies which source side ended first, including orderly
+// EOFs. It makes a local RDP socket closure visibly different from a relay
+// transport failure in agent diagnostics.
 func (result PipeResult) EndInitiator(aName, bName string) string {
+	switch result.FirstCompleted {
+	case "a":
+		return aName
+	case "b":
+		return bName
+	}
 	switch {
 	case result.AToB.CopyErr != nil && result.BToA.CopyErr == nil:
 		return aName
@@ -57,9 +67,11 @@ func PipeWithResult(a, b net.Conn) PipeResult {
 	started := time.Now()
 	var result PipeResult
 	var wg sync.WaitGroup
+	completed := make(chan string, 2)
 	wg.Add(2)
-	go copyHalf(&wg, b, a, &result.AToB)
-	go copyHalf(&wg, a, b, &result.BToA)
+	go copyHalf(&wg, b, a, &result.AToB, completed, "a")
+	go copyHalf(&wg, a, b, &result.BToA, completed, "b")
+	result.FirstCompleted = <-completed
 	wg.Wait()
 	result.ACloseErr = a.Close()
 	result.BCloseErr = b.Close()
@@ -67,9 +79,10 @@ func PipeWithResult(a, b net.Conn) PipeResult {
 	return result
 }
 
-func copyHalf(wg *sync.WaitGroup, dst, src net.Conn, result *CopyResult) {
+func copyHalf(wg *sync.WaitGroup, dst, src net.Conn, result *CopyResult, completed chan<- string, source string) {
 	defer wg.Done()
 	result.Bytes, result.CopyErr = io.Copy(dst, src)
+	completed <- source
 	if cw, ok := dst.(closeWriter); ok {
 		result.CloseWriteErr = cw.CloseWrite()
 	} else {
