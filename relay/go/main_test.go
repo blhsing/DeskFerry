@@ -251,6 +251,7 @@ func TestV2OnDemandSessionPairingAndBusyRejection(t *testing.T) {
 	clientHeaders := http.Header{}
 	tunnel.AddProtocolV2Header(clientHeaders)
 	clientHeaders.Set(tunnel.HeaderResumable, "1")
+	tunnel.AddHeartbeatHeader(clientHeaders)
 	tunnel.AddServiceHeader(clientHeaders, tunnel.ServiceScreen)
 	client, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleClient, "", clientHeaders)
 	if err != nil {
@@ -264,7 +265,10 @@ func TestV2OnDemandSessionPairingAndBusyRejection(t *testing.T) {
 	if err := tunnel.ValidateSessionOffer(offer, "unit-v2", "unit-agent", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	if err := tunnel.WriteControlMessage(ctx, control, tunnel.ControlMessage{Type: tunnel.MessageAccept, SessionID: offer.SessionID}); err != nil {
+	if !offer.Heartbeat {
+		t.Fatal("session offer omitted heartbeat capability")
+	}
+	if err := tunnel.WriteControlMessage(ctx, control, tunnel.ControlMessage{Type: tunnel.MessageAccept, SessionID: offer.SessionID, Heartbeat: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -280,11 +284,11 @@ func TestV2OnDemandSessionPairingAndBusyRejection(t *testing.T) {
 	}
 	defer tunnel.CloseWebSocket(agent)
 	agentReady, err := tunnel.ReadControlMessage(ctx, agent)
-	if err != nil || agentReady.SessionID != offer.SessionID || agentReady.Service != tunnel.ServiceScreen {
+	if err != nil || agentReady.SessionID != offer.SessionID || agentReady.Service != tunnel.ServiceScreen || !agentReady.Heartbeat {
 		t.Fatalf("agent ready=%#v error=%v", agentReady, err)
 	}
-	if id, v2, err := tunnel.AwaitSessionReadyCompatibleService(ctx, client, tunnel.ServiceScreen); err != nil || !v2 || id != offer.SessionID {
-		t.Fatalf("client ready id=%q v2=%t error=%v", id, v2, err)
+	if ready, err := tunnel.AwaitSessionReadyCompatibleServiceInfo(ctx, client, tunnel.ServiceScreen); err != nil || !ready.ProtocolV2 || ready.SessionID != offer.SessionID || !ready.Heartbeat {
+		t.Fatalf("client ready=%+v error=%v", ready, err)
 	}
 
 	busyClient, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleClient, "", clientHeaders)
@@ -365,8 +369,8 @@ func TestLegacyClientPairsThroughV2Control(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if offer.Resumable || offer.Service != tunnel.ServiceSMB {
-		t.Fatalf("mixed offer resumable=%t service=%q", offer.Resumable, offer.Service)
+	if offer.Resumable || offer.Heartbeat || offer.Service != tunnel.ServiceSMB {
+		t.Fatalf("mixed offer resumable=%t heartbeat=%t service=%q", offer.Resumable, offer.Heartbeat, offer.Service)
 	}
 	if err := tunnel.WriteControlMessage(ctx, control, tunnel.ControlMessage{Type: tunnel.MessageAccept, SessionID: offer.SessionID}); err != nil {
 		t.Fatal(err)

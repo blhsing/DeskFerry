@@ -19,6 +19,7 @@ const (
 	HeaderAgentInstance   = "X-DeskFerry-Agent-Instance"
 	HeaderAgentServices   = "X-DeskFerry-Agent-Services"
 	HeaderConcurrency     = "X-DeskFerry-Concurrency"
+	HeaderHeartbeat       = "X-DeskFerry-Heartbeat"
 
 	MessageControlReady       = "control-ready"
 	MessageSessionOffer       = "session-offer"
@@ -46,7 +47,14 @@ type ControlMessage struct {
 	ExpiresAt       time.Time `json:"expires_at,omitempty"`
 	ProtocolVersion int       `json:"protocol_version,omitempty"`
 	Resumable       bool      `json:"resumable,omitempty"`
+	Heartbeat       bool      `json:"heartbeat,omitempty"`
 	Reason          string    `json:"reason,omitempty"`
+}
+
+type SessionReadyInfo struct {
+	SessionID  string
+	ProtocolV2 bool
+	Heartbeat  bool
 }
 
 type SessionResultError struct {
@@ -73,6 +81,10 @@ func (e *SessionResultError) RetryNextRelay() bool {
 
 func AddProtocolV2Header(headers http.Header) {
 	headers.Set(HeaderProtocolVersion, "2")
+}
+
+func AddHeartbeatHeader(headers http.Header) {
+	headers.Set(HeaderHeartbeat, "1")
 }
 
 func WriteControlMessage(ctx context.Context, c *websocket.Conn, message ControlMessage) error {
@@ -115,29 +127,43 @@ func AwaitControlReady(ctx context.Context, c *websocket.Conn) error {
 }
 
 func AwaitSessionReady(ctx context.Context, c *websocket.Conn) (string, error) {
-	sessionID, _, err := AwaitSessionReadyCompatible(ctx, c)
-	return sessionID, err
+	info, err := AwaitSessionReadyInfoResult(ctx, c)
+	return info.SessionID, err
+}
+
+func AwaitSessionReadyInfoResult(ctx context.Context, c *websocket.Conn) (SessionReadyInfo, error) {
+	return awaitSessionReadyCompatibleInfoService(ctx, c, "")
 }
 
 // AwaitSessionReadyCompatible accepts a protocol-v2 result or the legacy
 // "start" control frame. It allows upgraded Home clients to operate through a
 // relay that is still paired with rollback-mode work-agent slots.
 func AwaitSessionReadyCompatible(ctx context.Context, c *websocket.Conn) (string, bool, error) {
-	return awaitSessionReadyCompatibleService(ctx, c, "")
+	info, err := AwaitSessionReadyCompatibleInfo(ctx, c)
+	return info.SessionID, info.ProtocolV2, err
+}
+
+func AwaitSessionReadyCompatibleInfo(ctx context.Context, c *websocket.Conn) (SessionReadyInfo, error) {
+	return awaitSessionReadyCompatibleInfoService(ctx, c, "")
 }
 
 // AwaitSessionReadyCompatibleService additionally requires a protocol-v2
 // relay to echo the requested service. New services use this to avoid being
 // silently mapped to RDP by an older relay.
 func AwaitSessionReadyCompatibleService(ctx context.Context, c *websocket.Conn, expectedService string) (string, bool, error) {
-	return awaitSessionReadyCompatibleService(ctx, c, strings.ToLower(strings.TrimSpace(expectedService)))
+	info, err := AwaitSessionReadyCompatibleServiceInfo(ctx, c, expectedService)
+	return info.SessionID, info.ProtocolV2, err
 }
 
-func awaitSessionReadyCompatibleService(ctx context.Context, c *websocket.Conn, expectedService string) (string, bool, error) {
+func AwaitSessionReadyCompatibleServiceInfo(ctx context.Context, c *websocket.Conn, expectedService string) (SessionReadyInfo, error) {
+	return awaitSessionReadyCompatibleInfoService(ctx, c, strings.ToLower(strings.TrimSpace(expectedService)))
+}
+
+func awaitSessionReadyCompatibleInfoService(ctx context.Context, c *websocket.Conn, expectedService string) (SessionReadyInfo, error) {
 	for {
 		typ, payload, err := c.Read(ctx)
 		if err != nil {
-			return "", false, fmt.Errorf("wait for session result: %w", err)
+			return SessionReadyInfo{}, fmt.Errorf("wait for session result: %w", err)
 		}
 		if typ != websocket.MessageText {
 			continue
@@ -145,35 +171,40 @@ func awaitSessionReadyCompatibleService(ctx context.Context, c *websocket.Conn, 
 		fields := strings.Fields(string(payload))
 		if len(fields) > 0 && fields[0] == webSocketStartMessage {
 			if expectedService != "" {
-				return "", false, fmt.Errorf("relay does not confirm support for service %q", expectedService)
+				return SessionReadyInfo{}, fmt.Errorf("relay does not confirm support for service %q", expectedService)
 			}
 			if len(fields) > 1 {
-				return cleanProtocolSessionID(fields[1]), false, nil
+				return SessionReadyInfo{SessionID: cleanProtocolSessionID(fields[1])}, nil
 			}
-			return "", false, nil
+			return SessionReadyInfo{}, nil
 		}
 		var message ControlMessage
 		if err := json.Unmarshal(payload, &message); err != nil {
-			return "", true, fmt.Errorf("decode relay session result: %w", err)
+			return SessionReadyInfo{ProtocolV2: true}, fmt.Errorf("decode relay session result: %w", err)
 		}
 		message.Type = strings.ToLower(strings.TrimSpace(message.Type))
 		message.SessionID = strings.ToLower(strings.TrimSpace(message.SessionID))
 		message.Service = strings.ToLower(strings.TrimSpace(message.Service))
 		if message.Type == MessageSessionReady && expectedService != "" && message.Service != expectedService {
-			return "", true, fmt.Errorf("relay confirmed service %q instead of %q", message.Service, expectedService)
+			return SessionReadyInfo{ProtocolV2: true}, fmt.Errorf("relay confirmed service %q instead of %q", message.Service, expectedService)
 		}
-		return sessionResult(message)
+		return sessionResultInfo(message)
 	}
 }
 
-func sessionResult(message ControlMessage) (string, bool, error) {
+func sessionResultInfo(message ControlMessage) (SessionReadyInfo, error) {
 	if message.Type == MessageSessionReady && cleanProtocolSessionID(message.SessionID) != "" {
-		return message.SessionID, true, nil
+		return SessionReadyInfo{SessionID: message.SessionID, ProtocolV2: true, Heartbeat: message.Heartbeat}, nil
 	}
 	if message.Type == "" {
 		message.Type = MessageInvalidRequest
 	}
-	return "", true, &SessionResultError{Result: message.Type, SessionID: message.SessionID, Reason: message.Reason}
+	return SessionReadyInfo{ProtocolV2: true}, &SessionResultError{Result: message.Type, SessionID: message.SessionID, Reason: message.Reason}
+}
+
+func sessionResult(message ControlMessage) (string, bool, error) {
+	info, err := sessionResultInfo(message)
+	return info.SessionID, info.ProtocolV2, err
 }
 
 func ValidateSessionOffer(message ControlMessage, room, agentID string, now time.Time) error {

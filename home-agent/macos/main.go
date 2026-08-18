@@ -448,30 +448,31 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 			tunnel.AddProtocolV2Header(headers)
 			if service != tunnel.ServiceScreen {
 				headers.Set(tunnel.HeaderResumable, "1")
+				tunnel.AddHeartbeatHeader(headers)
 			}
 			addRoomCredentialHeader(headers, cfg, relayAddr)
 			tunnel.AddServiceHeader(headers, service)
 			ws, err := tunnel.DialWebSocketWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
-			sessionID := ""
-			v2 := false
+			ready := tunnel.SessionReadyInfo{}
 			if err == nil {
 				if service == tunnel.ServiceScreen {
-					sessionID, v2, err = tunnel.AwaitSessionReadyCompatibleService(attemptCtx, ws, service)
+					ready, err = tunnel.AwaitSessionReadyCompatibleServiceInfo(attemptCtx, ws, service)
 				} else {
-					sessionID, v2, err = tunnel.AwaitSessionReadyCompatible(attemptCtx, ws)
+					ready, err = tunnel.AwaitSessionReadyCompatibleInfo(attemptCtx, ws)
 				}
 			}
 			if err == nil {
 				cancel()
-				log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t via=%s elapsed=%s", relayAddr, service, v2, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
-				if sessionID != "" && service != tunnel.ServiceScreen {
+				log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t heartbeat=%t via=%s elapsed=%s", relayAddr, service, ready.ProtocolV2, ready.Heartbeat, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
+				if ready.SessionID != "" && service != tunnel.ServiceScreen {
 					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{
 						RelayAddr: relayAddr,
 						Proxy:     cfg.Proxy,
-						SessionID: sessionID,
+						SessionID: ready.SessionID,
 						Side:      "client",
 						RoomProof: roomProof(cfg, relayAddr),
 						Service:   service,
+						Heartbeat: ready.Heartbeat,
 					}), relayAddr, nil
 				}
 				return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil

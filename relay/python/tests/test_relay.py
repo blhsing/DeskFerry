@@ -354,7 +354,7 @@ def test_v2_on_demand_pairing_and_busy_rejection():
         assert control.json_messages[0]["type"] == "control-ready"
 
         home_task = asyncio.create_task(
-            hub.serve_v2_client("unit-v2", home, "home", True, "", "screen")
+            hub.serve_v2_client("unit-v2", home, "home", True, "", "screen", heartbeat=True)
         )
         for _ in range(50):
             if len(control.json_messages) > 1:
@@ -363,7 +363,8 @@ def test_v2_on_demand_pairing_and_busy_rejection():
         offer = control.json_messages[1]
         assert offer["type"] == "session-offer"
         assert offer["service"] == "screen"
-        await control._received.put({"type": "accept", "session_id": offer["session_id"]})
+        assert offer["heartbeat"] is True
+        await control._received.put({"type": "accept", "session_id": offer["session_id"], "heartbeat": True})
         agent_task = asyncio.create_task(
             hub.serve_agent_session(
                 "unit-v2", agent, "work-data", "unit-agent",
@@ -376,8 +377,10 @@ def test_v2_on_demand_pairing_and_busy_rejection():
             await asyncio.sleep(0.01)
         assert home.json_messages[-1]["type"] == "session-ready"
         assert home.json_messages[-1]["service"] == "screen"
+        assert home.json_messages[-1]["heartbeat"] is True
         assert agent.json_messages[-1]["session_id"] == offer["session_id"]
         assert agent.json_messages[-1]["service"] == "screen"
+        assert agent.json_messages[-1]["heartbeat"] is True
 
         busy = FakeWebSocket()
         await hub.serve_v2_client("unit-v2", busy, "home-2", True, "", "screen")

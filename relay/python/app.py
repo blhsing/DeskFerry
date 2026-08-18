@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.10.11"
+RELAY_VERSION = "0.10.12"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -137,6 +137,10 @@ def read_agent_identity(websocket: WebSocket) -> AgentIdentity:
 
 def read_resumable(websocket: WebSocket) -> bool:
     return websocket.headers.get("x-deskferry-resumable", "").strip().lower() in {"1", "true"}
+
+
+def read_heartbeat(websocket: WebSocket) -> bool:
+    return websocket.headers.get("x-deskferry-heartbeat", "").strip().lower() in {"1", "true"}
 
 
 def read_agent_services(websocket: WebSocket) -> set[str]:
@@ -724,6 +728,7 @@ class PendingSession:
     proof: str
     service: str
     resumable: bool
+    heartbeat: bool
     created_at: datetime
     expires_at: datetime
     response: asyncio.Future[dict[str, Any]] = field(default_factory=asyncio.Future)
@@ -800,7 +805,7 @@ class RelayHub:
 
     async def serve_v2_client(
         self, token: str, websocket: WebSocket, remote: str, resumable: bool = False,
-        proof: str = "", service: str = "rdp",
+        proof: str = "", service: str = "rdp", heartbeat: bool = False,
     ) -> None:
         room = await self._room_for(token)
         if not await room.authorize_client(proof):
@@ -822,11 +827,11 @@ class RelayHub:
             await send_v2(websocket, {"type": result, "reason": reason})
             await close_quietly(websocket, 1000, reason)
             return
-        await self._serve_on_demand_client(room, websocket, remote, resumable, proof, service, control, True)
+        await self._serve_on_demand_client(room, websocket, remote, resumable, heartbeat, proof, service, control, True)
 
     async def _serve_on_demand_client(
         self, room: RelayRoom, websocket: WebSocket, remote: str, resumable: bool,
-        proof: str, service: str, control: AgentControl, typed: bool,
+        heartbeat: bool, proof: str, service: str, control: AgentControl, typed: bool,
     ) -> None:
         if len(self._pending) >= 4096:
             control.release()
@@ -835,7 +840,7 @@ class RelayHub:
             return
         created_at = utc_now()
         expires_at = datetime.fromtimestamp(created_at.timestamp() + SESSION_OFFER_SECONDS, timezone.utc)
-        pending = PendingSession(uuid.uuid4().hex, room, control, websocket, remote, proof, service, resumable, created_at, expires_at)
+        pending = PendingSession(uuid.uuid4().hex, room, control, websocket, remote, proof, service, resumable, heartbeat, created_at, expires_at)
         key = f"{room.id}/{pending.id}"
         self._pending[key] = pending
         await room.pending_started(service)
@@ -847,6 +852,7 @@ class RelayHub:
                 "service": service, "agent_id": control.agent_id,
                 "created_at": json_time(created_at), "expires_at": json_time(expires_at),
                 "resumable": resumable,
+                "heartbeat": heartbeat,
             }
             if not await control.send(offer):
                 await room.record_rejection("no-agent")
@@ -873,7 +879,8 @@ class RelayHub:
             self._pending.pop(key, None)
             await room.pending_ended(service)
             pending_open = False
-            ready = {"type": "session-ready", "session_id": pending.id, "service": service}
+            heartbeat = pending.heartbeat and bool(response.get("heartbeat"))
+            ready = {"type": "session-ready", "session_id": pending.id, "service": service, "heartbeat": heartbeat}
             client_ready = await send_v2(websocket, ready) if typed else await send_control(websocket, f"start {pending.id}", "legacy-client", room.id, remote)
             if not await send_v2(agent.websocket, ready) or not client_ready:
                 await close_quietly(agent.websocket)
@@ -998,7 +1005,7 @@ class RelayHub:
             return
         control = self._select_control(room.id, service)
         if control is not None:
-            await self._serve_on_demand_client(room, websocket, remote, resumable, proof, service, control, False)
+            await self._serve_on_demand_client(room, websocket, remote, resumable, False, proof, service, control, False)
             return
         if any(key.startswith(f"{room.id}/") and service in value.services for key, value in self._controls.items()):
             await room.record_rejection("busy")
@@ -1217,7 +1224,7 @@ async def relay_websocket(websocket: WebSocket, room: str | None) -> None:
         await hub.serve_agent_session(token, websocket, remote, read_agent_identity(websocket).instance, websocket.headers.get("x-deskferry-session"), read_resumable(websocket), read_room_proof(websocket), read_service(websocket))
     elif role == "client":
         if websocket.headers.get("x-deskferry-protocol", "").strip() == "2":
-            await hub.serve_v2_client(token, websocket, remote, read_resumable(websocket), read_room_proof(websocket), read_service(websocket))
+            await hub.serve_v2_client(token, websocket, remote, read_resumable(websocket), read_room_proof(websocket), read_service(websocket), heartbeat=read_heartbeat(websocket))
         else:
             await hub.serve_client(token, websocket, remote, read_resumable(websocket), read_room_proof(websocket), read_service(websocket))
     elif role == RESUME_ROLE:

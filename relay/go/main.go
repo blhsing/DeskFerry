@@ -209,7 +209,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hub *RelayHub, room
 		hub.ServeAgentSession(ctx, token, c, remote, readAgentIdentity(r).Instance, r.Header.Get(tunnel.HeaderSessionID), readResumable(r), proof, service)
 	case "client":
 		if strings.TrimSpace(r.Header.Get(tunnel.HeaderProtocolVersion)) == protocolV2 {
-			hub.ServeV2Client(ctx, token, c, remote, readResumable(r), proof, service)
+			hub.ServeV2Client(ctx, token, c, remote, readResumable(r), readHeartbeat(r), proof, service)
 		} else {
 			hub.ServeClient(ctx, token, c, remote, readResumable(r), proof, service)
 		}
@@ -347,6 +347,11 @@ func readAgentIdentity(r *http.Request) AgentIdentity {
 
 func readResumable(r *http.Request) bool {
 	value := strings.TrimSpace(r.Header.Get("X-DeskFerry-Resumable"))
+	return value == "1" || strings.EqualFold(value, "true")
+}
+
+func readHeartbeat(r *http.Request) bool {
+	value := strings.TrimSpace(r.Header.Get(tunnel.HeaderHeartbeat))
 	return value == "1" || strings.EqualFold(value, "true")
 }
 
@@ -526,6 +531,7 @@ type PendingSession struct {
 	Proof     string
 	Service   string
 	Resumable bool
+	Heartbeat bool
 	ExpiresAt time.Time
 	Response  chan tunnel.ControlMessage
 	Agent     chan *AgentDataSocket
@@ -609,7 +615,7 @@ func (h *RelayHub) ServeAgentControl(ctx context.Context, token string, c *webso
 	}
 }
 
-func (h *RelayHub) ServeV2Client(ctx context.Context, token string, c *websocket.Conn, remote string, resumable bool, proof, service string) {
+func (h *RelayHub) ServeV2Client(ctx context.Context, token string, c *websocket.Conn, remote string, resumable, heartbeat bool, proof, service string) {
 	room := h.roomFor(token)
 	if !room.AuthorizeClient(proof) {
 		sendV2Result(c, tunnel.MessageAuthFailed, "", "room authentication failed")
@@ -631,15 +637,15 @@ func (h *RelayHub) ServeV2Client(ctx context.Context, token string, c *websocket
 		closeQuietly(c, websocket.StatusNormalClosure, reason)
 		return
 	}
-	h.serveOnDemandClient(ctx, room, c, remote, resumable, proof, service, control, true)
+	h.serveOnDemandClient(ctx, room, c, remote, resumable, heartbeat, proof, service, control, true)
 }
 
-func (h *RelayHub) serveOnDemandClient(ctx context.Context, room *RelayRoom, c *websocket.Conn, remote string, resumable bool, proof, service string, control *AgentControl, typed bool) {
+func (h *RelayHub) serveOnDemandClient(ctx context.Context, room *RelayRoom, c *websocket.Conn, remote string, resumable, heartbeat bool, proof, service string, control *AgentControl, typed bool) {
 	defer control.Release()
 	now := time.Now().UTC()
 	pending := &PendingSession{
 		ID: randomID(), Room: room, Control: control, Client: c, Remote: remote, Proof: proof, Service: service,
-		Resumable: resumable, ExpiresAt: now.Add(sessionOfferTTL), Response: make(chan tunnel.ControlMessage, 1), Agent: make(chan *AgentDataSocket, 1),
+		Resumable: resumable, Heartbeat: heartbeat, ExpiresAt: now.Add(sessionOfferTTL), Response: make(chan tunnel.ControlMessage, 1), Agent: make(chan *AgentDataSocket, 1),
 	}
 	key := room.ID + "/" + pending.ID
 	h.mu.Lock()
@@ -665,7 +671,7 @@ func (h *RelayHub) serveOnDemandClient(ctx context.Context, room *RelayRoom, c *
 		h.NotifyDashboards()
 	}
 	defer cleanupPending()
-	offer := tunnel.ControlMessage{Type: tunnel.MessageSessionOffer, SessionID: pending.ID, Room: room.ID, Service: service, AgentID: control.AgentID, CreatedAt: now, ExpiresAt: pending.ExpiresAt, ProtocolVersion: tunnel.ProtocolVersion2, Resumable: resumable}
+	offer := tunnel.ControlMessage{Type: tunnel.MessageSessionOffer, SessionID: pending.ID, Room: room.ID, Service: service, AgentID: control.AgentID, CreatedAt: now, ExpiresAt: pending.ExpiresAt, ProtocolVersion: tunnel.ProtocolVersion2, Resumable: resumable, Heartbeat: heartbeat}
 	if !control.Send(offer) {
 		room.RecordRejection(tunnel.MessageNoAgent)
 		rejectSessionClient(c, typed, tunnel.MessageNoAgent, pending.ID, "work control disconnected")
@@ -700,13 +706,14 @@ func (h *RelayHub) serveOnDemandClient(ctx context.Context, room *RelayRoom, c *
 		return
 	}
 	cleanupPending()
+	heartbeat = pending.Heartbeat && response.Heartbeat
 	clientReady := false
 	if typed {
-		clientReady = sendV2ServiceResult(c, tunnel.MessageSessionReady, pending.ID, service, "")
+		clientReady = sendV2SessionReady(c, pending.ID, service, heartbeat)
 	} else {
 		clientReady = sendControl(c, room.ID, remote, "legacy-client", startMessage+" "+pending.ID)
 	}
-	if !sendV2ServiceResult(agent.Conn, tunnel.MessageSessionReady, pending.ID, service, "") || !clientReady {
+	if !sendV2SessionReady(agent.Conn, pending.ID, service, heartbeat) || !clientReady {
 		closeQuietly(agent.Conn, websocket.StatusNormalClosure, "peer unavailable")
 		return
 	}
@@ -783,6 +790,12 @@ func sendV2ServiceResult(c *websocket.Conn, result, sessionID, service, reason s
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return tunnel.WriteControlMessage(ctx, c, tunnel.ControlMessage{Type: result, SessionID: sessionID, Service: service, ProtocolVersion: tunnel.ProtocolVersion2, Reason: reason}) == nil
+}
+
+func sendV2SessionReady(c *websocket.Conn, sessionID, service string, heartbeat bool) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return tunnel.WriteControlMessage(ctx, c, tunnel.ControlMessage{Type: tunnel.MessageSessionReady, SessionID: sessionID, Service: service, ProtocolVersion: tunnel.ProtocolVersion2, Heartbeat: heartbeat}) == nil
 }
 
 func rejectSessionClient(c *websocket.Conn, typed bool, result, sessionID, reason string) {
@@ -867,7 +880,7 @@ func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.C
 	}
 	control, serviceControlExists := h.selectControl(room.ID, service)
 	if control != nil {
-		h.serveOnDemandClient(ctx, room, c, remote, resumable, proof, service, control, false)
+		h.serveOnDemandClient(ctx, room, c, remote, resumable, false, proof, service, control, false)
 		return
 	}
 	if serviceControlExists {

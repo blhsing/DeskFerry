@@ -95,7 +95,7 @@ async Task RelayWebSocketHandler(HttpContext context, RelayHub hub)
         case "client":
             if (context.Request.Headers["X-DeskFerry-Protocol"].FirstOrDefault()?.Trim() == "2")
             {
-                await hub.ServeV2ClientAsync(token, socket, remote, ReadResumable(context.Request), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
+                await hub.ServeV2ClientAsync(token, socket, remote, ReadResumable(context.Request), ReadHeartbeat(context.Request), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
             }
             else
             {
@@ -146,6 +146,12 @@ static int ReadConcurrency(HttpRequest request) =>
 static bool ReadResumable(HttpRequest request)
 {
     var value = request.Headers["X-DeskFerry-Resumable"].FirstOrDefault()?.Trim();
+    return value == "1" || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+}
+
+static bool ReadHeartbeat(HttpRequest request)
+{
+    var value = request.Headers["X-DeskFerry-Heartbeat"].FirstOrDefault()?.Trim();
     return value == "1" || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
 }
 
@@ -598,6 +604,7 @@ sealed record ControlMessage(
     [property: JsonPropertyName("expires_at")] DateTimeOffset? ExpiresAt = null,
     [property: JsonPropertyName("protocol_version")] int ProtocolVersion = 0,
     [property: JsonPropertyName("resumable")] bool Resumable = false,
+    [property: JsonPropertyName("heartbeat")] bool Heartbeat = false,
     [property: JsonPropertyName("reason")] string? Reason = null);
 
 sealed record DiagnosticLogBatch([property: JsonPropertyName("entries")] string[]? Entries);
@@ -691,7 +698,7 @@ sealed record AgentDataSocket(WebSocket Socket, string Remote, bool Resumable, T
 
 sealed class PendingSession
 {
-    public PendingSession(string id, RelayRoom room, AgentControl control, WebSocket client, string remote, string proof, string service, bool resumable, DateTimeOffset expiresAt)
+    public PendingSession(string id, RelayRoom room, AgentControl control, WebSocket client, string remote, string proof, string service, bool resumable, bool heartbeat, DateTimeOffset expiresAt)
     {
         Id = id;
         Room = room;
@@ -701,6 +708,7 @@ sealed class PendingSession
         Proof = proof;
         Service = service;
         Resumable = resumable;
+        Heartbeat = heartbeat;
         ExpiresAt = expiresAt;
     }
 
@@ -712,6 +720,7 @@ sealed class PendingSession
     public string Proof { get; }
     public string Service { get; }
     public bool Resumable { get; }
+    public bool Heartbeat { get; }
     public DateTimeOffset ExpiresAt { get; }
     public TaskCompletionSource<ControlMessage> Response { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public TaskCompletionSource<AgentDataSocket> Agent { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -816,7 +825,7 @@ sealed class RelayHub
         }
     }
 
-    public async Task ServeV2ClientAsync(string token, WebSocket socket, string remote, bool resumable, string proof, string service, CancellationToken abort)
+    public async Task ServeV2ClientAsync(string token, WebSocket socket, string remote, bool resumable, bool heartbeat, string proof, string service, CancellationToken abort)
     {
         var room = RoomFor(token);
         if (!room.AuthorizeClient(proof))
@@ -841,13 +850,13 @@ sealed class RelayHub
             await CloseQuietlyAsync(socket, WebSocketCloseStatus.NormalClosure, reason);
             return;
         }
-		await ServeOnDemandClientAsync(room, socket, remote, resumable, proof, service, control, true, abort);
+		await ServeOnDemandClientAsync(room, socket, remote, resumable, heartbeat, proof, service, control, true, abort);
     }
 
-    private async Task ServeOnDemandClientAsync(RelayRoom room, WebSocket socket, string remote, bool resumable, string proof, string service, AgentControl control, bool typed, CancellationToken abort)
+    private async Task ServeOnDemandClientAsync(RelayRoom room, WebSocket socket, string remote, bool resumable, bool heartbeat, string proof, string service, AgentControl control, bool typed, CancellationToken abort)
     {
         var now = DateTimeOffset.UtcNow;
-        var pending = new PendingSession(Guid.NewGuid().ToString("N"), room, control, socket, remote, proof, service, resumable, now.Add(SessionOfferTtl));
+        var pending = new PendingSession(Guid.NewGuid().ToString("N"), room, control, socket, remote, proof, service, resumable, heartbeat, now.Add(SessionOfferTtl));
         var key = $"{room.Id}/{pending.Id}";
         if (_pending.Count >= 4096 || !_pending.TryAdd(key, pending))
         {
@@ -861,7 +870,7 @@ sealed class RelayHub
         var pendingOpen = true;
         try
         {
-            var offer = new ControlMessage("session-offer", pending.Id, room.Id, service, control.AgentId, now, pending.ExpiresAt, ProtocolVersion, resumable);
+            var offer = new ControlMessage("session-offer", pending.Id, room.Id, service, control.AgentId, now, pending.ExpiresAt, ProtocolVersion, resumable, heartbeat);
             if (!await control.SendAsync(offer, abort))
             {
                 room.RecordRejection("no-agent");
@@ -900,7 +909,8 @@ sealed class RelayHub
             _pending.TryRemove(key, out _);
             room.PendingEnded(service);
             pendingOpen = false;
-            var ready = new ControlMessage("session-ready", pending.Id, Service: service, ProtocolVersion: ProtocolVersion);
+            heartbeat = pending.Heartbeat && response.Heartbeat;
+            var ready = new ControlMessage("session-ready", pending.Id, Service: service, ProtocolVersion: ProtocolVersion, Heartbeat: heartbeat);
             var clientReady = typed
                 ? await SendV2Async(socket, ready, CancellationToken.None)
                 : await TrySendControlAsync(socket, room.Id, remote, "legacy-client", $"start {pending.Id}", CancellationToken.None);
@@ -1058,7 +1068,7 @@ sealed class RelayHub
         var control = SelectControl(room.Id, service);
         if (control is not null)
         {
-            await ServeOnDemandClientAsync(room, socket, remote, resumable, proof, service, control, false, abort);
+            await ServeOnDemandClientAsync(room, socket, remote, resumable, false, proof, service, control, false, abort);
             return;
         }
         if (_controls.Any(item => item.Key.StartsWith(room.Id + "/", StringComparison.Ordinal) && item.Value.Services.Contains(service)))
@@ -2098,7 +2108,7 @@ sealed class ResumeSession
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.10.11";
+    public const string Version = "0.10.12";
 }
 
 sealed class WaitingAgent

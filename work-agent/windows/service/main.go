@@ -890,7 +890,7 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 		log.Printf("session offer local dial failed relay=%s session=%s service=%s target=%s duration=%s error=%v", cfg.RelayAddr, offer.SessionID, target.Service, target.Address, time.Since(started).Round(time.Millisecond), err)
 		return
 	}
-	if err := writer.send(parent, tunnel.ControlMessage{Type: tunnel.MessageAccept, SessionID: offer.SessionID}); err != nil {
+	if err := writer.send(parent, tunnel.ControlMessage{Type: tunnel.MessageAccept, SessionID: offer.SessionID, Heartbeat: offer.Heartbeat}); err != nil {
 		_ = localConn.Close()
 		return
 	}
@@ -909,7 +909,8 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 		log.Printf("agent session dial failed relay=%s session=%s service=%s duration=%s error=%v", cfg.RelayAddr, offer.SessionID, target.Service, time.Since(started).Round(time.Millisecond), err)
 		return
 	}
-	if _, err := tunnel.AwaitSessionReady(sessionCtx, ws); err != nil {
+	ready, err := tunnel.AwaitSessionReadyInfoResult(sessionCtx, ws)
+	if err != nil {
 		_ = localConn.Close()
 		tunnel.CloseWebSocket(ws)
 		log.Printf("agent session rejected relay=%s session=%s service=%s error=%v", cfg.RelayAddr, offer.SessionID, target.Service, err)
@@ -918,9 +919,9 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 	cancel()
 	stream := net.Conn(tunnel.WebSocketNetConn(parent, ws))
 	if offer.Resumable {
-		stream = tunnel.NewResumableWebSocketConn(parent, ws, tunnel.ResumableWebSocketOptions{RelayAddr: cfg.RelayAddr, Proxy: cfg.Proxy, SessionID: offer.SessionID, Side: "agent", RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword), Service: target.Service})
+		stream = tunnel.NewResumableWebSocketConn(parent, ws, tunnel.ResumableWebSocketOptions{RelayAddr: cfg.RelayAddr, Proxy: cfg.Proxy, SessionID: offer.SessionID, Side: "agent", RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword), Service: target.Service, Heartbeat: ready.Heartbeat})
 	}
-	log.Printf("session ready relay=%s session=%s service=%s target=%s setup_duration=%s", cfg.RelayAddr, offer.SessionID, target.Service, target.Address, time.Since(started).Round(time.Millisecond))
+	log.Printf("session ready relay=%s session=%s service=%s target=%s heartbeat=%t setup_duration=%s", cfg.RelayAddr, offer.SessionID, target.Service, target.Address, ready.Heartbeat, time.Since(started).Round(time.Millisecond))
 	pipeStream := stream
 	if target.Interactive {
 		pipeStream = drainScreenResponse(stream)

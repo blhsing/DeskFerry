@@ -132,6 +132,100 @@ func TestResumableWebSocketConnReplaysUnacknowledgedData(t *testing.T) {
 	}
 }
 
+func TestResumableHeartbeatResumesSilentTransport(t *testing.T) {
+	const sessionID = "fedcba9876543210fedcba9876543210"
+	serverErrors := make(chan error, 2)
+	var connections atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		index := connections.Add(1)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		command := "start " + sessionID
+		if index > 1 {
+			command = "resume " + sessionID
+		}
+		if err := ws.Write(ctx, websocket.MessageText, []byte(command)); err != nil {
+			serverErrors <- err
+			return
+		}
+		if _, _, err := ws.Read(ctx); err != nil { // initial receive acknowledgement
+			serverErrors <- err
+			return
+		}
+		if index == 1 {
+			// Keep the WebSocket open but deliberately swallow the heartbeat.
+			// The client must declare this transport lost and attach a new one.
+			_, _, _ = ws.Read(ctx)
+			return
+		}
+		if err := ws.Write(ctx, websocket.MessageBinary, makeFrame(resumableFrameData, 0, []byte("resumed"))); err != nil {
+			serverErrors <- err
+			return
+		}
+		for {
+			_, payload, err := ws.Read(ctx)
+			if err != nil {
+				return
+			}
+			frameType, nonce, _, err := parseFrame(payload)
+			if err != nil {
+				serverErrors <- err
+				return
+			}
+			if frameType == resumableFramePing {
+				if err := ws.Write(ctx, websocket.MessageBinary, makeFrame(resumableFramePong, nonce, nil)); err != nil {
+					serverErrors <- err
+				}
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	headers := http.Header{}
+	headers.Set(HeaderResumable, "1")
+	initial, err := DialWebSocketWithHeaders(ctx, server.URL+"/relay/heartbeat", "direct", RoleClient, "", headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AwaitWebSocketStartSession(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	conn := NewResumableWebSocketConn(ctx, initial, ResumableWebSocketOptions{
+		RelayAddr:         server.URL + "/relay/heartbeat",
+		Proxy:             "direct",
+		SessionID:         sessionID,
+		Side:              "client",
+		Heartbeat:         true,
+		heartbeatInterval: 20 * time.Millisecond,
+		heartbeatTimeout:  60 * time.Millisecond,
+	})
+	defer conn.Close()
+	received := make([]byte, len("resumed"))
+	if _, err := io.ReadFull(conn, received); err != nil {
+		t.Fatal(err)
+	}
+	if string(received) != "resumed" {
+		t.Fatalf("received %q, want resumed", received)
+	}
+	if connections.Load() < 2 {
+		t.Fatalf("heartbeat did not replace silent transport; connections=%d", connections.Load())
+	}
+	select {
+	case err := <-serverErrors:
+		t.Fatal(err)
+	default:
+	}
+}
+
 func TestLogicalSessionCloseRequiresExplicitReason(t *testing.T) {
 	if isLogicalSessionClose(websocket.CloseError{Code: websocket.StatusNormalClosure}) {
 		t.Fatal("normal transport close without marker ended the logical session")
@@ -168,5 +262,8 @@ func TestParseFrameRejectsOversizedDataAndAckPayload(t *testing.T) {
 	}
 	if _, _, _, err := parseFrame(makeFrame(resumableFrameAck, 0, []byte{1})); err == nil {
 		t.Fatal("acknowledgement payload was accepted")
+	}
+	if _, _, _, err := parseFrame(makeFrame(resumableFramePing, 1, []byte{1})); err == nil {
+		t.Fatal("heartbeat payload was accepted")
 	}
 }

@@ -76,6 +76,8 @@ public class TunnelService extends Service {
     private static final int RESUMABLE_MAX_BUFFER = 8 * 1024 * 1024;
     private static final int RESUMABLE_CHUNK_SIZE = 64 * 1024;
     private static final long RESUMABLE_WINDOW_MS = 5L * 60L * 1000L;
+	private static final long HEARTBEAT_INTERVAL_MS = 15L * 1000L;
+	private static final long HEARTBEAT_TIMEOUT_MS = 45L * 1000L;
 	private static final long RESUME_ATTEMPT_TIMEOUT_MS = 20L * 1000L;
 	private static final int MAX_CONCURRENT_BRIDGES_PER_SERVICE = 2;
     private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss", Locale.ROOT);
@@ -992,6 +994,10 @@ public class TunnelService extends Service {
         private long sendBase;
         private long sendEnd;
         private long receiveOffset;
+		private boolean heartbeatEnabled;
+		private long transportGeneration;
+		private long heartbeatNonce;
+		private long heartbeatAcknowledged;
 
 		BridgeSession(Socket localSocket, String service) {
             this.localSocket = localSocket;
@@ -1071,6 +1077,7 @@ public class TunnelService extends Service {
             Request request = webSocketRequest(candidate, "client").newBuilder()
 					.header("X-DeskFerry-Service", service)
                     .header("X-DeskFerry-Resumable", "1")
+					.header("X-DeskFerry-Heartbeat", "1")
                     .header("X-DeskFerry-Protocol", "2")
                     .build();
             WebSocket socket = httpClient.newWebSocket(request, bridgeListener(paired, started, failure, true));
@@ -1112,6 +1119,7 @@ public class TunnelService extends Service {
 									return;
 								}
                                 sessionId = message.optString("session_id", "").trim();
+								heartbeatEnabled = message.optBoolean("heartbeat", false);
                                 if (sessionId.isEmpty()) {
                                     failure.set(new IOException("relay session-ready result omitted the session ID"));
                                     ready.countDown();
@@ -1225,11 +1233,13 @@ public class TunnelService extends Service {
         }
 
         private boolean attachTransport(WebSocket socket) {
+			long generation;
             synchronized (resumeLock) {
                 if (closed.get()) {
                     return false;
                 }
                 webSocket = socket;
+				generation = ++transportGeneration;
                 if (!socket.send(frame((byte) 2, receiveOffset, null))) {
                     webSocket = null;
                     return false;
@@ -1247,9 +1257,58 @@ public class TunnelService extends Service {
                     offset += size;
                 }
                 resumeLock.notifyAll();
-                return true;
             }
+			if (heartbeatEnabled) {
+				startHeartbeat(socket, generation);
+			}
+			return true;
         }
+
+		private void startHeartbeat(WebSocket socket, long generation) {
+			new Thread(() -> {
+				while (!closed.get()) {
+					sleepQuietly(HEARTBEAT_INTERVAL_MS);
+					long nonce;
+					synchronized (resumeLock) {
+						if (closed.get() || webSocket != socket || transportGeneration != generation) {
+							return;
+						}
+						if (heartbeatNonce == Long.MAX_VALUE) {
+							heartbeatNonce = 0;
+							heartbeatAcknowledged = 0;
+						}
+						nonce = ++heartbeatNonce;
+					}
+					if (!socket.send(frame((byte) 3, nonce, null))) {
+						markTransportLost(socket, "heartbeat send failed");
+						return;
+					}
+					long deadline = SystemClock.elapsedRealtime() + HEARTBEAT_TIMEOUT_MS;
+					synchronized (resumeLock) {
+						while (!closed.get() && webSocket == socket && transportGeneration == generation
+								&& heartbeatAcknowledged < nonce) {
+							long remaining = deadline - SystemClock.elapsedRealtime();
+							if (remaining <= 0) {
+								break;
+							}
+							try {
+								resumeLock.wait(remaining);
+							} catch (InterruptedException interrupted) {
+								Thread.currentThread().interrupt();
+								return;
+							}
+						}
+						if (closed.get() || webSocket != socket || transportGeneration != generation) {
+							return;
+						}
+						if (heartbeatAcknowledged < nonce) {
+							markTransportLost(socket, "end-to-end heartbeat timed out");
+							return;
+						}
+					}
+				}
+			}, "DeskFerry-" + serviceLabel + "-Heartbeat").start();
+		}
 
         private void markTransportLost(WebSocket socket, String reason) {
             synchronized (resumeLock) {
@@ -1412,6 +1471,23 @@ public class TunnelService extends Service {
                 applyAcknowledgement(offset);
                 return;
             }
+			if (type == 3 || type == 4) {
+				if (frame.hasRemaining()) {
+					markTransportLost(socket, "invalid heartbeat frame");
+					return;
+				}
+				if (type == 3) {
+					if (!socket.send(frame((byte) 4, offset, null))) {
+						markTransportLost(socket, "heartbeat response failed");
+					}
+				} else {
+					synchronized (resumeLock) {
+						heartbeatAcknowledged = Math.max(heartbeatAcknowledged, offset);
+						resumeLock.notifyAll();
+					}
+				}
+				return;
+			}
             if (type != 1) {
                 markTransportLost(socket, "unknown resumable frame");
                 return;

@@ -20,9 +20,13 @@ func TestValidateSessionOffer(t *testing.T) {
 		ExpiresAt:       now.Add(8 * time.Second),
 		ProtocolVersion: ProtocolVersion2,
 		Resumable:       true,
+		Heartbeat:       true,
 	}
 	if err := ValidateSessionOffer(offer, "workdesk", "agent-1", now); err != nil {
 		t.Fatal(err)
+	}
+	if !offer.Heartbeat {
+		t.Fatal("heartbeat capability was not preserved")
 	}
 	offer.ExpiresAt = now.Add(-time.Millisecond)
 	if err := ValidateSessionOffer(offer, "workdesk", "agent-1", now); err == nil {

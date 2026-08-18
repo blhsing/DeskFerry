@@ -1,5 +1,12 @@
 # Release Notes
 
+## 0.10.12 - 2026-08-18
+
+- Add negotiated end-to-end heartbeats to resumable RDP, WinRM, and SMB streams so silently stalled relay paths are replaced automatically without closing the local TCP connection.
+- Keep heartbeat framing compatible with rolling upgrades by enabling it only after both Home and Work agents confirm support through the relay.
+- Add the same heartbeat and transparent-resume behavior to the Android Home agent.
+- Attribute tunnel shutdowns to the first endpoint that actually ended, including orderly EOFs.
+
 ## 0.10.11 - 2026-08-13
 
 - Fix passwordless local-account RDP authentication by resolving a bare username such as `Owner` through WinRM and saving it as the Work computer-qualified identity, such as `DESKTOP-G2EEM1V\Owner`.

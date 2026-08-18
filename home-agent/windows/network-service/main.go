@@ -345,6 +345,7 @@ func dialSMBRelay(ctx context.Context, cfg homenetwork.Config) (net.Conn, string
 		headers := http.Header{}
 		tunnel.AddProtocolV2Header(headers)
 		headers.Set(tunnel.HeaderResumable, "1")
+		tunnel.AddHeartbeatHeader(headers)
 		headers.Set(tunnel.HeaderRoomProof, cfg.RoomProof)
 		tunnel.AddServiceHeader(headers, tunnel.ServiceSMB)
 		ws, err := tunnel.DialWebSocketWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
@@ -354,7 +355,7 @@ func dialSMBRelay(ctx context.Context, cfg homenetwork.Config) (net.Conn, string
 			failures = append(failures, fmt.Errorf("%s: %w", relayAddr, err))
 			continue
 		}
-		sessionID, v2, err := tunnel.AwaitSessionReadyCompatible(attemptCtx, ws)
+		ready, err := tunnel.AwaitSessionReadyCompatibleInfo(attemptCtx, ws)
 		if err != nil {
 			cancel()
 			tunnel.CloseWebSocket(ws)
@@ -367,9 +368,9 @@ func dialSMBRelay(ctx context.Context, cfg homenetwork.Config) (net.Conn, string
 			continue
 		}
 		cancel()
-		log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t elapsed=%s", relayAddr, tunnel.ServiceSMB, v2, time.Since(attemptStarted).Round(time.Millisecond))
-		if sessionID != "" {
-			return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: sessionID, Side: "client", RoomProof: cfg.RoomProof, Service: tunnel.ServiceSMB}), relayAddr, nil
+		log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t heartbeat=%t elapsed=%s", relayAddr, tunnel.ServiceSMB, ready.ProtocolV2, ready.Heartbeat, time.Since(attemptStarted).Round(time.Millisecond))
+		if ready.SessionID != "" {
+			return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: ready.SessionID, Side: "client", RoomProof: cfg.RoomProof, Service: tunnel.ServiceSMB, Heartbeat: ready.Heartbeat}), relayAddr, nil
 		}
 		return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil
 	}

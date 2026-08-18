@@ -15,12 +15,16 @@ import (
 )
 
 const (
-	resumableFrameData = byte(1)
-	resumableFrameAck  = byte(2)
-	resumableHeaderLen = 9
-	resumableChunkSize = 64 * 1024
-	resumableMaxBuffer = 8 * 1024 * 1024
-	resumableWindow    = 5 * time.Minute
+	resumableFrameData       = byte(1)
+	resumableFrameAck        = byte(2)
+	resumableFramePing       = byte(3)
+	resumableFramePong       = byte(4)
+	resumableHeaderLen       = 9
+	resumableChunkSize       = 64 * 1024
+	resumableMaxBuffer       = 8 * 1024 * 1024
+	resumableWindow          = 5 * time.Minute
+	defaultHeartbeatInterval = 15 * time.Second
+	defaultHeartbeatTimeout  = 45 * time.Second
 )
 
 type ResumableWebSocketOptions struct {
@@ -31,6 +35,10 @@ type ResumableWebSocketOptions struct {
 	Side      string
 	RoomProof string
 	Service   string
+	Heartbeat bool
+
+	heartbeatInterval time.Duration
+	heartbeatTimeout  time.Duration
 }
 
 // NewResumableWebSocketConn exposes a reliable byte stream over replaceable
@@ -45,6 +53,13 @@ func NewResumableWebSocketConn(ctx context.Context, initial *websocket.Conn, opt
 		lost:       make(chan struct{}, 1),
 		localAddr:  resumableAddr("deskferry-local"),
 		remoteAddr: resumableAddr(opts.RelayAddr),
+		heartbeats: make(map[uint64]*heartbeatState),
+	}
+	if c.opts.heartbeatInterval <= 0 {
+		c.opts.heartbeatInterval = defaultHeartbeatInterval
+	}
+	if c.opts.heartbeatTimeout <= 0 {
+		c.opts.heartbeatTimeout = defaultHeartbeatTimeout
 	}
 	c.cond = sync.NewCond(&c.mu)
 	go c.connectionLoop(initial)
@@ -70,11 +85,27 @@ type resumableWebSocketConn struct {
 	sendBase   uint64
 	sendEnd    uint64
 
-	writeMu sync.Mutex
-	lost    chan struct{}
+	writeMu        sync.Mutex
+	lost           chan struct{}
+	heartbeats     map[uint64]*heartbeatState
+	heartbeatNonce uint64
 
 	localAddr  net.Addr
 	remoteAddr net.Addr
+}
+
+type heartbeatState struct {
+	ack      chan uint64
+	lost     chan struct{}
+	stopOnce sync.Once
+}
+
+func newHeartbeatState() *heartbeatState {
+	return &heartbeatState{ack: make(chan uint64, 1), lost: make(chan struct{})}
+}
+
+func (state *heartbeatState) stop() {
+	state.stopOnce.Do(func() { close(state.lost) })
 }
 
 func (c *resumableWebSocketConn) Read(p []byte) (int, error) {
@@ -315,11 +346,81 @@ func (c *resumableWebSocketConn) attachTransport(ws *websocket.Conn) error {
 	}
 	c.writeMu.Unlock()
 
+	var heartbeat *heartbeatState
 	c.mu.Lock()
+	if c.opts.Heartbeat && c.ws == ws && c.generation == generation && !c.closed {
+		heartbeat = newHeartbeatState()
+		c.heartbeats[generation] = heartbeat
+	}
 	c.cond.Broadcast()
 	c.mu.Unlock()
 	go c.readTransport(ws, generation)
+	if heartbeat != nil {
+		go c.heartbeatTransport(ws, generation, heartbeat)
+	}
 	return nil
+}
+
+func (c *resumableWebSocketConn) heartbeatTransport(ws *websocket.Conn, generation uint64, state *heartbeatState) {
+	defer func() {
+		c.mu.Lock()
+		if c.heartbeats[generation] == state {
+			delete(c.heartbeats, generation)
+		}
+		c.mu.Unlock()
+	}()
+	timer := time.NewTimer(c.opts.heartbeatInterval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-state.lost:
+			return
+		case <-timer.C:
+		}
+		if !c.isCurrentTransport(ws, generation) {
+			return
+		}
+		c.mu.Lock()
+		c.heartbeatNonce++
+		nonce := c.heartbeatNonce
+		c.mu.Unlock()
+		if err := c.writeFrame(ws, makeFrame(resumableFramePing, nonce, nil)); err != nil {
+			c.dropTransport(ws, generation)
+			return
+		}
+		timeout := time.NewTimer(c.opts.heartbeatTimeout)
+		acknowledged := false
+		for !acknowledged {
+			select {
+			case <-c.ctx.Done():
+				timeout.Stop()
+				return
+			case <-state.lost:
+				timeout.Stop()
+				return
+			case ack := <-state.ack:
+				acknowledged = ack == nonce
+			case <-timeout.C:
+				c.dropTransport(ws, generation)
+				return
+			}
+		}
+		if !timeout.Stop() {
+			select {
+			case <-timeout.C:
+			default:
+			}
+		}
+		timer.Reset(c.opts.heartbeatInterval)
+	}
+}
+
+func (c *resumableWebSocketConn) isCurrentTransport(ws *websocket.Conn, generation uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.closed && c.ws == ws && c.generation == generation
 }
 
 func writeFrameWithTimeout(ctx context.Context, ws *websocket.Conn, frame []byte) error {
@@ -363,9 +464,37 @@ func (c *resumableWebSocketConn) readTransport(ws *websocket.Conn, generation ui
 				c.dropTransport(ws, generation)
 				return
 			}
+		case resumableFramePing:
+			if err := c.writeFrame(ws, makeFrame(resumableFramePong, offset, nil)); err != nil {
+				c.dropTransport(ws, generation)
+				return
+			}
+		case resumableFramePong:
+			c.signalHeartbeatAck(generation, offset)
 		default:
 			c.dropTransport(ws, generation)
 			return
+		}
+	}
+}
+
+func (c *resumableWebSocketConn) signalHeartbeatAck(generation, nonce uint64) {
+	c.mu.Lock()
+	state := c.heartbeats[generation]
+	c.mu.Unlock()
+	if state == nil {
+		return
+	}
+	select {
+	case state.ack <- nonce:
+	default:
+		select {
+		case <-state.ack:
+		default:
+		}
+		select {
+		case state.ack <- nonce:
+		default:
 		}
 	}
 }
@@ -422,11 +551,15 @@ func (c *resumableWebSocketConn) dropTransport(ws *websocket.Conn, generation ui
 		return
 	}
 	c.ws = nil
+	heartbeat := c.heartbeats[generation]
 	if c.lostAt.IsZero() {
 		c.lostAt = time.Now()
 	}
 	c.cond.Broadcast()
 	c.mu.Unlock()
+	if heartbeat != nil {
+		heartbeat.stop()
+	}
 	_ = ws.CloseNow()
 	select {
 	case c.lost <- struct{}{}:
@@ -496,8 +629,8 @@ func parseFrame(frame []byte) (byte, uint64, []byte, error) {
 	frameType := frame[0]
 	offset := binary.BigEndian.Uint64(frame[1:resumableHeaderLen])
 	payload := frame[resumableHeaderLen:]
-	if frameType == resumableFrameAck && len(payload) != 0 {
-		return 0, 0, nil, errors.New("resumable acknowledgement has a payload")
+	if (frameType == resumableFrameAck || frameType == resumableFramePing || frameType == resumableFramePong) && len(payload) != 0 {
+		return 0, 0, nil, errors.New("resumable control frame has a payload")
 	}
 	if frameType == resumableFrameData && len(payload) > resumableChunkSize {
 		return 0, 0, nil, errors.New("resumable data frame exceeds the chunk limit")
