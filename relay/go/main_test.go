@@ -451,6 +451,48 @@ func TestResumablePairReattachesAfterWebSocketDrop(t *testing.T) {
 	}
 }
 
+func TestResumablePairReconstructsAfterRelayRestart(t *testing.T) {
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	sessionID := strings.Repeat("a", 32)
+	proof := strings.Repeat("p", 43)
+	resumeHeaders := func(side string) http.Header {
+		return http.Header{
+			"X-DeskFerry-Session":      []string{sessionID},
+			"X-DeskFerry-Session-Side": []string{side},
+			"X-DeskFerry-Room-Proof":   []string{proof},
+			"X-DeskFerry-Service":      []string{serviceRDP},
+		}
+	}
+
+	earlyHome := dialRoleHeaders(t, ctx, server.URL, "/relay/unit-restart/ws", resumeRole, resumeHeaders("client"))
+	if _, _, err := earlyHome.Read(ctx); websocket.CloseStatus(err) != websocket.StatusTryAgainLater {
+		t.Fatalf("early client resume error = %v, want retryable close", err)
+	}
+
+	// The agent-side resume is allowed to reconstruct the protected room and
+	// session after a relay process restart. The client then proves knowledge
+	// of the same room credential and random session ID.
+	agent := dialRoleHeaders(t, ctx, server.URL, "/relay/unit-restart/ws", resumeRole, resumeHeaders("agent"))
+	home := dialRoleHeaders(t, ctx, server.URL, "/relay/unit-restart/ws", resumeRole, resumeHeaders("client"))
+	defer agent.Close(websocket.StatusNormalClosure, "session closed")
+	defer home.Close(websocket.StatusNormalClosure, "session closed")
+	expectText(t, ctx, agent, resumeMessage+" "+sessionID)
+	expectText(t, ctx, home, resumeMessage+" "+sessionID)
+
+	if err := home.Write(ctx, websocket.MessageBinary, []byte("after-relay-restart")); err != nil {
+		t.Fatal(err)
+	}
+	expectBinary(t, ctx, agent, "after-relay-restart")
+	status := getStatus(t, server.URL, "unit-restart")
+	if len(status.Rooms) != 1 || status.Rooms[0].ActivePairs != 1 || status.Rooms[0].TotalPairs != 1 {
+		t.Fatalf("reconstructed bridge counts = %+v", status.Rooms)
+	}
+}
+
 func TestResumableStreamsSurviveForcedRelayTransportLoss(t *testing.T) {
 	server := httptest.NewServer(newServer())
 	defer server.Close()

@@ -185,6 +185,48 @@ def test_resumable_pair_reattaches_after_websocket_drop():
     asyncio.run(scenario())
 
 
+def test_resumable_pair_reconstructs_after_relay_restart():
+    async def scenario():
+        hub = RelayHub()
+        session_id = "a" * 32
+        proof = "p" * 43
+        agent = FakeWebSocket()
+        home = FakeWebSocket()
+        early_home = FakeWebSocket()
+        await hub.serve_resume("unit-restart", early_home, "home-early", session_id, "client", proof, "rdp")
+        assert early_home.close_code == 1013
+        assert early_home.close_reason == "resume room not ready"
+
+        agent_task = asyncio.create_task(
+            hub.serve_resume("unit-restart", agent, "work", session_id, "agent", proof, "rdp")
+        )
+        home_task = asyncio.create_task(
+            hub.serve_resume("unit-restart", home, "home", session_id, "client", proof, "rdp")
+        )
+        for _ in range(50):
+            if agent.text_messages and home.text_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert agent.text_messages == ["resume " + session_id]
+        assert home.text_messages == ["resume " + session_id]
+
+        await home._received.put({"type": "websocket.receive", "bytes": b"after-relay-restart"})
+        for _ in range(50):
+            if agent.byte_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert agent.byte_messages == [b"after-relay-restart"]
+
+        await home._received.put({"type": "websocket.disconnect", "code": 1000, "reason": "session closed"})
+        await asyncio.wait_for(asyncio.gather(agent_task, home_task), timeout=2)
+        assert f"unit-restart/{session_id}" not in hub._sessions
+        status = await hub.snapshot("unit-restart")
+        assert status["rooms"][0]["active_pairs"] == 0
+        assert status["rooms"][0]["total_pairs"] == 1
+
+    asyncio.run(scenario())
+
+
 def test_dashboard_websocket_receives_snapshot():
     client = TestClient(app)
 

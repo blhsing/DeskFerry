@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.10.13 - 2026-08-19
+
+- Reconstruct authenticated resumable relay sessions after a relay process restart so active RDP, WinRM, and SMB streams can reattach using their endpoint-owned replay buffers instead of failing with `unknown resumable session`.
+- Return a retryable response when the Home-side resume reaches a restarted relay before the Work side has restored the protected room, while keeping invalid credentials terminal.
+- Keep Android resume deadlines responsive when its local RDP consumer stalls by moving potentially blocking loopback writes out of the resume-state lock.
+
 ## 0.10.12 - 2026-08-18
 
 - Add negotiated end-to-end heartbeats to resumable RDP, WinRM, and SMB streams so silently stalled relay paths are replaced automatically without closing the local TCP connection.

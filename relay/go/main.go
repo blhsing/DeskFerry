@@ -922,20 +922,80 @@ func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.C
 }
 
 func (h *RelayHub) ServeResume(ctx context.Context, token string, c *websocket.Conn, remote, sessionID, side, proof, service string) {
-	room := roomID(token)
+	roomID := roomID(token)
 	sessionID = cleanSessionValue(sessionID)
-	key := room + "/" + sessionID
-	h.mu.Lock()
-	session := h.sessions[key]
-	h.mu.Unlock()
-	if session == nil || (side != "agent" && side != "client") || session.Service != service || !proofEqual(session.RoomProof, proof) {
-		log.Printf("resume rejected room=%s session=%s side=%s remote=%s", room, sessionID, side, remote)
+	side = strings.ToLower(strings.TrimSpace(side))
+	if sessionID == "" || (side != "agent" && side != "client") {
+		log.Printf("resume rejected room=%s session=%s side=%s remote=%s", roomID, sessionID, side, remote)
 		closeQuietly(c, websocket.StatusPolicyViolation, "unknown resumable session")
 		return
 	}
-	log.Printf("resume attachment waiting room=%s session=%s side=%s remote=%s", room, sessionID, side, remote)
+	key := roomID + "/" + sessionID
+	h.mu.Lock()
+	session := h.sessions[key]
+	h.mu.Unlock()
+	if session == nil {
+		room := h.existingRoom(roomID)
+		if side == "agent" {
+			if room == nil {
+				room = h.roomFor(token)
+			}
+			if !room.AuthorizeAgent(proof) {
+				log.Printf("resume authentication failed room=%s session=%s side=%s remote=%s", roomID, sessionID, side, remote)
+				closeQuietly(c, websocket.StatusPolicyViolation, "room authentication failed")
+				return
+			}
+		} else {
+			if room == nil || !room.CredentialSet() {
+				log.Printf("resume room not ready room=%s session=%s side=%s remote=%s", roomID, sessionID, side, remote)
+				closeQuietly(c, websocket.StatusTryAgainLater, "resume room not ready")
+				return
+			}
+			if !room.AuthorizeClient(proof) {
+				log.Printf("resume authentication failed room=%s session=%s side=%s remote=%s", roomID, sessionID, side, remote)
+				closeQuietly(c, websocket.StatusPolicyViolation, "room authentication failed")
+				return
+			}
+		}
+
+		created := false
+		h.mu.Lock()
+		session = h.sessions[key]
+		if session == nil && len(h.sessions) < 4096 {
+			agentRemote, clientRemote := "", ""
+			if side == "agent" {
+				agentRemote = remote
+			} else {
+				clientRemote = remote
+			}
+			session = NewResumeSession(sessionID, room, agentRemote, clientRemote, proof, service, func(completed *ResumeSession) {
+				h.mu.Lock()
+				if h.sessions[key] == completed {
+					delete(h.sessions, key)
+				}
+				h.mu.Unlock()
+			})
+			h.sessions[key] = session
+			created = true
+		}
+		h.mu.Unlock()
+		if session == nil {
+			closeQuietly(c, websocket.StatusTryAgainLater, "relay resumable-session limit reached")
+			return
+		}
+		if created {
+			log.Printf("reconstructed resumable session room=%s session=%s service=%s first_side=%s remote=%s", roomID, sessionID, service, side, remote)
+			go session.RunRecovered(h.NotifyDashboards)
+		}
+	}
+	if session.Service != service || !proofEqual(session.RoomProof, proof) {
+		log.Printf("resume rejected room=%s session=%s side=%s remote=%s", roomID, sessionID, side, remote)
+		closeQuietly(c, websocket.StatusPolicyViolation, "unknown resumable session")
+		return
+	}
+	log.Printf("resume attachment waiting room=%s session=%s side=%s remote=%s", roomID, sessionID, side, remote)
 	attached := session.Attach(ctx, side, c, remote)
-	log.Printf("resume attachment released room=%s session=%s side=%s remote=%s attached=%t", room, sessionID, side, remote, attached)
+	log.Printf("resume attachment released room=%s session=%s side=%s remote=%s attached=%t", roomID, sessionID, side, remote, attached)
 	if !attached {
 		closeQuietly(c, websocket.StatusTryAgainLater, "resumable session unavailable")
 	}
@@ -1047,6 +1107,12 @@ func (h *RelayHub) roomFor(token string) *RelayRoom {
 	room := NewRelayRoom(id)
 	h.rooms[id] = room
 	return room
+}
+
+func (h *RelayHub) existingRoom(id string) *RelayRoom {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.rooms[id]
 }
 
 func (h *RelayHub) removeDashboard(id string) {
@@ -1189,6 +1255,12 @@ func (r *RelayRoom) AuthorizeClient(proof string) bool {
 		return proof == ""
 	}
 	return proofEqual(r.roomProof, proof)
+}
+
+func (r *RelayRoom) CredentialSet() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.credentialSet
 }
 
 func proofEqual(expected, actual string) bool {
@@ -1568,18 +1640,48 @@ func (s *ResumeSession) Attach(ctx context.Context, side string, conn *websocket
 }
 
 func (s *ResumeSession) Run(agent, client *websocket.Conn, clientDone chan struct{}, stateChanged func()) {
+	s.run(agent, client, clientDone, stateChanged, nil, nil)
+}
+
+func (s *ResumeSession) RunRecovered(stateChanged func()) {
+	defer s.Finish()
+	for {
+		agentAttachment, clientAttachment, ok := s.waitForAttachments()
+		if !ok {
+			return
+		}
+		if !sendControl(agentAttachment.Conn, s.Room.ID, agentAttachment.Remote, "agent", resumeMessage+" "+s.ID) ||
+			!sendControl(clientAttachment.Conn, s.Room.ID, clientAttachment.Remote, "client", resumeMessage+" "+s.ID) {
+			closeQuietly(agentAttachment.Conn, websocket.StatusServiceRestart, "retry resume")
+			closeQuietly(clientAttachment.Conn, websocket.StatusServiceRestart, "retry resume")
+			closeOnce(agentAttachment.Done)
+			closeOnce(clientAttachment.Done)
+			continue
+		}
+		s.AgentRemote = agentAttachment.Remote
+		s.ClientRemote = clientAttachment.Remote
+		s.Room.ServiceSessionStarted(s.Service)
+		defer s.Room.ServiceSessionEnded(s.Service)
+		log.Printf("reconstructed resumable bridge ready room=%s session=%s service=%s agent=%s client=%s", s.Room.ID, s.ID, s.Service, s.AgentRemote, s.ClientRemote)
+		s.run(agentAttachment.Conn, clientAttachment.Conn, nil, stateChanged, agentAttachment, clientAttachment)
+		return
+	}
+}
+
+func (s *ResumeSession) run(agent, client *websocket.Conn, clientDone chan struct{}, stateChanged func(), agentAttachment, clientAttachment *ResumeAttachment) {
 	startedAt := time.Now()
 	pairID := s.Room.PairStarted(s.ClientRemote)
 	stateChanged()
 	defer func() {
 		s.Room.PairEnded()
-		closeOnce(clientDone)
+		if clientDone != nil {
+			closeOnce(clientDone)
+		}
 		s.Finish()
 		stateChanged()
 		log.Printf("resumable bridge closed room=%s pair=%d session=%s agent=%s client=%s duration=%s", s.Room.ID, pairID, s.ID, s.AgentRemote, s.ClientRemote, time.Since(startedAt).Round(time.Millisecond))
 	}()
 
-	var agentAttachment, clientAttachment *ResumeAttachment
 	for {
 		first, second := bridgeSockets(agent, client)
 		if isSessionClose(first.Err) || isSessionClose(second.Err) {

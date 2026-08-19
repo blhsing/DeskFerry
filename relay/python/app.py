@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.10.12"
+RELAY_VERSION = "0.10.13"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -353,6 +353,10 @@ class RelayRoom:
                 self._credential_set and hmac.compare_digest(self._room_proof, proof)
             )
 
+    async def credential_set(self) -> bool:
+        async with self._lock:
+            return self._credential_set
+
     async def enqueue_agent(self, websocket: WebSocket, remote: str, identity: AgentIdentity, resumable: bool = False, service: str = "rdp") -> tuple[WaitingAgent, int]:
         waiting = WaitingAgent(websocket, remote, identity, resumable, service)
         replaced: list[WaitingAgent] = []
@@ -599,11 +603,50 @@ class ResumeSession:
         client_done: asyncio.Future[None],
         state_changed: Any,
     ) -> None:
+        await self._run(agent, client, client_done, state_changed, None, None)
+
+    async def run_recovered(self, state_changed: Any) -> None:
+        try:
+            while not self._done.is_set():
+                try:
+                    agent_attachment, client_attachment = await asyncio.wait_for(
+                        asyncio.gather(self._agent.get(), self._client.get()), timeout=300
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    return
+                if not await send_control(agent_attachment.websocket, f"resume {self.id}", "agent", self.room.id, agent_attachment.remote) or not await send_control(client_attachment.websocket, f"resume {self.id}", "client", self.room.id, client_attachment.remote):
+                    await close_quietly(agent_attachment.websocket, 1012, "retry resume")
+                    await close_quietly(client_attachment.websocket, 1012, "retry resume")
+                    try_set_result(agent_attachment.done, None)
+                    try_set_result(client_attachment.done, None)
+                    continue
+                self.agent_remote = agent_attachment.remote
+                self.client_remote = client_attachment.remote
+                await self.room.service_session_started(self.service)
+                try:
+                    logger.info("reconstructed resumable bridge ready room=%s session=%s service=%s agent=%s client=%s", self.room.id, self.id, self.service, self.agent_remote, self.client_remote)
+                    await self._run(
+                        agent_attachment.websocket, client_attachment.websocket, None,
+                        state_changed, agent_attachment, client_attachment,
+                    )
+                finally:
+                    await self.room.service_session_ended(self.service)
+                return
+        finally:
+            self.finish()
+
+    async def _run(
+        self,
+        agent: WebSocket,
+        client: WebSocket,
+        client_done: asyncio.Future[None] | None,
+        state_changed: Any,
+        agent_attachment: ResumeAttachment | None,
+        client_attachment: ResumeAttachment | None,
+    ) -> None:
         started_at = time.monotonic()
         pair_id = await self.room.pair_started(self.client_remote)
         state_changed()
-        agent_attachment: ResumeAttachment | None = None
-        client_attachment: ResumeAttachment | None = None
         try:
             while True:
                 first, second = await bridge_once(agent, client)
@@ -647,7 +690,8 @@ class ResumeSession:
             if client_attachment is not None:
                 try_set_result(client_attachment.done, None)
             await self.room.pair_ended()
-            try_set_result(client_done, None)
+            if client_done is not None:
+                try_set_result(client_done, None)
             self.finish()
             state_changed()
             logger.info("resumable bridge closed room=%s pair=%s session=%s agent=%s client=%s duration_ms=%d", self.room.id, pair_id, self.id, self.agent_remote, self.client_remote, round((time.monotonic() - started_at) * 1000))
@@ -1041,13 +1085,54 @@ class RelayHub:
     async def serve_resume(self, token: str, websocket: WebSocket, remote: str, session_id: str | None, side: str | None, proof: str = "", service: str = "rdp") -> None:
         session_id = clean_session_value(session_id)
         side = (side or "").strip().lower()
-        session = self._sessions.get(f"{room_id(token)}/{session_id}")
-        if (not session_id or side not in {"agent", "client"} or session is None or
-                session.service != service or not hmac.compare_digest(session.room_proof, proof)):
+        room_key = room_id(token)
+        if not session_id or side not in {"agent", "client"}:
+            await close_quietly(websocket, 1008, "unknown resumable session")
+            return
+        key = f"{room_key}/{session_id}"
+        session = self._sessions.get(key)
+        if session is None:
+            if side == "agent":
+                room = await self._room_for(token)
+                authorized = await room.authorize_agent(proof)
+            else:
+                async with self._lock:
+                    room = self._rooms.get(room_key)
+                if room is None or not await room.credential_set():
+                    logger.info("resume room not ready room=%s session=%s side=%s remote=%s", room_key, session_id, side, remote)
+                    await close_quietly(websocket, 1013, "resume room not ready")
+                    return
+                authorized = await room.authorize_client(proof)
+            if not authorized:
+                logger.info("resume authentication failed room=%s session=%s side=%s remote=%s", room_key, session_id, side, remote)
+                await close_quietly(websocket, 1008, "room authentication failed")
+                return
+            created = False
+            async with self._lock:
+                session = self._sessions.get(key)
+                if session is None and len(self._sessions) < 4096:
+                    agent_remote = remote if side == "agent" else ""
+                    client_remote = remote if side == "client" else ""
+                    session = self._new_resume_session(room, agent_remote, client_remote, proof, service, session_id)
+                    created = True
+            if session is None:
+                await close_quietly(websocket, 1013, "relay resumable-session limit reached")
+                return
+            if created:
+                logger.info("reconstructed resumable session room=%s session=%s service=%s first_side=%s remote=%s", room_key, session_id, service, side, remote)
+                asyncio.create_task(self._run_recovered_session(session))
+        if session.service != service or not hmac.compare_digest(session.room_proof, proof):
             await close_quietly(websocket, 1008, "unknown resumable session")
             return
         if not await session.attach(side, websocket, remote):
             await close_quietly(websocket, 1013, "resumable session unavailable")
+
+    async def _run_recovered_session(self, session: ResumeSession) -> None:
+        try:
+            await session.run_recovered(self.notify_dashboards)
+        except Exception:
+            logger.exception("reconstructed resumable bridge failed room=%s session=%s service=%s", session.room.id, session.id, session.service)
+            session.finish()
 
     def _new_resume_session(self, room: RelayRoom, agent_remote: str, client_remote: str, proof: str, service: str, session_id: str | None = None) -> ResumeSession:
         def remove(session: ResumeSession) -> None:

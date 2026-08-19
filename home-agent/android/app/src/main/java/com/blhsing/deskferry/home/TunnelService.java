@@ -984,6 +984,7 @@ public class TunnelService extends Service {
         private final AtomicReference<String> termination = new AtomicReference<>("running");
         private final AtomicBoolean reconnecting = new AtomicBoolean(false);
         private final Object resumeLock = new Object();
+		private final Object receiveLock = new Object();
         private final long startedAt = SystemClock.elapsedRealtime();
         private volatile WebSocket webSocket;
         private volatile WebSocket pendingResumeSocket;
@@ -1234,13 +1235,17 @@ public class TunnelService extends Service {
 
         private boolean attachTransport(WebSocket socket) {
 			long generation;
+			long acknowledgedOffset;
+			synchronized (receiveLock) {
+				acknowledgedOffset = receiveOffset;
+			}
             synchronized (resumeLock) {
                 if (closed.get()) {
                     return false;
                 }
                 webSocket = socket;
 				generation = ++transportGeneration;
-                if (!socket.send(frame((byte) 2, receiveOffset, null))) {
+                if (!socket.send(frame((byte) 2, acknowledgedOffset, null))) {
                     webSocket = null;
                     return false;
                 }
@@ -1494,22 +1499,34 @@ public class TunnelService extends Service {
             }
             byte[] data = new byte[frame.remaining()];
             frame.get(data);
-            synchronized (resumeLock) {
+			boolean sequenceGap = false;
+			long acknowledgedOffset;
+			synchronized (receiveLock) {
                 long end = offset + data.length;
                 if (offset > receiveOffset) {
-                    markTransportLost(socket, "resumable sequence gap");
-                    return;
-                }
-                if (end > receiveOffset) {
+					sequenceGap = true;
+				} else if (end > receiveOffset) {
                     int trim = (int) (receiveOffset - offset);
                     byte[] fresh = Arrays.copyOfRange(data, trim, data.length);
+					// A slow or backgrounded RDP client can block this socket write.
+					// Keep it serialized for byte ordering, but never hold resumeLock:
+					// reconnect cancellation and its 20-second attempt deadline must
+					// remain responsive while the local consumer is stalled.
                     writeLocal(fresh);
                     receiveOffset += fresh.length;
                 }
-                WebSocket current = webSocket;
-                if (current != null && !current.send(frame((byte) 2, receiveOffset, null))) {
-                    markTransportLost(current, "acknowledgement send failed");
-                }
+				acknowledgedOffset = receiveOffset;
+			}
+			if (sequenceGap) {
+				markTransportLost(socket, "resumable sequence gap");
+				return;
+			}
+			WebSocket current;
+			synchronized (resumeLock) {
+				current = webSocket;
+			}
+			if (current != null && !current.send(frame((byte) 2, acknowledgedOffset, null))) {
+				markTransportLost(current, "acknowledgement send failed");
             }
         }
 
