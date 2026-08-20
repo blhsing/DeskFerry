@@ -1,5 +1,10 @@
 # Release Notes
 
+## Unreleased
+
+- Explicitly enable MSTSC automatic reconnection in generated Windows Home RDP profiles so a transient tunnel or network interruption does not depend on the user's saved Remote Desktop client preference.
+- Encode CLI WinRM worker output and errors as UTF-8 base64 inside its JSON protocol, preventing event logs and other Windows text containing backslashes or control characters from corrupting diagnostic command responses.
+
 ## 0.10.13 - 2026-08-19
 
 - Reconstruct authenticated resumable relay sessions after a relay process restart so active RDP, WinRM, and SMB streams can reattach using their endpoint-owned replay buffers instead of failing with `unknown resumable session`.

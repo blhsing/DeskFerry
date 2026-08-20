@@ -126,6 +126,23 @@ func TestWinRMSessionWorkerProtocol(t *testing.T) {
 	}
 }
 
+func TestDecodeWinRMResponseText(t *testing.T) {
+	response := winRMResponse{
+		OutputBase64: base64.StdEncoding.EncodeToString([]byte("HKLM:\\SOFTWARE\r\nline two")),
+		ErrorBase64:  base64.StdEncoding.EncodeToString([]byte("remote error: path C:\\Windows")),
+	}
+	if err := decodeWinRMResponseText(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Output != "HKLM:\\SOFTWARE\r\nline two" || response.Error != "remote error: path C:\\Windows" {
+		t.Fatalf("decoded response = %#v", response)
+	}
+	response.OutputBase64 = "not-base64"
+	if err := decodeWinRMResponseText(&response); err == nil {
+		t.Fatal("invalid response base64 was accepted")
+	}
+}
+
 func TestWinRMSessionWorkerAcceptsBlankPassword(t *testing.T) {
 	manager := newWinRMSessionManager(time.Minute)
 	defer manager.Close()
@@ -244,6 +261,7 @@ func TestMSTSCProfileContentPasswordlessRDP(t *testing.T) {
 	}
 	content := mstscProfileContent(cfg)
 	for _, expected := range []string{
+		"autoreconnection enabled:i:1",
 		"authentication level:i:0",
 		"enablecredsspsupport:i:0",
 		`username:s:DESKTOP-G2EEM1V\Owner`,

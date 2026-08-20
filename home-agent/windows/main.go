@@ -2840,6 +2840,7 @@ func mstscProfileContent(cfg config) string {
 		"use multimon:i:0",
 		"session bpp:i:32",
 		"full address:s:" + target,
+		"autoreconnection enabled:i:1",
 		"prompt for credentials:i:0",
 		"promptcredentialonce:i:1",
 		"authentication level:i:" + authenticationLevel,

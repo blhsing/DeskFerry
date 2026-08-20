@@ -32,11 +32,13 @@ type winRMRequest struct {
 }
 
 type winRMResponse struct {
-	ID     uint64 `json:"id"`
-	OK     bool   `json:"ok"`
-	Output string `json:"output"`
-	Error  string `json:"error"`
-	Reused bool   `json:"reused"`
+	ID           uint64 `json:"id"`
+	OK           bool   `json:"ok"`
+	Output       string `json:"output"`
+	Error        string `json:"error"`
+	OutputBase64 string `json:"output_base64"`
+	ErrorBase64  string `json:"error_base64"`
+	Reused       bool   `json:"reused"`
 }
 
 type winRMSessionManager struct {
@@ -113,6 +115,10 @@ func (m *winRMSessionManager) Execute(ctx context.Context, destination, user, pa
 		m.stopWorkerLocked()
 		return winRMResponse{}, fmt.Errorf("decode persistent PowerShell worker response: %w", err)
 	}
+	if err := decodeWinRMResponseText(&response); err != nil {
+		m.stopWorkerLocked()
+		return winRMResponse{}, fmt.Errorf("decode persistent PowerShell worker response text: %w", err)
+	}
 	if response.ID != request.ID {
 		m.stopWorkerLocked()
 		return winRMResponse{}, fmt.Errorf("persistent PowerShell worker returned response %d for request %d", response.ID, request.ID)
@@ -122,6 +128,23 @@ func (m *winRMSessionManager) Execute(ctx context.Context, destination, user, pa
 		return response, errors.New(response.Error)
 	}
 	return response, nil
+}
+
+func decodeWinRMResponseText(response *winRMResponse) error {
+	for encoded, destination := range map[string]*string{
+		response.OutputBase64: &response.Output,
+		response.ErrorBase64:  &response.Error,
+	} {
+		if encoded == "" {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return err
+		}
+		*destination = string(decoded)
+	}
+	return nil
 }
 
 func (m *winRMSessionManager) Close() {
@@ -229,7 +252,7 @@ try {
             [Console]::Out.Flush()
             continue
         }
-        $response = [ordered]@{ id = [uint64]$request.id; ok = $false; output = ''; error = ''; reused = $false }
+        $response = [ordered]@{ id = [uint64]$request.id; ok = $false; output_base64 = ''; error_base64 = ''; reused = $false }
         try {
             $canReuse = $session -ne $null -and $sessionKey -eq [string]$request.key -and $session.State -eq 'Opened'
             if (-not $canReuse) {
@@ -246,10 +269,11 @@ try {
             } else {
                 $response.reused = $true
             }
-            $response.output = Invoke-Command -Session $session -ScriptBlock ([ScriptBlock]::Create([string]$request.command)) | Out-String -Width 240
+            $outputText = Invoke-Command -Session $session -ScriptBlock ([ScriptBlock]::Create([string]$request.command)) | Out-String -Width 240
+            $response.output_base64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$outputText))
             $response.ok = $true
         } catch {
-            $response.error = $_.Exception.Message
+            $response.error_base64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$_.Exception.Message))
             if ($session -ne $null) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
             $session = $null
             $sessionKey = ''
