@@ -32,4 +32,12 @@ public class TunnelServiceTest {
     public void explicitSessionCloseDoesNotReconnect() {
         assertTrue(TunnelService.isLogicalSessionClose(1000, "session closed"));
     }
+
+    @Test
+    public void completedOrRejectedResumeIsTerminal() {
+        assertTrue(TunnelService.isTerminalResumeClose(1000));
+        assertTrue(TunnelService.isTerminalResumeClose(1008));
+        assertFalse(TunnelService.isTerminalResumeClose(1012));
+        assertFalse(TunnelService.isTerminalResumeClose(1013));
+    }
 }

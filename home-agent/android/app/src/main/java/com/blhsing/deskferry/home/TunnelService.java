@@ -1158,6 +1158,8 @@ public class TunnelService extends Service {
 
         private WebSocketListener bridgeListener(CountDownLatch ready, AtomicBoolean started, AtomicReference<Throwable> failure, boolean initial) {
             return new WebSocketListener() {
+                private final AtomicBoolean closeHandled = new AtomicBoolean(false);
+
                 @Override
                 public void onMessage(WebSocket socket, String text) {
                     String value = text.trim();
@@ -1220,10 +1222,27 @@ public class TunnelService extends Service {
                 }
 
                 @Override
+                public void onClosing(WebSocket socket, int code, String reason) {
+                    // OkHttp waits for the application to acknowledge a peer-initiated
+                    // close before invoking onClosed. Handle it here so a completed
+                    // session or rejected resume does not sit through repeated resume
+                    // timeouts while the stale local RDP socket remains open.
+                    socket.close(code, reason);
+                    handleClose(socket, code, reason);
+                }
+
+                @Override
                 public void onClosed(WebSocket socket, int code, String reason) {
+                    handleClose(socket, code, reason);
+                }
+
+                private void handleClose(WebSocket socket, int code, String reason) {
+                    if (!closeHandled.compareAndSet(false, true)) {
+                        return;
+                    }
                     if (!started.get()) {
                         if (failure.get() == null) {
-                            IOException error = !initial && (code == 1000 || code == 1008)
+                            IOException error = !initial && isTerminalResumeClose(code)
                                     ? new TerminalResumeException("relay resume rejected code=" + code + " reason=" + reason)
                                     : new IOException("relay closed before pairing code=" + code + " reason=" + reason);
                             failure.set(error);
@@ -1245,8 +1264,11 @@ public class TunnelService extends Service {
                     Throwable reported = !initial && (status == 401 || status == 403)
                             ? new TerminalResumeException("relay resume authentication failed http_status=" + status, t)
                             : t;
-                    failure.set(reported);
+                    failure.compareAndSet(null, reported);
                     ready.countDown();
+                    if (closeHandled.get()) {
+                        return;
+                    }
                     if (!started.get()) {
                         return;
                     }
@@ -1755,5 +1777,9 @@ public class TunnelService extends Service {
 
 	static boolean isLogicalSessionClose(int code, String reason) {
 		return code == 1000 && "session closed".equals(reason);
+	}
+
+	static boolean isTerminalResumeClose(int code) {
+		return code == 1000 || code == 1008;
 	}
 }

@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.10.16 - 2026-08-21
+
+- Acknowledge relay-initiated WebSocket closes as soon as Android receives them, allowing completed RDP sessions and rejected resumes to release their stale loopback connection immediately instead of waiting through repeated 20-second resume attempts.
+
 ## 0.10.15 - 2026-08-21
 
 - Deliver relay-to-local Android RDP and SMB data on a dedicated ordered writer so a backgrounded or stalled local client cannot block WebSocket failure callbacks and delay transparent resumption for minutes.

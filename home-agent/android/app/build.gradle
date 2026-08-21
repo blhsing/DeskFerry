@@ -18,9 +18,9 @@ android {
         minSdk 23
         targetSdk 35
         // SemVer ordering: major*10,000 + minor*100 + patch.
-        // Thus 0.10.15 is 1015 and a future 1.0.0 is 10000.
-        versionCode 1015
-        versionName "0.10.15"
+        // Thus 0.10.16 is 1016 and a future 1.0.0 is 10000.
+        versionCode 1016
+        versionName "0.10.16"
     }
 
     compileOptions {
