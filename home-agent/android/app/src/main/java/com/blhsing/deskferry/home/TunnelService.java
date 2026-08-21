@@ -981,20 +981,24 @@ public class TunnelService extends Service {
         private final AtomicLong localToRelayMessages = new AtomicLong();
         private final AtomicLong relayToLocalBytes = new AtomicLong();
         private final AtomicLong relayToLocalMessages = new AtomicLong();
+		private final AtomicLong pendingLocalBytes = new AtomicLong();
         private final AtomicReference<String> termination = new AtomicReference<>("running");
         private final AtomicBoolean reconnecting = new AtomicBoolean(false);
         private final Object resumeLock = new Object();
 		private final Object receiveLock = new Object();
+		private final LinkedBlockingQueue<ReceivedChunk> localWriteQueue = new LinkedBlockingQueue<>();
         private final long startedAt = SystemClock.elapsedRealtime();
         private volatile WebSocket webSocket;
         private volatile WebSocket pendingResumeSocket;
 		private volatile CountDownLatch pendingResumeReady;
+		private volatile Thread localWriterThread;
         private volatile String selectedRelay = "none";
         private volatile String sessionId = "";
         private byte[] sendBuffer = new byte[0];
         private long sendBase;
         private long sendEnd;
         private long receiveOffset;
+		private long receiveQueuedOffset;
 		private boolean heartbeatEnabled;
 		private long transportGeneration;
 		private long heartbeatNonce;
@@ -1005,7 +1009,61 @@ public class TunnelService extends Service {
 			this.service = "smb".equals(service) ? "smb" : "rdp";
 			this.serviceLabel = this.service.toUpperCase(Locale.ROOT);
 			this.permits = "smb".equals(this.service) ? smbBridgePermits : rdpBridgePermits;
+			startLocalWriter();
         }
+
+		private final class ReceivedChunk {
+			final long offset;
+			final byte[] data;
+			final boolean resumable;
+
+			ReceivedChunk(long offset, byte[] data, boolean resumable) {
+				this.offset = offset;
+				this.data = data;
+				this.resumable = resumable;
+			}
+		}
+
+		private void startLocalWriter() {
+			Thread writer = new Thread(() -> {
+				while (!closed.get()) {
+					ReceivedChunk chunk;
+					try {
+						chunk = localWriteQueue.take();
+					} catch (InterruptedException interrupted) {
+						if (!closed.get()) {
+							Thread.currentThread().interrupt();
+						}
+						return;
+					}
+					try {
+						writeLocal(chunk.data);
+						if (chunk.resumable) {
+							long acknowledgedOffset;
+							synchronized (receiveLock) {
+								if (chunk.offset != receiveOffset) {
+									throw new IOException("out-of-order local delivery");
+								}
+								receiveOffset += chunk.data.length;
+								acknowledgedOffset = receiveOffset;
+							}
+							acknowledgeLocalDelivery(acknowledgedOffset);
+						}
+					} catch (IOException ex) {
+						if (!closed.get()) {
+							recordTermination("relay_to_local_write_error=" + throwableText(ex));
+							append(serviceLabel + " local delivery failed: " + throwableText(ex));
+							close();
+						}
+						return;
+					} finally {
+						pendingLocalBytes.addAndGet(-chunk.data.length);
+					}
+				}
+			}, "DeskFerry-" + serviceLabel + "-LocalWriter");
+			localWriterThread = writer;
+			writer.start();
+		}
 
         @Override
         public void run() {
@@ -1454,7 +1512,7 @@ public class TunnelService extends Service {
 
         private void handleRelayPayload(WebSocket socket, byte[] payload) throws IOException {
             if (sessionId.isEmpty()) {
-                writeLocal(payload);
+				enqueueLocalDelivery(0, payload, false);
                 return;
             }
             if (payload.length < 9 || payload.length > 9 + RESUMABLE_CHUNK_SIZE) {
@@ -1500,35 +1558,44 @@ public class TunnelService extends Service {
             byte[] data = new byte[frame.remaining()];
             frame.get(data);
 			boolean sequenceGap = false;
-			long acknowledgedOffset;
 			synchronized (receiveLock) {
                 long end = offset + data.length;
-                if (offset > receiveOffset) {
+				if (offset > receiveQueuedOffset) {
 					sequenceGap = true;
-				} else if (end > receiveOffset) {
-                    int trim = (int) (receiveOffset - offset);
+				} else if (end > receiveQueuedOffset) {
+					int trim = (int) (receiveQueuedOffset - offset);
                     byte[] fresh = Arrays.copyOfRange(data, trim, data.length);
-					// A slow or backgrounded RDP client can block this socket write.
-					// Keep it serialized for byte ordering, but never hold resumeLock:
-					// reconnect cancellation and its 20-second attempt deadline must
-					// remain responsive while the local consumer is stalled.
-                    writeLocal(fresh);
-                    receiveOffset += fresh.length;
+					enqueueLocalDelivery(receiveQueuedOffset, fresh, true);
+					receiveQueuedOffset += fresh.length;
                 }
-				acknowledgedOffset = receiveOffset;
 			}
 			if (sequenceGap) {
 				markTransportLost(socket, "resumable sequence gap");
 				return;
 			}
+        }
+
+		private void enqueueLocalDelivery(long offset, byte[] payload, boolean resumable) throws IOException {
+			long queued = pendingLocalBytes.addAndGet(payload.length);
+			if (queued > RESUMABLE_MAX_BUFFER) {
+				pendingLocalBytes.addAndGet(-payload.length);
+				throw new IOException("local consumer stalled with more than " + RESUMABLE_MAX_BUFFER + " queued bytes");
+			}
+			if (!localWriteQueue.offer(new ReceivedChunk(offset, payload, resumable))) {
+				pendingLocalBytes.addAndGet(-payload.length);
+				throw new IOException("local delivery queue rejected data");
+			}
+		}
+
+		private void acknowledgeLocalDelivery(long offset) {
 			WebSocket current;
 			synchronized (resumeLock) {
 				current = webSocket;
 			}
-			if (current != null && !current.send(frame((byte) 2, acknowledgedOffset, null))) {
+			if (current != null && !current.send(frame((byte) 2, offset, null))) {
 				markTransportLost(current, "acknowledgement send failed");
-            }
-        }
+			}
+		}
 
         private void writeLocal(byte[] payload) throws IOException {
             OutputStream output = localSocket.getOutputStream();
@@ -1591,6 +1658,10 @@ public class TunnelService extends Service {
                 resumeLock.notifyAll();
             }
             closeQuietly(localSocket);
+			Thread writer = localWriterThread;
+			if (writer != null && writer != Thread.currentThread()) {
+				writer.interrupt();
+			}
             sessions.remove(this);
             activeConnections = Math.max(0, activeConnections - 1);
             updateState("Running", null, null, null);

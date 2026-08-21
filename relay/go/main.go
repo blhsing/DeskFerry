@@ -448,6 +448,7 @@ type RelayHub struct {
 	rooms      map[string]*RelayRoom
 	dashboards map[string]*DashboardClient
 	sessions   map[string]*ResumeSession
+	completed  map[string]time.Time
 	controls   map[string]*AgentControl
 	pending    map[string]*PendingSession
 }
@@ -457,6 +458,7 @@ func newRelayHub() *RelayHub {
 		rooms:      make(map[string]*RelayRoom),
 		dashboards: make(map[string]*DashboardClient),
 		sessions:   make(map[string]*ResumeSession),
+		completed:  make(map[string]time.Time),
 		controls:   make(map[string]*AgentControl),
 		pending:    make(map[string]*PendingSession),
 	}
@@ -933,8 +935,18 @@ func (h *RelayHub) ServeResume(ctx context.Context, token string, c *websocket.C
 	key := roomID + "/" + sessionID
 	h.mu.Lock()
 	session := h.sessions[key]
+	completedUntil := h.completed[key]
+	if !completedUntil.IsZero() && !time.Now().Before(completedUntil) {
+		delete(h.completed, key)
+		completedUntil = time.Time{}
+	}
 	h.mu.Unlock()
 	if session == nil {
+		if !completedUntil.IsZero() {
+			log.Printf("resume rejected for completed session room=%s session=%s side=%s remote=%s", roomID, sessionID, side, remote)
+			closeQuietly(c, websocket.StatusPolicyViolation, "unknown resumable session")
+			return
+		}
 		room := h.existingRoom(roomID)
 		if side == "agent" {
 			if room == nil {
@@ -972,7 +984,9 @@ func (h *RelayHub) ServeResume(ctx context.Context, token string, c *websocket.C
 				h.mu.Lock()
 				if h.sessions[key] == completed {
 					delete(h.sessions, key)
+					h.completed[key] = time.Now().Add(5 * time.Minute)
 				}
+				h.pruneCompletedLocked()
 				h.mu.Unlock()
 			})
 			h.sessions[key] = session
@@ -1006,15 +1020,31 @@ func (h *RelayHub) newResumeSession(room *RelayRoom, agentRemote, clientRemote, 
 }
 
 func (h *RelayHub) newResumeSessionWithID(id string, room *RelayRoom, agentRemote, clientRemote, proof, service string) *ResumeSession {
+	key := room.ID + "/" + id
 	session := NewResumeSession(id, room, agentRemote, clientRemote, proof, service, func(s *ResumeSession) {
 		h.mu.Lock()
-		delete(h.sessions, room.ID+"/"+s.ID)
+		delete(h.sessions, key)
+		h.completed[key] = time.Now().Add(5 * time.Minute)
+		h.pruneCompletedLocked()
 		h.mu.Unlock()
 	})
 	h.mu.Lock()
-	h.sessions[room.ID+"/"+session.ID] = session
+	delete(h.completed, key)
+	h.sessions[key] = session
 	h.mu.Unlock()
 	return session
+}
+
+func (h *RelayHub) pruneCompletedLocked() {
+	if len(h.completed) <= 4096 {
+		return
+	}
+	now := time.Now()
+	for key, expiresAt := range h.completed {
+		if !now.Before(expiresAt) {
+			delete(h.completed, key)
+		}
+	}
 }
 
 func (h *RelayHub) ServeHomeAgent(ctx context.Context, token string, c *websocket.Conn, remote, proof string) {

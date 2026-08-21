@@ -737,6 +737,7 @@ sealed class RelayHub
     private readonly ConcurrentDictionary<string, RelayRoom> _rooms = new();
     private readonly ConcurrentDictionary<Guid, DashboardClient> _dashboards = new();
     private readonly ConcurrentDictionary<string, ResumeSession> _sessions = new();
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _completedSessions = new();
     private readonly ConcurrentDictionary<string, AgentControl> _controls = new();
     private readonly ConcurrentDictionary<string, PendingSession> _pending = new();
     private readonly ILogger<RelayHub> _log;
@@ -1139,6 +1140,16 @@ sealed class RelayHub
         var key = $"{roomId}/{sessionId}";
         if (!_sessions.TryGetValue(key, out var session))
         {
+            if (_completedSessions.TryGetValue(key, out var completedUntil))
+            {
+                if (completedUntil > DateTimeOffset.UtcNow)
+                {
+                    _log.LogInformation("resume rejected for completed session room={Room} session={Session} side={Side} remote={Remote}", roomId, sessionId, side, remote);
+                    await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "unknown resumable session");
+                    return;
+                }
+                _completedSessions.TryRemove(key, out _);
+            }
             RelayRoom? room;
             bool authorized;
             if (side == "agent")
@@ -1198,6 +1209,7 @@ sealed class RelayHub
 
     private ResumeSession NewResumeSession(string id, RelayRoom room, string agentRemote, string clientRemote, string proof, string service)
     {
+        _completedSessions.TryRemove($"{room.Id}/{id}", out _);
         var session = CreateResumeSession(id, room, agentRemote, clientRemote, proof, service);
         _sessions[$"{room.Id}/{session.Id}"] = session;
         return session;
@@ -1207,7 +1219,20 @@ sealed class RelayHub
     {
         return new ResumeSession(id, room, agentRemote, clientRemote, proof, service, _log, completed =>
         {
-            _sessions.TryRemove($"{room.Id}/{completed.Id}", out _);
+            var key = $"{room.Id}/{completed.Id}";
+            _sessions.TryRemove(key, out _);
+            _completedSessions[key] = DateTimeOffset.UtcNow.AddMinutes(5);
+            if (_completedSessions.Count > 4096)
+            {
+                var now = DateTimeOffset.UtcNow;
+                foreach (var entry in _completedSessions)
+                {
+                    if (entry.Value <= now)
+                    {
+                        _completedSessions.TryRemove(entry.Key, out _);
+                    }
+                }
+            }
         });
     }
 
@@ -2233,7 +2258,7 @@ sealed class ResumeSession
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.10.14";
+    public const string Version = "0.10.15";
 }
 
 sealed class WaitingAgent

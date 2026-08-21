@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.10.14"
+RELAY_VERSION = "0.10.15"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -785,6 +785,7 @@ class RelayHub:
         self._rooms: dict[str, RelayRoom] = {}
         self._dashboards: dict[str, DashboardClient] = {}
         self._sessions: dict[str, ResumeSession] = {}
+        self._completed_sessions: dict[str, float] = {}
         self._controls: dict[str, AgentControl] = {}
         self._pending: dict[str, PendingSession] = {}
 
@@ -1092,6 +1093,12 @@ class RelayHub:
         key = f"{room_key}/{session_id}"
         session = self._sessions.get(key)
         if session is None:
+            completed_until = self._completed_sessions.get(key, 0.0)
+            if completed_until > time.monotonic():
+                logger.info("resume rejected for completed session room=%s session=%s side=%s remote=%s", room_key, session_id, side, remote)
+                await close_quietly(websocket, 1008, "unknown resumable session")
+                return
+            self._completed_sessions.pop(key, None)
             if side == "agent":
                 room = await self._room_for(token)
                 authorized = await room.authorize_agent(proof)
@@ -1136,10 +1143,21 @@ class RelayHub:
 
     def _new_resume_session(self, room: RelayRoom, agent_remote: str, client_remote: str, proof: str, service: str, session_id: str | None = None) -> ResumeSession:
         def remove(session: ResumeSession) -> None:
-            self._sessions.pop(f"{room.id}/{session.id}", None)
+            key = f"{room.id}/{session.id}"
+            self._sessions.pop(key, None)
+            self._completed_sessions[key] = time.monotonic() + 5 * 60
+            if len(self._completed_sessions) > 4096:
+                now = time.monotonic()
+                self._completed_sessions = {
+                    completed_key: expires_at
+                    for completed_key, expires_at in self._completed_sessions.items()
+                    if expires_at > now
+                }
 
         session = ResumeSession(session_id or uuid.uuid4().hex, room, agent_remote, client_remote, remove, proof, service)
-        self._sessions[f"{room.id}/{session.id}"] = session
+        key = f"{room.id}/{session.id}"
+        self._completed_sessions.pop(key, None)
+        self._sessions[key] = session
         return session
 
     async def serve_home_agent(self, token: str, websocket: WebSocket, remote: str, proof: str = "") -> None:

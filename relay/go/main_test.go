@@ -493,6 +493,35 @@ func TestResumablePairReconstructsAfterRelayRestart(t *testing.T) {
 	}
 }
 
+func TestCompletedResumableSessionIsNotReconstructed(t *testing.T) {
+	hub := newRelayHub()
+	room := hub.roomFor("unit-completed")
+	proof := strings.Repeat("p", 43)
+	if !room.AuthorizeAgent(proof) {
+		t.Fatal("could not establish room credential")
+	}
+	sessionID := strings.Repeat("c", 32)
+	session := hub.newResumeSessionWithID(sessionID, room, "work", "home", proof, serviceRDP)
+	session.Finish()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleRelay(w, r, hub)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	headers := http.Header{
+		"X-DeskFerry-Session":      []string{sessionID},
+		"X-DeskFerry-Session-Side": []string{"client"},
+		"X-DeskFerry-Room-Proof":   []string{proof},
+		"X-DeskFerry-Service":      []string{serviceRDP},
+	}
+	home := dialRoleHeaders(t, ctx, server.URL, "/relay/unit-completed/ws", resumeRole, headers)
+	if _, _, err := home.Read(ctx); websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
+		t.Fatalf("completed client resume error = %v, want terminal close", err)
+	}
+}
+
 func TestResumableStreamsSurviveForcedRelayTransportLoss(t *testing.T) {
 	server := httptest.NewServer(newServer())
 	defer server.Close()

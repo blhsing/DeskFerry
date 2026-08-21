@@ -227,6 +227,25 @@ def test_resumable_pair_reconstructs_after_relay_restart():
     asyncio.run(scenario())
 
 
+def test_completed_resumable_session_is_not_reconstructed():
+    async def scenario():
+        hub = RelayHub()
+        room = await hub._room_for("unit-completed")
+        proof = "p" * 43
+        assert await room.authorize_agent(proof)
+        session_id = "c" * 32
+        session = hub._new_resume_session(room, "work", "home", proof, "rdp", session_id)
+        session.finish()
+
+        home = FakeWebSocket()
+        await hub.serve_resume("unit-completed", home, "home-2", session_id, "client", proof, "rdp")
+        assert home.close_code == 1008
+        assert home.close_reason == "unknown resumable session"
+        assert f"unit-completed/{session_id}" not in hub._sessions
+
+    asyncio.run(scenario())
+
+
 def test_dashboard_websocket_receives_snapshot():
     client = TestClient(app)
 

@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.10.15 - 2026-08-21
+
+- Deliver relay-to-local Android RDP and SMB data on a dedicated ordered writer so a backgrounded or stalled local client cannot block WebSocket failure callbacks and delay transparent resumption for minutes.
+- Bound Android's pending local-delivery buffer and acknowledge resumable data only after it reaches the local client, preserving replay safety without allowing unbounded memory growth.
+- Retain short-lived completed-session tombstones in every relay implementation so a finished session is rejected immediately instead of being reconstructed as a phantom session that causes repeated resume timeouts and stuck manual connection attempts.
+
 ## 0.10.14 - 2026-08-20
 
 - Explicitly enable MSTSC automatic reconnection in generated Windows Home RDP profiles so a transient tunnel or network interruption does not depend on the user's saved Remote Desktop client preference.
