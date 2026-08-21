@@ -10,16 +10,59 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/lxn/walk"
 	"golang.org/x/sys/windows"
 )
+
+func TestRelayStatusClientReusesBoundedConnection(t *testing.T) {
+	var newConnections atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/relay/status" || r.URL.Query().Get("room") != "test-room" {
+			t.Fatalf("unexpected relay status request: %s", r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"service":"DeskFerry.Relay","time":"2026-08-22T00:00:00Z","rooms":[{"id":"test-room","waiting_agents":1}]}`))
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			newConnections.Add(1)
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	cfg := config{RelayAddr: server.URL + "/relay/test-room", Proxy: "direct"}
+	client := httpClient(cfg)
+	defer client.CloseIdleConnections()
+	for range 2 {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		summary, err := queryRelaySummaryWithClient(ctx, cfg, client)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !summary.WorkOnline || summary.Room != "test-room" {
+			t.Fatalf("unexpected relay summary: %#v", summary)
+		}
+	}
+	if got := newConnections.Load(); got != 1 {
+		t.Fatalf("status polling opened %d connections, want one reused connection", got)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport.IdleConnTimeout <= 0 || transport.MaxConnsPerHost <= 0 {
+		t.Fatalf("status client transport is not bounded: %#v", client.Transport)
+	}
+}
 
 func TestEncodePowerShellCommandUsesUTF16LE(t *testing.T) {
 	encoded := encodePowerShellCommand("Write-Output 'ready'")

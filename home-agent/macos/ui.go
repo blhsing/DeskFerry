@@ -356,12 +356,27 @@ func (c *macUIController) stopTunnel() {
 func (c *macUIController) statusLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	var client *http.Client
+	var clientProxy string
+	defer func() {
+		if client != nil {
+			client.CloseIdleConnections()
+		}
+	}()
 	for {
 		c.mu.Lock()
 		cfg := c.cfg
 		c.mu.Unlock()
+		proxyKey := strings.TrimSpace(cfg.Proxy)
+		if client == nil || !strings.EqualFold(clientProxy, proxyKey) {
+			if client != nil {
+				client.CloseIdleConnections()
+			}
+			client = httpClient(cfg)
+			clientProxy = proxyKey
+		}
 		ctx, cancel := context.WithTimeout(c.root, 8*time.Second)
-		summary, err := queryRelaySummary(ctx, cfg)
+		summary, err := queryRelaySummaryWithClient(ctx, cfg, client)
 		cancel()
 		c.mu.Lock()
 		if err != nil {

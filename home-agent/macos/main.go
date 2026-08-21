@@ -590,9 +590,15 @@ func rdpTarget(listenAddr string) string {
 }
 
 func queryRelaySummary(ctx context.Context, cfg config) (relaySummary, error) {
+	client := httpClient(cfg)
+	defer client.CloseIdleConnections()
+	return queryRelaySummaryWithClient(ctx, cfg, client)
+}
+
+func queryRelaySummaryWithClient(ctx context.Context, cfg config, client *http.Client) (relaySummary, error) {
 	var errs []string
 	for _, relayAddr := range cfg.relayAddresses() {
-		summary, err := queryRelaySummaryFor(ctx, cfg.withRelayAddress(relayAddr))
+		summary, err := queryRelaySummaryFor(ctx, cfg.withRelayAddress(relayAddr), client)
 		if err == nil {
 			return summary, nil
 		}
@@ -604,7 +610,7 @@ func queryRelaySummary(ctx context.Context, cfg config) (relaySummary, error) {
 	return relaySummary{}, fmt.Errorf("all relay status checks failed: %s", strings.Join(errs, "; "))
 }
 
-func queryRelaySummaryFor(ctx context.Context, cfg config) (relaySummary, error) {
+func queryRelaySummaryFor(ctx context.Context, cfg config, client *http.Client) (relaySummary, error) {
 	statusURL, room, err := relayStatusURL(cfg.RelayAddr)
 	if err != nil {
 		return relaySummary{}, err
@@ -613,7 +619,7 @@ func queryRelaySummaryFor(ctx context.Context, cfg config) (relaySummary, error)
 	if err != nil {
 		return relaySummary{}, err
 	}
-	resp, err := httpClient(cfg).Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return relaySummary{}, err
 	}
@@ -674,15 +680,16 @@ func formatRelayDetails(summary relaySummary, cfg config) string {
 }
 
 func httpClient(cfg config) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	transport.Proxy = httpProxyFunc(cfg.Proxy)
+	transport.MaxIdleConns = 4
+	transport.MaxIdleConnsPerHost = 2
+	transport.MaxConnsPerHost = 4
+	transport.IdleConnTimeout = 30 * time.Second
 	return &http.Client{
-		Timeout: 8 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				ServerName: tunnel.HostFromRelayAddress(cfg.RelayAddr),
-			},
-			Proxy: httpProxyFunc(cfg.Proxy),
-		},
+		Timeout:   8 * time.Second,
+		Transport: transport,
 	}
 }
 

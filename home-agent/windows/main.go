@@ -152,6 +152,9 @@ type clientApp struct {
 	activeLocal         int
 	activeWinRM         int
 	statusCancel        context.CancelFunc
+	statusHTTPClient    *http.Client
+	statusHTTPProxy     string
+	statusRefreshActive bool
 	winRMSession        *winRMSessionManager
 	exiting             bool
 }
@@ -1926,11 +1929,34 @@ func (a *clientApp) setHomePresence(text string) {
 }
 
 func (a *clientApp) refreshRelayStatusAsync() {
-	cfg := a.currentConfig()
+	a.mu.Lock()
+	if a.exiting || a.statusRefreshActive {
+		a.mu.Unlock()
+		return
+	}
+	cfg := a.cfg
+	proxyKey := strings.TrimSpace(cfg.Proxy)
+	retiredClient := (*http.Client)(nil)
+	if a.statusHTTPClient == nil || !strings.EqualFold(a.statusHTTPProxy, proxyKey) {
+		retiredClient = a.statusHTTPClient
+		a.statusHTTPClient = httpClient(cfg)
+		a.statusHTTPProxy = proxyKey
+	}
+	client := a.statusHTTPClient
+	a.statusRefreshActive = true
+	a.mu.Unlock()
+	if retiredClient != nil {
+		retiredClient.CloseIdleConnections()
+	}
 	go func() {
+		defer func() {
+			a.mu.Lock()
+			a.statusRefreshActive = false
+			a.mu.Unlock()
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 		defer cancel()
-		summary, err := queryRelaySummary(ctx, cfg)
+		summary, err := queryRelaySummaryWithClient(ctx, cfg, client)
 		a.onUI(func() {
 			if err != nil {
 				_ = a.workStatus.SetText("Check relay")
@@ -1955,7 +1981,7 @@ func (a *clientApp) startStatusPoller() {
 		ticker := time.NewTicker(4 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			if a.mw == nil || a.exiting {
+			if a.mw == nil {
 				return
 			}
 			a.refreshRelayStatusAsync()
@@ -1989,14 +2015,19 @@ func (a *clientApp) onUI(f func()) {
 }
 
 func (a *clientApp) shutdown() {
-	a.exiting = true
-	a.stopTunnel()
 	a.mu.Lock()
+	a.exiting = true
 	cancel := a.statusCancel
 	a.statusCancel = nil
+	statusClient := a.statusHTTPClient
+	a.statusHTTPClient = nil
 	a.mu.Unlock()
+	a.stopTunnel()
 	if cancel != nil {
 		cancel()
+	}
+	if statusClient != nil {
+		statusClient.CloseIdleConnections()
 	}
 	if a.ni != nil {
 		_ = a.ni.SetVisible(false)
@@ -2459,9 +2490,15 @@ func relayAttemptResult(err error) string {
 }
 
 func queryRelaySummary(ctx context.Context, cfg config) (relaySummary, error) {
+	client := httpClient(cfg)
+	defer client.CloseIdleConnections()
+	return queryRelaySummaryWithClient(ctx, cfg, client)
+}
+
+func queryRelaySummaryWithClient(ctx context.Context, cfg config, client *http.Client) (relaySummary, error) {
 	var errs []string
 	for _, relayAddr := range cfg.relayAddresses() {
-		summary, err := queryRelaySummaryFor(ctx, cfg.withRelayAddress(relayAddr))
+		summary, err := queryRelaySummaryFor(ctx, cfg.withRelayAddress(relayAddr), client)
 		if err == nil {
 			return summary, nil
 		}
@@ -2473,7 +2510,7 @@ func queryRelaySummary(ctx context.Context, cfg config) (relaySummary, error) {
 	return relaySummary{}, fmt.Errorf("all relay status checks failed: %s", strings.Join(errs, "; "))
 }
 
-func queryRelaySummaryFor(ctx context.Context, cfg config) (relaySummary, error) {
+func queryRelaySummaryFor(ctx context.Context, cfg config, client *http.Client) (relaySummary, error) {
 	statusURL, room, err := relayStatusURL(cfg.RelayAddr)
 	if err != nil {
 		return relaySummary{}, err
@@ -2482,7 +2519,7 @@ func queryRelaySummaryFor(ctx context.Context, cfg config) (relaySummary, error)
 	if err != nil {
 		return relaySummary{}, err
 	}
-	resp, err := httpClient(cfg).Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return relaySummary{}, err
 	}
@@ -2543,15 +2580,16 @@ func formatRelayDetails(summary relaySummary, cfg config) string {
 }
 
 func httpClient(cfg config) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	transport.Proxy = httpProxyFunc(cfg.Proxy)
+	transport.MaxIdleConns = 4
+	transport.MaxIdleConnsPerHost = 2
+	transport.MaxConnsPerHost = 4
+	transport.IdleConnTimeout = 30 * time.Second
 	return &http.Client{
-		Timeout: 8 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				ServerName: tunnel.HostFromRelayAddress(cfg.RelayAddr),
-			},
-			Proxy: httpProxyFunc(cfg.Proxy),
-		},
+		Timeout:   8 * time.Second,
+		Transport: transport,
 	}
 }
 

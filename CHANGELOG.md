@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.10.17 - 2026-08-22
+
+- Reuse a bounded HTTP connection pool for Windows and macOS Home relay-status checks instead of leaving a new idle connection behind after every poll.
+- Prevent overlapping Windows Home status checks and close retired pooled connections when proxy settings change or the app exits, avoiding gradual outbound-port exhaustion that can disrupt unrelated RDP traffic.
+
 ## 0.10.16 - 2026-08-21
 
 - Acknowledge relay-initiated WebSocket closes as soon as Android receives them, allowing completed RDP sessions and rejected resumes to release their stale loopback connection immediately instead of waiting through repeated 20-second resume attempts.
