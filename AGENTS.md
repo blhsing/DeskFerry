@@ -160,6 +160,7 @@ Android lint may need uncached artifacts from `dl.google.com`; if this host cann
 
 ## Coding Guidance
 
+- After making code changes, commit and push the completed, verified changes to the configured upstream branch before finishing the task unless the user explicitly asks to keep them local.
 - Prefer existing package boundaries and helper APIs.
 - Keep `internal/tunnel` focused on current protocol primitives: WebSocket dialing, proxy URL handling, v2 control messages, role constants, resumption, and byte piping.
 - Keep the Windows home app relay-first; it should store relay service bases, a profile room name, and local UI settings, not implement the broker.

@@ -1,10 +1,14 @@
 package tunnel
 
 import (
+	"bufio"
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -100,17 +104,84 @@ func TestHTTPRelayThroughProxyUsesConnectTunnel(t *testing.T) {
 	}
 }
 
-func TestHTTPSRelayThroughProxyUsesStandardProxyTransport(t *testing.T) {
+func TestHTTPSRelayThroughProxyUsesConnectTunnel(t *testing.T) {
 	client := webSocketHTTPClient("https://test-officialwebsite.azurewebsites.net/relay/b", "http://192.9.200.25:3128")
 	transport, ok := client.Transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("transport = %T, want *http.Transport", client.Transport)
 	}
 	if transport.DialContext == nil {
-		t.Fatal("DialContext is nil, want DNS-resilient standard proxy transport")
+		t.Fatal("DialContext is nil, want proxy CONNECT tunnel dialer")
 	}
-	if transport.Proxy == nil {
-		t.Fatal("Proxy is nil, want standard HTTPS proxy transport")
+	if transport.Proxy != nil {
+		t.Fatal("Proxy is set, want authenticated CONNECT tunnel")
+	}
+}
+
+type fakeProxyAuthenticator struct{}
+
+func (*fakeProxyAuthenticator) Scheme() string       { return "NTLM" }
+func (*fakeProxyAuthenticator) InitialToken() []byte { return []byte("initial") }
+func (*fakeProxyAuthenticator) Close() error         { return nil }
+func (*fakeProxyAuthenticator) NextToken(challenge []byte) ([]byte, error) {
+	if string(challenge) != "challenge" {
+		return nil, fmt.Errorf("challenge = %q", challenge)
+	}
+	return []byte("response"), nil
+}
+
+func TestProxyConnectUsesIntegratedAuthentication(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		for attempt, expected := range []string{"initial", "response"} {
+			req, err := http.ReadRequest(reader)
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			want := "NTLM " + base64.StdEncoding.EncodeToString([]byte(expected))
+			if got := req.Header.Get("Proxy-Authorization"); got != want {
+				serverErr <- fmt.Errorf("attempt %d authorization = %q, want %q", attempt, got, want)
+				return
+			}
+			if attempt == 0 {
+				challenge := base64.StdEncoding.EncodeToString([]byte("challenge"))
+				_, err = fmt.Fprintf(conn, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: NTLM %s\r\nContent-Length: 0\r\n\r\n", challenge)
+			} else {
+				_, err = fmt.Fprint(conn, "HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n")
+			}
+			if err != nil {
+				serverErr <- err
+				return
+			}
+		}
+		serverErr <- nil
+	}()
+
+	proxyURL := &url.URL{Scheme: "http", Host: listener.Addr().String()}
+	dial := proxyConnectDialContextWithAuth(proxyURL, func() (integratedProxyAuthenticator, error) {
+		return &fakeProxyAuthenticator{}, nil
+	})
+	conn, err := dial(context.Background(), "tcp", "relay.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
 	}
 }
 

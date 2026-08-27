@@ -2140,7 +2140,12 @@ sealed class ResumeSession
             while (true)
             {
                 var (first, second) = await BridgeOnceAsync(agent, client);
-                if (IsSessionClose(first) || IsSessionClose(second))
+                // Only the pump that ended first can initiate a logical stream
+                // close. The other pump is canceled below by BridgeOnceAsync;
+                // its socket can concurrently acquire the peer's close status
+                // and must not turn an otherwise resumable transport failure
+                // into a permanently completed session.
+                if (IsSessionClose(first))
                 {
                     await Task.WhenAll(
                         RelayRoom.CloseQuietlyAsync(agent, WebSocketCloseStatus.NormalClosure, "session closed"),
@@ -2150,7 +2155,7 @@ sealed class ResumeSession
                     return;
                 }
 
-                _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} trigger_direction={TriggerDirection} trigger_error={TriggerError} other_direction={OtherDirection} other_error={OtherError}", Room.Id, pairId, Id, first.Direction, first.Error, second.Direction, second.Error);
+                _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} trigger_direction={TriggerDirection} trigger_end={TriggerEnd} trigger_close_status={TriggerCloseStatus} trigger_close_reason={TriggerCloseReason} trigger_error={TriggerError} other_direction={OtherDirection} other_end={OtherEnd} other_close_status={OtherCloseStatus} other_close_reason={OtherCloseReason} other_error={OtherError}", Room.Id, pairId, Id, first.Direction, first.End, first.CloseStatus, first.CloseReason, first.Error, second.Direction, second.End, second.CloseStatus, second.CloseReason, second.Error);
                 // A canceled receive can leave the server-side WebSocket aborted
                 // without delivering a close frame to the peer. Discard both
                 // obsolete transports so both resumable endpoints wake at once.
@@ -2226,7 +2231,8 @@ sealed class ResumeSession
 
     private static bool IsSessionClose(PumpResult result)
     {
-        return result.CloseStatus == WebSocketCloseStatus.NormalClosure &&
+        return string.Equals(result.End, "close-frame", StringComparison.Ordinal) &&
+            result.CloseStatus == WebSocketCloseStatus.NormalClosure &&
             string.Equals(result.CloseReason, "session closed", StringComparison.Ordinal);
     }
 
@@ -2258,7 +2264,7 @@ sealed class ResumeSession
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.10.17";
+    public const string Version = "0.10.18";
 }
 
 sealed class WaitingAgent

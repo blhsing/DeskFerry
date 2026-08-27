@@ -650,7 +650,11 @@ class ResumeSession:
         try:
             while True:
                 first, second = await bridge_once(agent, client)
-                if is_session_close(first) or is_session_close(second):
+                # bridge_once cancels the opposite pump after the first one
+                # ends. A close observed by that canceled pump did not
+                # initiate shutdown and must not complete an otherwise
+                # resumable session.
+                if is_session_close(first):
                     await close_quietly(agent, 1000, "session closed")
                     await close_quietly(client, 1000, "session closed")
                     if agent_attachment is not None:
@@ -660,8 +664,8 @@ class ResumeSession:
                     return
 
                 logger.info(
-                    "resumable bridge interrupted room=%s pair=%s session=%s trigger_direction=%s trigger_error=%r other_direction=%s other_error=%r",
-                    self.room.id, pair_id, self.id, first.direction, first.error, second.direction, second.error,
+                    "resumable bridge interrupted room=%s pair=%s session=%s trigger_direction=%s trigger_end=%s trigger_close_code=%s trigger_close_reason=%r trigger_error=%r other_direction=%s other_end=%s other_close_code=%s other_close_reason=%r other_error=%r",
+                    self.room.id, pair_id, self.id, first.direction, first.end, first.close_code, first.close_reason, first.error, second.direction, second.end, second.close_code, second.close_reason, second.error,
                 )
                 await close_quietly(agent, 1012, "resume session")
                 await close_quietly(client, 1012, "resume session")
@@ -704,7 +708,7 @@ class ResumeSession:
 
 
 def is_session_close(result: PumpResult) -> bool:
-    return result.close_code == 1000 and result.close_reason == "session closed"
+    return result.end == "close-frame" and result.close_code == 1000 and result.close_reason == "session closed"
 
 
 async def bridge_once(agent: WebSocket, client: WebSocket) -> tuple[PumpResult, PumpResult]:

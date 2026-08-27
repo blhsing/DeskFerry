@@ -1714,7 +1714,10 @@ func (s *ResumeSession) run(agent, client *websocket.Conn, clientDone chan struc
 
 	for {
 		first, second := bridgeSockets(agent, client)
-		if isSessionClose(first.Err) || isSessionClose(second.Err) {
+		// bridgeSockets cancels the opposite pump after the first one ends.
+		// A close observed by that canceled pump did not initiate shutdown and
+		// must not complete an otherwise resumable session.
+		if isSessionClose(first.Err) {
 			closeQuietly(agent, websocket.StatusNormalClosure, "session closed")
 			closeQuietly(client, websocket.StatusNormalClosure, "session closed")
 			if agentAttachment != nil {

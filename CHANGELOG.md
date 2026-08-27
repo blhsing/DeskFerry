@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.10.18 - 2026-08-26
+
+- Keep relay sessions resumable when one WebSocket pump fails while the canceled opposite pump concurrently observes a logical-close status, instead of prematurely completing the session and rejecting the reconnecting endpoint.
+- Record both pumps' end state and close details for interrupted resumable Azure and Python relay sessions so future transport failures identify the initiating direction.
+
 ## 0.10.17 - 2026-08-22
 
 - Reuse a bounded HTTP connection pool for Windows and macOS Home relay-status checks instead of leaving a new idle connection behind after every poll.

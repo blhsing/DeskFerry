@@ -682,7 +682,7 @@ func formatRelayDetails(summary relaySummary, cfg config) string {
 func httpClient(cfg config) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-	transport.Proxy = httpProxyFunc(cfg.Proxy)
+	tunnel.ConfigureHTTPTransport(transport, cfg.Proxy)
 	transport.MaxIdleConns = 4
 	transport.MaxIdleConnsPerHost = 2
 	transport.MaxConnsPerHost = 4
@@ -690,19 +690,6 @@ func httpClient(cfg config) *http.Client {
 	return &http.Client{
 		Timeout:   8 * time.Second,
 		Transport: transport,
-	}
-}
-
-func httpProxyFunc(proxySpec string) func(*http.Request) (*url.URL, error) {
-	return func(req *http.Request) (*url.URL, error) {
-		spec := strings.TrimSpace(proxySpec)
-		if spec == "" || strings.EqualFold(spec, "direct") {
-			return nil, nil
-		}
-		if strings.EqualFold(spec, "env") || strings.EqualFold(spec, "auto") {
-			return http.ProxyFromEnvironment(req)
-		}
-		return url.Parse(spec)
 	}
 }
 

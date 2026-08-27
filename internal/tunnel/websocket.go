@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -429,7 +430,7 @@ func webSocketHTTPClient(relayAddr, proxySpec string) *http.Client {
 		DialContext: resilientDNSDialer.DialContext,
 	}
 	if endpoint, err := WebSocketEndpoint(relayAddr); err == nil {
-		if endpointURL, err := url.Parse(endpoint); err == nil && endpointURL.Scheme == "ws" {
+		if endpointURL, err := url.Parse(endpoint); err == nil {
 			proxyURL, err := webSocketProxyURL(endpointURL.Host, proxySpec)
 			if err == nil && proxyURL != nil {
 				transport.DialContext = proxyConnectDialContext(proxyURL)
@@ -453,6 +454,19 @@ func webSocketProxyURL(targetAddr, proxySpec string) (*url.URL, error) {
 }
 
 func proxyConnectDialContext(proxyURL *url.URL) func(context.Context, string, string) (net.Conn, error) {
+	return proxyConnectDialContextWithAuth(proxyURL, newIntegratedProxyAuthenticator)
+}
+
+type integratedProxyAuthenticator interface {
+	Scheme() string
+	InitialToken() []byte
+	NextToken([]byte) ([]byte, error)
+	Close() error
+}
+
+type integratedProxyAuthFactory func() (integratedProxyAuthenticator, error)
+
+func proxyConnectDialContextWithAuth(proxyURL *url.URL, authFactory integratedProxyAuthFactory) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
 		conn, err := resilientDNSDialer.DialContext(ctx, network, canonicalProxyAddr(proxyURL))
 		if err != nil {
@@ -469,32 +483,98 @@ func proxyConnectDialContext(proxyURL *url.URL) func(context.Context, string, st
 			}
 			conn = tlsConn
 		}
-		if err := writeProxyConnect(conn, proxyURL, address); err != nil {
-			conn.Close()
-			return nil, err
+
+		var auth integratedProxyAuthenticator
+		var authorization string
+		if proxyURL.User == nil && authFactory != nil {
+			auth, err = authFactory()
+			if err == nil && auth != nil {
+				defer auth.Close()
+				authorization = proxyAuthorization(auth.Scheme(), auth.InitialToken())
+			}
 		}
-		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("read proxy CONNECT response: %w", err)
+
+		reader := bufio.NewReader(conn)
+		for attempt := 0; attempt < 2; attempt++ {
+			if err := writeProxyConnect(conn, proxyURL, address, authorization); err != nil {
+				conn.Close()
+				return nil, err
+			}
+			resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+			if err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("read proxy CONNECT response: %w", err)
+			}
+			if resp.StatusCode == http.StatusOK {
+				_ = resp.Body.Close()
+				return &bufferedConn{Conn: conn, reader: reader}, nil
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != http.StatusProxyAuthRequired || auth == nil || attempt > 0 {
+				conn.Close()
+				return nil, fmt.Errorf("proxy CONNECT %s via %s failed: %s", address, proxyURLForLog(proxyURL), resp.Status)
+			}
+			challenge, ok := proxyAuthenticationChallenge(resp.Header, auth.Scheme())
+			if !ok {
+				conn.Close()
+				return nil, fmt.Errorf("proxy CONNECT %s via %s requested unsupported authentication", address, proxyURLForLog(proxyURL))
+			}
+			nextToken, err := auth.NextToken(challenge)
+			if err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("authenticate proxy %s with Windows credentials: %w", proxyURLForLog(proxyURL), err)
+			}
+			authorization = proxyAuthorization(auth.Scheme(), nextToken)
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			conn.Close()
-			return nil, fmt.Errorf("proxy CONNECT %s via %s failed: %s", address, proxyURLForLog(proxyURL), resp.Status)
-		}
-		return conn, nil
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT %s via %s authentication did not complete", address, proxyURLForLog(proxyURL))
 	}
 }
 
-func writeProxyConnect(conn net.Conn, proxyURL *url.URL, address string) error {
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func proxyAuthorization(scheme string, token []byte) string {
+	if scheme == "" || len(token) == 0 {
+		return ""
+	}
+	return scheme + " " + base64.StdEncoding.EncodeToString(token)
+}
+
+func proxyAuthenticationChallenge(header http.Header, scheme string) ([]byte, bool) {
+	for _, value := range header.Values("Proxy-Authenticate") {
+		fields := strings.Fields(value)
+		if len(fields) < 2 || !strings.EqualFold(fields[0], scheme) {
+			continue
+		}
+		token, err := base64.StdEncoding.DecodeString(fields[1])
+		if err == nil && len(token) > 0 {
+			return token, true
+		}
+	}
+	return nil, false
+}
+
+func writeProxyConnect(conn net.Conn, proxyURL *url.URL, address, authorization string) error {
 	var builder strings.Builder
 	builder.WriteString("CONNECT ")
 	builder.WriteString(address)
 	builder.WriteString(" HTTP/1.1\r\nHost: ")
 	builder.WriteString(address)
 	builder.WriteString("\r\nUser-Agent: DeskFerry/" + buildinfo.Version + "\r\nProxy-Connection: Keep-Alive\r\n")
-	if proxyURL.User != nil {
+	if authorization != "" {
+		builder.WriteString("Proxy-Authorization: ")
+		builder.WriteString(authorization)
+		builder.WriteString("\r\n")
+	} else if proxyURL.User != nil {
 		username := proxyURL.User.Username()
 		password, _ := proxyURL.User.Password()
 		token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
@@ -505,6 +585,27 @@ func writeProxyConnect(conn net.Conn, proxyURL *url.URL, address string) error {
 	builder.WriteString("\r\n")
 	_, err := conn.Write([]byte(builder.String()))
 	return err
+}
+
+// ConfigureHTTPTransport routes HTTP requests through the configured proxy by
+// using CONNECT tunnels. On Windows those tunnels negotiate the current
+// process identity when the proxy requests NTLM authentication.
+func ConfigureHTTPTransport(transport *http.Transport, proxySpec string) {
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		spec := strings.TrimSpace(proxySpec)
+		if spec == "" || strings.EqualFold(spec, "direct") {
+			return resilientDNSDialer.DialContext(ctx, network, address)
+		}
+		proxyURL, err := resolveProxyURL(address, spec)
+		if err != nil {
+			return nil, err
+		}
+		if proxyURL == nil {
+			return resilientDNSDialer.DialContext(ctx, network, address)
+		}
+		return proxyConnectDialContext(proxyURL)(ctx, network, address)
+	}
 }
 
 func canonicalProxyAddr(proxyURL *url.URL) string {
