@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.10.19 - 2026-08-28
+
+- Detect silently blackholed resumable transports after a 5-second idle interval and a 15-second unanswered heartbeat instead of waiting up to roughly a minute before starting transparent reconnection.
+- Use the same faster failure detection in the Android Home agent so mobile, Windows, and macOS clients recover on comparable timelines.
+- Mark generated Windows loopback RDP profiles as fixed-LAN connections and disable MSTSC network and bandwidth auto-detection, preventing physical-interface changes from being applied to the local `127.0.0.1` tunnel.
+
 ## 0.10.18 - 2026-08-26
 
 - Keep relay sessions resumable when one WebSocket pump fails while the canceled opposite pump concurrently observes a logical-close status, instead of prematurely completing the session and rejecting the reconnecting endpoint.

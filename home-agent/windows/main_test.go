@@ -305,6 +305,9 @@ func TestMSTSCProfileContentPasswordlessRDP(t *testing.T) {
 	content := mstscProfileContent(cfg)
 	for _, expected := range []string{
 		"autoreconnection enabled:i:1",
+		"connection type:i:6",
+		"networkautodetect:i:0",
+		"bandwidthautodetect:i:0",
 		"authentication level:i:0",
 		"enablecredsspsupport:i:0",
 		`username:s:DESKTOP-G2EEM1V\Owner`,

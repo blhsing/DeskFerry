@@ -23,8 +23,8 @@ const (
 	resumableChunkSize       = 64 * 1024
 	resumableMaxBuffer       = 8 * 1024 * 1024
 	resumableWindow          = 5 * time.Minute
-	defaultHeartbeatInterval = 15 * time.Second
-	defaultHeartbeatTimeout  = 45 * time.Second
+	defaultHeartbeatInterval = 5 * time.Second
+	defaultHeartbeatTimeout  = 15 * time.Second
 )
 
 type ResumableWebSocketOptions struct {
