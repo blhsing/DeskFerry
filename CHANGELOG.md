@@ -5,6 +5,7 @@
 - Detect silently blackholed resumable transports after a 5-second idle interval and a 15-second unanswered heartbeat instead of waiting up to roughly a minute before starting transparent reconnection.
 - Use the same faster failure detection in the Android Home agent so mobile, Windows, and macOS clients recover on comparable timelines.
 - Mark generated Windows loopback RDP profiles as fixed-LAN connections and disable MSTSC network and bandwidth auto-detection, preventing physical-interface changes from being applied to the local `127.0.0.1` tunnel.
+- Preflight running-file locks before a Windows Home upgrade removes the optional network service, so an open Home GUI cannot leave file access stopped after a failed executable replacement.
 
 ## 0.10.18 - 2026-08-26
 

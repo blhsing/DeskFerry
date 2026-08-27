@@ -1072,6 +1072,12 @@ func installProduct(opts setupOptions) (string, error) {
 	if err := os.MkdirAll(installDir, 0755); err != nil {
 		return "", err
 	}
+	for _, name := range []string{"DeskFerryHome.exe", "DeskFerryHomeSetup.exe"} {
+		target := filepath.Join(installDir, name)
+		if err := ensureReplaceable(target); err != nil {
+			return "", fmt.Errorf("prepare to install %s: %w (close DeskFerry Home if it is running)", name, err)
+		}
+	}
 	if err := stopAndDeleteNetworkService(); err != nil {
 		return "", err
 	}
@@ -1134,6 +1140,17 @@ func installProduct(opts setupOptions) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("DeskFerry Home and file access were installed. Open \\\\%s\\sharename after the work agent enables SMB.", cfg.Alias), nil
+}
+
+func ensureReplaceable(path string) error {
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return file.Close()
 }
 
 func configureHomeClient(opts setupOptions, proof string) error {

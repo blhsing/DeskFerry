@@ -51,6 +51,26 @@ func TestHiddenCommandSuppressesConsoleWindow(t *testing.T) {
 	}
 }
 
+func TestEnsureReplaceableChecksRunningExecutableBeforeInstall(t *testing.T) {
+	writable := filepath.Join(t.TempDir(), "DeskFerryHome.exe")
+	if err := os.WriteFile(writable, []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureReplaceable(writable); err != nil {
+		t.Fatalf("writable file rejected: %v", err)
+	}
+	if err := ensureReplaceable(filepath.Join(t.TempDir(), "missing.exe")); err != nil {
+		t.Fatalf("missing installation target rejected: %v", err)
+	}
+	running, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureReplaceable(running); err == nil {
+		t.Fatal("running executable was reported replaceable")
+	}
+}
+
 func TestNetworkConfigUsesRoomScopedProof(t *testing.T) {
 	opts := setupOptions{
 		InstallDir:   `C:\Program Files\DeskFerry Home`,
