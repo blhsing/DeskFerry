@@ -2866,6 +2866,7 @@ func mstscProfileContent(cfg config) string {
 		"session bpp:i:32",
 		"full address:s:" + target,
 		"autoreconnection enabled:i:1",
+		"autoreconnect max retries:i:200",
 		"connection type:i:6",
 		"networkautodetect:i:0",
 		"bandwidthautodetect:i:0",

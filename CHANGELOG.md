@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.10.20 - 2026-08-29
+
+- Keep Windows MSTSC automatic reconnection trying for the supported maximum of 200 attempts, so a longer Home-network or DNS interruption is less likely to exhaust the generated DeskFerry RDP profile's retry window.
+
 ## 0.10.19 - 2026-08-28
 
 - Detect silently blackholed resumable transports after a 5-second idle interval and a 15-second unanswered heartbeat instead of waiting up to roughly a minute before starting transparent reconnection.
