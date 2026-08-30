@@ -2156,11 +2156,14 @@ sealed class ResumeSession
                 }
 
                 _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} trigger_direction={TriggerDirection} trigger_end={TriggerEnd} trigger_close_status={TriggerCloseStatus} trigger_close_reason={TriggerCloseReason} trigger_error={TriggerError} other_direction={OtherDirection} other_end={OtherEnd} other_close_status={OtherCloseStatus} other_close_reason={OtherCloseReason} other_error={OtherError}", Room.Id, pairId, Id, first.Direction, first.End, first.CloseStatus, first.CloseReason, first.Error, second.Direction, second.End, second.CloseStatus, second.CloseReason, second.Error);
-                // A canceled receive can leave the server-side WebSocket aborted
-                // without delivering a close frame to the peer. Discard both
-                // obsolete transports so both resumable endpoints wake at once.
-                AbortQuietly(agent);
-                AbortQuietly(client);
+                // Notify the surviving peer before discarding both obsolete
+                // transports. WebSocket.Abort only tears down the server-side
+                // object and IIS/Azure can leave the peer unaware until its
+                // heartbeat expires. A close-output frame with service-restart
+                // status makes both resumable endpoints reconnect immediately.
+                await Task.WhenAll(
+                    InterruptQuietlyAsync(agent),
+                    InterruptQuietlyAsync(client));
                 agentAttachment?.Done.TrySetResult();
                 clientAttachment?.Done.TrySetResult();
 
@@ -2247,6 +2250,25 @@ sealed class ResumeSession
         }
     }
 
+    private static async Task InterruptQuietlyAsync(WebSocket socket)
+    {
+        try
+        {
+            if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                await socket.CloseOutputAsync(ResumeCloseStatus, "resume transport", timeout.Token);
+            }
+        }
+        catch
+        {
+        }
+        finally
+        {
+            AbortQuietly(socket);
+        }
+    }
+
     private static async Task<bool> TrySendControlAsync(WebSocket socket, string message)
     {
         try
@@ -2264,7 +2286,7 @@ sealed class ResumeSession
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.10.18";
+    public const string Version = "0.10.22";
 }
 
 sealed class WaitingAgent

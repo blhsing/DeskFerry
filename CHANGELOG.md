@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.10.22 - 2026-08-30
+
+- Make the Azure relay notify both endpoints with a service-restart close frame before aborting an interrupted resumable bridge, so the surviving endpoint immediately reattaches instead of remaining unaware behind IIS or an Azure frontend until RDP disconnects.
+
 ## 0.10.21 - 2026-08-30
 
 - Add an administrator-applied Windows Home setting for Automatic, Hardware, or Software RDP graphics decoding without interrupting active sessions.
