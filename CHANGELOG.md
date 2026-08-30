@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.10.21 - 2026-08-30
+
+- Add an administrator-applied Windows Home setting for Automatic, Hardware, or Software RDP graphics decoding without interrupting active sessions.
+- Recommend software decoding when recent RDP socket-abort disconnects coincide with a display driver more than three years old, while leaving the final policy choice to the user.
+
 ## 0.10.20 - 2026-08-29
 
 - Keep Windows MSTSC automatic reconnection trying for the supported maximum of 200 attempts, so a longer Home-network or DNS interruption is less likely to exhaust the generated DeskFerry RDP profile's retry window.

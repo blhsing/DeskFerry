@@ -326,6 +326,45 @@ func TestMSTSCProfileContentPasswordlessRDP(t *testing.T) {
 	}
 }
 
+func TestRDPDecodingModeSelection(t *testing.T) {
+	for index, want := range []rdpDecodingMode{rdpDecodingAutomatic, rdpDecodingHardware, rdpDecodingSoftware} {
+		got, err := rdpDecodingModeAt(index)
+		if err != nil || got != want {
+			t.Fatalf("mode at %d = %q, %v; want %q", index, got, err, want)
+		}
+		if gotIndex := rdpDecodingModeIndex(got); gotIndex != index {
+			t.Fatalf("index for %q = %d, want %d", got, gotIndex, index)
+		}
+	}
+	if _, err := rdpDecodingModeAt(-1); err == nil {
+		t.Fatal("invalid decoding selection was accepted")
+	}
+	if _, err := parseRDPDecodingMode("gpu-magic"); err == nil {
+		t.Fatal("invalid decoding mode was accepted")
+	}
+}
+
+func TestRecommendRDPDecodingRequiresRepeatedAbortsAndOldDriver(t *testing.T) {
+	now := time.Date(2026, time.August, 30, 0, 0, 0, 0, time.UTC)
+	oldDriver := rdpGraphicsDiagnostics{
+		SocketAbortCount: 2,
+		GPUName:          "Intel(R) HD Graphics 520",
+		DriverDateUTC:    "2022-01-20T00:00:00Z",
+	}
+	if got := recommendRDPDecoding(now, oldDriver); got.Mode != rdpDecodingSoftware || !strings.Contains(got.Reason, "2 RDP socket-abort") {
+		t.Fatalf("old-driver recommendation = %#v", got)
+	}
+	oldDriver.SocketAbortCount = 1
+	if got := recommendRDPDecoding(now, oldDriver); got.Mode != rdpDecodingAutomatic {
+		t.Fatalf("single-abort recommendation = %#v", got)
+	}
+	oldDriver.SocketAbortCount = 5
+	oldDriver.DriverDateUTC = "2025-01-20T00:00:00Z"
+	if got := recommendRDPDecoding(now, oldDriver); got.Mode != rdpDecodingAutomatic {
+		t.Fatalf("current-driver recommendation = %#v", got)
+	}
+}
+
 func TestEnsureDestinationsMigratesLegacyRelayList(t *testing.T) {
 	cfg := config{
 		RelayAddr: "https://primary.example/relay/office",

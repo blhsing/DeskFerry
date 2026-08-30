@@ -116,6 +116,10 @@ type clientApp struct {
 	smbUNCPreview      *walk.LineEdit
 	roomPass           *walk.LineEdit
 	clearRoomPassword  *walk.CheckBox
+	rdpDecodingMode    *walk.ComboBox
+	rdpDecodingState   *walk.LineEdit
+	rdpDecodingAdvice  *walk.LineEdit
+	applyRDPDecoding   *walk.PushButton
 	winrmListen        *walk.LineEdit
 	winrmCommand       *walk.TextEdit
 	winrmOutput        *walk.TextEdit
@@ -212,6 +216,7 @@ func main() {
 	var screenshotStream string
 	var screenInterval time.Duration
 	var screenCount int
+	var setRDPDecodingModeFlag string
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.StringVar(&listenAddr, "listen", "", "local RDP listen address")
 	flag.StringVar(&proxyFlag, "proxy", "", "proxy: env, direct, or http(s)://host:port")
@@ -227,6 +232,7 @@ func main() {
 	flag.StringVar(&screenshotStream, "screenshot-stream", "", "stream complete Work screen PNGs into this directory")
 	flag.DurationVar(&screenInterval, "screen-interval", time.Second, "screenshot stream interval")
 	flag.IntVar(&screenCount, "screen-count", 0, "number of streamed screenshots to save; 0 runs until interrupted")
+	flag.StringVar(&setRDPDecodingModeFlag, "set-rdp-decoding-mode", "", "set the machine RDP decoding policy (automatic, hardware, or software)")
 	flag.Parse()
 	winRMCommandMode := winRMCommand != "" || winRMCommandFile != ""
 	screenOptions := screenview.CLIOptions{Screenshot: screenshot, StreamDirectory: screenshotStream, Interval: screenInterval, Count: screenCount}
@@ -236,7 +242,7 @@ func main() {
 			screenCommandMode = true
 		}
 	})
-	commandMode := winRMCommandMode || syncSMBProfile || screenCommandMode
+	commandMode := winRMCommandMode || syncSMBProfile || screenCommandMode || setRDPDecodingModeFlag != ""
 	if commandMode {
 		attachParentConsole()
 	}
@@ -246,6 +252,17 @@ func main() {
 		log.Printf("diagnostic log file: %s retention_days=%d", path, logRetentionDays)
 	}
 	log.Printf("DeskFerry Home Agent version=%s platform=windows", buildinfo.Version)
+	if setRDPDecodingModeFlag != "" {
+		mode, err := parseRDPDecodingMode(setRDPDecodingModeFlag)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := setRDPDecodingMode(mode); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("RDP decoding policy updated mode=%s", mode)
+		return
+	}
 
 	if !smokeTest && !commandMode {
 		instance, alreadyRunning, err := acquireNamedInstanceMutex(singleInstanceName)
@@ -507,6 +524,12 @@ func activateExistingHomeWindow() {
 }
 
 func (a *clientApp) run(smokeTest bool) error {
+	decodingMode, decodingErr := readRDPDecodingMode()
+	decodingState := "Current: " + rdpDecodingModeDescription(decodingMode)
+	if decodingErr != nil {
+		decodingMode = rdpDecodingAutomatic
+		decodingState = "Current mode unavailable: " + decodingErr.Error()
+	}
 	window := MainWindow{
 		AssignTo: &a.mw,
 		Title:    appTitle(),
@@ -589,6 +612,11 @@ func (a *clientApp) run(smokeTest bool) error {
 											},
 										},
 									},
+									Label{Text: "RDP graphics decoding"},
+									ComboBox{AssignTo: &a.rdpDecodingMode, Model: rdpDecodingModeLabels, CurrentIndex: rdpDecodingModeIndex(decodingMode)},
+									LineEdit{AssignTo: &a.rdpDecodingState, Text: decodingState, ReadOnly: true},
+									PushButton{AssignTo: &a.applyRDPDecoding, Text: "Apply (admin)", MinSize: Size{Height: 30}, OnClicked: a.applyRDPDecodingSelection},
+									LineEdit{AssignTo: &a.rdpDecodingAdvice, Text: "Recommendation: Checking recent RDP stability...", ReadOnly: true, ColumnSpan: 4},
 									Composite{
 										ColumnSpan: 4,
 										Layout:     VBox{MarginsZero: true, Spacing: 7},
@@ -683,6 +711,9 @@ func (a *clientApp) run(smokeTest bool) error {
 	})
 
 	a.appendLog("Ready.")
+	if !smokeTest {
+		a.refreshRDPDecodingRecommendation()
+	}
 	a.refreshLocalState()
 	a.restartHomePresence()
 	a.refreshRelayStatusAsync()
