@@ -116,8 +116,7 @@ type clientApp struct {
 	roomPass           *walk.LineEdit
 	clearRoomPassword  *walk.CheckBox
 	rdpDecodingMode    *walk.ComboBox
-	rdpDecodingState   *walk.LineEdit
-	rdpDecodingAdvice  *walk.LineEdit
+	rdpDecodingAdvice  *walk.TextLabel
 	applyRDPDecoding   *walk.PushButton
 	winrmListen        *walk.LineEdit
 	winrmCommand       *walk.TextEdit
@@ -524,10 +523,9 @@ func activateExistingHomeWindow() {
 
 func (a *clientApp) run(smokeTest bool) error {
 	decodingMode, decodingErr := readRDPDecodingMode()
-	decodingState := "Current: " + rdpDecodingModeDescription(decodingMode)
+	decodingApplied := rdpDecodingAppliedText(decodingMode, decodingErr)
 	if decodingErr != nil {
 		decodingMode = rdpDecodingAutomatic
-		decodingState = "Current mode unavailable: " + decodingErr.Error()
 	}
 	window := MainWindow{
 		AssignTo: &a.mw,
@@ -621,11 +619,16 @@ func (a *clientApp) run(smokeTest bool) error {
 											},
 										},
 									},
-									Label{Text: "RDP graphics decoding"},
-									ComboBox{AssignTo: &a.rdpDecodingMode, Model: rdpDecodingModeLabels, CurrentIndex: rdpDecodingModeIndex(decodingMode)},
-									LineEdit{AssignTo: &a.rdpDecodingState, Text: decodingState, ReadOnly: true},
-									PushButton{AssignTo: &a.applyRDPDecoding, Text: "Apply (admin)", MinSize: Size{Height: 30}, OnClicked: a.applyRDPDecodingSelection},
-									LineEdit{AssignTo: &a.rdpDecodingAdvice, Text: "Recommendation: Checking recent RDP stability...", ReadOnly: true, ColumnSpan: 4},
+									GroupBox{
+										Title:      "RDP graphics decoding",
+										ColumnSpan: 4,
+										Layout:     Grid{Columns: 3, Spacing: 7},
+										Children: []Widget{
+											ComboBox{AssignTo: &a.rdpDecodingMode, Model: rdpDecodingModeLabels, CurrentIndex: rdpDecodingModeIndex(decodingMode), ColumnSpan: 2},
+											PushButton{AssignTo: &a.applyRDPDecoding, Text: "Apply (admin)", MinSize: Size{Height: 30}, OnClicked: a.applyRDPDecodingSelection},
+											TextLabel{AssignTo: &a.rdpDecodingAdvice, Text: decodingApplied + ". Recommendation: Checking recent RDP stability...", MinSize: Size{Width: 420}, ColumnSpan: 3},
+										},
+									},
 									Composite{
 										ColumnSpan: 4,
 										Layout:     VBox{MarginsZero: true, Spacing: 7},

@@ -252,34 +252,41 @@ func (a *clientApp) waitForRDPDecodingMode(want rdpDecodingMode) {
 		}
 		a.onUI(func() {
 			_ = a.rdpDecodingMode.SetCurrentIndex(rdpDecodingModeIndex(mode))
-			_ = a.rdpDecodingState.SetText("Current: " + rdpDecodingModeDescription(mode) + " (restart Remote Desktop to apply)")
 		})
+		a.refreshRDPDecodingRecommendation()
 		a.appendLog("RDP graphics decoding policy applied: %s. Restart Remote Desktop when convenient; active sessions were left running.", mode)
 		return
 	}
 	a.onUI(func() {
 		mode, err := readRDPDecodingMode()
-		if err != nil {
-			_ = a.rdpDecodingState.SetText("Current mode unavailable: " + err.Error())
-			return
+		if err == nil {
+			_ = a.rdpDecodingMode.SetCurrentIndex(rdpDecodingModeIndex(mode))
 		}
-		_ = a.rdpDecodingMode.SetCurrentIndex(rdpDecodingModeIndex(mode))
-		_ = a.rdpDecodingState.SetText("Current: " + rdpDecodingModeDescription(mode))
 	})
+	a.refreshRDPDecodingRecommendation()
 	a.appendLog("RDP graphics decoding policy was not changed; administrator approval may have been canceled.")
+}
+
+func rdpDecodingAppliedText(mode rdpDecodingMode, err error) string {
+	if err != nil {
+		return "Applied mode unavailable: " + err.Error()
+	}
+	return "Applied: " + rdpDecodingModeDescription(mode)
 }
 
 func (a *clientApp) refreshRDPDecodingRecommendation() {
 	go func() {
+		mode, modeErr := readRDPDecodingMode()
+		applied := rdpDecodingAppliedText(mode, modeErr)
 		diagnostics, err := collectRDPGraphicsDiagnostics()
 		if err != nil {
 			a.onUI(func() {
-				_ = a.rdpDecodingAdvice.SetText("Recommendation unavailable: " + err.Error())
+				_ = a.rdpDecodingAdvice.SetText(applied + ". Recommendation unavailable: " + err.Error())
 			})
 			return
 		}
 		recommendation := recommendRDPDecoding(time.Now(), diagnostics)
-		text := fmt.Sprintf("Recommendation: %s — %s", rdpDecodingModeTitle(recommendation.Mode), recommendation.Reason)
+		text := fmt.Sprintf("%s. Recommendation: %s — %s", applied, rdpDecodingModeTitle(recommendation.Mode), recommendation.Reason)
 		a.onUI(func() {
 			_ = a.rdpDecodingAdvice.SetText(text)
 		})
