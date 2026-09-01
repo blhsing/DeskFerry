@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.11.2 - 2026-09-01
+
+- Rework the Windows Home connection form as a DPI-safe two-column layout so labels sit beside full-width fields and destination and relay controls no longer clip at display scaling.
+
 ## 0.11.1 - 2026-09-01
 
 - Authenticate plain-HTTP fallback requests through NTLM forward proxies with the current Windows identity, including every replacement `POST` and `GET` connection; LocalSystem services securely acquire the credential from a logged-on interactive session instead of presenting the rejected machine account.

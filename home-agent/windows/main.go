@@ -559,58 +559,48 @@ func (a *clientApp) run(smokeTest bool) error {
 								Title:         "Connection",
 								MinSize:       Size{Width: 580},
 								StretchFactor: 2,
-								Layout:        Grid{Columns: 4, Spacing: 7},
+								Layout:        Grid{Columns: 2, Spacing: 7},
 								Children: []Widget{
-									Label{Text: "Destination"},
+									Label{Text: "Destination", MinSize: Size{Width: 120}, MaxSize: Size{Width: 120}},
 									Composite{
-										ColumnSpan: 2,
-										Layout:     HBox{MarginsZero: true, Spacing: 7},
+										Layout: HBox{MarginsZero: true, Spacing: 4},
 										Children: []Widget{
 											ComboBox{
 												AssignTo:              &a.destinationList,
 												Model:                 destinationNames(a.cfg.Destinations),
-												MinSize:               Size{Width: 100},
 												MaxSize:               Size{Width: 110},
 												OnCurrentIndexChanged: a.destinationSelectionChanged,
 											},
-											LineEdit{AssignTo: &a.destinationEdit, CueBanner: "Work destination name", MinSize: Size{Width: 110}, StretchFactor: 1},
+											LineEdit{AssignTo: &a.destinationEdit, CueBanner: "Work destination name", StretchFactor: 1},
+											PushButton{AssignTo: &a.destinationAdd, Text: "Add", OnClicked: a.addDestination},
+											PushButton{AssignTo: &a.destinationRename, Text: "Rename", OnClicked: a.renameDestination},
+											PushButton{AssignTo: &a.destinationDelete, Text: "Delete", OnClicked: a.deleteDestination},
 										},
 									},
+									Label{Text: "Room name", MinSize: Size{Width: 120}, MaxSize: Size{Width: 120}},
+									LineEdit{AssignTo: &a.roomName, Text: defaultRoomName, CueBanner: defaultRoomName},
+									Label{Text: "Relay service base URLs", MinSize: Size{Width: 120}, MaxSize: Size{Width: 120}},
 									Composite{
-										MinSize: Size{Width: 193},
-										MaxSize: Size{Width: 193},
-										Layout:  HBox{MarginsZero: true, Spacing: 4},
-										Children: []Widget{
-											PushButton{AssignTo: &a.destinationAdd, Text: "Add", MinSize: Size{Width: 55}, MaxSize: Size{Width: 55}, OnClicked: a.addDestination},
-											PushButton{AssignTo: &a.destinationRename, Text: "Rename", MinSize: Size{Width: 70}, MaxSize: Size{Width: 70}, OnClicked: a.renameDestination},
-											PushButton{AssignTo: &a.destinationDelete, Text: "Delete", MinSize: Size{Width: 60}, MaxSize: Size{Width: 60}, OnClicked: a.deleteDestination},
-										},
-									},
-									Label{Text: "Room name"},
-									LineEdit{AssignTo: &a.roomName, Text: defaultRoomName, CueBanner: defaultRoomName, ColumnSpan: 3},
-									Label{Text: "Relay service base URLs"},
-									Composite{
-										ColumnSpan: 3,
-										Layout:     VBox{Spacing: 6},
+										Layout: VBox{MarginsZero: true, Spacing: 4},
 										Children: []Widget{
 											ListBox{
 												AssignTo:              &a.relayList,
 												Model:                 a.cfg.relayAddresses(),
-												MinSize:               Size{Height: 74},
+												MinSize:               Size{Height: 58},
 												OnCurrentIndexChanged: a.relaySelectionChanged,
 												OnMouseDown:           a.relayListMouseDown,
 												OnMouseMove:           a.relayListMouseMove,
 												OnMouseUp:             a.relayListMouseUp,
 											},
 											Composite{
-												Layout: Grid{Columns: 4, Spacing: 6},
+												Layout: Grid{Columns: 4, MarginsZero: true, Spacing: 6},
 												Children: []Widget{
 													Label{Text: "Selected URL"},
 													LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultAzureRelayBase, ColumnSpan: 3},
 												},
 											},
 											Composite{
-												Layout: Grid{Columns: 5, Spacing: 6},
+												Layout: Grid{Columns: 5, MarginsZero: true, Spacing: 6},
 												Children: []Widget{
 													PushButton{AssignTo: &a.relayAdd, Text: "Add", MinSize: Size{Height: 30}, OnClicked: a.addRelayURL},
 													PushButton{AssignTo: &a.relayUpdate, Text: "Update", MinSize: Size{Height: 30}, OnClicked: a.updateRelayURL},
@@ -623,7 +613,7 @@ func (a *clientApp) run(smokeTest bool) error {
 									},
 									GroupBox{
 										Title:      "RDP graphics decoding",
-										ColumnSpan: 4,
+										ColumnSpan: 2,
 										Layout:     Grid{Columns: 3, Spacing: 7},
 										Children: []Widget{
 											ComboBox{AssignTo: &a.rdpDecodingMode, Model: rdpDecodingModeLabels, CurrentIndex: rdpDecodingModeIndex(decodingMode), ColumnSpan: 2},
@@ -632,8 +622,8 @@ func (a *clientApp) run(smokeTest bool) error {
 										},
 									},
 									Composite{
-										ColumnSpan: 4,
-										Layout:     VBox{MarginsZero: true, Spacing: 7},
+										ColumnSpan: 2,
+										Layout:     VBox{MarginsZero: true, Spacing: 5},
 										Children: []Widget{
 											connectionPair(
 												"Local RDP address", LineEdit{AssignTo: &a.listenAddr, Text: a.cfg.ListenAddr, CueBanner: defaultListenAddr, StretchFactor: 1},
@@ -654,7 +644,7 @@ func (a *clientApp) run(smokeTest bool) error {
 										},
 									},
 									Composite{
-										ColumnSpan: 4,
+										ColumnSpan: 2,
 										Layout:     Grid{Columns: 4, Spacing: 6},
 										Children: []Widget{
 											PushButton{AssignTo: &a.connectButton, Text: "Connect", MinSize: Size{Height: 30}, OnClicked: func() { a.connectFromUI() }},
