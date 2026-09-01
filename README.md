@@ -2,7 +2,7 @@
 
 # DeskFerry
 
-DeskFerry is an outbound-only RDP, WinRM, SMB, and authenticated screen-view rendezvous tunnel for a work PC that cannot accept inbound connections. The current architecture uses an Azure App Service relay at `https://test-officialwebsite.azurewebsites.net/relay/` and an OCI Always Free fallback relay at `http://217.142.228.117/relay/`. The Azure relay implementation is .NET, the OCI relay implementation is a lightweight Go service, and a protocol-compatible Python/FastAPI relay is also available under `relay/python/`. The work-side Windows service and the Windows, macOS, and Android home agents connect out to relay web services over WebSockets.
+DeskFerry is an outbound-only RDP, WinRM, SMB, and authenticated screen-view rendezvous tunnel for a work PC that cannot accept inbound connections. The current architecture uses an Azure App Service relay at `https://test-officialwebsite.azurewebsites.net/relay/` and an OCI Always Free fallback relay at `http://217.142.228.117/relay/`. The Azure relay implementation is .NET, the OCI relay implementation is a lightweight Go service, and a protocol-compatible Python/FastAPI relay is also available under `relay/python/`. The work-side Windows service and the Windows, macOS, and Android home agents prefer outbound WebSockets and transparently use paired acknowledged HTTP `POST`/`GET` streams when a proxy rejects WebSocket setup.
 
 Home and Work profiles accept a room name plus one or more relay service base URLs in priority order. The first service is primary; later services are fallbacks. The agents append the profile room to each base URL at runtime. Existing full room-URL settings migrate automatically. New profiles are pre-filled with these two known relay services:
 
@@ -64,7 +64,7 @@ Home PC, Mac, or Android device
         v
 DeskFerry home agent
   Windows GUI, macOS control panel/CLI, or Android foreground service
-  outbound WebSocket over HTTPS
+  outbound WebSocket, or paired HTTP POST/GET streams
         |
         v
 Relay web service
@@ -73,7 +73,8 @@ Relay web service
         |
         v
 agent.exe Windows service
-  outbound WebSockets to one or more relay services, optionally through an HTTP or HTTPS proxy
+  outbound WebSocket or paired HTTP-stream connections to one or more relay services
+  optionally through an HTTP or HTTPS proxy
   RDP sockets   -> 127.0.0.1:3389
   WinRM sockets -> 127.0.0.1:5985 (when enabled)
   SMB sockets   -> 127.0.0.1:445 (when enabled)
@@ -87,7 +88,7 @@ Current agents negotiate resumable RDP streams with the relay. If an HTTP proxy 
 
 Resumption is enabled only when both paired endpoints send `X-DeskFerry-Resumable: 1`. Heartbeats are enabled only when the Home client requests `X-DeskFerry-Heartbeat: 1`, the Work agent confirms the `heartbeat` capability in its offer response, and the relay returns it in both typed `session-ready` results. This negotiation prevents new heartbeat frames from reaching an older peer during a rolling upgrade. Protocol v2 returns the random session ID in a typed `session-ready` result; legacy pairs use `start <session-id>`. Following an abnormal transport close or a heartbeat timeout, each endpoint reconnects with the `resume` role, the session ID, and its `agent` or `client` side. Normal closure, explicit completion, and authentication rejection are terminal and never enter the resume loop. If a relay process restarts and loses its in-memory rendezvous record, it reconstructs the session after both endpoints present the same random session ID, service, opposite sides, and valid room proof; stream offsets and replay data remain endpoint-owned and do not need relay persistence.
 
-The home app also keeps a lightweight `home-agent` presence WebSocket open while it is running. That presence socket lets the relay dashboard and home control panels show whether the home side is online; RDP data still flows only when a home agent starts a local listener and an RDP client connects to it.
+The home app also keeps a lightweight `home-agent` presence connection open while it is running, using the same WebSocket-first transport selection. That presence connection lets the relay dashboard and home control panels show whether the home side is online; RDP data still flows only when a home agent starts a local listener and an RDP client connects to it.
 
 The Android home app follows the same model. It runs a foreground service, listens on Android loopback, and lets a separate Android RDP client connect to `127.0.0.1:<port>` on the phone. The phone is not a relay and does not need inbound access from the internet.
 
@@ -281,7 +282,7 @@ Start the Windows home app, choose or create a named destination, enter its room
 .\deskferry-home-windows-amd64.exe -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk -relay-url http://217.142.228.117/relay/workdesk
 ```
 
-The app opens a friendly control panel and a notification-area icon. Enter the same room password once for the selected destination, then click `Connect` to start the local listeners and open Remote Desktop. The default RDP listener is `127.0.0.1:3390`, avoiding Windows' normal local RDP port `3389`. When a room credential is saved, the app also listens on `127.0.0.1:3391` for WinRM and opens one outbound WebSocket to the first reachable relay for each local connection.
+The app opens a friendly control panel and a notification-area icon. Enter the same room password once for the selected destination, then click `Connect` to start the local listeners and open Remote Desktop. The default RDP listener is `127.0.0.1:3390`, avoiding Windows' normal local RDP port `3389`. When a room credential is saved, the app also listens on `127.0.0.1:3391` for WinRM and opens one outbound relay transport to the first reachable service for each local connection. That transport prefers WebSocket and falls back to the paired HTTP streams described under [How It Works](#how-it-works).
 
 Click **Screen Viewer** to capture the Work computer's primary display without opening RDP. Capturing one display avoids presenting inactive or lock-screen-black secondary monitors as unused viewer space. The separate viewer supports one-shot capture, 0.5/1/2/5-second delta streams, stop, fullscreen, Auto Fit without scrollbars, manual zoom/pan, and saving the reconstructed image as PNG. On Windows it opens maximized for a large remote display, uses a fitted window for a smaller display, and remains focused until closed. The Work configurator must have screen viewing enabled for the same protected room.
 
@@ -370,7 +371,7 @@ Android writes the same daily diagnostics to the app-specific external-files `lo
 - `GET /relay/ws` and `GET /relay/{room}/ws` as WebSocket endpoints.
 - `POST /relay[/<room>]/stream/<id>/up` and `GET /relay[/<room>]/stream/<id>/down` as the acknowledged non-CONNECT fallback.
 
-WebSocket clients identify their role with:
+Relay clients identify their role with the same headers on either transport:
 
 ```text
 X-DeskFerry-Role: agent-control | agent-session | client | resume | agent | home-agent | probe | dashboard
@@ -453,7 +454,7 @@ Default behavior:
 - `-room <name>` plus repeatable `-relay-base-url <url>` configures the preferred pairing model.
 - `-relay-url <url>` selects a named room.
 - `-relay-url` can be repeated to add more relay URLs.
-- The service keeps one lightweight control WebSocket per configured relay URL and opens data sockets only for accepted requests.
+- The service keeps one lightweight WebSocket-first control transport per configured relay URL and opens data transports only for accepted requests.
 - A persistent local agent identity lets each relay replace stale control connections after reconnects or service restarts.
 - Live-session concurrency defaults to 32 and can be changed from 1 through 256 with the service environment variable `DESKFERRY_MAX_SESSIONS`.
 - `DESKFERRY_FORCE_LEGACY=1` temporarily restores four legacy slots per enabled service and relay for rollback.
@@ -513,8 +514,8 @@ The Windows package also includes:
 
 - A profile-oriented local control panel with the same room, ordered relay-base, connection, status, and screen-view workflows as Windows.
 - A foreground local RDP listener, normally `127.0.0.1:3389`.
-- One outbound `client` WebSocket per local RDP connection.
-- A persistent `home-agent` presence WebSocket while it runs.
+- One outbound WebSocket-first `client` transport per local RDP connection.
+- A persistent WebSocket-first `home-agent` presence transport while it runs.
 - A room name plus primary/fallback relay service base URLs for presence, status, and RDP stream connections.
 - `-status` for relay room status.
 - `-open-rdp` to write and open a local `.rdp` profile with the configured loopback target.
@@ -531,8 +532,8 @@ It provides:
 - A foreground service so the tunnel can keep running while another app is active.
 - A loopback RDP listener, normally `127.0.0.1:3389`.
 - A password-gated loopback SMB forward, normally `127.0.0.1:1445`, for Android file managers such as CX File Explorer that accept a custom SMB port.
-- One outbound `client` WebSocket per local RDP connection.
-- A persistent `home-agent` presence WebSocket while the service is running.
+- One outbound WebSocket-first `client` transport per local RDP connection.
+- A persistent WebSocket-first `home-agent` presence transport while the service is running.
 - A persistent `dashboard` WebSocket for real-time work-agent and stream status.
 - Named work-destination profiles, each with its own room and primary/fallback relay service base URL list for presence, status, and RDP stream connections.
 - Destination add, rename, delete, and selection controls, plus relay base URL add, inline edit, delete, button reorder, and drag reorder controls.
@@ -542,7 +543,7 @@ Good free Android RDP client options include Microsoft's Remote Desktop/Windows 
 
 ## Security Model
 
-- Work and home endpoints make outbound WebSocket connections only; use HTTPS/WSS whenever the relay supports it.
+- Work and home endpoints make outbound relay connections only. Native WebSocket is preferred; paired HTTP `POST`/`GET` streams are the fallback. Use HTTPS/WSS whenever the relay and proxy path support it.
 - The room name is the pairing key for an unprotected room. Protected rooms additionally require the room-scoped password proof set by the work agent.
 - Room passwords are not placed in URLs, service command lines, relay logs, or relay status. The work configurator stores the password as a machine-scope DPAPI blob; home profiles store only the derived proof.
 - A room proof is a bearer credential. Use a strong, unique room password and prefer `https://` relays. The plain-HTTP OCI fallback cannot protect a captured proof from interception and replay.
@@ -677,7 +678,7 @@ Rules:
 
 ### Diagnostic Logs
 
-DeskFerry records connection lifecycle details intended to make intermittent disconnects traceable across the home agent, work agent, and relay. Entries include relay selection and dialing, proxy use, WebSocket connection and close information, pairing identifiers, stream direction, byte and message counts, elapsed time, socket state, cancellation state, and errors. Credentials, proxy passwords, and RDP payload contents are not intentionally logged.
+DeskFerry records connection lifecycle details intended to make intermittent disconnects traceable across the home agent, work agent, and relay. Entries include relay selection and dialing, proxy use, selected WebSocket or HTTP-stream transport, connection and close information, pairing identifiers, stream direction, byte and message counts, elapsed time, socket state, cancellation state, and errors. Credentials, proxy passwords, and RDP payload contents are not intentionally logged.
 
 Go-based Windows and macOS agents use daily files named `home-agent-YYYY-MM-DD.log` or `work-agent-YYYY-MM-DD.log`. Android uses `home-agent-YYYY-MM-DD.log`. A daily file rotates to `.old` when it reaches 8 MiB. Expired daily and legacy log files are pruned at startup and on date rollover. The configured retention includes the current calendar day, so the default of 7 keeps today plus the previous six days.
 
@@ -720,7 +721,7 @@ $env:DESKFERRY_COMPAT_PROXY='direct'
 go test .\internal\tunnel -run TestExternalRelayResumption -count=1 -v -timeout 60s
 ```
 
-The test deliberately drops the relay transport and succeeds only if both sides reattach and continue the same logical stream. Deploying or restarting a 0.10.13-or-newer relay briefly replaces the WebSocket transports, then reconstructs authenticated resumable sessions from the two endpoint attachments. Older relays reject those attachments as unknown sessions and interrupt the local RDP connection.
+The test deliberately drops the relay transport and succeeds only if both sides reattach and continue the same logical stream. Deploying or restarting a 0.10.13-or-newer relay briefly replaces the active relay transports, then reconstructs authenticated resumable sessions from the two endpoint attachments. Older relays reject those attachments as unknown sessions and interrupt the local RDP connection.
 
 Agents cache successful relay DNS answers for the lifetime of the process. If a later DNS lookup fails transiently, reconnect attempts try the cached addresses while preserving the relay hostname for TLS validation. Session-end log entries include `end_initiator=local_rdp`, `end_initiator=relay`, or `end_initiator=both` to distinguish a local RDP socket close from a relay-side interruption.
 
@@ -853,9 +854,9 @@ Rebuild after Go agent/client/relay changes:
 ## Repository Layout
 
 ```text
-relay/azure-dotnet/      .NET Azure App Service WebSocket relay
-relay/go/                Go WebSocket relay used by the OCI VM deployment
-relay/python/            Python/FastAPI WebSocket relay
+relay/azure-dotnet/      .NET Azure App Service WebSocket/HTTP-stream relay
+relay/go/                Go WebSocket/HTTP-stream relay used by the OCI VM deployment
+relay/python/            Python/FastAPI WebSocket/HTTP-stream relay
 work-agent/windows/service
                          Windows service work-side agent
 work-agent/windows/configurator
@@ -867,7 +868,7 @@ home-agent/windows/network-service
                          Restricted Wintun/tun2socks SMB network service
 home-agent/macos         macOS control-panel and foreground CLI home agent
 home-agent/android       Android foreground-service home app
-internal/tunnel          WebSocket, proxy, pipe, and role helpers
+internal/tunnel          WebSocket, HTTP-stream, proxy, pipe, and role helpers
 build/                   build scripts
 ```
 
@@ -875,9 +876,9 @@ build/                   build scripts
 
 This repo currently contains:
 
-- Azure App Service WebSocket relay source and publish script.
-- Lightweight Go WebSocket relay source and Linux build artifact for OCI.
-- Protocol-compatible Python WebSocket relay source and publish script.
+- Azure App Service WebSocket/HTTP-stream relay source and publish script.
+- Lightweight Go WebSocket/HTTP-stream relay source and Linux build artifact for OCI.
+- Protocol-compatible Python WebSocket/HTTP-stream relay source and publish script.
 - Live dashboard with WebSocket status updates.
 - Named-room URL joining under `/relay/<room>`.
 - Windows work agent implemented as a Windows service deliverable.
