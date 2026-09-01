@@ -20,9 +20,45 @@ import (
 	"testing"
 	"time"
 
+	"deskferry/internal/tunnel"
+
 	"github.com/lxn/walk"
 	"golang.org/x/sys/windows"
 )
+
+func TestProxyHTTPStreamCapabilityPersistsAcrossStarts(t *testing.T) {
+	t.Setenv("APPDATA", t.TempDir())
+	proxySpec := "http://192.9.200.22:9090"
+	tunnel.ClearProxyHTTPStreamOnly(proxySpec)
+	defer tunnel.ClearProxyHTTPStreamOnly(proxySpec)
+
+	tunnel.MarkProxyHTTPStreamOnly(proxySpec)
+	if err := persistProxyCapabilitiesIfChanged(); err != nil {
+		t.Fatal(err)
+	}
+	tunnel.ClearProxyHTTPStreamOnly(proxySpec)
+	if tunnel.ProxyHTTPStreamOnly(proxySpec) {
+		t.Fatal("proxy capability remained in memory before reload")
+	}
+	if err := loadProxyCapabilities(); err != nil {
+		t.Fatal(err)
+	}
+	if !tunnel.ProxyHTTPStreamOnly(proxySpec) {
+		t.Fatal("saved HTTP-stream-only proxy capability was not restored")
+	}
+
+	path, err := proxyCapabilitiesPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte(proxySpec)) {
+		t.Fatalf("saved proxy capabilities do not contain %q: %s", proxySpec, data)
+	}
+}
 
 func TestRelayStatusClientReusesBoundedConnection(t *testing.T) {
 	var newConnections atomic.Int32

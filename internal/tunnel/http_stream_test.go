@@ -102,7 +102,7 @@ func TestHTTPStreamFallbackWithoutProxyCONNECT(t *testing.T) {
 	defer cancel()
 
 	accepted := make(chan struct{}, 1)
-	serverClosed := make(chan struct{}, 1)
+	serverClosed := make(chan struct{}, 4)
 	streams := NewHTTPStreamServer(func(ctx context.Context, conn MessageConn, _ *http.Request, _ string) {
 		defer func() { serverClosed <- struct{}{} }()
 		select {
@@ -152,6 +152,7 @@ func TestHTTPStreamFallbackWithoutProxyCONNECT(t *testing.T) {
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
 			connectAttempts.Add(1)
+			time.Sleep(5 * time.Second)
 			http.Error(w, "CONNECT is not allowed", http.StatusMethodNotAllowed)
 			return
 		}
@@ -200,6 +201,7 @@ func TestHTTPStreamFallbackWithoutProxyCONNECT(t *testing.T) {
 		_, _ = io.Copy(w, response.Body)
 	}))
 	defer proxy.Close()
+	defer ClearProxyHTTPStreamOnly(proxy.URL)
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
 	conn, err := DialMessageConnWithHeaders(dialCtx, origin.URL+"/relay/unit", proxy.URL, RoleProbe, "", nil)
@@ -210,6 +212,26 @@ func TestHTTPStreamFallbackWithoutProxyCONNECT(t *testing.T) {
 	// Dial contexts are handshake-only, matching native WebSocket behavior.
 	// Existing app callers cancel them immediately after a successful pair.
 	dialCancel()
+	if got := connectAttempts.Load(); got != 1 {
+		t.Fatalf("WebSocket CONNECT attempts = %d, want 1", got)
+	}
+
+	// A successful fallback remembers the proxy capability, so a subsequent
+	// RDP, WinRM, SMB, or presence connection does not repeat a WebSocket probe
+	// that this proxy is known to hold until its deadline.
+	preferredCtx, preferredCancel := context.WithTimeout(ctx, 2*time.Second)
+	preferred, err := DialMessageConnWithHeaders(preferredCtx, origin.URL+"/relay/unit", proxy.URL, RoleProbe, "", nil)
+	preferredCancel()
+	if err != nil {
+		t.Fatalf("dial remembered fallback: %v", err)
+	}
+	CloseMessageConn(preferred)
+	if got := connectAttempts.Load(); got != 1 {
+		t.Fatalf("remembered fallback repeated WebSocket CONNECT probe: attempts=%d", got)
+	}
+	if _, err := DialMessageConnWithHeaders(ctx, "https://relay.example/relay/unit", proxy.URL, RoleProbe, "", nil); err == nil || !strings.Contains(err.Error(), "requires CONNECT") {
+		t.Fatalf("remembered non-CONNECT proxy accepted HTTPS relay: %v", err)
+	}
 
 	select {
 	case <-accepted:

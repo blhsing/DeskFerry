@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.11.3 - 2026-09-01
+
+- Bound proxy WebSocket/CONNECT probes so a gateway that holds a rejected upgrade cannot consume the HTTP-stream fallback's entire setup budget.
+- Persist explicit proxies that have demonstrated a working plain-HTTP `POST`/`GET` fallback, letting later Home connections and process starts skip CONNECT and immediately bypass incompatible HTTPS relays.
+- Align the Room password field and Password options checkbox with the other Windows Home connection rows.
+
 ## 0.11.2 - 2026-09-01
 
 - Rework the Windows Home connection form as a DPI-safe two-column layout so labels sit beside full-width fields and destination and relay controls no longer clip at display scaling.

@@ -37,6 +37,53 @@ func TestExternalHTTPProxyAuthentication(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
+// TestExternalRelayProxyFallbackSelection verifies automatic WebSocket-first
+// selection through a real proxy, then confirms the learned proxy capability
+// makes a second connection go directly to the acknowledged HTTP transport.
+func TestExternalRelayProxyFallbackSelection(t *testing.T) {
+	baseURL := strings.TrimRight(os.Getenv("DESKFERRY_COMPAT_RELAY_URL"), "/")
+	proxySpec := strings.TrimSpace(os.Getenv("DESKFERRY_COMPAT_PROXY"))
+	if baseURL == "" || proxySpec == "" || strings.EqualFold(proxySpec, "direct") {
+		t.Skip("DESKFERRY_COMPAT_RELAY_URL and DESKFERRY_COMPAT_PROXY are not set")
+	}
+	ClearProxyHTTPStreamOnly(proxySpec)
+	defer ClearProxyHTTPStreamOnly(proxySpec)
+	relayAddr := baseURL + "/relay/compat-proxy-" + time.Now().Format("150405.000000")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	first, err := DialMessageConn(ctx, relayAddr, proxySpec, RoleProbe, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstElapsed := time.Since(started)
+	firstProtocol := MessageConnProtocol(first)
+	CloseMessageConn(first)
+	if firstProtocol != "http-stream" {
+		t.Fatalf("first protocol = %q, want http-stream", firstProtocol)
+	}
+	if !ProxyHTTPStreamOnly(proxySpec) {
+		t.Fatal("successful proxy fallback did not record HTTP-stream-only capability")
+	}
+
+	started = time.Now()
+	second, err := DialMessageConn(ctx, relayAddr, proxySpec, RoleProbe, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondElapsed := time.Since(started)
+	secondProtocol := MessageConnProtocol(second)
+	CloseMessageConn(second)
+	if secondProtocol != "http-stream" {
+		t.Fatalf("second protocol = %q, want http-stream", secondProtocol)
+	}
+	if secondElapsed >= firstElapsed {
+		t.Fatalf("remembered fallback did not improve setup: first=%s second=%s", firstElapsed, secondElapsed)
+	}
+	t.Logf("proxy fallback selected first=%s second=%s", firstElapsed, secondElapsed)
+}
+
 // TestExternalRelayResumption is opt-in so the same protocol probe can run
 // against the Azure, Go, or Python relay implementation during release checks.
 func TestExternalRelayResumption(t *testing.T) {

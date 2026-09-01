@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"deskferry/internal/buildinfo"
 
@@ -27,6 +28,14 @@ type dnsFallbackDialer struct {
 }
 
 var resilientDNSDialer = newDNSFallbackDialer()
+
+const (
+	webSocketFallbackProbeTimeout = 4 * time.Second
+	httpStreamFallbackReserve     = 2 * time.Second
+	httpStreamPreferredDialLimit  = 6 * time.Second
+)
+
+var httpStreamOnlyProxies sync.Map
 
 func newDNSFallbackDialer() *dnsFallbackDialer {
 	var dialer net.Dialer
@@ -343,8 +352,27 @@ func DialMessageConn(ctx context.Context, relayAddr, proxySpec, role, token stri
 }
 
 func DialMessageConnWithHeaders(ctx context.Context, relayAddr, proxySpec, role, token string, extraHeaders http.Header) (MessageConn, error) {
-	ws, wsErr := DialWebSocketWithHeaders(ctx, relayAddr, proxySpec, role, token, extraHeaders)
+	if ProxyHTTPStreamOnly(proxySpec) {
+		if relayRequiresProxyCONNECT(relayAddr) {
+			return nil, fmt.Errorf("proxy %s is recorded as HTTP-stream-only; HTTPS relay %s requires CONNECT", ProxySpecForLog(proxySpec), relayAddr)
+		}
+		streamCtx, cancel := context.WithTimeout(ctx, httpStreamPreferredDialLimit)
+		stream, streamErr := DialHTTPStreamWithHeaders(streamCtx, relayAddr, proxySpec, role, token, extraHeaders)
+		cancel()
+		if streamErr == nil {
+			return stream, nil
+		}
+		ClearProxyHTTPStreamOnly(proxySpec)
+		if ctx.Err() != nil {
+			return nil, streamErr
+		}
+	}
+
+	wsCtx, cancelWS := webSocketFallbackProbeContext(ctx, proxySpec)
+	ws, wsErr := DialWebSocketWithHeaders(wsCtx, relayAddr, proxySpec, role, token, extraHeaders)
+	cancelWS()
 	if wsErr == nil {
+		ClearProxyHTTPStreamOnly(proxySpec)
 		return ws, nil
 	}
 	if !shouldTryHTTPStreamFallback(proxySpec, wsErr) {
@@ -354,7 +382,97 @@ func DialMessageConnWithHeaders(ctx context.Context, relayAddr, proxySpec, role,
 	if streamErr != nil {
 		return nil, fmt.Errorf("websocket transport failed (%v); HTTP stream fallback failed: %w", wsErr, streamErr)
 	}
+	if !relayRequiresProxyCONNECT(relayAddr) {
+		MarkProxyHTTPStreamOnly(proxySpec)
+	}
 	return stream, nil
+}
+
+func webSocketFallbackProbeContext(ctx context.Context, proxySpec string) (context.Context, context.CancelFunc) {
+	spec := strings.TrimSpace(proxySpec)
+	if spec == "" || strings.EqualFold(spec, "direct") {
+		return context.WithCancel(ctx)
+	}
+	budget := webSocketFallbackProbeTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return context.WithCancel(ctx)
+		}
+		if remaining <= webSocketFallbackProbeTimeout+httpStreamFallbackReserve {
+			budget = remaining / 2
+		} else if available := remaining - httpStreamFallbackReserve; available < budget {
+			budget = available
+		}
+	}
+	if budget <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, budget)
+}
+
+func relayRequiresProxyCONNECT(relayAddr string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(relayAddr))
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "https", "wss":
+		return true
+	default:
+		return false
+	}
+}
+
+// MarkProxyHTTPStreamOnly records that an explicit proxy has demonstrated a
+// working plain-HTTP POST/GET path after failing WebSocket setup. Callers may
+// persist ProxyHTTPStreamOnlyKeys and restore them on the next process start.
+func MarkProxyHTTPStreamOnly(proxySpec string) {
+	if key, ok := proxyCapabilityKey(proxySpec); ok {
+		httpStreamOnlyProxies.Store(key, struct{}{})
+	}
+}
+
+func ClearProxyHTTPStreamOnly(proxySpec string) {
+	if key, ok := proxyCapabilityKey(proxySpec); ok {
+		httpStreamOnlyProxies.Delete(key)
+	}
+}
+
+func ProxyHTTPStreamOnly(proxySpec string) bool {
+	key, ok := proxyCapabilityKey(proxySpec)
+	if !ok {
+		return false
+	}
+	_, ok = httpStreamOnlyProxies.Load(key)
+	return ok
+}
+
+func ProxyHTTPStreamOnlyKeys() []string {
+	keys := make([]string, 0)
+	httpStreamOnlyProxies.Range(func(key, _ any) bool {
+		if value, ok := key.(string); ok {
+			keys = append(keys, value)
+		}
+		return true
+	})
+	return keys
+}
+
+func proxyCapabilityKey(proxySpec string) (string, bool) {
+	spec := strings.TrimSpace(proxySpec)
+	if spec == "" || strings.EqualFold(spec, "direct") || strings.EqualFold(spec, "env") || strings.EqualFold(spec, "auto") {
+		return "", false
+	}
+	parsed, err := url.Parse(spec)
+	if err != nil || parsed.Host == "" || parsed.User != nil {
+		return "", false
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	return scheme + "://" + strings.ToLower(parsed.Host), true
 }
 
 func shouldTryHTTPStreamFallback(proxySpec string, err error) bool {

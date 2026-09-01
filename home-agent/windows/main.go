@@ -283,6 +283,9 @@ func main() {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(1)
 	}
+	if err := loadProxyCapabilities(); err != nil {
+		log.Printf("load saved proxy capabilities: %v", err)
+	}
 	if err := selectDestinationConfig(&cfg, destinationFlag); err != nil {
 		log.Fatal(err)
 	}
@@ -630,8 +633,8 @@ func (a *clientApp) run(smokeTest bool) error {
 												"Proxy", LineEdit{AssignTo: &a.proxy, Text: a.cfg.Proxy, CueBanner: "env, direct, or http(s)://host:port", StretchFactor: 1},
 											),
 											connectionPair(
-												"Room password", LineEdit{AssignTo: &a.roomPass, PasswordMode: true, CueBanner: "optional room password", MinSize: Size{Width: 162}, MaxSize: Size{Width: 162}, StretchFactor: 1},
-												"Password options", CheckBox{AssignTo: &a.clearRoomPassword, Text: "Clear saved room credential", StretchFactor: 1},
+												"Room password", LineEdit{AssignTo: &a.roomPass, PasswordMode: true, CueBanner: "optional room password", StretchFactor: 1},
+												"Password options", CheckBox{AssignTo: &a.clearRoomPassword, Text: "Clear saved room credential", Alignment: AlignHNearVCenter, StretchFactor: 1},
 											),
 											connectionPair(
 												"Windows username", LineEdit{AssignTo: &a.rdpUser, Text: a.cfg.RDPUser, CueBanner: `DOMAIN\user or user@example.com`, StretchFactor: 1},
@@ -2479,6 +2482,9 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 			}
 			if err == nil {
 				cancel()
+				if persistErr := persistProxyCapabilitiesIfChanged(); persistErr != nil {
+					log.Printf("save proxy capability: %v", persistErr)
+				}
 				relayProtocol := "legacy"
 				if ready.ProtocolV2 {
 					relayProtocol = "v2"
@@ -2492,6 +2498,9 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 			}
 			cancel()
 			tunnel.CloseMessageConn(ws)
+			if persistErr := persistProxyCapabilitiesIfChanged(); persistErr != nil {
+				log.Printf("save proxy capability: %v", persistErr)
+			}
 			elapsed := time.Since(attemptStarted).Round(time.Millisecond)
 			log.Printf("relay attempt failed relay=%s service=%s elapsed=%s result=%s error=%v", relayAddr, service, elapsed, relayAttemptResult(err), err)
 			errs = append(errs, fmt.Sprintf("%s after %s: %v", relayAddr, elapsed, err))
@@ -2786,6 +2795,9 @@ func dialWebSocketFallback(ctx context.Context, cfg config, role string) (tunnel
 			headers.Set(tunnel.HeaderRoomProof, proof)
 		}
 		conn, err := tunnel.DialMessageConnWithHeaders(ctx, relayAddr, cfg.Proxy, role, "", headers)
+		if persistErr := persistProxyCapabilitiesIfChanged(); persistErr != nil {
+			log.Printf("save proxy capability: %v", persistErr)
+		}
 		if err == nil {
 			return conn, relayAddr, nil
 		}
