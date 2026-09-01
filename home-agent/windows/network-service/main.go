@@ -348,7 +348,7 @@ func dialSMBRelay(ctx context.Context, cfg homenetwork.Config) (net.Conn, string
 		tunnel.AddHeartbeatHeader(headers)
 		headers.Set(tunnel.HeaderRoomProof, cfg.RoomProof)
 		tunnel.AddServiceHeader(headers, tunnel.ServiceSMB)
-		ws, err := tunnel.DialWebSocketWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
+		ws, err := tunnel.DialMessageConnWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
 		if err != nil {
 			cancel()
 			log.Printf("relay attempt failed relay=%s service=%s elapsed=%s result=transport-failure error=%v", relayAddr, tunnel.ServiceSMB, time.Since(attemptStarted).Round(time.Millisecond), err)
@@ -358,7 +358,7 @@ func dialSMBRelay(ctx context.Context, cfg homenetwork.Config) (net.Conn, string
 		ready, err := tunnel.AwaitSessionReadyCompatibleInfo(attemptCtx, ws)
 		if err != nil {
 			cancel()
-			tunnel.CloseWebSocket(ws)
+			tunnel.CloseMessageConn(ws)
 			log.Printf("relay attempt failed relay=%s service=%s elapsed=%s error=%v", relayAddr, tunnel.ServiceSMB, time.Since(attemptStarted).Round(time.Millisecond), err)
 			failures = append(failures, fmt.Errorf("%s: %w", relayAddr, err))
 			var rejected *tunnel.SessionResultError
@@ -372,7 +372,7 @@ func dialSMBRelay(ctx context.Context, cfg homenetwork.Config) (net.Conn, string
 		if ready.SessionID != "" {
 			return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: ready.SessionID, Side: "client", RoomProof: cfg.RoomProof, Service: tunnel.ServiceSMB, Heartbeat: ready.Heartbeat}), relayAddr, nil
 		}
-		return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil
+		return tunnel.MessageNetConn(ctx, ws), relayAddr, nil
 	}
 	return nil, "", fmt.Errorf("no relay could open the SMB room: %w", errors.Join(failures...))
 }

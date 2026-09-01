@@ -27,7 +27,6 @@ import (
 	. "github.com/lxn/walk/declarative"
 	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
-	"nhooyr.io/websocket"
 
 	"deskferry/internal/buildinfo"
 	"deskferry/internal/diaglog"
@@ -1936,7 +1935,7 @@ func (a *clientApp) homePresenceLoop(ctx context.Context, cfg config) {
 			a.setHomePresence("Online")
 			a.appendLog("Home status connected to %s.", relayAddr)
 			_, _, err = conn.Read(ctx)
-			tunnel.CloseWebSocket(conn)
+			tunnel.CloseMessageConn(conn)
 			if ctx.Err() != nil {
 				return
 			}
@@ -2457,7 +2456,7 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 				headers.Set(tunnel.HeaderRoomProof, proof)
 			}
 			tunnel.AddServiceHeader(headers, service)
-			ws, err := tunnel.DialWebSocketWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
+			ws, err := tunnel.DialMessageConnWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
 			ready := tunnel.SessionReadyInfo{}
 			if err == nil {
 				if service == tunnel.ServiceScreen {
@@ -2472,10 +2471,10 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 				if ready.SessionID != "" && service != tunnel.ServiceScreen {
 					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: ready.SessionID, Side: "client", RoomProof: cfg.roomProof(), Service: service, Heartbeat: ready.Heartbeat}), relayAddr, nil
 				}
-				return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil
+				return tunnel.MessageNetConn(ctx, ws), relayAddr, nil
 			}
 			cancel()
-			tunnel.CloseWebSocket(ws)
+			tunnel.CloseMessageConn(ws)
 			elapsed := time.Since(attemptStarted).Round(time.Millisecond)
 			log.Printf("relay attempt failed relay=%s service=%s elapsed=%s result=%s error=%v", relayAddr, service, elapsed, relayAttemptResult(err), err)
 			errs = append(errs, fmt.Sprintf("%s after %s: %v", relayAddr, elapsed, err))
@@ -2762,14 +2761,14 @@ func (c config) roomProof() string {
 	return c.RoomProof
 }
 
-func dialWebSocketFallback(ctx context.Context, cfg config, role string) (*websocket.Conn, string, error) {
+func dialWebSocketFallback(ctx context.Context, cfg config, role string) (tunnel.MessageConn, string, error) {
 	var errs []string
 	for _, relayAddr := range cfg.relayAddresses() {
 		headers := http.Header{}
 		if proof := cfg.roomProof(); proof != "" {
 			headers.Set(tunnel.HeaderRoomProof, proof)
 		}
-		conn, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, cfg.Proxy, role, "", headers)
+		conn, err := tunnel.DialMessageConnWithHeaders(ctx, relayAddr, cfg.Proxy, role, "", headers)
 		if err == nil {
 			return conn, relayAddr, nil
 		}

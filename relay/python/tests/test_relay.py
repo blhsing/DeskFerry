@@ -2,9 +2,21 @@ import json
 import asyncio
 
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 from starlette.websockets import WebSocketState
 
-from app import AgentIdentity, RELAY_VERSION, RelayHub, app, room_id
+from app import (
+    AgentIdentity,
+    HTTP_STREAM_ACK,
+    HTTP_STREAM_BINARY,
+    HTTP_STREAM_TEXT,
+    HTTPStreamFrame,
+    HTTPStreamWebSocket,
+    RELAY_VERSION,
+    RelayHub,
+    app,
+    room_id,
+)
 
 
 class FakeWebSocket:
@@ -79,6 +91,37 @@ def test_icon_endpoint():
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("image/svg+xml")
     assert "<svg" in response.text
+
+
+def test_http_stream_sequence_ack_and_duplicate_suppression():
+    async def scenario():
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/relay/unit/stream/id/down",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 12345),
+            "server": ("127.0.0.1", 80),
+            "scheme": "http",
+        })
+        stream = HTTPStreamWebSocket(request, "s" * 32)
+        await stream.apply(HTTPStreamFrame(HTTP_STREAM_TEXT, 1, b"one"))
+        await stream.apply(HTTPStreamFrame(HTTP_STREAM_TEXT, 1, b"one"))
+        assert await stream.receive_text() == "one"
+        assert stream.incoming.empty()
+
+        await stream.send_bytes(b"two")
+        frames, ack = await stream.snapshot(0)
+        assert ack == 1
+        assert [(frame.kind, frame.sequence, frame.payload) for frame in frames] == [
+            (HTTP_STREAM_BINARY, 1, b"two")
+        ]
+        await stream.apply(HTTPStreamFrame(HTTP_STREAM_ACK, 1))
+        frames, _ = await stream.snapshot(0)
+        assert frames == []
+
+    asyncio.run(scenario())
 
 
 def test_home_agent_status_presence():

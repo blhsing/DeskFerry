@@ -130,7 +130,7 @@ func (h *Hub) runTarget(ctx context.Context, target Target, next uint64) {
 			tunnel.AddRoomPasswordHeader(headers, target.RelayAddr, "", target.RoomPassword)
 		}
 		dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		conn, err := tunnel.DialWebSocketWithHeaders(dialCtx, target.RelayAddr, target.Proxy, tunnel.RoleDiagnosticLog, "", headers)
+		conn, err := tunnel.DialMessageConnWithHeaders(dialCtx, target.RelayAddr, target.Proxy, tunnel.RoleDiagnosticLog, "", headers)
 		cancel()
 		if err != nil {
 			if !wait(ctx, backoff, h.notify) {
@@ -141,7 +141,7 @@ func (h *Hub) runTarget(ctx context.Context, target Target, next uint64) {
 		}
 		backoff = time.Second
 		next = h.upload(ctx, conn, next)
-		tunnel.CloseWebSocket(conn)
+		tunnel.CloseMessageConn(conn)
 		if !wait(ctx, backoff, h.notify) {
 			return
 		}
@@ -155,7 +155,7 @@ type acknowledgement struct {
 	Accepted int `json:"accepted"`
 }
 
-func (h *Hub) upload(ctx context.Context, conn *websocket.Conn, next uint64) uint64 {
+func (h *Hub) upload(ctx context.Context, conn tunnel.MessageConn, next uint64) uint64 {
 	for ctx.Err() == nil {
 		entries, first := h.batch(next)
 		if len(entries) == 0 {

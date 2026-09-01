@@ -87,7 +87,7 @@ func AddHeartbeatHeader(headers http.Header) {
 	headers.Set(HeaderHeartbeat, "1")
 }
 
-func WriteControlMessage(ctx context.Context, c *websocket.Conn, message ControlMessage) error {
+func WriteControlMessage(ctx context.Context, c MessageConn, message ControlMessage) error {
 	payload, err := json.Marshal(message)
 	if err != nil {
 		return err
@@ -95,7 +95,7 @@ func WriteControlMessage(ctx context.Context, c *websocket.Conn, message Control
 	return c.Write(ctx, websocket.MessageText, payload)
 }
 
-func ReadControlMessage(ctx context.Context, c *websocket.Conn) (ControlMessage, error) {
+func ReadControlMessage(ctx context.Context, c MessageConn) (ControlMessage, error) {
 	for {
 		typ, payload, err := c.Read(ctx)
 		if err != nil {
@@ -115,7 +115,7 @@ func ReadControlMessage(ctx context.Context, c *websocket.Conn) (ControlMessage,
 	}
 }
 
-func AwaitControlReady(ctx context.Context, c *websocket.Conn) error {
+func AwaitControlReady(ctx context.Context, c MessageConn) error {
 	message, err := ReadControlMessage(ctx, c)
 	if err != nil {
 		return fmt.Errorf("wait for control channel: %w", err)
@@ -126,40 +126,40 @@ func AwaitControlReady(ctx context.Context, c *websocket.Conn) error {
 	return nil
 }
 
-func AwaitSessionReady(ctx context.Context, c *websocket.Conn) (string, error) {
+func AwaitSessionReady(ctx context.Context, c MessageConn) (string, error) {
 	info, err := AwaitSessionReadyInfoResult(ctx, c)
 	return info.SessionID, err
 }
 
-func AwaitSessionReadyInfoResult(ctx context.Context, c *websocket.Conn) (SessionReadyInfo, error) {
+func AwaitSessionReadyInfoResult(ctx context.Context, c MessageConn) (SessionReadyInfo, error) {
 	return awaitSessionReadyCompatibleInfoService(ctx, c, "")
 }
 
 // AwaitSessionReadyCompatible accepts a protocol-v2 result or the legacy
 // "start" control frame. It allows upgraded Home clients to operate through a
 // relay that is still paired with rollback-mode work-agent slots.
-func AwaitSessionReadyCompatible(ctx context.Context, c *websocket.Conn) (string, bool, error) {
+func AwaitSessionReadyCompatible(ctx context.Context, c MessageConn) (string, bool, error) {
 	info, err := AwaitSessionReadyCompatibleInfo(ctx, c)
 	return info.SessionID, info.ProtocolV2, err
 }
 
-func AwaitSessionReadyCompatibleInfo(ctx context.Context, c *websocket.Conn) (SessionReadyInfo, error) {
+func AwaitSessionReadyCompatibleInfo(ctx context.Context, c MessageConn) (SessionReadyInfo, error) {
 	return awaitSessionReadyCompatibleInfoService(ctx, c, "")
 }
 
 // AwaitSessionReadyCompatibleService additionally requires a protocol-v2
 // relay to echo the requested service. New services use this to avoid being
 // silently mapped to RDP by an older relay.
-func AwaitSessionReadyCompatibleService(ctx context.Context, c *websocket.Conn, expectedService string) (string, bool, error) {
+func AwaitSessionReadyCompatibleService(ctx context.Context, c MessageConn, expectedService string) (string, bool, error) {
 	info, err := AwaitSessionReadyCompatibleServiceInfo(ctx, c, expectedService)
 	return info.SessionID, info.ProtocolV2, err
 }
 
-func AwaitSessionReadyCompatibleServiceInfo(ctx context.Context, c *websocket.Conn, expectedService string) (SessionReadyInfo, error) {
+func AwaitSessionReadyCompatibleServiceInfo(ctx context.Context, c MessageConn, expectedService string) (SessionReadyInfo, error) {
 	return awaitSessionReadyCompatibleInfoService(ctx, c, strings.ToLower(strings.TrimSpace(expectedService)))
 }
 
-func awaitSessionReadyCompatibleInfoService(ctx context.Context, c *websocket.Conn, expectedService string) (SessionReadyInfo, error) {
+func awaitSessionReadyCompatibleInfoService(ctx context.Context, c MessageConn, expectedService string) (SessionReadyInfo, error) {
 	for {
 		typ, payload, err := c.Read(ctx)
 		if err != nil {

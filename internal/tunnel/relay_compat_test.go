@@ -132,6 +132,75 @@ func TestExternalRelayV2OnDemand(t *testing.T) {
 	compatTransfer(t, ctx, clientStream, agentStream, []byte("protocol-v2"))
 }
 
+// TestExternalRelayHTTPStreamV2 exercises the non-CONNECT wire protocol
+// directly so every relay implementation is checked against the shared Go
+// client without depending on a particular forward-proxy test harness.
+func TestExternalRelayHTTPStreamV2(t *testing.T) {
+	baseURL := strings.TrimRight(os.Getenv("DESKFERRY_COMPAT_RELAY_URL"), "/")
+	if baseURL == "" {
+		t.Skip("DESKFERRY_COMPAT_RELAY_URL is not set")
+	}
+	proxySpec := strings.TrimSpace(os.Getenv("DESKFERRY_COMPAT_PROXY"))
+	if proxySpec == "" {
+		proxySpec = "direct"
+	}
+	room := "compat-http-" + time.Now().Format("150405.000000")
+	relayAddr := baseURL + "/relay/" + room
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	controlHeaders := http.Header{}
+	AddProtocolV2Header(controlHeaders)
+	controlHeaders.Set(HeaderAgentInstance, "compat-http-agent")
+	controlHeaders.Set(HeaderAgentServices, ServiceRDP)
+	controlHeaders.Set(HeaderConcurrency, "2")
+	control, err := DialHTTPStreamWithHeaders(ctx, relayAddr, proxySpec, RoleAgentControl, "", controlHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseMessageConn(control)
+	if err := AwaitControlReady(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+
+	clientHeaders := http.Header{}
+	AddProtocolV2Header(clientHeaders)
+	AddServiceHeader(clientHeaders, ServiceRDP)
+	client, err := DialHTTPStreamWithHeaders(ctx, relayAddr, proxySpec, RoleClient, "", clientHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseMessageConn(client)
+	offer, err := ReadControlMessage(ctx, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateSessionOffer(offer, room, "compat-http-agent", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteControlMessage(ctx, control, ControlMessage{Type: MessageAccept, SessionID: offer.SessionID}); err != nil {
+		t.Fatal(err)
+	}
+
+	agentHeaders := http.Header{}
+	AddProtocolV2Header(agentHeaders)
+	agentHeaders.Set(HeaderAgentInstance, "compat-http-agent")
+	agentHeaders.Set(HeaderSessionID, offer.SessionID)
+	AddServiceHeader(agentHeaders, ServiceRDP)
+	agent, err := DialHTTPStreamWithHeaders(ctx, relayAddr, proxySpec, RoleAgentSession, "", agentHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseMessageConn(agent)
+	if _, err := AwaitSessionReady(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := AwaitSessionReadyCompatible(ctx, client); err != nil {
+		t.Fatal(err)
+	}
+	compatTransfer(t, ctx, MessageNetConn(ctx, client), MessageNetConn(ctx, agent), []byte("http-stream-v2"))
+}
+
 func TestExternalRelayLegacyClientThroughV2Control(t *testing.T) {
 	baseURL := strings.TrimRight(os.Getenv("DESKFERRY_COMPAT_RELAY_URL"), "/")
 	if baseURL == "" {

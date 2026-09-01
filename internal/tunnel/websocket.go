@@ -314,17 +314,17 @@ func SplitRelayRoomURLs(relayAddrs []string) ([]string, string, error) {
 }
 
 func DialWebSocketStream(ctx context.Context, relayAddr, proxySpec, role, token string) (net.Conn, error) {
-	c, err := DialWebSocket(ctx, relayAddr, proxySpec, role, token)
+	c, err := DialMessageConn(ctx, relayAddr, proxySpec, role, token)
 	if err != nil {
 		return nil, err
 	}
 	if role == RoleClient {
 		if err := AwaitWebSocketStart(ctx, c); err != nil {
-			CloseWebSocket(c)
+			CloseMessageConn(c)
 			return nil, err
 		}
 	}
-	return WebSocketNetConn(ctx, c), nil
+	return MessageNetConn(ctx, c), nil
 }
 
 func WebSocketNetConn(ctx context.Context, c *websocket.Conn) net.Conn {
@@ -333,6 +333,42 @@ func WebSocketNetConn(ctx context.Context, c *websocket.Conn) net.Conn {
 
 func DialWebSocket(ctx context.Context, relayAddr, proxySpec, role, token string) (*websocket.Conn, error) {
 	return DialWebSocketWithHeaders(ctx, relayAddr, proxySpec, role, token, nil)
+}
+
+// DialMessageConn prefers the native WebSocket transport and falls back to a
+// reconnecting HTTP POST/GET pair when an explicit or environment proxy cannot
+// establish the WebSocket tunnel.
+func DialMessageConn(ctx context.Context, relayAddr, proxySpec, role, token string) (MessageConn, error) {
+	return DialMessageConnWithHeaders(ctx, relayAddr, proxySpec, role, token, nil)
+}
+
+func DialMessageConnWithHeaders(ctx context.Context, relayAddr, proxySpec, role, token string, extraHeaders http.Header) (MessageConn, error) {
+	ws, wsErr := DialWebSocketWithHeaders(ctx, relayAddr, proxySpec, role, token, extraHeaders)
+	if wsErr == nil {
+		return ws, nil
+	}
+	if !shouldTryHTTPStreamFallback(proxySpec, wsErr) {
+		return nil, wsErr
+	}
+	stream, streamErr := DialHTTPStreamWithHeaders(ctx, relayAddr, proxySpec, role, token, extraHeaders)
+	if streamErr != nil {
+		return nil, fmt.Errorf("websocket transport failed (%v); HTTP stream fallback failed: %w", wsErr, streamErr)
+	}
+	return stream, nil
+}
+
+func shouldTryHTTPStreamFallback(proxySpec string, err error) bool {
+	spec := strings.TrimSpace(proxySpec)
+	if err == nil || spec == "" || strings.EqualFold(spec, "direct") {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	if strings.Contains(text, "http 401") || strings.Contains(text, "http 403") && !strings.Contains(text, "proxy") {
+		return false
+	}
+	return strings.Contains(text, "proxy connect") ||
+		strings.Contains(text, "websocket dial failed") ||
+		strings.Contains(text, "status code 101")
 }
 
 func DialWebSocketWithHeaders(ctx context.Context, relayAddr, proxySpec, role, token string, extraHeaders http.Header) (*websocket.Conn, error) {
@@ -371,18 +407,18 @@ func DialWebSocketWithHeaders(ctx context.Context, relayAddr, proxySpec, role, t
 	return c, nil
 }
 
-func AwaitWebSocketStart(ctx context.Context, c *websocket.Conn) error {
+func AwaitWebSocketStart(ctx context.Context, c MessageConn) error {
 	_, err := AwaitWebSocketStartSession(ctx, c)
 	return err
 }
 
 // AwaitWebSocketStartSession waits for relay pairing and returns the optional
 // resumable session identifier negotiated by upgraded peers.
-func AwaitWebSocketStartSession(ctx context.Context, c *websocket.Conn) (string, error) {
+func AwaitWebSocketStartSession(ctx context.Context, c MessageConn) (string, error) {
 	return awaitWebSocketControl(ctx, c, webSocketStartMessage)
 }
 
-func AwaitWebSocketResume(ctx context.Context, c *websocket.Conn, sessionID string) error {
+func AwaitWebSocketResume(ctx context.Context, c MessageConn, sessionID string) error {
 	got, err := awaitWebSocketControl(ctx, c, webSocketResumeMessage)
 	if err != nil {
 		return err
@@ -393,7 +429,7 @@ func AwaitWebSocketResume(ctx context.Context, c *websocket.Conn, sessionID stri
 	return nil
 }
 
-func awaitWebSocketControl(ctx context.Context, c *websocket.Conn, command string) (string, error) {
+func awaitWebSocketControl(ctx context.Context, c MessageConn, command string) (string, error) {
 	readCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	for {
@@ -415,6 +451,13 @@ func awaitWebSocketControl(ctx context.Context, c *websocket.Conn, command strin
 }
 
 func CloseWebSocket(c *websocket.Conn) {
+	if c == nil {
+		return
+	}
+	_ = c.Close(websocket.StatusNormalClosure, "")
+}
+
+func CloseMessageConn(c MessageConn) {
 	if c == nil {
 		return
 	}

@@ -1,5 +1,13 @@
 # Release Notes
 
+## 0.11.0 - 2026-09-01
+
+- Fall back automatically to a pair of persistent HTTP streams when a configured forward proxy rejects the WebSocket `CONNECT` path: a chunked `POST` carries upstream messages and a streaming `GET` carries downstream messages.
+- Reconnect either HTTP half independently with sequence acknowledgements, bounded replay buffers, duplicate suppression, and keepalive records; automatically rotate an unacknowledged upload so managed front ends that buffer chunked requests release the batch.
+- Preserve control, presence, diagnostic, RDP, WinRM, SMB, screen, and resumable-session messages across proxy timeouts.
+- Add the compatible HTTP-stream endpoint to the Azure .NET, OCI Go, and Python relays, and use the fallback from the Windows Work agent plus Windows, macOS, and Android Home clients.
+- Keep native WebSockets as the preferred transport and retain `-proxy direct` as the explicit bypass; HTTPS relays still require a proxy capable of `CONNECT`, so a non-CONNECT path must use a configured plain-HTTP relay such as the OCI fallback.
+
 ## 0.10.22 - 2026-08-30
 
 - Make the Azure relay notify both endpoints with a service-restart close frame before aborting an interrupted resumable bridge, so the surviving endpoint immediately reattaches instead of remaining unaware behind IIS or an Azure frontend until RDP disconnects.

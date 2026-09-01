@@ -32,6 +32,7 @@ if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("WEBSITE_INSTA
     }
 }
 builder.Services.AddSingleton<RelayHub>();
+builder.Services.AddSingleton<HttpStreamRegistry>();
 
 var app = builder.Build();
 app.Logger.LogInformation("DeskFerry Azure relay version={Version}", RelayBuildInfo.Version);
@@ -52,6 +53,9 @@ app.MapGet("/relay/health", () => Results.Json(new
 app.MapGet("/relay/icon.svg", () => Results.Text(IconSvg(), "image/svg+xml; charset=utf-8"));
 app.MapGet("/relay/status", (HttpContext context, RelayHub hub) => Results.Json(hub.Snapshot(context.Request.Query["room"].FirstOrDefault())));
 app.MapGet("/relay/{room}", (string room) => Results.Text(DashboardHtml(room), "text/html; charset=utf-8"));
+
+app.MapMethods("/relay/stream/{id}/{direction}", [HttpMethods.Get, HttpMethods.Post], RelayHttpStreamHandler);
+app.MapMethods("/relay/{room}/stream/{id}/{direction}", [HttpMethods.Get, HttpMethods.Post], RelayHttpStreamHandler);
 
 app.Map("/relay/ws", RelayWebSocketHandler);
 app.Map("/relay/{room}/ws", RelayWebSocketHandler);
@@ -75,44 +79,112 @@ async Task RelayWebSocketHandler(HttpContext context, RelayHub hub)
     }
 
     using var socket = await context.WebSockets.AcceptWebSocketAsync();
+    await ServeRelaySocketAsync(socket, context, hub, context.RequestAborted, "websocket");
+}
+
+async Task RelayHttpStreamHandler(HttpContext context, RelayHub hub, HttpStreamRegistry streams, string id, string direction)
+{
+    var room = ReadRoom(context) ?? "";
+    var secret = context.Request.Headers["X-DeskFerry-Stream-Secret"].FirstOrDefault()?.Trim() ?? "";
+    direction = direction.Trim().ToLowerInvariant();
+    if (id.Length is < 16 or > 128 || secret.Length is < 24 or > 256 || direction is not ("up" or "down"))
+    {
+        context.Response.StatusCode = StatusCodes.Status400BadRequest;
+        await context.Response.WriteAsync("Invalid HTTP stream request.");
+        return;
+    }
+    HttpStreamWebSocket socket;
+    bool created;
+    try
+    {
+        (socket, created) = streams.GetOrCreate(room, id, secret);
+    }
+    catch (InvalidOperationException)
+    {
+        context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+        await context.Response.WriteAsync("HTTP stream capacity reached.");
+        return;
+    }
+    if (!socket.SecretMatches(secret))
+    {
+        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+        await context.Response.WriteAsync("HTTP stream secret mismatch.");
+        return;
+    }
+    if (created)
+    {
+        _ = ServeRelaySocketAsync(socket, context, hub, socket.Lifetime, "http-stream");
+    }
+    if (direction == "up")
+    {
+        await socket.ServeUploadAsync(context);
+    }
+    else
+    {
+        await socket.ServeDownloadAsync(context);
+    }
+}
+
+async Task ServeRelaySocketAsync(WebSocket socket, HttpContext context, RelayHub hub, CancellationToken abort, string transport)
+{
+    var role = ReadRole(context.Request);
+    var token = ReadRoom(context) ?? (role == "dashboard" ? "dashboard" : ReadToken(context.Request));
+    if (role is null || token is null)
+    {
+        await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "missing relay role or bearer token", CancellationToken.None);
+        return;
+    }
     var remote = RemoteAddress(context);
     var roomForLog = ReadRoom(context) ?? (role == "dashboard" ? "overview" : "header-token");
-    app.Logger.LogInformation("websocket connected role={Role} room={Room} remote={Remote} user_agent={UserAgent}", role, roomForLog, remote, context.Request.Headers.UserAgent.ToString());
+    var room = ReadRoom(context);
+    var identity = ReadAgentIdentity(context.Request);
+    var resumable = ReadResumable(context.Request);
+    var heartbeat = ReadHeartbeat(context.Request);
+    var proof = ReadRoomProof(context.Request);
+    var service = ReadService(context.Request);
+    var agentServices = ReadAgentServices(context.Request);
+    var concurrency = ReadConcurrency(context.Request);
+    var sessionId = context.Request.Headers["X-DeskFerry-Session"].FirstOrDefault();
+    var sessionSide = context.Request.Headers["X-DeskFerry-Session-Side"].FirstOrDefault();
+    var protocol = context.Request.Headers["X-DeskFerry-Protocol"].FirstOrDefault()?.Trim();
+    var logComponent = context.Request.Headers["X-DeskFerry-Log-Component"].FirstOrDefault();
+    var logInstance = context.Request.Headers["X-DeskFerry-Log-Instance"].FirstOrDefault();
+    app.Logger.LogInformation("relay transport connected transport={Transport} role={Role} room={Room} remote={Remote} user_agent={UserAgent}", transport, role, roomForLog, remote, context.Request.Headers.UserAgent.ToString());
     switch (role)
     {
         case "dashboard":
-            await hub.ServeDashboardAsync(socket, remote, ReadRoom(context), context.RequestAborted);
+            await hub.ServeDashboardAsync(socket, remote, room, abort);
             break;
         case "agent":
-            await hub.ServeAgentAsync(token, socket, remote, ReadAgentIdentity(context.Request), ReadResumable(context.Request), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
+            await hub.ServeAgentAsync(token, socket, remote, identity, resumable, proof, service, abort);
             break;
         case "agent-control":
-            await hub.ServeAgentControlAsync(token, socket, remote, ReadAgentIdentity(context.Request).Instance, ReadAgentServices(context.Request), ReadConcurrency(context.Request), ReadRoomProof(context.Request), context.RequestAborted);
+            await hub.ServeAgentControlAsync(token, socket, remote, identity.Instance, agentServices, concurrency, proof, abort);
             break;
         case "agent-session":
-            await hub.ServeAgentSessionAsync(token, socket, remote, ReadAgentIdentity(context.Request).Instance, context.Request.Headers["X-DeskFerry-Session"].FirstOrDefault(), ReadResumable(context.Request), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
+            await hub.ServeAgentSessionAsync(token, socket, remote, identity.Instance, sessionId, resumable, proof, service, abort);
             break;
         case "client":
-            if (context.Request.Headers["X-DeskFerry-Protocol"].FirstOrDefault()?.Trim() == "2")
+            if (protocol == "2")
             {
-                await hub.ServeV2ClientAsync(token, socket, remote, ReadResumable(context.Request), ReadHeartbeat(context.Request), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
+                await hub.ServeV2ClientAsync(token, socket, remote, resumable, heartbeat, proof, service, abort);
             }
             else
             {
-                await hub.ServeClientAsync(token, socket, remote, ReadResumable(context.Request), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
+                await hub.ServeClientAsync(token, socket, remote, resumable, proof, service, abort);
             }
             break;
         case "resume":
-            await hub.ServeResumeAsync(token, socket, remote, context.Request.Headers["X-DeskFerry-Session"].FirstOrDefault(), context.Request.Headers["X-DeskFerry-Session-Side"].FirstOrDefault(), ReadRoomProof(context.Request), ReadService(context.Request), context.RequestAborted);
+            await hub.ServeResumeAsync(token, socket, remote, sessionId, sessionSide, proof, service, abort);
             break;
         case "home-agent":
-            await hub.ServeHomeAgentAsync(token, socket, remote, ReadRoomProof(context.Request), context.RequestAborted);
+            await hub.ServeHomeAgentAsync(token, socket, remote, proof, abort);
             break;
         case "diagnostic-log":
-            await hub.ServeDiagnosticLogAsync(token, socket, remote, ReadRoomProof(context.Request), context.Request.Headers["X-DeskFerry-Log-Component"].FirstOrDefault(), context.Request.Headers["X-DeskFerry-Log-Instance"].FirstOrDefault(), context.RequestAborted);
+            await hub.ServeDiagnosticLogAsync(token, socket, remote, proof, logComponent, logInstance, abort);
             break;
         case "probe":
-            await hub.ServeProbeAsync(token, socket, ReadRoomProof(context.Request));
+            await hub.ServeProbeAsync(token, socket, proof);
             break;
         default:
             await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "unsupported role", CancellationToken.None);
@@ -2286,7 +2358,7 @@ sealed class ResumeSession
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.10.22";
+    public const string Version = "0.11.0";
 }
 
 sealed class WaitingAgent

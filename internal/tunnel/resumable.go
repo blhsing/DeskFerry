@@ -44,7 +44,7 @@ type ResumableWebSocketOptions struct {
 // NewResumableWebSocketConn exposes a reliable byte stream over replaceable
 // WebSockets. Sequence acknowledgements and a bounded replay buffer hide
 // transient proxy disconnects from the local TCP peer.
-func NewResumableWebSocketConn(ctx context.Context, initial *websocket.Conn, opts ResumableWebSocketOptions) net.Conn {
+func NewResumableWebSocketConn(ctx context.Context, initial MessageConn, opts ResumableWebSocketOptions) net.Conn {
 	childCtx, cancel := context.WithCancel(ctx)
 	c := &resumableWebSocketConn{
 		ctx:        childCtx,
@@ -73,7 +73,7 @@ type resumableWebSocketConn struct {
 
 	mu          sync.Mutex
 	cond        *sync.Cond
-	ws          *websocket.Conn
+	ws          MessageConn
 	generation  uint64
 	closed      bool
 	terminalErr error
@@ -177,7 +177,7 @@ func (c *resumableWebSocketConn) sendDataUntilAccepted(offset uint64, payload []
 	}
 }
 
-func (c *resumableWebSocketConn) waitTransport() (*websocket.Conn, uint64, error) {
+func (c *resumableWebSocketConn) waitTransport() (MessageConn, uint64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for c.ws == nil && !c.closed {
@@ -196,7 +196,7 @@ func (c *resumableWebSocketConn) connectionErrorLocked() error {
 	return net.ErrClosed
 }
 
-func (c *resumableWebSocketConn) writeFrame(ws *websocket.Conn, frame []byte) error {
+func (c *resumableWebSocketConn) writeFrame(ws MessageConn, frame []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	writeCtx, cancel := context.WithTimeout(c.ctx, 20*time.Second)
@@ -204,7 +204,7 @@ func (c *resumableWebSocketConn) writeFrame(ws *websocket.Conn, frame []byte) er
 	return ws.Write(writeCtx, websocket.MessageBinary, frame)
 }
 
-func (c *resumableWebSocketConn) connectionLoop(initial *websocket.Conn) {
+func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 	defer func() {
 		if err := c.ctx.Err(); err != nil {
 			c.setTerminal(err)
@@ -223,7 +223,7 @@ func (c *resumableWebSocketConn) connectionLoop(initial *websocket.Conn) {
 				case <-c.lost:
 				}
 			} else {
-				CloseWebSocket(ws)
+				CloseMessageConn(ws)
 			}
 			ws = nil
 		}
@@ -257,7 +257,7 @@ func (c *resumableWebSocketConn) connectionLoop(initial *websocket.Conn) {
 			err = AwaitWebSocketResume(resumeCtx, candidate, c.opts.SessionID)
 			cancelResume()
 			if err != nil {
-				CloseWebSocket(candidate)
+				CloseMessageConn(candidate)
 			}
 		}
 		if err == nil {
@@ -294,7 +294,7 @@ func (c *resumableWebSocketConn) drainLostSignal() {
 	}
 }
 
-func (c *resumableWebSocketConn) dialResume(ctx context.Context) (*websocket.Conn, error) {
+func (c *resumableWebSocketConn) dialResume(ctx context.Context) (MessageConn, error) {
 	headers := http.Header{}
 	headers.Set(HeaderSessionID, c.opts.SessionID)
 	headers.Set(HeaderSessionSide, c.opts.Side)
@@ -302,14 +302,14 @@ func (c *resumableWebSocketConn) dialResume(ctx context.Context) (*websocket.Con
 		headers.Set(HeaderRoomProof, c.opts.RoomProof)
 	}
 	AddServiceHeader(headers, c.opts.Service)
-	ws, err := DialWebSocketWithHeaders(ctx, c.opts.RelayAddr, c.opts.Proxy, RoleResume, c.opts.Token, headers)
+	ws, err := DialMessageConnWithHeaders(ctx, c.opts.RelayAddr, c.opts.Proxy, RoleResume, c.opts.Token, headers)
 	if err != nil {
 		return nil, err
 	}
 	return ws, nil
 }
 
-func (c *resumableWebSocketConn) attachTransport(ws *websocket.Conn) error {
+func (c *resumableWebSocketConn) attachTransport(ws MessageConn) error {
 	c.writeMu.Lock()
 	c.mu.Lock()
 	if c.closed {
@@ -361,7 +361,7 @@ func (c *resumableWebSocketConn) attachTransport(ws *websocket.Conn) error {
 	return nil
 }
 
-func (c *resumableWebSocketConn) heartbeatTransport(ws *websocket.Conn, generation uint64, state *heartbeatState) {
+func (c *resumableWebSocketConn) heartbeatTransport(ws MessageConn, generation uint64, state *heartbeatState) {
 	defer func() {
 		c.mu.Lock()
 		if c.heartbeats[generation] == state {
@@ -417,19 +417,19 @@ func (c *resumableWebSocketConn) heartbeatTransport(ws *websocket.Conn, generati
 	}
 }
 
-func (c *resumableWebSocketConn) isCurrentTransport(ws *websocket.Conn, generation uint64) bool {
+func (c *resumableWebSocketConn) isCurrentTransport(ws MessageConn, generation uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return !c.closed && c.ws == ws && c.generation == generation
 }
 
-func writeFrameWithTimeout(ctx context.Context, ws *websocket.Conn, frame []byte) error {
+func writeFrameWithTimeout(ctx context.Context, ws MessageConn, frame []byte) error {
 	writeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	return ws.Write(writeCtx, websocket.MessageBinary, frame)
 }
 
-func (c *resumableWebSocketConn) readTransport(ws *websocket.Conn, generation uint64) {
+func (c *resumableWebSocketConn) readTransport(ws MessageConn, generation uint64) {
 	for {
 		typ, payload, err := ws.Read(c.ctx)
 		if err != nil {
@@ -544,7 +544,7 @@ func (c *resumableWebSocketConn) applyData(offset uint64, data []byte) (uint64, 
 	return c.recvOffset, true
 }
 
-func (c *resumableWebSocketConn) dropTransport(ws *websocket.Conn, generation uint64) {
+func (c *resumableWebSocketConn) dropTransport(ws MessageConn, generation uint64) {
 	c.mu.Lock()
 	if c.ws != ws || c.generation != generation || c.closed {
 		c.mu.Unlock()

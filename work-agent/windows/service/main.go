@@ -22,8 +22,6 @@ import (
 	"syscall"
 	"time"
 
-	"nhooyr.io/websocket"
-
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/eventlog"
@@ -801,7 +799,7 @@ func runLegacyPools(ctx context.Context, cfg config, agentID string, targets []s
 
 type controlWriter struct {
 	mu sync.Mutex
-	ws *websocket.Conn
+	ws tunnel.MessageConn
 }
 
 func (w *controlWriter) send(ctx context.Context, message tunnel.ControlMessage) error {
@@ -825,11 +823,11 @@ func runAgentControlOnce(ctx context.Context, cfg config, agentID string, target
 	}
 	headers.Set(tunnel.HeaderAgentServices, strings.Join(services, ","))
 	tunnel.AddRoomPasswordHeader(headers, cfg.RelayAddr, "", cfg.RoomPassword)
-	ws, err := tunnel.DialWebSocketWithHeaders(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgentControl, "", headers)
+	ws, err := tunnel.DialMessageConnWithHeaders(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgentControl, "", headers)
 	if err != nil {
 		return false, err
 	}
-	defer tunnel.CloseWebSocket(ws)
+	defer tunnel.CloseMessageConn(ws)
 	readyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	err = tunnel.AwaitControlReady(readyCtx, ws)
 	cancel()
@@ -903,7 +901,7 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 	}
 	tunnel.AddRoomPasswordHeader(headers, cfg.RelayAddr, "", cfg.RoomPassword)
 	tunnel.AddServiceHeader(headers, target.Service)
-	ws, err := tunnel.DialWebSocketWithHeaders(sessionCtx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgentSession, "", headers)
+	ws, err := tunnel.DialMessageConnWithHeaders(sessionCtx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgentSession, "", headers)
 	if err != nil {
 		_ = localConn.Close()
 		log.Printf("agent session dial failed relay=%s session=%s service=%s duration=%s error=%v", cfg.RelayAddr, offer.SessionID, target.Service, time.Since(started).Round(time.Millisecond), err)
@@ -912,12 +910,12 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 	ready, err := tunnel.AwaitSessionReadyInfoResult(sessionCtx, ws)
 	if err != nil {
 		_ = localConn.Close()
-		tunnel.CloseWebSocket(ws)
+		tunnel.CloseMessageConn(ws)
 		log.Printf("agent session rejected relay=%s session=%s service=%s error=%v", cfg.RelayAddr, offer.SessionID, target.Service, err)
 		return
 	}
 	cancel()
-	stream := net.Conn(tunnel.WebSocketNetConn(parent, ws))
+	stream := net.Conn(tunnel.MessageNetConn(parent, ws))
 	if offer.Resumable {
 		stream = tunnel.NewResumableWebSocketConn(parent, ws, tunnel.ResumableWebSocketOptions{RelayAddr: cfg.RelayAddr, Proxy: cfg.Proxy, SessionID: offer.SessionID, Side: "agent", RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword), Service: target.Service, Heartbeat: ready.Heartbeat})
 	}
@@ -980,11 +978,11 @@ func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string,
 	headers.Set(tunnel.HeaderResumable, "1")
 	tunnel.AddRoomPasswordHeader(headers, cfg.RelayAddr, "", cfg.RoomPassword)
 	tunnel.AddServiceHeader(headers, target.Service)
-	ws, err := tunnel.DialWebSocketWithHeaders(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgent, "", headers)
+	ws, err := tunnel.DialMessageConnWithHeaders(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgent, "", headers)
 	if err != nil {
 		return false, fmt.Errorf("dial after %s: %w", time.Since(connectedAt).Round(time.Millisecond), err)
 	}
-	defer tunnel.CloseWebSocket(ws)
+	defer tunnel.CloseMessageConn(ws)
 
 	log.Printf("websocket agent service=%s slot=%d connected to relay %s via %s", target.Service, slot, cfg.RelayAddr, tunnel.ProxySpecForLog(cfg.Proxy))
 	sessionID, err := tunnel.AwaitWebSocketStartSession(ctx, ws)
@@ -993,7 +991,7 @@ func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string,
 	}
 	pairedAt := time.Now()
 	log.Printf("websocket agent service=%s slot=%d paired on relay %s after idle=%s; forwarding to %s", target.Service, slot, cfg.RelayAddr, pairedAt.Sub(connectedAt).Round(time.Millisecond), target.Address)
-	stream := net.Conn(tunnel.WebSocketNetConn(ctx, ws))
+	stream := net.Conn(tunnel.MessageNetConn(ctx, ws))
 	if sessionID != "" {
 		stream = tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{
 			RelayAddr: cfg.RelayAddr,
@@ -1124,11 +1122,11 @@ func selfTestRelay(ctx context.Context, cfg config) error {
 	log.Printf("self-test relay target: %s via %s", cfg.RelayAddr, tunnel.ProxySpecForLog(cfg.Proxy))
 	headers := http.Header{}
 	tunnel.AddRoomPasswordHeader(headers, cfg.RelayAddr, "", cfg.RoomPassword)
-	ws, err := tunnel.DialWebSocketWithHeaders(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleProbe, "", headers)
+	ws, err := tunnel.DialMessageConnWithHeaders(ctx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleProbe, "", headers)
 	if err != nil {
 		return fmt.Errorf("websocket relay connection test failed: %w. %s", err, relayDialHint(err, cfg))
 	}
-	tunnel.CloseWebSocket(ws)
+	tunnel.CloseMessageConn(ws)
 	return nil
 }
 
@@ -1136,7 +1134,7 @@ func relayDialHint(err error, cfg config) string {
 	errText := strings.ToLower(err.Error())
 	if strings.Contains(errText, "proxy connect") {
 		return fmt.Sprintf(
-			"The proxy returned an HTTP error before the WebSocket handshake. Confirm that the proxy allows CONNECT to %s, that it can reach the relay host, and that port %s is permitted. If the work network allows direct outbound connections, rerun the agent without -proxy.",
+			"The proxy rejected WebSocket CONNECT and the HTTP-stream fallback also failed. Confirm that the proxy can forward ordinary POST/GET requests to a configured plain-HTTP relay, or permits CONNECT to %s on port %s. If the work network allows direct outbound connections, rerun the agent without -proxy.",
 			cfg.RelayAddr,
 			relayPortForHint(cfg.RelayAddr),
 		)

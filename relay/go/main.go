@@ -85,6 +85,9 @@ func envOrDefault(name, fallback string) string {
 
 func newServer() http.Handler {
 	hub := newRelayHub()
+	streams := tunnel.NewHTTPStreamServer(func(ctx context.Context, conn tunnel.MessageConn, r *http.Request, room string) {
+		serveRelayConn(ctx, conn, r, hub, room, "http-stream")
+	})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
@@ -95,13 +98,21 @@ func newServer() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		handleRelay(w, r, hub)
+		handleRelay(w, r, hub, streams)
 	})
 	return mux
 }
 
-func handleRelay(w http.ResponseWriter, r *http.Request, hub *RelayHub) {
+func handleRelay(w http.ResponseWriter, r *http.Request, hub *RelayHub, streamServers ...*tunnel.HTTPStreamServer) {
 	rest := strings.TrimPrefix(r.URL.Path, "/relay")
+	if room, id, direction, ok := parseHTTPStreamPath(rest); ok {
+		if len(streamServers) == 0 || streamServers[0] == nil {
+			http.NotFound(w, r)
+			return
+		}
+		streamServers[0].Serve(w, r, room, id, direction)
+		return
+	}
 	switch {
 	case rest == "" || rest == "/":
 		writeHTML(w, dashboardHTML(""))
@@ -131,6 +142,22 @@ func handleRelay(w http.ResponseWriter, r *http.Request, hub *RelayHub) {
 		}
 		writeHTML(w, dashboardHTML(room))
 	}
+}
+
+func parseHTTPStreamPath(rest string) (room, id, direction string, ok bool) {
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	switch {
+	case len(parts) == 3 && parts[0] == "stream":
+		id, direction = parts[1], parts[2]
+	case len(parts) == 4 && parts[1] == "stream":
+		room, id, direction = parts[0], parts[2], parts[3]
+	default:
+		return "", "", "", false
+	}
+	if direction != "up" && direction != "down" {
+		return "", "", "", false
+	}
+	return room, id, direction, true
 }
 
 func parseRoomPath(rest string) (room string, ws bool, ok bool) {
@@ -187,15 +214,31 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hub *RelayHub, room
 		return
 	}
 
+	serveRelayConn(r.Context(), c, r, hub, room, "websocket")
+}
+
+func serveRelayConn(ctx context.Context, c tunnel.MessageConn, r *http.Request, hub *RelayHub, room, transport string) {
+	role := readRole(r)
+	token := room
+	if token == "" {
+		if role == dashboardRole {
+			token = dashboardRole
+		} else {
+			token = readToken(r)
+		}
+	}
+	if role == "" || token == "" {
+		closeQuietly(c, websocket.StatusPolicyViolation, "missing relay role or bearer token")
+		return
+	}
 	remote := remoteAddr(r)
-	ctx := r.Context()
 	proof := readRoomProof(r)
 	service := readService(r)
 	if (role == "agent" || role == "client" || role == agentSessionRole || role == resumeRole) && service == "" {
 		closeQuietly(c, websocket.StatusPolicyViolation, "unsupported service")
 		return
 	}
-	log.Printf("websocket connected role=%s room=%s service=%s remote=%s user_agent=%q", role, roomID(token), service, remote, r.UserAgent())
+	log.Printf("relay transport connected transport=%s role=%s room=%s service=%s remote=%s user_agent=%q", transport, role, roomID(token), service, remote, r.UserAgent())
 	switch role {
 	case dashboardRole:
 		hub.ServeDashboard(ctx, c, remote, room)
@@ -235,7 +278,7 @@ type diagnosticLogBatch struct {
 	Entries []string `json:"entries"`
 }
 
-func (h *RelayHub) ServeDiagnosticLog(ctx context.Context, token string, c *websocket.Conn, remote, proof, component, instance string) {
+func (h *RelayHub) ServeDiagnosticLog(ctx context.Context, token string, c tunnel.MessageConn, remote, proof, component, instance string) {
 	room := h.roomFor(token)
 	if !room.AuthorizeClient(proof) {
 		closeQuietly(c, websocket.StatusPolicyViolation, "room authentication failed")
@@ -466,7 +509,7 @@ func newRelayHub() *RelayHub {
 
 type AgentControl struct {
 	Room        *RelayRoom
-	Conn        *websocket.Conn
+	Conn        tunnel.MessageConn
 	Remote      string
 	AgentID     string
 	Services    map[string]bool
@@ -518,7 +561,7 @@ func (a *AgentControl) Close(reason string) {
 }
 
 type AgentDataSocket struct {
-	Conn      *websocket.Conn
+	Conn      tunnel.MessageConn
 	Remote    string
 	Resumable bool
 	Done      chan struct{}
@@ -528,7 +571,7 @@ type PendingSession struct {
 	ID        string
 	Room      *RelayRoom
 	Control   *AgentControl
-	Client    *websocket.Conn
+	Client    tunnel.MessageConn
 	Remote    string
 	Proof     string
 	Service   string
@@ -539,7 +582,7 @@ type PendingSession struct {
 	Agent     chan *AgentDataSocket
 }
 
-func (h *RelayHub) ServeAgentControl(ctx context.Context, token string, c *websocket.Conn, remote, agentID string, services map[string]bool, concurrency int, proof string) {
+func (h *RelayHub) ServeAgentControl(ctx context.Context, token string, c tunnel.MessageConn, remote, agentID string, services map[string]bool, concurrency int, proof string) {
 	room := h.roomFor(token)
 	if agentID == "" || len(services) == 0 {
 		sendV2Result(c, tunnel.MessageInvalidRequest, "", "agent identity and services are required")
@@ -617,7 +660,7 @@ func (h *RelayHub) ServeAgentControl(ctx context.Context, token string, c *webso
 	}
 }
 
-func (h *RelayHub) ServeV2Client(ctx context.Context, token string, c *websocket.Conn, remote string, resumable, heartbeat bool, proof, service string) {
+func (h *RelayHub) ServeV2Client(ctx context.Context, token string, c tunnel.MessageConn, remote string, resumable, heartbeat bool, proof, service string) {
 	room := h.roomFor(token)
 	if !room.AuthorizeClient(proof) {
 		sendV2Result(c, tunnel.MessageAuthFailed, "", "room authentication failed")
@@ -642,7 +685,7 @@ func (h *RelayHub) ServeV2Client(ctx context.Context, token string, c *websocket
 	h.serveOnDemandClient(ctx, room, c, remote, resumable, heartbeat, proof, service, control, true)
 }
 
-func (h *RelayHub) serveOnDemandClient(ctx context.Context, room *RelayRoom, c *websocket.Conn, remote string, resumable, heartbeat bool, proof, service string, control *AgentControl, typed bool) {
+func (h *RelayHub) serveOnDemandClient(ctx context.Context, room *RelayRoom, c tunnel.MessageConn, remote string, resumable, heartbeat bool, proof, service string, control *AgentControl, typed bool) {
 	defer control.Release()
 	now := time.Now().UTC()
 	pending := &PendingSession{
@@ -730,7 +773,7 @@ func (h *RelayHub) serveOnDemandClient(ctx context.Context, room *RelayRoom, c *
 	room.Bridge(ctx, agent.Conn, c, agent.Remote, remote, agent.Done, h.NotifyDashboards)
 }
 
-func (h *RelayHub) ServeAgentSession(ctx context.Context, token string, c *websocket.Conn, remote, agentID, sessionID string, resumable bool, proof, service string) {
+func (h *RelayHub) ServeAgentSession(ctx context.Context, token string, c tunnel.MessageConn, remote, agentID, sessionID string, resumable bool, proof, service string) {
 	room := roomID(token)
 	sessionID = cleanSessionValue(sessionID)
 	h.mu.Lock()
@@ -784,30 +827,30 @@ func sortedServices(services map[string]bool) []string {
 	return out
 }
 
-func sendV2Result(c *websocket.Conn, result, sessionID, reason string) bool {
+func sendV2Result(c tunnel.MessageConn, result, sessionID, reason string) bool {
 	return sendV2ServiceResult(c, result, sessionID, "", reason)
 }
 
-func sendV2ServiceResult(c *websocket.Conn, result, sessionID, service, reason string) bool {
+func sendV2ServiceResult(c tunnel.MessageConn, result, sessionID, service, reason string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return tunnel.WriteControlMessage(ctx, c, tunnel.ControlMessage{Type: result, SessionID: sessionID, Service: service, ProtocolVersion: tunnel.ProtocolVersion2, Reason: reason}) == nil
 }
 
-func sendV2SessionReady(c *websocket.Conn, sessionID, service string, heartbeat bool) bool {
+func sendV2SessionReady(c tunnel.MessageConn, sessionID, service string, heartbeat bool) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return tunnel.WriteControlMessage(ctx, c, tunnel.ControlMessage{Type: tunnel.MessageSessionReady, SessionID: sessionID, Service: service, ProtocolVersion: tunnel.ProtocolVersion2, Heartbeat: heartbeat}) == nil
 }
 
-func rejectSessionClient(c *websocket.Conn, typed bool, result, sessionID, reason string) {
+func rejectSessionClient(c tunnel.MessageConn, typed bool, result, sessionID, reason string) {
 	if typed {
 		sendV2Result(c, result, sessionID, reason)
 	}
 	closeQuietly(c, websocket.StatusTryAgainLater, reason)
 }
 
-func (h *RelayHub) ServeAgent(ctx context.Context, token string, c *websocket.Conn, remote string, identity AgentIdentity, resumable bool, proof, service string) {
+func (h *RelayHub) ServeAgent(ctx context.Context, token string, c tunnel.MessageConn, remote string, identity AgentIdentity, resumable bool, proof, service string) {
 	room := h.roomFor(token)
 	if !room.AuthorizeAgent(proof) {
 		log.Printf("agent rejected by room authentication room=%s service=%s remote=%s", room.ID, service, remote)
@@ -873,7 +916,7 @@ paired:
 	room.Bridge(ctx, c, peer.Conn, remote, peer.Remote, peer.Done, h.NotifyDashboards)
 }
 
-func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.Conn, remote string, resumable bool, proof, service string) {
+func (h *RelayHub) ServeClient(ctx context.Context, token string, c tunnel.MessageConn, remote string, resumable bool, proof, service string) {
 	room := h.roomFor(token)
 	if !room.AuthorizeClient(proof) {
 		log.Printf("client rejected by room authentication room=%s service=%s remote=%s", room.ID, service, remote)
@@ -923,7 +966,7 @@ func (h *RelayHub) ServeClient(ctx context.Context, token string, c *websocket.C
 	}
 }
 
-func (h *RelayHub) ServeResume(ctx context.Context, token string, c *websocket.Conn, remote, sessionID, side, proof, service string) {
+func (h *RelayHub) ServeResume(ctx context.Context, token string, c tunnel.MessageConn, remote, sessionID, side, proof, service string) {
 	roomID := roomID(token)
 	sessionID = cleanSessionValue(sessionID)
 	side = strings.ToLower(strings.TrimSpace(side))
@@ -1047,7 +1090,7 @@ func (h *RelayHub) pruneCompletedLocked() {
 	}
 }
 
-func (h *RelayHub) ServeHomeAgent(ctx context.Context, token string, c *websocket.Conn, remote, proof string) {
+func (h *RelayHub) ServeHomeAgent(ctx context.Context, token string, c tunnel.MessageConn, remote, proof string) {
 	room := h.roomFor(token)
 	if !room.AuthorizeClient(proof) {
 		closeQuietly(c, websocket.StatusPolicyViolation, "room authentication failed")
@@ -1067,7 +1110,7 @@ func (h *RelayHub) ServeHomeAgent(ctx context.Context, token string, c *websocke
 	log.Printf("home app receive ended room=%s remote=%s error=%v close_status=%d context_error=%v", room.ID, remote, err, websocket.CloseStatus(err), ctx.Err())
 }
 
-func (h *RelayHub) ServeDashboard(ctx context.Context, c *websocket.Conn, remote, room string) {
+func (h *RelayHub) ServeDashboard(ctx context.Context, c tunnel.MessageConn, remote, room string) {
 	client := &DashboardClient{ID: randomID(), Conn: c}
 	if room != "" {
 		selected := roomID(room)
@@ -1300,7 +1343,7 @@ func proofEqual(expected, actual string) bool {
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) == 1
 }
 
-func (r *RelayRoom) EnqueueAgent(c *websocket.Conn, remote string, identity AgentIdentity, resumable bool, service string) (*WaitingAgent, int) {
+func (r *RelayRoom) EnqueueAgent(c tunnel.MessageConn, remote string, identity AgentIdentity, resumable bool, service string) (*WaitingAgent, int) {
 	waiting := NewWaitingAgent(c, remote, identity, resumable, service)
 	now := time.Now().UTC()
 	remoteCopy := remote
@@ -1397,7 +1440,7 @@ func (r *RelayRoom) HomeAgentDisconnected(remote string) {
 	r.mu.Unlock()
 }
 
-func (r *RelayRoom) Bridge(ctx context.Context, agent, client *websocket.Conn, agentRemote, clientRemote string, clientDone chan struct{}, stateChanged func()) {
+func (r *RelayRoom) Bridge(ctx context.Context, agent, client tunnel.MessageConn, agentRemote, clientRemote string, clientDone chan struct{}, stateChanged func()) {
 	started := time.Now()
 	pairID := r.PairStarted(clientRemote)
 	stateChanged()
@@ -1540,7 +1583,7 @@ func (i AgentIdentity) LogString() string {
 }
 
 type WaitingAgent struct {
-	Conn      *websocket.Conn
+	Conn      tunnel.MessageConn
 	Remote    string
 	Identity  AgentIdentity
 	Resumable bool
@@ -1553,7 +1596,7 @@ type WaitingAgent struct {
 	once   sync.Once
 }
 
-func NewWaitingAgent(c *websocket.Conn, remote string, identity AgentIdentity, resumable bool, service string) *WaitingAgent {
+func NewWaitingAgent(c tunnel.MessageConn, remote string, identity AgentIdentity, resumable bool, service string) *WaitingAgent {
 	return &WaitingAgent{
 		Conn:      c,
 		Remote:    remote,
@@ -1584,7 +1627,7 @@ func (w *WaitingAgent) Cancel() {
 }
 
 type HomePeer struct {
-	Conn      *websocket.Conn
+	Conn      tunnel.MessageConn
 	Remote    string
 	Resumable bool
 	Done      chan struct{}
@@ -1594,7 +1637,7 @@ type HomePeer struct {
 	startedOnce sync.Once
 }
 
-func NewHomePeer(c *websocket.Conn, remote string, resumable bool) *HomePeer {
+func NewHomePeer(c tunnel.MessageConn, remote string, resumable bool) *HomePeer {
 	return &HomePeer{
 		Conn:      c,
 		Remote:    remote,
@@ -1613,7 +1656,7 @@ func (p *HomePeer) SetStarted(value string) {
 }
 
 type ResumeAttachment struct {
-	Conn   *websocket.Conn
+	Conn   tunnel.MessageConn
 	Remote string
 	Done   chan struct{}
 }
@@ -1648,7 +1691,7 @@ func NewResumeSession(id string, room *RelayRoom, agentRemote, clientRemote, pro
 	}
 }
 
-func (s *ResumeSession) Attach(ctx context.Context, side string, conn *websocket.Conn, remote string) bool {
+func (s *ResumeSession) Attach(ctx context.Context, side string, conn tunnel.MessageConn, remote string) bool {
 	attachment := &ResumeAttachment{Conn: conn, Remote: remote, Done: make(chan struct{})}
 	queue := s.client
 	if side == "agent" {
@@ -1669,7 +1712,7 @@ func (s *ResumeSession) Attach(ctx context.Context, side string, conn *websocket
 	}
 }
 
-func (s *ResumeSession) Run(agent, client *websocket.Conn, clientDone chan struct{}, stateChanged func()) {
+func (s *ResumeSession) Run(agent, client tunnel.MessageConn, clientDone chan struct{}, stateChanged func()) {
 	s.run(agent, client, clientDone, stateChanged, nil, nil)
 }
 
@@ -1698,7 +1741,7 @@ func (s *ResumeSession) RunRecovered(stateChanged func()) {
 	}
 }
 
-func (s *ResumeSession) run(agent, client *websocket.Conn, clientDone chan struct{}, stateChanged func(), agentAttachment, clientAttachment *ResumeAttachment) {
+func (s *ResumeSession) run(agent, client tunnel.MessageConn, clientDone chan struct{}, stateChanged func(), agentAttachment, clientAttachment *ResumeAttachment) {
 	startedAt := time.Now()
 	pairID := s.Room.PairStarted(s.ClientRemote)
 	stateChanged()
@@ -1806,7 +1849,7 @@ func (s *ResumeSession) Finish() {
 	})
 }
 
-func bridgeSockets(agent, client *websocket.Conn) (pumpResult, pumpResult) {
+func bridgeSockets(agent, client tunnel.MessageConn) (pumpResult, pumpResult) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan pumpResult, 2)
 	go pumpBinary(ctx, agent, client, "agent_to_client", done)
@@ -1819,7 +1862,7 @@ func bridgeSockets(agent, client *websocket.Conn) (pumpResult, pumpResult) {
 
 type DashboardClient struct {
 	ID     string
-	Conn   *websocket.Conn
+	Conn   tunnel.MessageConn
 	RoomID *string
 	SendMu sync.Mutex
 }
@@ -1856,11 +1899,11 @@ type RoomSnapshot struct {
 	LastClientDisconnectedAt *time.Time     `json:"last_client_disconnected_at"`
 }
 
-func sendStart(c *websocket.Conn, room, remote, side string) bool {
+func sendStart(c tunnel.MessageConn, room, remote, side string) bool {
 	return sendControl(c, room, remote, side, startMessage)
 }
 
-func sendControl(c *websocket.Conn, room, remote, side, message string) bool {
+func sendControl(c tunnel.MessageConn, room, remote, side, message string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := c.Write(ctx, websocket.MessageText, []byte(message)); err != nil {
@@ -1891,7 +1934,7 @@ type pumpResult struct {
 	Err       error
 }
 
-func pumpBinary(ctx context.Context, source, destination *websocket.Conn, direction string, done chan<- pumpResult) {
+func pumpBinary(ctx context.Context, source, destination tunnel.MessageConn, direction string, done chan<- pumpResult) {
 	result := pumpResult{Direction: direction}
 	defer func() { done <- result }()
 	for {
@@ -1912,7 +1955,7 @@ func pumpBinary(ctx context.Context, source, destination *websocket.Conn, direct
 	}
 }
 
-func drainUntilClose(ctx context.Context, c *websocket.Conn) error {
+func drainUntilClose(ctx context.Context, c tunnel.MessageConn) error {
 	for {
 		if _, _, err := c.Read(ctx); err != nil {
 			return err
@@ -1920,7 +1963,7 @@ func drainUntilClose(ctx context.Context, c *websocket.Conn) error {
 	}
 }
 
-func closeQuietly(c *websocket.Conn, status websocket.StatusCode, reason string) {
+func closeQuietly(c tunnel.MessageConn, status websocket.StatusCode, reason string) {
 	if c == nil {
 		return
 	}
@@ -1930,7 +1973,7 @@ func closeQuietly(c *websocket.Conn, status websocket.StatusCode, reason string)
 // Resume peers must not wait for a close handshake from a transport that may
 // already have vanished behind a proxy. Replacement sockets carry the
 // protocol-level continuation, so discard the obsolete transport immediately.
-func abortQuietly(c *websocket.Conn) {
+func abortQuietly(c tunnel.MessageConn) {
 	if c == nil {
 		return
 	}

@@ -1,22 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 import hmac
 import json
 import logging
 import time
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi import FastAPI, Request, WebSocket
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.10.17"
+RELAY_VERSION = "0.11.0"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -30,7 +33,197 @@ logger = logging.getLogger("deskferry.relay")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger.info("DeskFerry Python relay version=%s", RELAY_VERSION)
 
-app = FastAPI(title="DeskFerry Python Relay", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def app_lifespan(_: FastAPI):
+    sweeper = asyncio.create_task(sweep_http_streams())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
+        with suppress(asyncio.CancelledError):
+            await sweeper
+
+
+app = FastAPI(title="DeskFerry Python Relay", docs_url=None, redoc_url=None, lifespan=app_lifespan)
+
+HTTP_STREAM_ACK = 0
+HTTP_STREAM_TEXT = 1
+HTTP_STREAM_BINARY = 2
+HTTP_STREAM_CLOSE = 8
+HTTP_STREAM_HEADER = 13
+HTTP_STREAM_LIMIT = 1 << 20
+HTTP_STREAM_BUFFER = 8 * 1024 * 1024
+HTTP_STREAM_KEEPALIVE = 10
+HTTP_STREAM_RETENTION = 300
+
+
+@dataclass
+class HTTPStreamFrame:
+    kind: int
+    sequence: int
+    payload: bytes = b""
+
+
+class HTTPStreamWebSocket:
+    """Starlette WebSocket-compatible facade over a reliable POST/GET pair."""
+
+    def __init__(self, request: Request, secret: str) -> None:
+        self.headers = request.headers
+        self.query_params = request.query_params
+        self.client = request.client
+        self.client_state = WebSocketState.CONNECTED
+        self.application_state = WebSocketState.CONNECTED
+        self.secret = secret
+        self.incoming: asyncio.Queue[HTTPStreamFrame] = asyncio.Queue()
+        self.outgoing: list[HTTPStreamFrame] = []
+        self.outgoing_bytes = 0
+        self.next_send = 1
+        self.next_receive = 1
+        self.changed = asyncio.Event()
+        self.lock = asyncio.Lock()
+        self.up_generation = 0
+        self.down_generation = 0
+        self.last_activity = time.monotonic()
+        self.closed = asyncio.Event()
+
+    async def receive(self) -> dict[str, Any]:
+        frame = await self.incoming.get()
+        if frame.kind == HTTP_STREAM_CLOSE:
+            code = struct.unpack(">H", frame.payload[:2])[0] if len(frame.payload) >= 2 else 1000
+            reason = frame.payload[2:].decode("utf-8", errors="replace") if len(frame.payload) > 2 else ""
+            self.client_state = WebSocketState.DISCONNECTED
+            return {"type": "websocket.disconnect", "code": code, "reason": reason}
+        if frame.kind == HTTP_STREAM_TEXT:
+            return {"type": "websocket.receive", "text": frame.payload.decode("utf-8")}
+        return {"type": "websocket.receive", "bytes": frame.payload}
+
+    async def receive_text(self) -> str:
+        message = await self.receive()
+        if message["type"] == "websocket.disconnect":
+            raise WebSocketDisconnect(message.get("code", 1000), message.get("reason", ""))
+        if "text" not in message:
+            raise WebSocketDisconnect(1003, "text message required")
+        return message["text"]
+
+    async def receive_json(self) -> Any:
+        return json.loads(await self.receive_text())
+
+    async def send_text(self, value: str) -> None:
+        await self._send(HTTP_STREAM_TEXT, value.encode("utf-8"))
+
+    async def send_bytes(self, value: bytes) -> None:
+        await self._send(HTTP_STREAM_BINARY, bytes(value))
+
+    async def send_json(self, value: Any) -> None:
+        await self.send_text(json.dumps(value, separators=(",", ":")))
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        if self.application_state != WebSocketState.CONNECTED:
+            return
+        reason_bytes = reason.encode("utf-8")[:123]
+        await self._send(HTTP_STREAM_CLOSE, struct.pack(">H", code) + reason_bytes)
+        self.application_state = WebSocketState.DISCONNECTED
+        self.closed.set()
+
+    async def _send(self, kind: int, payload: bytes) -> None:
+        if len(payload) > HTTP_STREAM_LIMIT:
+            raise WebSocketDisconnect(1009, "message exceeds relay limit")
+        while True:
+            async with self.lock:
+                if self.application_state != WebSocketState.CONNECTED:
+                    raise WebSocketDisconnect(1006, "HTTP stream is closed")
+                if self.outgoing_bytes + len(payload) <= HTTP_STREAM_BUFFER:
+                    self.outgoing.append(HTTPStreamFrame(kind, self.next_send, payload))
+                    self.next_send += 1
+                    self.outgoing_bytes += len(payload)
+                    self.changed.set()
+                    return
+            await asyncio.sleep(0.01)
+
+    async def apply(self, frame: HTTPStreamFrame) -> None:
+        async with self.lock:
+            self.last_activity = time.monotonic()
+            if frame.kind == HTTP_STREAM_ACK:
+                if frame.sequence >= self.next_send:
+                    raise ValueError("HTTP stream acknowledgement exceeds sent sequence")
+                while self.outgoing and self.outgoing[0].sequence <= frame.sequence:
+                    self.outgoing_bytes -= len(self.outgoing.pop(0).payload)
+                return
+            if frame.sequence < self.next_receive:
+                self.changed.set()
+                return
+            if frame.sequence != self.next_receive or frame.kind not in {HTTP_STREAM_TEXT, HTTP_STREAM_BINARY, HTTP_STREAM_CLOSE}:
+                raise ValueError("invalid HTTP stream sequence or record type")
+            self.next_receive += 1
+            self.incoming.put_nowait(frame)
+            self.changed.set()
+
+    async def snapshot(self, last_sequence: int) -> tuple[list[HTTPStreamFrame], int]:
+        async with self.lock:
+            # Clear while holding the same lock used by producers so a frame
+            # queued after this snapshot cannot lose its wake-up signal.
+            self.changed.clear()
+            return ([frame for frame in self.outgoing if frame.sequence > last_sequence], self.next_receive - 1)
+
+    async def serve_upload(self, request: Request) -> Response:
+        if request.method != "POST":
+            return Response("HTTP stream upstream requires POST", status_code=405)
+        self.up_generation += 1
+        generation = self.up_generation
+        buffered = bytearray()
+        try:
+            async for chunk in request.stream():
+                if generation != self.up_generation:
+                    break
+                buffered.extend(chunk)
+                while len(buffered) >= HTTP_STREAM_HEADER:
+                    kind, sequence, length = struct.unpack(">BQI", buffered[:HTTP_STREAM_HEADER])
+                    if length > HTTP_STREAM_LIMIT:
+                        raise ValueError("HTTP stream record exceeds relay limit")
+                    total = HTTP_STREAM_HEADER + length
+                    if len(buffered) < total:
+                        break
+                    payload = bytes(buffered[HTTP_STREAM_HEADER:total])
+                    del buffered[:total]
+                    await self.apply(HTTPStreamFrame(kind, sequence, payload))
+        except (asyncio.CancelledError, ClientDisconnect, ConnectionError):
+            pass
+        return Response(status_code=204)
+
+    def serve_download(self, request: Request) -> StreamingResponse:
+        self.down_generation += 1
+        generation = self.down_generation
+
+        async def records():
+            last_sequence = 0
+            last_ack = 0
+            force_ack = True
+            while generation == self.down_generation and not await request.is_disconnected():
+                frames, ack = await self.snapshot(last_sequence)
+                if force_ack or ack > last_ack:
+                    yield encode_http_stream_record(HTTPStreamFrame(HTTP_STREAM_ACK, ack))
+                    last_ack = ack
+                    force_ack = False
+                for frame in frames:
+                    yield encode_http_stream_record(frame)
+                    last_sequence = frame.sequence
+                try:
+                    await asyncio.wait_for(self.changed.wait(), timeout=HTTP_STREAM_KEEPALIVE)
+                except asyncio.TimeoutError:
+                    force_ack = True
+
+        return StreamingResponse(records(), media_type="application/octet-stream", headers={
+            "Cache-Control": "no-store, no-transform",
+            "X-Accel-Buffering": "no",
+        })
+
+
+def encode_http_stream_record(frame: HTTPStreamFrame) -> bytes:
+    return struct.pack(">BQI", frame.kind, frame.sequence, len(frame.payload)) + frame.payload
+
+
+http_streams: dict[str, HTTPStreamWebSocket] = {}
+http_streams_lock = asyncio.Lock()
 
 
 def utc_now() -> datetime:
@@ -1294,6 +1487,54 @@ async def status(room: str | None = None) -> JSONResponse:
     return JSONResponse(await hub.snapshot(room))
 
 
+@app.api_route("/relay/stream/{stream_id}/{direction}", methods=["GET", "POST"])
+@app.api_route("/relay/{room}/stream/{stream_id}/{direction}", methods=["GET", "POST"])
+async def relay_http_stream(request: Request, stream_id: str, direction: str, room: str | None = None) -> Response:
+    secret = request.headers.get("x-deskferry-stream-secret", "").strip()
+    direction = direction.strip().lower()
+    if not 16 <= len(stream_id) <= 128 or not 24 <= len(secret) <= 256 or direction not in {"up", "down"}:
+        return Response("Invalid HTTP stream request.", status_code=400)
+    key = f"{(room or '').lower()}/{stream_id}"
+    created = False
+    async with http_streams_lock:
+        websocket = http_streams.get(key)
+        if websocket is None:
+            if len(http_streams) >= 4096:
+                return Response("HTTP stream capacity reached.", status_code=503)
+            websocket = HTTPStreamWebSocket(request, secret)
+            http_streams[key] = websocket
+            created = True
+    if not hmac.compare_digest(websocket.secret, secret):
+        return Response("HTTP stream secret mismatch.", status_code=403)
+    if created:
+        asyncio.create_task(serve_http_stream_socket(websocket, room))
+    if direction == "up":
+        return await websocket.serve_upload(request)
+    return websocket.serve_download(request)
+
+
+async def serve_http_stream_socket(websocket: HTTPStreamWebSocket, room: str | None) -> None:
+    try:
+        await serve_relay_socket(websocket, room, "http-stream")
+    except Exception:
+        logger.exception("HTTP stream relay handler failed room=%s", room_id(room))
+        await close_quietly(websocket, 1011, "relay handler failed")
+
+
+async def sweep_http_streams() -> None:
+    while True:
+        await asyncio.sleep(60)
+        cutoff = time.monotonic() - HTTP_STREAM_RETENTION
+        async with http_streams_lock:
+            expired = [key for key, value in http_streams.items() if value.last_activity < cutoff]
+            for key in expired:
+                stream = http_streams.pop(key)
+                stream.application_state = WebSocketState.DISCONNECTED
+                stream.client_state = WebSocketState.DISCONNECTED
+                stream.incoming.put_nowait(HTTPStreamFrame(HTTP_STREAM_CLOSE, stream.next_receive, struct.pack(">H", 1001) + b"HTTP stream expired"))
+                stream.closed.set()
+
+
 @app.get("/relay/{room}", response_class=HTMLResponse, include_in_schema=False)
 async def room_dashboard(room: str) -> HTMLResponse:
     return HTMLResponse(dashboard_html(room))
@@ -1319,8 +1560,17 @@ async def relay_websocket(websocket: WebSocket, room: str | None) -> None:
 
     await websocket.accept()
     await asyncio.sleep(0)
+    await serve_relay_socket(websocket, room, "websocket")
+
+
+async def serve_relay_socket(websocket: WebSocket, room: str | None, transport: str) -> None:
+    role = read_role(websocket)
+    token = room or (DASHBOARD_ROLE if role == DASHBOARD_ROLE else read_token(websocket))
+    if role is None or token is None:
+        await close_quietly(websocket, 1008, "missing relay role or bearer token")
+        return
     remote = websocket_remote(websocket)
-    logger.info("websocket connected role=%s room=%s remote=%s user_agent=%r", role, room_id(token), remote, websocket.headers.get("user-agent", ""))
+    logger.info("relay transport connected transport=%s role=%s room=%s remote=%s user_agent=%r", transport, role, room_id(token), remote, websocket.headers.get("user-agent", ""))
     if role == DASHBOARD_ROLE:
         await hub.serve_dashboard(websocket, remote, room)
     elif role == "agent":

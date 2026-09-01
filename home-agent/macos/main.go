@@ -415,7 +415,7 @@ func homePresenceLoop(ctx context.Context, cfg config) {
 		} else {
 			log.Printf("home status connected to %s after %s", relayAddr, time.Since(started).Round(time.Millisecond))
 			_, _, err = conn.Read(ctx)
-			tunnel.CloseWebSocket(conn)
+			tunnel.CloseMessageConn(conn)
 			if ctx.Err() != nil {
 				return
 			}
@@ -452,7 +452,7 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 			}
 			addRoomCredentialHeader(headers, cfg, relayAddr)
 			tunnel.AddServiceHeader(headers, service)
-			ws, err := tunnel.DialWebSocketWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
+			ws, err := tunnel.DialMessageConnWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
 			ready := tunnel.SessionReadyInfo{}
 			if err == nil {
 				if service == tunnel.ServiceScreen {
@@ -475,10 +475,10 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 						Heartbeat: ready.Heartbeat,
 					}), relayAddr, nil
 				}
-				return tunnel.WebSocketNetConn(ctx, ws), relayAddr, nil
+				return tunnel.MessageNetConn(ctx, ws), relayAddr, nil
 			}
 			cancel()
-			tunnel.CloseWebSocket(ws)
+			tunnel.CloseMessageConn(ws)
 			elapsed := time.Since(attemptStarted).Round(time.Millisecond)
 			log.Printf("relay attempt failed relay=%s service=%s elapsed=%s result=%s error=%v", relayAddr, service, elapsed, relayAttemptResult(err), err)
 			errs = append(errs, fmt.Sprintf("%s after %s: %v", relayAddr, elapsed, err))
@@ -810,12 +810,12 @@ func (c config) withRelayAddress(relayAddr string) config {
 	return next
 }
 
-func dialWebSocketFallback(ctx context.Context, cfg config, role string) (*websocket.Conn, string, error) {
+func dialWebSocketFallback(ctx context.Context, cfg config, role string) (tunnel.MessageConn, string, error) {
 	var errs []string
 	for _, relayAddr := range cfg.relayAddresses() {
 		headers := http.Header{}
 		addRoomCredentialHeader(headers, cfg, relayAddr)
-		conn, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, cfg.Proxy, role, "", headers)
+		conn, err := tunnel.DialMessageConnWithHeaders(ctx, relayAddr, cfg.Proxy, role, "", headers)
 		if err == nil {
 			return conn, relayAddr, nil
 		}

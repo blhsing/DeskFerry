@@ -203,6 +203,7 @@ public class TunnelService extends Service {
                 logRetentionDays = HomePrefs.sanitizeLogRetentionDays(requestedLogRetentionDays);
                 OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
                         .pingInterval(10, TimeUnit.SECONDS)
+                        .readTimeout(30, TimeUnit.SECONDS)
                         .retryOnConnectionFailure(true);
                 ProxySettings.apply(clientBuilder, requestedProxy);
                 httpClient = clientBuilder.build();
@@ -397,7 +398,7 @@ public class TunnelService extends Service {
                     long attemptStarted = SystemClock.elapsedRealtime();
                     try {
                         Request request = webSocketRequest(candidate, "home-agent");
-                        WebSocket socket = httpClient.newWebSocket(request, new WebSocketListener() {
+                        WebSocket socket = newRelayWebSocket(request, new WebSocketListener() {
                             @Override
                             public void onOpen(WebSocket webSocket, Response response) {
                                 presenceSocket = webSocket;
@@ -461,7 +462,7 @@ public class TunnelService extends Service {
                     long attemptStarted = SystemClock.elapsedRealtime();
                     try {
                         Request request = webSocketRequest(candidate, "dashboard");
-                        WebSocket socket = httpClient.newWebSocket(request, new WebSocketListener() {
+                        WebSocket socket = newRelayWebSocket(request, new WebSocketListener() {
                             @Override
                             public void onOpen(WebSocket webSocket, Response response) {
                                 statusSocket = webSocket;
@@ -556,6 +557,10 @@ public class TunnelService extends Service {
             request.header("X-DeskFerry-Log-Instance", emptyAs(instance, Build.MODEL));
         }
         return request.build();
+    }
+
+    private WebSocket newRelayWebSocket(Request request, WebSocketListener listener) {
+        return new FallbackWebSocket(httpClient, request, listener);
     }
 
     private List<String> relayUrlsSnapshot() {
@@ -657,7 +662,7 @@ public class TunnelService extends Service {
                 CountDownLatch ended = new CountDownLatch(1);
                 AtomicBoolean connected = new AtomicBoolean(false);
                 try {
-                    socket = httpClient.newWebSocket(webSocketRequest(target, "diagnostic-log"), new WebSocketListener() {
+                    socket = newRelayWebSocket(webSocketRequest(target, "diagnostic-log"), new WebSocketListener() {
                         @Override public void onOpen(WebSocket webSocket, Response response) { connected.set(true); opened.countDown(); }
                         @Override public void onMessage(WebSocket webSocket, String text) {
                             try { acknowledgements.offer(new JSONObject(text).optInt("accepted", -1)); } catch (Exception ignored) { acknowledgements.offer(-1); }
@@ -1139,7 +1144,7 @@ public class TunnelService extends Service {
 					.header("X-DeskFerry-Heartbeat", "1")
                     .header("X-DeskFerry-Protocol", "2")
                     .build();
-            WebSocket socket = httpClient.newWebSocket(request, bridgeListener(paired, started, failure, true));
+            WebSocket socket = newRelayWebSocket(request, bridgeListener(paired, started, failure, true));
             webSocket = socket;
             if (!paired.await(12, TimeUnit.SECONDS)) {
                 throw new IOException("relay did not pair with a work agent");
@@ -1460,7 +1465,7 @@ public class TunnelService extends Service {
                                     .header("X-DeskFerry-Session", sessionId)
                                     .header("X-DeskFerry-Session-Side", "client")
                                     .build();
-                            WebSocket candidate = httpClient.newWebSocket(request, bridgeListener(ready, started, failure, false));
+                            WebSocket candidate = newRelayWebSocket(request, bridgeListener(ready, started, failure, false));
 							synchronized (resumeLock) {
 								pendingResumeSocket = candidate;
 								pendingResumeReady = ready;
