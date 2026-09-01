@@ -20,6 +20,14 @@ type MessageConn interface {
 	CloseNow() error
 }
 
+// MessageConnProtocol identifies the selected wire transport for diagnostics.
+func MessageConnProtocol(conn MessageConn) string {
+	if _, ok := conn.(*HTTPStreamConn); ok {
+		return "http-stream"
+	}
+	return "websocket"
+}
+
 // MessageNetConn exposes binary messages as a byte stream. It is deliberately
 // independent of websocket.NetConn so HTTP-stream fallback connections and
 // native WebSockets have identical net.Conn behavior.

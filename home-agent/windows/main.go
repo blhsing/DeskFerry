@@ -296,12 +296,12 @@ func main() {
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		conn, relayAddr, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
+		conn, route, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
 		if err != nil {
 			log.Fatal(err)
 		}
 		defer conn.Close()
-		fmt.Fprintf(os.Stderr, "Connected to the Work screen service through %s.\n", relayAddr)
+		fmt.Fprintf(os.Stderr, "Connected to the Work screen service through %s proxy=%s protocol=%s relay_protocol=%s.\n", route.RelayAddr, route.Proxy, route.Protocol, route.RelayProtocol)
 		if err := screenview.RunCLI(ctx, conn, screenOptions); err != nil && !errors.Is(err, context.Canceled) {
 			log.Fatal(err)
 		}
@@ -562,12 +562,20 @@ func (a *clientApp) run(smokeTest bool) error {
 								Layout:        Grid{Columns: 4, Spacing: 7},
 								Children: []Widget{
 									Label{Text: "Destination"},
-									ComboBox{
-										AssignTo:              &a.destinationList,
-										Model:                 destinationNames(a.cfg.Destinations),
-										OnCurrentIndexChanged: a.destinationSelectionChanged,
+									Composite{
+										ColumnSpan: 2,
+										Layout:     HBox{MarginsZero: true, Spacing: 7},
+										Children: []Widget{
+											ComboBox{
+												AssignTo:              &a.destinationList,
+												Model:                 destinationNames(a.cfg.Destinations),
+												MinSize:               Size{Width: 120},
+												MaxSize:               Size{Width: 150},
+												OnCurrentIndexChanged: a.destinationSelectionChanged,
+											},
+											LineEdit{AssignTo: &a.destinationEdit, CueBanner: "Work destination name", MinSize: Size{Width: 120}, StretchFactor: 1},
+										},
 									},
-									LineEdit{AssignTo: &a.destinationEdit, CueBanner: "Work destination name"},
 									Composite{
 										Layout: Grid{Columns: 3, MarginsZero: true, Spacing: 5},
 										Children: []Widget{
@@ -1933,7 +1941,7 @@ func (a *clientApp) homePresenceLoop(ctx context.Context, cfg config) {
 			a.appendLog("Home status connection failed: %v", err)
 		} else {
 			a.setHomePresence("Online")
-			a.appendLog("Home status connected to %s.", relayAddr)
+			a.appendLog("Home status connected relay=%s proxy=%s protocol=%s.", relayAddr, tunnel.ProxyRouteForLog(relayAddr, cfg.Proxy), tunnel.MessageConnProtocol(conn))
 			_, _, err = conn.Read(ctx)
 			tunnel.CloseMessageConn(conn)
 			if ctx.Err() != nil {
@@ -2391,15 +2399,15 @@ func serveListener(ctx context.Context, cfg config, listener net.Listener, start
 func handleLocalConn(ctx context.Context, cfg config, localConn net.Conn, remote string, done func(string), logf func(string, ...any)) {
 	defer done(remote)
 	started := time.Now()
-	relayConn, relayAddr, err := dialRelay(ctx, cfg)
+	relayConn, route, err := dialRelay(ctx, cfg)
 	if err != nil {
 		logf("RDP session remote=%s relay dial failed after %s: %v", remote, time.Since(started).Round(time.Millisecond), err)
 		_ = localConn.Close()
 		return
 	}
-	logf("RDP session remote=%s connected relay=%s local=%s relay_stream=%s dial_duration=%s", remote, relayAddr, localConn.LocalAddr(), relayConn.RemoteAddr(), time.Since(started).Round(time.Millisecond))
+	logf("RDP session remote=%s connected relay=%s proxy=%s protocol=%s relay_protocol=%s local=%s relay_stream=%s dial_duration=%s", remote, route.RelayAddr, route.Proxy, route.Protocol, route.RelayProtocol, localConn.LocalAddr(), relayConn.RemoteAddr(), time.Since(started).Round(time.Millisecond))
 	result := tunnel.PipeWithResult(localConn, relayConn)
-	logf("RDP session remote=%s relay=%s ended duration=%s end_initiator=%s local_to_relay_bytes=%d local_to_relay_error=%v local_to_relay_half_close_error=%v relay_to_local_bytes=%d relay_to_local_error=%v relay_to_local_half_close_error=%v local_close_error=%v relay_close_error=%v", remote, relayAddr, result.Duration.Round(time.Millisecond), result.EndInitiator("local_rdp", "relay"), result.AToB.Bytes, result.AToB.CopyErr, result.AToB.CloseWriteErr, result.BToA.Bytes, result.BToA.CopyErr, result.BToA.CloseWriteErr, result.ACloseErr, result.BCloseErr)
+	logf("RDP session remote=%s relay=%s ended duration=%s end_initiator=%s local_to_relay_bytes=%d local_to_relay_error=%v local_to_relay_half_close_error=%v relay_to_local_bytes=%d relay_to_local_error=%v relay_to_local_half_close_error=%v local_close_error=%v relay_close_error=%v", remote, route.RelayAddr, result.Duration.Round(time.Millisecond), result.EndInitiator("local_rdp", "relay"), result.AToB.Bytes, result.AToB.CopyErr, result.AToB.CloseWriteErr, result.BToA.Bytes, result.BToA.CopyErr, result.BToA.CloseWriteErr, result.ACloseErr, result.BCloseErr)
 }
 
 func serveWinRMListener(ctx context.Context, cfg config, listener net.Listener, logf func(string, ...any)) error {
@@ -2422,22 +2430,29 @@ func serveWinRMListener(ctx context.Context, cfg config, listener net.Listener, 
 func handleLocalServiceConn(ctx context.Context, cfg config, localConn net.Conn, service string, logf func(string, ...any)) {
 	remote := localConn.RemoteAddr().String()
 	started := time.Now()
-	relayConn, relayAddr, err := dialRelayService(ctx, cfg, service)
+	relayConn, route, err := dialRelayService(ctx, cfg, service)
 	if err != nil {
 		logf("%s session remote=%s relay dial failed after %s: %v", strings.ToUpper(service), remote, time.Since(started).Round(time.Millisecond), err)
 		_ = localConn.Close()
 		return
 	}
-	logf("%s session remote=%s connected relay=%s", strings.ToUpper(service), remote, relayAddr)
+	logf("%s session remote=%s connected relay=%s proxy=%s protocol=%s relay_protocol=%s", strings.ToUpper(service), remote, route.RelayAddr, route.Proxy, route.Protocol, route.RelayProtocol)
 	result := tunnel.PipeWithResult(localConn, relayConn)
-	logf("%s session remote=%s relay=%s ended duration=%s local_to_relay_bytes=%d relay_to_local_bytes=%d local_error=%v relay_error=%v", strings.ToUpper(service), remote, relayAddr, result.Duration.Round(time.Millisecond), result.AToB.Bytes, result.BToA.Bytes, result.AToB.CopyErr, result.BToA.CopyErr)
+	logf("%s session remote=%s relay=%s ended duration=%s local_to_relay_bytes=%d relay_to_local_bytes=%d local_error=%v relay_error=%v", strings.ToUpper(service), remote, route.RelayAddr, result.Duration.Round(time.Millisecond), result.AToB.Bytes, result.BToA.Bytes, result.AToB.CopyErr, result.BToA.CopyErr)
 }
 
-func dialRelay(ctx context.Context, cfg config) (net.Conn, string, error) {
+type relayConnectionRoute struct {
+	RelayAddr     string
+	Proxy         string
+	Protocol      string
+	RelayProtocol string
+}
+
+func dialRelay(ctx context.Context, cfg config) (net.Conn, relayConnectionRoute, error) {
 	return dialRelayService(ctx, cfg, tunnel.ServiceRDP)
 }
 
-func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn, string, error) {
+func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn, relayConnectionRoute, error) {
 	deadline := time.Now().Add(5 * time.Minute)
 	backoff := 250 * time.Millisecond
 	var errs []string
@@ -2467,11 +2482,16 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 			}
 			if err == nil {
 				cancel()
-				log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t heartbeat=%t via=%s elapsed=%s", relayAddr, service, ready.ProtocolV2, ready.Heartbeat, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
-				if ready.SessionID != "" && service != tunnel.ServiceScreen {
-					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: ready.SessionID, Side: "client", RoomProof: cfg.roomProof(), Service: service, Heartbeat: ready.Heartbeat}), relayAddr, nil
+				relayProtocol := "legacy"
+				if ready.ProtocolV2 {
+					relayProtocol = "v2"
 				}
-				return tunnel.MessageNetConn(ctx, ws), relayAddr, nil
+				route := relayConnectionRoute{RelayAddr: relayAddr, Proxy: tunnel.ProxyRouteForLog(relayAddr, cfg.Proxy), Protocol: tunnel.MessageConnProtocol(ws), RelayProtocol: relayProtocol}
+				log.Printf("relay attempt selected relay=%s service=%s proxy=%s protocol=%s relay_protocol=%s heartbeat=%t elapsed=%s", route.RelayAddr, service, route.Proxy, route.Protocol, route.RelayProtocol, ready.Heartbeat, time.Since(attemptStarted).Round(time.Millisecond))
+				if ready.SessionID != "" && service != tunnel.ServiceScreen {
+					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: ready.SessionID, Side: "client", RoomProof: cfg.roomProof(), Service: service, Heartbeat: ready.Heartbeat}), route, nil
+				}
+				return tunnel.MessageNetConn(ctx, ws), route, nil
 			}
 			cancel()
 			tunnel.CloseMessageConn(ws)
@@ -2480,7 +2500,7 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 			errs = append(errs, fmt.Sprintf("%s after %s: %v", relayAddr, elapsed, err))
 			var rejected *tunnel.SessionResultError
 			if errors.As(err, &rejected) && (rejected.Result == tunnel.MessageAuthFailed || rejected.Result == tunnel.MessageServiceDisabled || rejected.Result == tunnel.MessageInvalidRequest) {
-				return nil, "", fmt.Errorf("relay rejected non-retryable %s session: %w", service, err)
+				return nil, relayConnectionRoute{}, fmt.Errorf("relay rejected non-retryable %s session: %w", service, err)
 			}
 			if ctx.Err() != nil {
 				break
@@ -2502,7 +2522,7 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 			}
 		}
 	}
-	return nil, "", fmt.Errorf("relay retry window ended: %s", strings.Join(errs, "; "))
+	return nil, relayConnectionRoute{}, fmt.Errorf("relay retry window ended: %s", strings.Join(errs, "; "))
 }
 
 func relayAttemptResult(err error) string {

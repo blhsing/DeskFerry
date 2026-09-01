@@ -5,6 +5,8 @@
 - Authenticate plain-HTTP fallback requests through NTLM forward proxies with the current Windows identity, including every replacement `POST` and `GET` connection; LocalSystem services securely acquire the credential from a logged-on interactive session instead of presenting the rejected machine account.
 - Request replay-safe finite HTTP batches so proxies that buffer endless uploads or downloads release control and data records promptly, while retaining persistent streams for older clients and non-buffering paths.
 - Extend the opt-in external compatibility probe and verify protocol-v2 pairing and data transfer through an authenticated Skyhigh Secure Web Gateway that rejects WebSocket `CONNECT`.
+- Show the effective proxy URL, selected wire protocol, and relay protocol in Windows Home activity messages without exposing proxy credentials or the unresolved `env` configuration keyword.
+- Rebalance the Windows Home destination row so the profile selector stays compact and the adjacent editable destination-name field remains usable.
 
 ## 0.11.0 - 2026-09-01
 

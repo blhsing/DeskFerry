@@ -502,7 +502,7 @@ func (v *screenViewer) start(stream bool) {
 
 func (v *screenViewer) receive(ctx context.Context, request screenview.Request) {
 	cfg := v.owner.currentConfig()
-	conn, relayAddr, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
+	conn, route, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
 	if err != nil {
 		if ctx.Err() == nil {
 			v.setStatus("Screen connection failed: " + err.Error())
@@ -510,7 +510,8 @@ func (v *screenViewer) receive(ctx context.Context, request screenview.Request) 
 		return
 	}
 	defer conn.Close()
-	v.setStatus(fmt.Sprintf("Connected through %s; waiting for the first frame...", relayAddr))
+	v.owner.appendLog("Screen connection selected relay=%s proxy=%s protocol=%s relay_protocol=%s.", route.RelayAddr, route.Proxy, route.Protocol, route.RelayProtocol)
+	v.setStatus(fmt.Sprintf("Connected through %s via %s (%s); waiting for the first frame...", route.RelayAddr, route.Proxy, route.Protocol))
 	err = screenview.Receive(conn, request, func(frame screenview.Frame, canvas *image.RGBA) error {
 		v.showFrame(canvas, frame.Seq, len(frame.Rects), request.Mode == screenview.ModeStream)
 		return nil

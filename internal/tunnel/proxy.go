@@ -26,6 +26,29 @@ func ProxySpecForLog(proxySpec string) string {
 	return proxyURLForLog(proxyURL)
 }
 
+// ProxyRouteForLog resolves environment/automatic settings for one relay and
+// redacts any embedded credentials. It returns only the effective proxy URL or
+// "direct", never the configuration keywords "env" or "auto".
+func ProxyRouteForLog(relayAddr, proxySpec string) string {
+	spec := strings.TrimSpace(proxySpec)
+	if spec == "" || strings.EqualFold(spec, "direct") {
+		return "direct"
+	}
+	endpoint, err := WebSocketEndpoint(relayAddr)
+	if err != nil {
+		return "unresolved"
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Host == "" {
+		return "unresolved"
+	}
+	proxyURL, err := webSocketProxyURL(parsed.Host, proxySpec)
+	if err != nil {
+		return "unresolved"
+	}
+	return proxyURLForLog(proxyURL)
+}
+
 func resolveProxyURL(targetAddr, proxySpec string) (*url.URL, error) {
 	spec := strings.TrimSpace(proxySpec)
 	if strings.EqualFold(spec, "env") || strings.EqualFold(spec, "auto") {

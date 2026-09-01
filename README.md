@@ -490,6 +490,7 @@ It:
 `home-agent/windows/` is the secure home-side Windows path. It provides:
 
 - A polished control panel with a room field, ordered relay service base URL list, local RDP address, proxy mode, status tiles, room details, and activity log.
+- Connection activity that reports the effective proxy URL plus the selected WebSocket or HTTP-stream transport and relay protocol.
 - A notification-area icon with open, connect, stop, Remote Desktop, and quit actions.
 - Windows Credential Manager integration for one shared RDP, WinRM, and SMB login per destination.
 - Persistent home-app presence on the relay dashboard.
