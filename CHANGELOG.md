@@ -8,6 +8,7 @@
 - Show the effective proxy URL, selected wire protocol, and relay protocol in Windows Home activity messages without exposing proxy credentials or the unresolved `env` configuration keyword.
 - Rebalance the Windows Home destination row so the profile selector stays compact and the adjacent editable destination-name field remains usable.
 - Simplify the RDP graphics-decoding row to the mode selector and apply button, and report the applied Windows policy alongside the recommendation instead of in a redundant field.
+- Serialize elevated SMB profile reconfiguration requests so rapid destination/save events cannot run overlapping installers and leave the optional network service removed.
 
 ## 0.11.0 - 2026-09-01
 

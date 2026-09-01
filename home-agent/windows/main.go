@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -54,6 +55,7 @@ const (
 var relayLogs = remotelog.New("home-agent-windows")
 var relayLogsTargetMu sync.Mutex
 var relayLogsTargetCancel context.CancelFunc
+var smbProfileSyncPending atomic.Bool
 
 type config struct {
 	ListenAddr          string               `json:"listen_addr"`
@@ -3075,6 +3077,15 @@ func requestSelectedSMBProfileSync(cfg config, force bool) (bool, error) {
 	if _, err := os.Stat(setupPath); err != nil {
 		return false, errors.New("DeskFerry Home Setup is not installed")
 	}
+	if !smbProfileSyncPending.CompareAndSwap(false, true) {
+		return false, nil
+	}
+	launched := false
+	defer func() {
+		if !launched {
+			smbProfileSyncPending.Store(false)
+		}
+	}()
 	request := selectedSMBSetupRequest{
 		InstallDir: metadata.InstallDir, Destination: profile.Name, RelayAddrs: relays,
 		Proxy: proxy, RoomProof: profile.RoomProof, Alias: alias, EnableNetwork: true,
@@ -3106,6 +3117,8 @@ func requestSelectedSMBProfileSync(cfg config, force bool) (bool, error) {
 		_ = os.Remove(requestPath)
 		return false, err
 	}
+	launched = true
+	time.AfterFunc(30*time.Second, func() { smbProfileSyncPending.Store(false) })
 	time.AfterFunc(10*time.Minute, func() { _ = os.Remove(requestPath) })
 	return true, nil
 }

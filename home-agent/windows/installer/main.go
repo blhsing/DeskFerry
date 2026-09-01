@@ -40,6 +40,7 @@ const (
 	defaultOCIRelayBase   = "http://217.142.228.117/relay"
 	defaultRoomName       = "workdesk"
 	productVersion        = "0.11.1"
+	setupInstallMutexName = `Global\DeskFerryHomeSetupInstall`
 	hostsBeginMarker      = "# BEGIN DeskFerry Home managed alias"
 	hostsEndMarker        = "# END DeskFerry Home managed alias"
 )
@@ -1054,6 +1055,14 @@ func networkConfig(opts setupOptions) homenetwork.Config {
 }
 
 func installProduct(opts setupOptions) (string, error) {
+	installMutex, err := acquireSetupInstallMutex()
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = windows.ReleaseMutex(installMutex)
+		_ = windows.CloseHandle(installMutex)
+	}()
 	preserveInstalledRoomProof(&opts)
 	if err := validateOptions(opts); err != nil {
 		return "", err
@@ -1140,6 +1149,27 @@ func installProduct(opts setupOptions) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("DeskFerry Home and file access were installed. Open \\\\%s\\sharename after the work agent enables SMB.", cfg.Alias), nil
+}
+
+func acquireSetupInstallMutex() (windows.Handle, error) {
+	name, err := windows.UTF16PtrFromString(setupInstallMutexName)
+	if err != nil {
+		return 0, err
+	}
+	handle, createErr := windows.CreateMutex(nil, false, name)
+	if createErr != nil && !errors.Is(createErr, windows.ERROR_ALREADY_EXISTS) {
+		return 0, fmt.Errorf("create setup install mutex: %w", createErr)
+	}
+	result, err := windows.WaitForSingleObject(handle, uint32((2*time.Minute)/time.Millisecond))
+	if err != nil {
+		_ = windows.CloseHandle(handle)
+		return 0, fmt.Errorf("wait for another DeskFerry Home setup: %w", err)
+	}
+	if result != windows.WAIT_OBJECT_0 && result != windows.WAIT_ABANDONED {
+		_ = windows.CloseHandle(handle)
+		return 0, errors.New("another DeskFerry Home setup did not finish within two minutes")
+	}
+	return handle, nil
 }
 
 func ensureReplaceable(path string) error {
