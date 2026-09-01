@@ -210,6 +210,17 @@ func httpStreamHTTPClientWithAuth(relayAddr, proxySpec string, authFactory integ
 		IdleConnTimeout:       30 * time.Second,
 		ExpectContinueTimeout: 2 * time.Second,
 	}
+	// HTTPS requests still need CONNECT before their ordinary POST/GET traffic
+	// can reach the relay. Use the same integrated-authentication tunnel dialer
+	// as WebSocket so an NTLM proxy sees the current Windows identity instead
+	// of an unauthenticated net/http CONNECT request.
+	if target, err := url.Parse(strings.TrimSpace(relayAddr)); err == nil && target.Host != "" &&
+		(strings.EqualFold(target.Scheme, "https") || strings.EqualFold(target.Scheme, "wss")) {
+		if proxyURL, proxyErr := webSocketProxyURL(target.Host, proxySpec); proxyErr == nil && proxyURL != nil {
+			transport.Proxy = nil
+			transport.DialContext = proxyConnectDialContextWithAuth(proxyURL, authFactory)
+		}
+	}
 	// A non-CONNECT proxy sees the POST and GET requests themselves. Go's
 	// standard proxy support handles Basic credentials embedded in the URL but
 	// does not negotiate connection-affine NTLM with the current Windows user.
@@ -238,8 +249,8 @@ func httpStreamIntegratedProxy(relayAddr, proxySpec string, authFactory integrat
 		target.Scheme = "http"
 	case "http":
 	case "wss", "https":
-		// A forward proxy cannot carry TLS without CONNECT. Leave HTTPS on the
-		// standard path so it reports the proxy's CONNECT rejection normally.
+		// HTTPS is configured above with the authenticated CONNECT dialer. This
+		// helper is only for plain forward-proxy requests.
 		return nil, nil, false
 	default:
 		return nil, nil, false

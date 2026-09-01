@@ -520,7 +520,7 @@ func relayAttemptResult(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "deadline exceeded") {
 		return "timeout"
 	}
-	return "transport-failure"
+	return tunnel.TransportFailureResult(err)
 }
 
 func launchRDP(cfg config) error {

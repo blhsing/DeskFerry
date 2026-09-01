@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -35,7 +36,17 @@ const (
 	httpStreamPreferredDialLimit  = 6 * time.Second
 )
 
-var httpStreamOnlyProxies sync.Map
+var (
+	httpStreamPreferredProxies     sync.Map
+	proxyCONNECTUnsupportedStore   sync.Map
+	proxyCONNECTRejectedCandidates sync.Map
+)
+
+var (
+	ErrProxyAuthentication      = errors.New("proxy authentication failed")
+	ErrProxyCONNECTRejected     = errors.New("proxy CONNECT rejected")
+	ErrWebSocketUpgradeRejected = errors.New("WebSocket upgrade rejected")
+)
 
 func newDNSFallbackDialer() *dnsFallbackDialer {
 	var dialer net.Dialer
@@ -352,17 +363,29 @@ func DialMessageConn(ctx context.Context, relayAddr, proxySpec, role, token stri
 }
 
 func DialMessageConnWithHeaders(ctx context.Context, relayAddr, proxySpec, role, token string, extraHeaders http.Header) (MessageConn, error) {
-	if ProxyHTTPStreamOnly(proxySpec) {
-		if relayRequiresProxyCONNECT(relayAddr) {
-			return nil, fmt.Errorf("proxy %s is recorded as HTTP-stream-only; HTTPS relay %s requires CONNECT", ProxySpecForLog(proxySpec), relayAddr)
+	if ProxyHTTPStreamPreferred(proxySpec) {
+		if ProxyCONNECTUnsupported(proxySpec) && relayRequiresProxyCONNECT(relayAddr) {
+			return nil, fmt.Errorf("%w: proxy %s is recorded as rejecting CONNECT; HTTPS relay %s cannot be reached through it", ErrProxyCONNECTRejected, ProxySpecForLog(proxySpec), relayAddr)
 		}
 		streamCtx, cancel := context.WithTimeout(ctx, httpStreamPreferredDialLimit)
 		stream, streamErr := DialHTTPStreamWithHeaders(streamCtx, relayAddr, proxySpec, role, token, extraHeaders)
 		cancel()
 		if streamErr == nil {
+			if relayRequiresProxyCONNECT(relayAddr) {
+				ClearProxyCONNECTUnsupported(proxySpec)
+				clearProxyCONNECTRejectedCandidate(proxySpec)
+			} else if proxyCONNECTRejectedCandidate(proxySpec) {
+				MarkProxyCONNECTUnsupported(proxySpec)
+				clearProxyCONNECTRejectedCandidate(proxySpec)
+			}
 			return stream, nil
 		}
-		ClearProxyHTTPStreamOnly(proxySpec)
+		if relayRequiresProxyCONNECT(relayAddr) && errors.Is(streamErr, ErrProxyCONNECTRejected) {
+			markProxyCONNECTRejectedCandidate(proxySpec)
+			return nil, streamErr
+		}
+		ClearProxyHTTPStreamPreferred(proxySpec)
+		clearProxyCONNECTRejectedCandidate(proxySpec)
 		if ctx.Err() != nil {
 			return nil, streamErr
 		}
@@ -372,7 +395,9 @@ func DialMessageConnWithHeaders(ctx context.Context, relayAddr, proxySpec, role,
 	ws, wsErr := DialWebSocketWithHeaders(wsCtx, relayAddr, proxySpec, role, token, extraHeaders)
 	cancelWS()
 	if wsErr == nil {
-		ClearProxyHTTPStreamOnly(proxySpec)
+		ClearProxyHTTPStreamPreferred(proxySpec)
+		ClearProxyCONNECTUnsupported(proxySpec)
+		clearProxyCONNECTRejectedCandidate(proxySpec)
 		return ws, nil
 	}
 	if !shouldTryHTTPStreamFallback(proxySpec, wsErr) {
@@ -380,10 +405,21 @@ func DialMessageConnWithHeaders(ctx context.Context, relayAddr, proxySpec, role,
 	}
 	stream, streamErr := DialHTTPStreamWithHeaders(ctx, relayAddr, proxySpec, role, token, extraHeaders)
 	if streamErr != nil {
+		if relayRequiresProxyCONNECT(relayAddr) && errors.Is(streamErr, ErrProxyCONNECTRejected) {
+			markProxyCONNECTRejectedCandidate(proxySpec)
+		}
 		return nil, fmt.Errorf("websocket transport failed (%v); HTTP stream fallback failed: %w", wsErr, streamErr)
 	}
-	if !relayRequiresProxyCONNECT(relayAddr) {
-		MarkProxyHTTPStreamOnly(proxySpec)
+	MarkProxyHTTPStreamPreferred(proxySpec)
+	if relayRequiresProxyCONNECT(relayAddr) {
+		ClearProxyCONNECTUnsupported(proxySpec)
+		clearProxyCONNECTRejectedCandidate(proxySpec)
+	} else if errors.Is(wsErr, ErrProxyCONNECTRejected) || proxyCONNECTRejectedCandidate(proxySpec) {
+		// The WebSocket client deliberately uses CONNECT even for a plain-HTTP
+		// relay. A rejected CONNECT followed by a successful forward-proxy
+		// POST/GET exchange validates both halves of this capability.
+		MarkProxyCONNECTUnsupported(proxySpec)
+		clearProxyCONNECTRejectedCandidate(proxySpec)
 	}
 	return stream, nil
 }
@@ -424,39 +460,103 @@ func relayRequiresProxyCONNECT(relayAddr string) bool {
 	}
 }
 
-// MarkProxyHTTPStreamOnly records that an explicit proxy has demonstrated a
-// working plain-HTTP POST/GET path after failing WebSocket setup. Callers may
-// persist ProxyHTTPStreamOnlyKeys and restore them on the next process start.
-func MarkProxyHTTPStreamOnly(proxySpec string) {
+// MarkProxyHTTPStreamPreferred records that an explicit proxy has demonstrated
+// a working POST/GET path after failing WebSocket setup. This does not imply
+// that the proxy rejects CONNECT; HTTPS POST/GET may still work through an
+// authenticated CONNECT tunnel.
+func MarkProxyHTTPStreamPreferred(proxySpec string) {
 	if key, ok := proxyCapabilityKey(proxySpec); ok {
-		httpStreamOnlyProxies.Store(key, struct{}{})
+		httpStreamPreferredProxies.Store(key, struct{}{})
 	}
 }
 
-func ClearProxyHTTPStreamOnly(proxySpec string) {
+func ClearProxyHTTPStreamPreferred(proxySpec string) {
 	if key, ok := proxyCapabilityKey(proxySpec); ok {
-		httpStreamOnlyProxies.Delete(key)
+		httpStreamPreferredProxies.Delete(key)
 	}
 }
 
-func ProxyHTTPStreamOnly(proxySpec string) bool {
+func ProxyHTTPStreamPreferred(proxySpec string) bool {
 	key, ok := proxyCapabilityKey(proxySpec)
 	if !ok {
 		return false
 	}
-	_, ok = httpStreamOnlyProxies.Load(key)
+	_, ok = httpStreamPreferredProxies.Load(key)
 	return ok
 }
 
-func ProxyHTTPStreamOnlyKeys() []string {
+func ProxyHTTPStreamPreferredKeys() []string {
+	return proxyCapabilityKeys(&httpStreamPreferredProxies)
+}
+
+func MarkProxyCONNECTUnsupported(proxySpec string) {
+	if key, ok := proxyCapabilityKey(proxySpec); ok {
+		proxyCONNECTUnsupportedStore.Store(key, struct{}{})
+	}
+}
+
+func ClearProxyCONNECTUnsupported(proxySpec string) {
+	if key, ok := proxyCapabilityKey(proxySpec); ok {
+		proxyCONNECTUnsupportedStore.Delete(key)
+	}
+}
+
+func ProxyCONNECTUnsupported(proxySpec string) bool {
+	key, ok := proxyCapabilityKey(proxySpec)
+	if !ok {
+		return false
+	}
+	_, ok = proxyCONNECTUnsupportedStore.Load(key)
+	return ok
+}
+
+func ProxyCONNECTUnsupportedKeys() []string {
+	return proxyCapabilityKeys(&proxyCONNECTUnsupportedStore)
+}
+
+func markProxyCONNECTRejectedCandidate(proxySpec string) {
+	if key, ok := proxyCapabilityKey(proxySpec); ok {
+		proxyCONNECTRejectedCandidates.Store(key, struct{}{})
+	}
+}
+
+func clearProxyCONNECTRejectedCandidate(proxySpec string) {
+	if key, ok := proxyCapabilityKey(proxySpec); ok {
+		proxyCONNECTRejectedCandidates.Delete(key)
+	}
+}
+
+func proxyCONNECTRejectedCandidate(proxySpec string) bool {
+	key, ok := proxyCapabilityKey(proxySpec)
+	if !ok {
+		return false
+	}
+	_, ok = proxyCONNECTRejectedCandidates.Load(key)
+	return ok
+}
+
+func proxyCapabilityKeys(store *sync.Map) []string {
 	keys := make([]string, 0)
-	httpStreamOnlyProxies.Range(func(key, _ any) bool {
+	store.Range(func(key, _ any) bool {
 		if value, ok := key.(string); ok {
 			keys = append(keys, value)
 		}
 		return true
 	})
 	return keys
+}
+
+func TransportFailureResult(err error) string {
+	switch {
+	case errors.Is(err, ErrProxyAuthentication):
+		return "proxy-authentication-failure"
+	case errors.Is(err, ErrProxyCONNECTRejected):
+		return "proxy-connect-rejected"
+	case errors.Is(err, ErrWebSocketUpgradeRejected):
+		return "websocket-upgrade-rejected"
+	default:
+		return "transport-failure"
+	}
 }
 
 func proxyCapabilityKey(proxySpec string) (string, bool) {
@@ -479,6 +579,9 @@ func shouldTryHTTPStreamFallback(proxySpec string, err error) bool {
 	spec := strings.TrimSpace(proxySpec)
 	if err == nil || spec == "" || strings.EqualFold(spec, "direct") {
 		return false
+	}
+	if errors.Is(err, ErrWebSocketUpgradeRejected) || errors.Is(err, ErrProxyCONNECTRejected) || errors.Is(err, ErrProxyAuthentication) {
+		return true
 	}
 	text := strings.ToLower(err.Error())
 	if strings.Contains(text, "http 401") || strings.Contains(text, "http 403") && !strings.Contains(text, "proxy") {
@@ -517,7 +620,7 @@ func DialWebSocketWithHeaders(ctx context.Context, relayAddr, proxySpec, role, t
 	})
 	if err != nil {
 		if resp != nil {
-			return nil, fmt.Errorf("websocket dial failed: HTTP %s", resp.Status)
+			return nil, fmt.Errorf("%w: HTTP %s", ErrWebSocketUpgradeRejected, resp.Status)
 		}
 		return nil, fmt.Errorf("websocket dial failed: %w", err)
 	}
@@ -649,7 +752,11 @@ func proxyConnectDialContextWithAuth(proxyURL *url.URL, authFactory integratedPr
 		var authorization string
 		if proxyURL.User == nil && authFactory != nil {
 			auth, err = authFactory()
-			if err == nil && auth != nil {
+			if err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("%w for %s: %v", ErrProxyAuthentication, proxyURLForLog(proxyURL), err)
+			}
+			if auth != nil {
 				defer auth.Close()
 				authorization = proxyAuthorization(auth.Scheme(), auth.InitialToken())
 			}
@@ -673,24 +780,28 @@ func proxyConnectDialContextWithAuth(proxyURL *url.URL, authFactory integratedPr
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 
-			if resp.StatusCode != http.StatusProxyAuthRequired || auth == nil || attempt > 0 {
+			if resp.StatusCode != http.StatusProxyAuthRequired {
 				conn.Close()
-				return nil, fmt.Errorf("proxy CONNECT %s via %s failed: %s", address, proxyURLForLog(proxyURL), resp.Status)
+				return nil, fmt.Errorf("%w: CONNECT %s via %s returned HTTP %s", ErrProxyCONNECTRejected, address, proxyURLForLog(proxyURL), resp.Status)
+			}
+			if auth == nil || attempt > 0 {
+				conn.Close()
+				return nil, fmt.Errorf("%w: CONNECT %s via %s returned HTTP %s", ErrProxyAuthentication, address, proxyURLForLog(proxyURL), resp.Status)
 			}
 			challenge, ok := proxyAuthenticationChallenge(resp.Header, auth.Scheme())
 			if !ok {
 				conn.Close()
-				return nil, fmt.Errorf("proxy CONNECT %s via %s requested unsupported authentication", address, proxyURLForLog(proxyURL))
+				return nil, fmt.Errorf("%w: CONNECT %s via %s requested unsupported authentication", ErrProxyAuthentication, address, proxyURLForLog(proxyURL))
 			}
 			nextToken, err := auth.NextToken(challenge)
 			if err != nil {
 				conn.Close()
-				return nil, fmt.Errorf("authenticate proxy %s with Windows credentials: %w", proxyURLForLog(proxyURL), err)
+				return nil, fmt.Errorf("%w for %s with Windows credentials: %v", ErrProxyAuthentication, proxyURLForLog(proxyURL), err)
 			}
 			authorization = proxyAuthorization(auth.Scheme(), nextToken)
 		}
 		conn.Close()
-		return nil, fmt.Errorf("proxy CONNECT %s via %s authentication did not complete", address, proxyURLForLog(proxyURL))
+		return nil, fmt.Errorf("%w: CONNECT %s via %s authentication did not complete", ErrProxyAuthentication, address, proxyURLForLog(proxyURL))
 	}
 }
 

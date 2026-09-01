@@ -26,25 +26,27 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func TestProxyHTTPStreamCapabilityPersistsAcrossStarts(t *testing.T) {
+func TestProxyCapabilitiesPersistAcrossStarts(t *testing.T) {
 	t.Setenv("APPDATA", t.TempDir())
 	proxySpec := "http://192.9.200.22:9090"
-	tunnel.ClearProxyHTTPStreamOnly(proxySpec)
-	defer tunnel.ClearProxyHTTPStreamOnly(proxySpec)
+	resetProxyCapabilityTestState(proxySpec)
+	defer resetProxyCapabilityTestState(proxySpec)
 
-	tunnel.MarkProxyHTTPStreamOnly(proxySpec)
+	tunnel.MarkProxyHTTPStreamPreferred(proxySpec)
+	tunnel.MarkProxyCONNECTUnsupported(proxySpec)
 	if err := persistProxyCapabilitiesIfChanged(); err != nil {
 		t.Fatal(err)
 	}
-	tunnel.ClearProxyHTTPStreamOnly(proxySpec)
-	if tunnel.ProxyHTTPStreamOnly(proxySpec) {
+	tunnel.ClearProxyHTTPStreamPreferred(proxySpec)
+	tunnel.ClearProxyCONNECTUnsupported(proxySpec)
+	if tunnel.ProxyHTTPStreamPreferred(proxySpec) || tunnel.ProxyCONNECTUnsupported(proxySpec) {
 		t.Fatal("proxy capability remained in memory before reload")
 	}
 	if err := loadProxyCapabilities(); err != nil {
 		t.Fatal(err)
 	}
-	if !tunnel.ProxyHTTPStreamOnly(proxySpec) {
-		t.Fatal("saved HTTP-stream-only proxy capability was not restored")
+	if !tunnel.ProxyHTTPStreamPreferred(proxySpec) || !tunnel.ProxyCONNECTUnsupported(proxySpec) {
+		t.Fatal("saved proxy capabilities were not restored")
 	}
 
 	path, err := proxyCapabilitiesPath()
@@ -55,9 +57,54 @@ func TestProxyHTTPStreamCapabilityPersistsAcrossStarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(data, []byte(proxySpec)) {
+	if !bytes.Contains(data, []byte(proxySpec)) || !bytes.Contains(data, []byte("http_stream_preferred")) || !bytes.Contains(data, []byte("connect_unsupported")) {
 		t.Fatalf("saved proxy capabilities do not contain %q: %s", proxySpec, data)
 	}
+}
+
+func TestLegacyHTTPStreamOnlyCapabilityDoesNotAssumeCONNECTFailure(t *testing.T) {
+	t.Setenv("APPDATA", t.TempDir())
+	proxySpec := "http://192.9.200.22:9090"
+	resetProxyCapabilityTestState(proxySpec)
+	defer resetProxyCapabilityTestState(proxySpec)
+	path, err := proxyCapabilitiesPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := []byte("{\n  \"http_stream_only\": [\"" + proxySpec + "\"]\n}\n")
+	if err := os.WriteFile(path, legacy, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadProxyCapabilities(); err != nil {
+		t.Fatal(err)
+	}
+	if !tunnel.ProxyHTTPStreamPreferred(proxySpec) {
+		t.Fatal("legacy capability did not preserve the POST/GET preference")
+	}
+	if tunnel.ProxyCONNECTUnsupported(proxySpec) {
+		t.Fatal("legacy capability incorrectly classified CONNECT as unsupported")
+	}
+	if err := persistProxyCapabilitiesIfChanged(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("http_stream_only")) || !bytes.Contains(data, []byte("http_stream_preferred")) {
+		t.Fatalf("legacy proxy capability was not migrated: %s", data)
+	}
+}
+
+func resetProxyCapabilityTestState(proxySpec string) {
+	tunnel.ClearProxyHTTPStreamPreferred(proxySpec)
+	tunnel.ClearProxyCONNECTUnsupported(proxySpec)
+	proxyCapabilitiesState.Lock()
+	proxyCapabilitiesState.signature = ""
+	proxyCapabilitiesState.Unlock()
 }
 
 func TestRelayStatusClientReusesBoundedConnection(t *testing.T) {

@@ -46,8 +46,10 @@ func TestExternalRelayProxyFallbackSelection(t *testing.T) {
 	if baseURL == "" || proxySpec == "" || strings.EqualFold(proxySpec, "direct") {
 		t.Skip("DESKFERRY_COMPAT_RELAY_URL and DESKFERRY_COMPAT_PROXY are not set")
 	}
-	ClearProxyHTTPStreamOnly(proxySpec)
-	defer ClearProxyHTTPStreamOnly(proxySpec)
+	ClearProxyHTTPStreamPreferred(proxySpec)
+	ClearProxyCONNECTUnsupported(proxySpec)
+	defer ClearProxyHTTPStreamPreferred(proxySpec)
+	defer ClearProxyCONNECTUnsupported(proxySpec)
 	relayAddr := baseURL + "/relay/compat-proxy-" + time.Now().Format("150405.000000")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -63,8 +65,8 @@ func TestExternalRelayProxyFallbackSelection(t *testing.T) {
 	if firstProtocol != "http-stream" {
 		t.Fatalf("first protocol = %q, want http-stream", firstProtocol)
 	}
-	if !ProxyHTTPStreamOnly(proxySpec) {
-		t.Fatal("successful proxy fallback did not record HTTP-stream-only capability")
+	if !ProxyHTTPStreamPreferred(proxySpec) {
+		t.Fatal("successful proxy fallback did not record HTTP-stream preference")
 	}
 
 	started = time.Now()

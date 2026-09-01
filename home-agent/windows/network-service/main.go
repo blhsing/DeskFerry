@@ -351,7 +351,7 @@ func dialSMBRelay(ctx context.Context, cfg homenetwork.Config) (net.Conn, string
 		ws, err := tunnel.DialMessageConnWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
 		if err != nil {
 			cancel()
-			log.Printf("relay attempt failed relay=%s service=%s elapsed=%s result=transport-failure error=%v", relayAddr, tunnel.ServiceSMB, time.Since(attemptStarted).Round(time.Millisecond), err)
+			log.Printf("relay attempt failed relay=%s service=%s elapsed=%s result=%s error=%v", relayAddr, tunnel.ServiceSMB, time.Since(attemptStarted).Round(time.Millisecond), tunnel.TransportFailureResult(err), err)
 			failures = append(failures, fmt.Errorf("%s: %w", relayAddr, err))
 			continue
 		}

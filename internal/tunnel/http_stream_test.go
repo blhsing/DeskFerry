@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -97,6 +98,96 @@ func TestHTTPStreamForwardProxyUsesIntegratedAuthentication(t *testing.T) {
 	}
 }
 
+func TestHTTPSHTTPStreamUsesIntegratedAuthenticationForCONNECT(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		for attempt, expected := range []string{"initial", "response"} {
+			req, err := http.ReadRequest(reader)
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			if req.Method != http.MethodConnect || req.Host != "relay.example:443" {
+				serverErr <- fmt.Errorf("CONNECT request method=%s host=%s", req.Method, req.Host)
+				return
+			}
+			want := "NTLM " + base64.StdEncoding.EncodeToString([]byte(expected))
+			if got := req.Header.Get("Proxy-Authorization"); got != want {
+				serverErr <- fmt.Errorf("attempt %d authorization = %q, want %q", attempt, got, want)
+				return
+			}
+			if attempt == 0 {
+				challenge := base64.StdEncoding.EncodeToString([]byte("challenge"))
+				_, err = fmt.Fprintf(conn, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: NTLM %s\r\nContent-Length: 0\r\n\r\n", challenge)
+			} else {
+				_, err = fmt.Fprint(conn, "HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n")
+			}
+			if err != nil {
+				serverErr <- err
+				return
+			}
+		}
+		serverErr <- nil
+	}()
+
+	client := httpStreamHTTPClientWithAuth("https://relay.example/relay/b", "http://"+listener.Addr().String(), func() (integratedProxyAuthenticator, error) {
+		return &fakeProxyAuthenticator{}, nil
+	})
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", client.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("HTTPS stream transport retained net/http proxy handling instead of authenticated CONNECT")
+	}
+	conn, err := transport.DialContext(context.Background(), "tcp", "relay.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCONNECTRejectionIsNotPersistedBeforePlainHTTPFallbackWorks(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			http.Error(w, "CONNECT is not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		http.Error(w, "unexpected forward request", http.StatusBadRequest)
+	}))
+	defer proxy.Close()
+	defer ClearProxyHTTPStreamPreferred(proxy.URL)
+	defer ClearProxyCONNECTUnsupported(proxy.URL)
+	defer clearProxyCONNECTRejectedCandidate(proxy.URL)
+	MarkProxyHTTPStreamPreferred(proxy.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := DialMessageConnWithHeaders(ctx, "https://relay.example/relay/unit", proxy.URL, RoleProbe, "", nil)
+	if !errors.Is(err, ErrProxyCONNECTRejected) {
+		t.Fatalf("HTTPS dial error = %v, want CONNECT rejection", err)
+	}
+	if ProxyCONNECTUnsupported(proxy.URL) {
+		t.Fatal("CONNECT rejection was persisted before a plain-HTTP POST/GET path succeeded")
+	}
+}
+
 func TestHTTPStreamFallbackWithoutProxyCONNECT(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -152,7 +243,6 @@ func TestHTTPStreamFallbackWithoutProxyCONNECT(t *testing.T) {
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
 			connectAttempts.Add(1)
-			time.Sleep(5 * time.Second)
 			http.Error(w, "CONNECT is not allowed", http.StatusMethodNotAllowed)
 			return
 		}
@@ -201,7 +291,8 @@ func TestHTTPStreamFallbackWithoutProxyCONNECT(t *testing.T) {
 		_, _ = io.Copy(w, response.Body)
 	}))
 	defer proxy.Close()
-	defer ClearProxyHTTPStreamOnly(proxy.URL)
+	defer ClearProxyHTTPStreamPreferred(proxy.URL)
+	defer ClearProxyCONNECTUnsupported(proxy.URL)
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
 	conn, err := DialMessageConnWithHeaders(dialCtx, origin.URL+"/relay/unit", proxy.URL, RoleProbe, "", nil)
@@ -215,10 +306,16 @@ func TestHTTPStreamFallbackWithoutProxyCONNECT(t *testing.T) {
 	if got := connectAttempts.Load(); got != 1 {
 		t.Fatalf("WebSocket CONNECT attempts = %d, want 1", got)
 	}
+	if !ProxyHTTPStreamPreferred(proxy.URL) {
+		t.Fatal("successful fallback did not record the POST/GET preference")
+	}
+	if !ProxyCONNECTUnsupported(proxy.URL) {
+		t.Fatal("rejected CONNECT followed by successful POST/GET was not recorded")
+	}
 
 	// A successful fallback remembers the proxy capability, so a subsequent
 	// RDP, WinRM, SMB, or presence connection does not repeat a WebSocket probe
-	// that this proxy is known to hold until its deadline.
+	// that this proxy is known to reject.
 	preferredCtx, preferredCancel := context.WithTimeout(ctx, 2*time.Second)
 	preferred, err := DialMessageConnWithHeaders(preferredCtx, origin.URL+"/relay/unit", proxy.URL, RoleProbe, "", nil)
 	preferredCancel()
@@ -229,8 +326,8 @@ func TestHTTPStreamFallbackWithoutProxyCONNECT(t *testing.T) {
 	if got := connectAttempts.Load(); got != 1 {
 		t.Fatalf("remembered fallback repeated WebSocket CONNECT probe: attempts=%d", got)
 	}
-	if _, err := DialMessageConnWithHeaders(ctx, "https://relay.example/relay/unit", proxy.URL, RoleProbe, "", nil); err == nil || !strings.Contains(err.Error(), "requires CONNECT") {
-		t.Fatalf("remembered non-CONNECT proxy accepted HTTPS relay: %v", err)
+	if _, err := DialMessageConnWithHeaders(ctx, "https://relay.example/relay/unit", proxy.URL, RoleProbe, "", nil); err == nil || !errors.Is(err, ErrProxyCONNECTRejected) {
+		t.Fatalf("remembered CONNECT rejection accepted HTTPS relay: %v", err)
 	}
 
 	select {

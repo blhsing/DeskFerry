@@ -185,6 +185,23 @@ func TestProxyConnectUsesIntegratedAuthentication(t *testing.T) {
 	}
 }
 
+func TestTransportFailureResultClassifiesProxyFailures(t *testing.T) {
+	tests := []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf("dial: %w", ErrProxyAuthentication), "proxy-authentication-failure"},
+		{fmt.Errorf("dial: %w", ErrProxyCONNECTRejected), "proxy-connect-rejected"},
+		{fmt.Errorf("dial: %w", ErrWebSocketUpgradeRejected), "websocket-upgrade-rejected"},
+		{errors.New("connection reset"), "transport-failure"},
+	}
+	for _, test := range tests {
+		if got := TransportFailureResult(test.err); got != test.want {
+			t.Errorf("TransportFailureResult(%v) = %q, want %q", test.err, got, test.want)
+		}
+	}
+}
+
 func TestDNSFallbackDialerUsesCachedAddressWhenLookupFails(t *testing.T) {
 	lookupCalls := 0
 	dialed := make([]string, 0, 2)

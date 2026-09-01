@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.11.4 - 2026-09-02
+
+- Authenticate HTTPS `POST`/`GET` fallback tunnels through NTLM proxies with the current Windows identity, allowing the Azure relay to remain usable when a gateway permits CONNECT but strips WebSocket upgrades.
+- Split the saved proxy capability into “prefer HTTP streams” and “CONNECT unsupported,” and migrate v0.11.3 state without incorrectly bypassing HTTPS relays.
+- Classify proxy authentication failures, CONNECT rejections, and WebSocket-upgrade rejections separately in connection logs.
+
 ## 0.11.3 - 2026-09-01
 
 - Bound proxy WebSocket/CONNECT probes so a gateway that holds a rejected upgrade cannot consume the HTTP-stream fallback's entire setup budget.
