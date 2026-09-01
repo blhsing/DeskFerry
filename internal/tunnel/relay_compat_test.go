@@ -12,6 +12,31 @@ import (
 	"time"
 )
 
+// TestExternalHTTPProxyAuthentication is an opt-in probe for the HTTP
+// transport used by the non-CONNECT fallback. On Windows it verifies that a
+// forward proxy can authenticate the current user before carrying requests.
+func TestExternalHTTPProxyAuthentication(t *testing.T) {
+	baseURL := strings.TrimRight(os.Getenv("DESKFERRY_COMPAT_RELAY_URL"), "/")
+	proxySpec := strings.TrimSpace(os.Getenv("DESKFERRY_COMPAT_PROXY"))
+	if baseURL == "" || proxySpec == "" || strings.EqualFold(proxySpec, "direct") {
+		t.Skip("DESKFERRY_COMPAT_RELAY_URL and DESKFERRY_COMPAT_PROXY are not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/relay/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := httpStreamHTTPClient(baseURL, proxySpec).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxy health probe returned HTTP %s", resp.Status)
+	}
+	_ = resp.Body.Close()
+}
+
 // TestExternalRelayResumption is opt-in so the same protocol probe can run
 // against the Azure, Go, or Python relay implementation during release checks.
 func TestExternalRelayResumption(t *testing.T) {
@@ -148,6 +173,7 @@ func TestExternalRelayHTTPStreamV2(t *testing.T) {
 	relayAddr := baseURL + "/relay/" + room
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	started := time.Now()
 
 	controlHeaders := http.Header{}
 	AddProtocolV2Header(controlHeaders)
@@ -162,6 +188,7 @@ func TestExternalRelayHTTPStreamV2(t *testing.T) {
 	if err := AwaitControlReady(ctx, control); err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("control ready after %s", time.Since(started))
 
 	clientHeaders := http.Header{}
 	AddProtocolV2Header(clientHeaders)
@@ -171,10 +198,12 @@ func TestExternalRelayHTTPStreamV2(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer CloseMessageConn(client)
+	t.Logf("client ready after %s", time.Since(started))
 	offer, err := ReadControlMessage(ctx, control)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("offer received after %s expires=%s", time.Since(started), offer.ExpiresAt.Format(time.RFC3339Nano))
 	if err := ValidateSessionOffer(offer, room, "compat-http-agent", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}

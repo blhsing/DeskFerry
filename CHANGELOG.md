@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.11.1 - 2026-09-01
+
+- Authenticate plain-HTTP fallback requests through NTLM forward proxies with the current Windows identity, including every replacement `POST` and `GET` connection; LocalSystem services securely acquire the credential from a logged-on interactive session instead of presenting the rejected machine account.
+- Request replay-safe finite HTTP batches so proxies that buffer endless uploads or downloads release control and data records promptly, while retaining persistent streams for older clients and non-buffering paths.
+- Extend the opt-in external compatibility probe and verify protocol-v2 pairing and data transfer through an authenticated Skyhigh Secure Web Gateway that rejects WebSocket `CONNECT`.
+
 ## 0.11.0 - 2026-09-01
 
 - Fall back automatically to a pair of persistent HTTP streams when a configured forward proxy rejects the WebSocket `CONNECT` path: a chunked `POST` carries upstream messages and a streaming `GET` carries downstream messages.

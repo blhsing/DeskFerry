@@ -80,6 +80,8 @@ sealed class HttpStreamWebSocket : WebSocket
     private int _buffered;
     private long _upGeneration;
     private long _downGeneration;
+    private bool _downBatch;
+    private bool _downPrimed;
     private WebSocketState _state = WebSocketState.Open;
     private WebSocketCloseStatus? _closeStatus;
     private string? _closeDescription;
@@ -99,6 +101,14 @@ sealed class HttpStreamWebSocket : WebSocket
     public bool IsTerminal => _lifetime.IsCancellationRequested;
     public bool SecretMatches(string value) => CryptographicOperations.FixedTimeEquals(
         System.Text.Encoding.UTF8.GetBytes(_secret), System.Text.Encoding.UTF8.GetBytes(value));
+
+    public void EnableBatchDownloads()
+    {
+        lock (_gate)
+        {
+            _downBatch = true;
+        }
+    }
 
     public override WebSocketCloseStatus? CloseStatus => _closeStatus;
     public override string? CloseStatusDescription => _closeDescription;
@@ -311,6 +321,22 @@ sealed class HttpStreamWebSocket : WebSocket
             return;
         }
         var generation = Interlocked.Increment(ref _downGeneration);
+        bool batchMode;
+        bool primeBatch;
+        lock (_gate)
+        {
+            batchMode = _downBatch;
+            primeBatch = batchMode && !_downPrimed;
+            if (primeBatch)
+            {
+                _downPrimed = true;
+            }
+        }
+        if (batchMode)
+        {
+            await ServeDownloadBatchAsync(context, generation, primeBatch);
+            return;
+        }
         context.Response.StatusCode = StatusCodes.Status200OK;
         context.Response.ContentType = "application/octet-stream";
         context.Response.Headers.CacheControl = "no-store, no-transform";
@@ -357,6 +383,53 @@ sealed class HttpStreamWebSocket : WebSocket
             }
         }
         catch (Exception exception) when (exception is IOException or OperationCanceledException) { }
+    }
+
+    private async Task ServeDownloadBatchAsync(HttpContext context, long generation, bool prime)
+    {
+        while (!context.RequestAborted.IsCancellationRequested && !_lifetime.IsCancellationRequested && generation == Volatile.Read(ref _downGeneration))
+        {
+            List<Frame> frames;
+            ulong ack;
+            lock (_gate)
+            {
+                frames = _outbound.ToList();
+                ack = _nextReceive - 1;
+            }
+            if (prime || frames.Count > 0)
+            {
+                await WriteDownloadBatchAsync(context, ack, frames);
+                return;
+            }
+
+            using var timeout = new CancellationTokenSource(Keepalive);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, _lifetime.Token, timeout.Token);
+            try
+            {
+                await _changed.WaitAsync(linked.Token);
+            }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested && !context.RequestAborted.IsCancellationRequested && !_lifetime.IsCancellationRequested)
+            {
+                await WriteDownloadBatchAsync(context, ack, []);
+                return;
+            }
+        }
+    }
+
+    private static async Task WriteDownloadBatchAsync(HttpContext context, ulong ack, List<Frame> frames)
+    {
+        await using var payload = new MemoryStream();
+        await WriteRecordAsync(payload, new Frame(AckRecord, ack, []), context.RequestAborted);
+        foreach (var frame in frames)
+        {
+            await WriteRecordAsync(payload, frame, context.RequestAborted);
+        }
+        context.Response.StatusCode = StatusCodes.Status200OK;
+        context.Response.ContentType = "application/octet-stream";
+        context.Response.ContentLength = payload.Length;
+        context.Response.Headers.CacheControl = "no-store, no-transform";
+        payload.Position = 0;
+        await payload.CopyToAsync(context.Response.Body, context.RequestAborted);
     }
 
     private void ApplyRecord(Frame frame)

@@ -1,6 +1,8 @@
 package tunnel
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -12,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +26,7 @@ import (
 
 const (
 	HeaderHTTPStreamSecret = "X-DeskFerry-Stream-Secret"
+	HeaderHTTPStreamBatch  = "X-DeskFerry-Stream-Batch"
 
 	httpStreamRecordAck    = byte(0)
 	httpStreamRecordText   = byte(1)
@@ -68,17 +72,20 @@ type HTTPStreamConn struct {
 	terminalErr error
 	lastActive  time.Time
 
-	client    *http.Client
-	endpoint  string
-	headers   http.Header
-	streamID  string
-	secret    string
-	ready     chan error
-	readyOnce sync.Once
-	upGen     uint64
-	downGen   uint64
-	started   sync.Once
-	closeOnce sync.Once
+	client     *http.Client
+	endpoint   string
+	headers    http.Header
+	batch      bool
+	streamID   string
+	secret     string
+	ready      chan error
+	readyOnce  sync.Once
+	upGen      uint64
+	downGen    uint64
+	downBatch  bool
+	downPrimed bool
+	started    sync.Once
+	closeOnce  sync.Once
 }
 
 func newHTTPStreamConn(ctx context.Context) *HTTPStreamConn {
@@ -122,6 +129,10 @@ func DialHTTPStreamWithHeaders(ctx context.Context, relayAddr, proxySpec, role, 
 	headers.Set("X-TunnelDesktop-Role", role)
 	headers.Set("User-Agent", "DeskFerry/"+buildinfo.Version)
 	headers.Set(HeaderHTTPStreamSecret, secret)
+	// Request finite downstream batches. A number of authenticated enterprise
+	// proxies buffer an otherwise endless chunked response until it closes.
+	// Sequence replay keeps these quick GET rotations lossless.
+	headers.Set(HeaderHTTPStreamBatch, "1")
 	for name, values := range extraHeaders {
 		for _, value := range values {
 			if strings.TrimSpace(value) != "" {
@@ -137,6 +148,7 @@ func DialHTTPStreamWithHeaders(ctx context.Context, relayAddr, proxySpec, role, 
 	c.client = httpStreamHTTPClient(relayAddr, proxySpec)
 	c.endpoint = endpoint
 	c.headers = headers
+	c.batch = true
 	c.streamID = id
 	c.secret = secret
 	c.ready = make(chan error, 1)
@@ -184,6 +196,10 @@ func httpStreamEndpoint(relayAddr, id string) (string, error) {
 }
 
 func httpStreamHTTPClient(relayAddr, proxySpec string) *http.Client {
+	return httpStreamHTTPClientWithAuth(relayAddr, proxySpec, newIntegratedProxyAuthenticator)
+}
+
+func httpStreamHTTPClientWithAuth(relayAddr, proxySpec string, authFactory integratedProxyAuthFactory) *http.Client {
 	transport := &http.Transport{
 		Proxy:                 proxyFunc(relayAddr, proxySpec),
 		DialContext:           resilientDNSDialer.DialContext,
@@ -194,7 +210,172 @@ func httpStreamHTTPClient(relayAddr, proxySpec string) *http.Client {
 		IdleConnTimeout:       30 * time.Second,
 		ExpectContinueTimeout: 2 * time.Second,
 	}
+	// A non-CONNECT proxy sees the POST and GET requests themselves. Go's
+	// standard proxy support handles Basic credentials embedded in the URL but
+	// does not negotiate connection-affine NTLM with the current Windows user.
+	// Authenticate each forward-proxy TCP connection before handing it to the
+	// standard transport so both persistent halves and every replacement
+	// connection inherit the authenticated proxy session.
+	if target, proxyURL, ok := httpStreamIntegratedProxy(relayAddr, proxySpec, authFactory); ok {
+		transportProxy := *proxyURL
+		// authenticatedForwardProxyDialContext performs TLS to an HTTPS proxy
+		// itself. Present it as HTTP to net/http so it writes proxy-form requests
+		// onto the already secured connection instead of wrapping TLS twice.
+		transportProxy.Scheme = "http"
+		transport.Proxy = http.ProxyURL(&transportProxy)
+		transport.DialContext = authenticatedForwardProxyDialContext(proxyURL, target, authFactory)
+	}
 	return &http.Client{Transport: transport}
+}
+
+func httpStreamIntegratedProxy(relayAddr, proxySpec string, authFactory integratedProxyAuthFactory) (*url.URL, *url.URL, bool) {
+	target, err := url.Parse(strings.TrimSpace(relayAddr))
+	if err != nil || target.Host == "" {
+		return nil, nil, false
+	}
+	switch strings.ToLower(target.Scheme) {
+	case "ws":
+		target.Scheme = "http"
+	case "http":
+	case "wss", "https":
+		// A forward proxy cannot carry TLS without CONNECT. Leave HTTPS on the
+		// standard path so it reports the proxy's CONNECT rejection normally.
+		return nil, nil, false
+	default:
+		return nil, nil, false
+	}
+	// Use the bounded health response for the authentication exchange. Some
+	// enterprise proxies wait indefinitely while forwarding HEAD, redirects,
+	// or dynamically generated room dashboards; the health GET always has an
+	// explicit finite body that can be drained before reusing the connection.
+	target.Path = "/relay/health"
+	target.RawQuery = ""
+	target.Fragment = ""
+
+	var proxyURL *url.URL
+	spec := strings.TrimSpace(proxySpec)
+	if spec == "" || strings.EqualFold(spec, "direct") {
+		return nil, nil, false
+	}
+	if strings.EqualFold(spec, "env") || strings.EqualFold(spec, "auto") {
+		proxyURL, err = http.ProxyFromEnvironment(&http.Request{URL: target})
+	} else {
+		proxyURL, err = resolveProxyURL(target.Host, spec)
+	}
+	if err != nil || proxyURL == nil || proxyURL.User != nil || authFactory == nil {
+		return nil, nil, false
+	}
+	// Avoid changing the request path on platforms without an integrated
+	// authenticator. Each actual connection receives a fresh NTLM context.
+	auth, err := authFactory()
+	if err != nil || auth == nil {
+		return nil, nil, false
+	}
+	_ = auth.Close()
+	return target, proxyURL, true
+}
+
+func authenticatedForwardProxyDialContext(proxyURL, target *url.URL, authFactory integratedProxyAuthFactory) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, _ string) (net.Conn, error) {
+		conn, err := resilientDNSDialer.DialContext(ctx, network, canonicalProxyAddr(proxyURL))
+		if err != nil {
+			return nil, err
+		}
+		if proxyURL.Scheme == "https" {
+			tlsConn := tls.Client(conn, &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				ServerName: proxyURL.Hostname(),
+			})
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				_ = conn.Close()
+				return nil, fmt.Errorf("TLS handshake with proxy %s failed: %w", proxyURLForLog(proxyURL), err)
+			}
+			conn = tlsConn
+		}
+		stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
+		defer stopCancellation()
+		authDeadline := time.Now().Add(20 * time.Second)
+		if deadline, ok := ctx.Deadline(); ok && deadline.Before(authDeadline) {
+			authDeadline = deadline
+		}
+		_ = conn.SetDeadline(authDeadline)
+
+		auth, err := authFactory()
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("initialize Windows authentication for proxy %s: %w", proxyURLForLog(proxyURL), err)
+		}
+		if auth == nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("integrated authentication is unavailable for proxy %s", proxyURLForLog(proxyURL))
+		}
+		defer auth.Close()
+
+		reader := bufio.NewReader(conn)
+		authorization := proxyAuthorization(auth.Scheme(), auth.InitialToken())
+		for attempt := 0; attempt < 2; attempt++ {
+			probe, err := writeForwardProxyProbe(conn, target, authorization)
+			if err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			resp, err := http.ReadResponse(reader, probe)
+			if err != nil {
+				_ = conn.Close()
+				return nil, fmt.Errorf("read proxy authentication response from %s: %w", proxyURLForLog(proxyURL), err)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusProxyAuthRequired {
+				if resp.Close {
+					_ = conn.Close()
+					return nil, fmt.Errorf("proxy %s closed the authenticated connection", proxyURLForLog(proxyURL))
+				}
+				_ = conn.SetDeadline(time.Time{})
+				return &bufferedConn{Conn: conn, reader: reader}, nil
+			}
+			if attempt > 0 {
+				_ = conn.Close()
+				return nil, fmt.Errorf("proxy %s rejected Windows authentication", proxyURLForLog(proxyURL))
+			}
+			challenge, ok := proxyAuthenticationChallenge(resp.Header, auth.Scheme())
+			if !ok {
+				_ = conn.Close()
+				return nil, fmt.Errorf("proxy %s requested unsupported authentication", proxyURLForLog(proxyURL))
+			}
+			nextToken, err := auth.NextToken(challenge)
+			if err != nil {
+				_ = conn.Close()
+				return nil, fmt.Errorf("authenticate proxy %s with Windows credentials: %w", proxyURLForLog(proxyURL), err)
+			}
+			authorization = proxyAuthorization(auth.Scheme(), nextToken)
+		}
+		_ = conn.Close()
+		return nil, fmt.Errorf("proxy %s authentication did not complete", proxyURLForLog(proxyURL))
+	}
+}
+
+func writeForwardProxyProbe(conn net.Conn, target *url.URL, authorization string) (*http.Request, error) {
+	probeURL := *target
+	probeURL.User = nil
+	probeURL.Fragment = ""
+	probe := &http.Request{
+		Method: http.MethodGet,
+		URL:    &probeURL,
+		Host:   probeURL.Host,
+		Header: http.Header{
+			"User-Agent":       {"DeskFerry/" + buildinfo.Version},
+			"Connection":       {"keep-alive"},
+			"Proxy-Connection": {"Keep-Alive"},
+		},
+	}
+	if authorization != "" {
+		probe.Header.Set("Proxy-Authorization", authorization)
+	}
+	if err := probe.WriteProxy(conn); err != nil {
+		return nil, fmt.Errorf("write proxy authentication request: %w", err)
+	}
+	return probe, nil
 }
 
 func (c *HTTPStreamConn) Read(ctx context.Context) (websocket.MessageType, []byte, error) {
@@ -392,6 +573,8 @@ func (c *HTTPStreamConn) snapshotAfter(lastSeq uint64) ([]httpStreamFrame, uint6
 
 func (c *HTTPStreamConn) clientUpLoop() {
 	backoff := 250 * time.Millisecond
+	deliveredAck := uint64(0)
+	deliveredSequence := uint64(0)
 	for c.ctx.Err() == nil {
 		attemptCtx, cancel := context.WithCancel(c.ctx)
 		reader, writer := io.Pipe()
@@ -419,18 +602,30 @@ func (c *HTTPStreamConn) clientUpLoop() {
 			}
 			result <- err
 		}()
-		writeDone := make(chan error, 1)
-		go func() { writeDone <- c.writeUpload(attemptCtx, writer) }()
+		type uploadWriteResult struct {
+			ack      uint64
+			sequence uint64
+			err      error
+		}
+		writeDone := make(chan uploadWriteResult, 1)
+		go func() {
+			ack, sequence, writeErr := c.writeUpload(attemptCtx, writer, deliveredAck, deliveredSequence)
+			writeDone <- uploadWriteResult{ack: ack, sequence: sequence, err: writeErr}
+		}()
 		var attemptErr error
 		normalRotation := false
+		attemptAck := deliveredAck
+		attemptSequence := deliveredSequence
 		select {
 		case attemptErr = <-result:
-		case writeErr := <-writeDone:
-			if writeErr != nil {
-				_ = writer.CloseWithError(writeErr)
+		case writeResult := <-writeDone:
+			attemptAck = writeResult.ack
+			attemptSequence = writeResult.sequence
+			if writeResult.err != nil {
+				_ = writer.CloseWithError(writeResult.err)
 			}
 			attemptErr = <-result
-			normalRotation = writeErr == nil && errors.Is(attemptErr, io.EOF)
+			normalRotation = writeResult.err == nil && errors.Is(attemptErr, io.EOF)
 		case <-c.ctx.Done():
 			cancel()
 			_ = writer.CloseWithError(c.ctx.Err())
@@ -442,6 +637,10 @@ func (c *HTTPStreamConn) clientUpLoop() {
 			return
 		}
 		if normalRotation {
+			if c.batch {
+				deliveredAck = attemptAck
+				deliveredSequence = attemptSequence
+			}
 			backoff = 250 * time.Millisecond
 			if !sleepHTTPStream(c.ctx, 25*time.Millisecond) {
 				return
@@ -455,7 +654,46 @@ func (c *HTTPStreamConn) clientUpLoop() {
 	}
 }
 
-func (c *HTTPStreamConn) writeUpload(ctx context.Context, writer *io.PipeWriter) error {
+func (c *HTTPStreamConn) writeUpload(ctx context.Context, writer *io.PipeWriter, deliveredAck, deliveredSequence uint64) (uint64, uint64, error) {
+	if c.batch {
+		return c.writeUploadBatch(ctx, writer, deliveredAck, deliveredSequence)
+	}
+	return deliveredAck, deliveredSequence, c.writePersistentUpload(ctx, writer)
+}
+
+func (c *HTTPStreamConn) writeUploadBatch(ctx context.Context, writer *io.PipeWriter, deliveredAck, deliveredSequence uint64) (uint64, uint64, error) {
+	defer writer.Close()
+	ticker := time.NewTicker(httpStreamKeepalive)
+	defer ticker.Stop()
+	for {
+		frames, ack := c.snapshotAfter(deliveredSequence)
+		if ack > deliveredAck || len(frames) > 0 {
+			if err := writeHTTPStreamRecord(writer, httpStreamFrame{kind: httpStreamRecordAck, seq: ack}); err != nil {
+				return deliveredAck, deliveredSequence, err
+			}
+			sequence := deliveredSequence
+			for _, frame := range frames {
+				if err := writeHTTPStreamRecord(writer, frame); err != nil {
+					return deliveredAck, deliveredSequence, err
+				}
+				sequence = frame.seq
+			}
+			return ack, sequence, nil
+		}
+		select {
+		case <-ctx.Done():
+			return deliveredAck, deliveredSequence, ctx.Err()
+		case <-c.wake:
+		case <-ticker.C:
+			if err := writeHTTPStreamRecord(writer, httpStreamFrame{kind: httpStreamRecordAck, seq: ack}); err != nil {
+				return deliveredAck, deliveredSequence, err
+			}
+			return ack, deliveredSequence, nil
+		}
+	}
+}
+
+func (c *HTTPStreamConn) writePersistentUpload(ctx context.Context, writer *io.PipeWriter) error {
 	defer writer.Close()
 	lastSeq, lastAck := uint64(0), uint64(0)
 	forceAck := true
@@ -627,7 +865,8 @@ func isPermanentHTTPStreamDialError(err error) bool {
 		return false
 	}
 	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "http 400") || strings.Contains(text, "http 401") || strings.Contains(text, "http 403") || strings.Contains(text, "http 404") || strings.Contains(text, "http 405")
+	return strings.Contains(text, "http 400") || strings.Contains(text, "http 401") || strings.Contains(text, "http 403") || strings.Contains(text, "http 404") || strings.Contains(text, "http 405") ||
+		strings.Contains(text, "proxy authentication") || strings.Contains(text, "proxy requested unsupported authentication")
 }
 
 // HTTPStreamServer owns logical HTTP-stream connections and lets a relay use
@@ -692,6 +931,11 @@ func (s *HTTPStreamServer) Serve(w http.ResponseWriter, r *http.Request, room, i
 		http.Error(w, "HTTP stream secret mismatch", http.StatusForbidden)
 		return
 	}
+	if value := strings.TrimSpace(r.Header.Get(HeaderHTTPStreamBatch)); value == "1" || strings.EqualFold(value, "true") {
+		c.mu.Lock()
+		c.downBatch = true
+		c.mu.Unlock()
+	}
 	if created {
 		request := r.Clone(c.ctx)
 		go s.onAccept(c.ctx, c, request, room)
@@ -749,7 +993,16 @@ func (c *HTTPStreamConn) serveDownload(w http.ResponseWriter, r *http.Request) {
 	c.downGen++
 	generation := c.downGen
 	c.lastActive = time.Now()
+	batchMode := c.downBatch
+	primeBatch := batchMode && !c.downPrimed
+	if primeBatch {
+		c.downPrimed = true
+	}
 	c.mu.Unlock()
+	if batchMode {
+		c.serveDownloadBatch(w, r, generation, primeBatch)
+		return
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store, no-transform")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -757,6 +1010,7 @@ func (c *HTTPStreamConn) serveDownload(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 	lastSeq, lastAck := uint64(0), uint64(0)
 	forceAck := true
+	unacknowledgedSince := time.Time{}
 	ticker := time.NewTicker(httpStreamKeepalive)
 	defer ticker.Stop()
 	for {
@@ -781,16 +1035,99 @@ func (c *HTTPStreamConn) serveDownload(w http.ResponseWriter, r *http.Request) {
 			lastSeq = frame.seq
 		}
 		flusher.Flush()
+		if lastSeq > 0 && !c.sendSequenceAcknowledged(lastSeq) {
+			if unacknowledgedSince.IsZero() {
+				unacknowledgedSince = time.Now()
+			}
+		} else {
+			unacknowledgedSince = time.Time{}
+		}
+		var rotate <-chan time.Time
+		var rotateTimer *time.Timer
+		if !unacknowledgedSince.IsZero() {
+			remaining := httpStreamUploadProbeTimeout - time.Since(unacknowledgedSince)
+			if remaining <= 0 {
+				c.mu.Lock()
+				if c.downGen == generation && !c.closed {
+					c.downBatch = true
+				}
+				c.mu.Unlock()
+				return
+			}
+			rotateTimer = time.NewTimer(remaining)
+			rotate = rotateTimer.C
+		}
+		select {
+		case <-r.Context().Done():
+			if rotateTimer != nil {
+				rotateTimer.Stop()
+			}
+			return
+		case <-c.ctx.Done():
+			if rotateTimer != nil {
+				rotateTimer.Stop()
+			}
+			return
+		case <-c.wake:
+		case <-ticker.C:
+			forceAck = true
+		case <-rotate:
+			c.mu.Lock()
+			if c.downGen == generation && !c.closed {
+				c.downBatch = true
+			}
+			c.mu.Unlock()
+			return
+		}
+		if rotateTimer != nil {
+			rotateTimer.Stop()
+		}
+	}
+}
+
+func (c *HTTPStreamConn) serveDownloadBatch(w http.ResponseWriter, r *http.Request, generation uint64, prime bool) {
+	timer := time.NewTimer(httpStreamKeepalive)
+	defer timer.Stop()
+	for {
+		c.mu.Lock()
+		current := c.downGen == generation && !c.closed
+		c.mu.Unlock()
+		if !current {
+			return
+		}
+		frames, ack := c.snapshotAfter(0)
+		if prime || len(frames) > 0 {
+			c.writeDownloadBatch(w, ack, frames)
+			return
+		}
 		select {
 		case <-r.Context().Done():
 			return
 		case <-c.ctx.Done():
 			return
 		case <-c.wake:
-		case <-ticker.C:
-			forceAck = true
+		case <-timer.C:
+			c.writeDownloadBatch(w, ack, nil)
+			return
 		}
 	}
+}
+
+func (c *HTTPStreamConn) writeDownloadBatch(w http.ResponseWriter, ack uint64, frames []httpStreamFrame) {
+	var payload bytes.Buffer
+	if err := writeHTTPStreamRecord(&payload, httpStreamFrame{kind: httpStreamRecordAck, seq: ack}); err != nil {
+		return
+	}
+	for _, frame := range frames {
+		if err := writeHTTPStreamRecord(&payload, frame); err != nil {
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store, no-transform")
+	w.Header().Set("Content-Length", strconv.Itoa(payload.Len()))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(payload.Bytes())
 }
 
 func (s *HTTPStreamServer) sweep() {

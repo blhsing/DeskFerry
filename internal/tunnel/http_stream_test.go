@@ -1,9 +1,13 @@
 package tunnel
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +17,85 @@ import (
 
 	"nhooyr.io/websocket"
 )
+
+func TestHTTPStreamForwardProxyUsesIntegratedAuthentication(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		for attempt, expected := range []string{"initial", "response"} {
+			req, err := http.ReadRequest(reader)
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			if req.Method != http.MethodGet || !req.URL.IsAbs() {
+				serverErr <- fmt.Errorf("authentication probe method=%s URL=%s", req.Method, req.URL)
+				return
+			}
+			want := "NTLM " + base64.StdEncoding.EncodeToString([]byte(expected))
+			if got := req.Header.Get("Proxy-Authorization"); got != want {
+				serverErr <- fmt.Errorf("attempt %d authorization = %q, want %q", attempt, got, want)
+				return
+			}
+			if attempt == 0 {
+				challenge := base64.StdEncoding.EncodeToString([]byte("challenge"))
+				_, err = fmt.Fprintf(conn, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: NTLM %s\r\nContent-Length: 0\r\n\r\n", challenge)
+			} else {
+				_, err = fmt.Fprint(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+			}
+			if err != nil {
+				serverErr <- err
+				return
+			}
+		}
+
+		req, err := http.ReadRequest(reader)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if req.Method != http.MethodGet || !req.URL.IsAbs() || req.URL.Host != "relay.example" {
+			serverErr <- fmt.Errorf("forwarded request method=%s URL=%s", req.Method, req.URL)
+			return
+		}
+		_, err = fmt.Fprint(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+		serverErr <- err
+	}()
+
+	client := httpStreamHTTPClientWithAuth("http://relay.example/relay/b", "http://"+listener.Addr().String(), func() (integratedProxyAuthenticator, error) {
+		return &fakeProxyAuthenticator{}, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://relay.example/relay/b/stream/test/down", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || string(body) != "ok" {
+		t.Fatalf("response body=%q error=%v", body, err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestHTTPStreamFallbackWithoutProxyCONNECT(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

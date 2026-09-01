@@ -111,6 +111,11 @@ async Task RelayHttpStreamHandler(HttpContext context, RelayHub hub, HttpStreamR
         await context.Response.WriteAsync("HTTP stream secret mismatch.");
         return;
     }
+    var batchHeader = context.Request.Headers["X-DeskFerry-Stream-Batch"].FirstOrDefault()?.Trim() ?? "";
+    if (batchHeader == "1" || batchHeader.Equals("true", StringComparison.OrdinalIgnoreCase))
+    {
+        socket.EnableBatchDownloads();
+    }
     if (created)
     {
         _ = ServeRelaySocketAsync(socket, context, hub, socket.Lifetime, "http-stream");
@@ -2358,7 +2363,7 @@ sealed class ResumeSession
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.11.0";
+    public const string Version = "0.11.1";
 }
 
 sealed class WaitingAgent

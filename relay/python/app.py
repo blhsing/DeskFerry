@@ -19,7 +19,7 @@ from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.11.0"
+RELAY_VERSION = "0.11.1"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -83,6 +83,8 @@ class HTTPStreamWebSocket:
         self.lock = asyncio.Lock()
         self.up_generation = 0
         self.down_generation = 0
+        self.down_batch = False
+        self.down_primed = False
         self.last_activity = time.monotonic()
         self.closed = asyncio.Event()
 
@@ -190,9 +192,29 @@ class HTTPStreamWebSocket:
             pass
         return Response(status_code=204)
 
-    def serve_download(self, request: Request) -> StreamingResponse:
+    async def serve_download(self, request: Request) -> Response:
         self.down_generation += 1
         generation = self.down_generation
+
+        if self.down_batch:
+            prime = not self.down_primed
+            self.down_primed = True
+            while generation == self.down_generation and not await request.is_disconnected():
+                frames, ack = await self.snapshot(0)
+                if prime or frames:
+                    payload = encode_http_stream_record(HTTPStreamFrame(HTTP_STREAM_ACK, ack))
+                    payload += b"".join(encode_http_stream_record(frame) for frame in frames)
+                    return Response(payload, media_type="application/octet-stream", headers={
+                        "Cache-Control": "no-store, no-transform",
+                    })
+                try:
+                    await asyncio.wait_for(self.changed.wait(), timeout=HTTP_STREAM_KEEPALIVE)
+                except asyncio.TimeoutError:
+                    payload = encode_http_stream_record(HTTPStreamFrame(HTTP_STREAM_ACK, ack))
+                    return Response(payload, media_type="application/octet-stream", headers={
+                        "Cache-Control": "no-store, no-transform",
+                    })
+            return Response(status_code=204)
 
         async def records():
             last_sequence = 0
@@ -1506,11 +1528,14 @@ async def relay_http_stream(request: Request, stream_id: str, direction: str, ro
             created = True
     if not hmac.compare_digest(websocket.secret, secret):
         return Response("HTTP stream secret mismatch.", status_code=403)
+    batch_header = request.headers.get("x-deskferry-stream-batch", "").strip().lower()
+    if batch_header in {"1", "true"}:
+        websocket.down_batch = True
     if created:
         asyncio.create_task(serve_http_stream_socket(websocket, room))
     if direction == "up":
         return await websocket.serve_upload(request)
-    return websocket.serve_download(request)
+    return await websocket.serve_download(request)
 
 
 async def serve_http_stream_socket(websocket: HTTPStreamWebSocket, room: str | None) -> None:

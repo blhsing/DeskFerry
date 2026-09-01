@@ -201,7 +201,8 @@ final class FallbackWebSocket implements WebSocket {
                     .removeHeader("Sec-WebSocket-Version")
                     .removeHeader("Upgrade")
                     .removeHeader("Connection")
-                    .header("X-DeskFerry-Stream-Secret", streamSecret);
+                    .header("X-DeskFerry-Stream-Secret", streamSecret)
+                    .header("X-DeskFerry-Stream-Batch", "1");
         }
 
         private final Request.Builder requestBase;
