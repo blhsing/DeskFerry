@@ -1,4 +1,4 @@
-package main
+package workservice
 
 import (
 	"context"
@@ -69,7 +69,7 @@ func (f *relayURLFlag) String() string {
 	return joinRelayURLs([]string(*f))
 }
 
-func main() {
+func Main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	var relayURLs relayURLFlag
 	var relayBases relayURLFlag

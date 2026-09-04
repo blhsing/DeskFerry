@@ -1,6 +1,6 @@
 param(
-    [string] $IcoPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'home-agent/windows/app.ico'),
-    [string] $PreviewPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'home-agent/windows/app-icon-256.png')
+    [string] $IcoPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'windows/app.ico'),
+    [string] $PreviewPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'windows/app-icon-256.png')
 )
 
 $ErrorActionPreference = 'Stop'

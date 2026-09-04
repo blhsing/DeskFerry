@@ -66,9 +66,9 @@ jobs:
           DESKFERRY_ANDROID_KEY_PASSWORD: ${{ secrets.DESKFERRY_ANDROID_KEY_PASSWORD }}
         run: |
           .\build\build-go.ps1
-          .\build\build-windows-home-installer.ps1 -SkipGoBuild
+          .\build\build-windows.ps1 -SkipGoBuild
           .\build\build-go.ps1 -DebugWindows -DebugArtifactSuffix
-          .\build\build-windows-home-installer.ps1 -DebugWindows -DebugArtifactSuffix -SkipGoBuild
+          .\build\build-windows.ps1 -DebugWindows -DebugArtifactSuffix -SkipGoBuild
           .\build\build-azure-relay.ps1
           .\build\build-python-relay.ps1
           if ([string]::IsNullOrWhiteSpace($env:DESKFERRY_ANDROID_KEYSTORE_BASE64)) { throw 'Android release signing keystore secret is missing' }
@@ -81,17 +81,8 @@ jobs:
         shell: pwsh
         run: |
           $files = @(
-            'dist\bin\deskferry-agent-windows-amd64.exe',
-            'dist\bin\deskferry-agent-configurator-windows-amd64.exe',
-            'dist\bin\deskferry-home-windows-amd64.exe',
-            'dist\bin\deskferry-home-network-windows-amd64.exe',
-            'dist\windows-home-installer\DeskFerryHomeSetup.exe',
-            'dist\bin\deskferry-agent-windows-amd64-debug.exe',
-            'dist\bin\deskferry-agent-configurator-windows-amd64-debug.exe',
-            'dist\bin\deskferry-home-windows-amd64-debug.exe',
-            'dist\bin\deskferry-home-network-windows-amd64-debug.exe',
-            'dist\bin\deskferry-home-setup-windows-amd64-debug.exe',
-            'dist\windows-home-installer\DeskFerryHomeSetup-debug.exe',
+            'dist\bin\deskferry-windows-amd64.exe',
+            'dist\bin\deskferry-windows-amd64-debug.exe',
             'dist\bin\deskferry-home-macos-arm64',
             'dist\bin\deskferry-home-macos-amd64',
             'dist\bin\deskferry-relay-linux-amd64',
@@ -132,17 +123,8 @@ jobs:
             'dist\python-relay\deskferry-python-relay.zip' `
             'dist\python-relay\deskferry-python-relay-linux-cp39-vendored.zip' `
             'dist\android\deskferry-home-android-debug.apk' `
-            'dist\bin\deskferry-agent-windows-amd64.exe' `
-            'dist\bin\deskferry-agent-configurator-windows-amd64.exe' `
-            'dist\bin\deskferry-home-windows-amd64.exe' `
-            'dist\bin\deskferry-home-network-windows-amd64.exe' `
-            'dist\windows-home-installer\DeskFerryHomeSetup.exe' `
-            'dist\bin\deskferry-agent-windows-amd64-debug.exe' `
-            'dist\bin\deskferry-agent-configurator-windows-amd64-debug.exe' `
-            'dist\bin\deskferry-home-windows-amd64-debug.exe' `
-            'dist\bin\deskferry-home-network-windows-amd64-debug.exe' `
-            'dist\bin\deskferry-home-setup-windows-amd64-debug.exe' `
-            'dist\windows-home-installer\DeskFerryHomeSetup-debug.exe' `
+            'dist\bin\deskferry-windows-amd64.exe' `
+            'dist\bin\deskferry-windows-amd64-debug.exe' `
             'dist\bin\deskferry-home-macos-arm64' `
             'dist\bin\deskferry-home-macos-amd64' `
             'dist\bin\deskferry-relay-linux-amd64' `

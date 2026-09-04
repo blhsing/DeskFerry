@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package workconfigurator
 
 import (
 	"bytes"
@@ -30,12 +30,13 @@ import (
 	"deskferry/internal/buildinfo"
 	"deskferry/internal/tunnel"
 	"deskferry/internal/winsecret"
+	"deskferry/internal/winservice"
 )
 
 const (
 	serviceName           = "DeskFerryAgent"
 	serviceDisplayName    = "DeskFerry Agent"
-	installedAgentName    = "agent.exe"
+	installedAgentName    = "DeskFerry.exe"
 	defaultAzureRelayBase = "https://test-officialwebsite.azurewebsites.net/relay"
 	defaultOCIRelayBase   = "http://217.142.228.117/relay"
 	defaultRoomName       = "workdesk"
@@ -54,24 +55,34 @@ type app struct {
 	relayUp         *walk.PushButton
 	relayDown       *walk.PushButton
 	roomName        *walk.LineEdit
+	proxy           *walk.LineEdit
 	roomPassword    *walk.LineEdit
 	clearPassword   *walk.CheckBox
 	screenView      *walk.CheckBox
+	winrmEnabled    *walk.CheckBox
+	smbEnabled      *walk.CheckBox
 	winrmAddr       *walk.LineEdit
 	smbAddr         *walk.LineEdit
 	smbAlias        *walk.LineEdit
 	status          *walk.Label
 	log             *walk.TextEdit
+	installButton   *walk.PushButton
+	startButton     *walk.PushButton
+	stopButton      *walk.PushButton
+	restartButton   *walk.PushButton
+	uninstallButton *walk.PushButton
 	relayURLs       []string
 	relayDragIndex  int
 	relayDragStartY int
 	relayDragging   bool
+	sharedProfile   bool
 }
 
 type actionOptions struct {
 	InstallDir        string
 	AgentPath         string
 	RelayURL          string
+	Proxy             string
 	RoomPassword      string
 	RoomPasswordBlob  string
 	ClearRoomPassword bool
@@ -87,9 +98,46 @@ type serviceInfo struct {
 	ProcessID uint32
 }
 
-func main() {
+type startupProfile struct {
+	Name       string
+	RelayBases []string
+	Room       string
+	Proxy      string
+}
+
+func parseStartupProfile(args []string) (startupProfile, error) {
+	var profile startupProfile
+	var bases relayURLFlags
+	fs := flag.NewFlagSet("DeskFerry Work Services", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.StringVar(&profile.Name, "profile-name", "", "shared connection profile name")
+	fs.Var(&bases, "relay-base-url", "shared relay service base URL")
+	fs.StringVar(&profile.Room, "room", "", "shared room name")
+	fs.StringVar(&profile.Proxy, "proxy", "", "shared relay proxy")
+	_ = fs.Bool("ui-smoke-test", false, "close the UI after a smoke test")
+	if err := fs.Parse(args); err != nil {
+		return startupProfile{}, err
+	}
+	if fs.NArg() != 0 {
+		return startupProfile{}, fmt.Errorf("unexpected Work Services arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	for _, base := range bases {
+		normalized, err := tunnel.RelayServiceBaseURL(base)
+		if err != nil {
+			return startupProfile{}, err
+		}
+		profile.RelayBases = append(profile.RelayBases, normalized)
+	}
+	return profile, nil
+}
+
+func Main() {
 	if hasArg(os.Args[1:], "-ui-smoke-test") {
-		if err := (&app{}).run(true); err != nil {
+		startup, startupErr := parseStartupProfile(os.Args[1:])
+		if startupErr != nil {
+			os.Exit(2)
+		}
+		if err := (&app{}).run(true, startup); err != nil {
 			os.Exit(1)
 		}
 		return
@@ -112,39 +160,45 @@ func main() {
 		runElevatedAction(os.Args[1:])
 		return
 	}
-	if err := (&app{}).run(false); err != nil {
+	startup, startupErr := parseStartupProfile(os.Args[1:])
+	if startupErr != nil {
+		windowsMessageBox(appTitle(), startupErr.Error(), windows.MB_OK|windows.MB_ICONERROR)
+		return
+	}
+	if err := (&app{}).run(false, startup); err != nil {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(1)
 	}
 }
 
-func (a *app) run(smokeTest bool) error {
-	installDir := defaultInstallDir()
-	agentPath := defaultAgentPath()
+func (a *app) run(smokeTest bool, startup startupProfile) error {
 	a.relayDragIndex = -1
+	a.sharedProfile = strings.TrimSpace(startup.Name) != ""
+	installedOpts, _ := installedServiceOptions()
+	if startup.Room == "" {
+		startup.Room = roomFromRelayURLs(installedOpts.RelayURL)
+	}
+	if len(startup.RelayBases) == 0 {
+		startup.RelayBases, _, _ = tunnel.SplitRelayRoomURLs(splitRelayURLs(installedOpts.RelayURL))
+	}
+	if startup.Proxy == "" {
+		startup.Proxy = installedOpts.Proxy
+	}
 
 	window := MainWindow{
 		AssignTo: &a.mw,
-		Title:    appTitle(),
+		Title:    appTitleWithProfile(startup.Name),
 		MinSize:  Size{Width: 760, Height: 560},
 		Size:     Size{Width: 860, Height: 680},
 		Layout:   VBox{Margins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10}, Spacing: 8},
 		Visible:  !smokeTest,
 		Children: []Widget{
 			GroupBox{
-				Title:  "Files",
+				Title:  "Allow access to this PC",
 				Layout: Grid{Columns: 3, Spacing: 6},
 				Children: []Widget{
-					Label{Text: "Install directory"},
-					LineEdit{AssignTo: &a.installDir, Text: installDir, ColumnSpan: 1},
-					PushButton{Text: "Browse", OnClicked: a.browseInstallDir},
-
-					Label{Text: "Agent executable"},
-					LineEdit{AssignTo: &a.agentPath, Text: agentPath, ColumnSpan: 1},
-					PushButton{Text: "Browse", OnClicked: a.browseAgentPath},
-
 					Label{Text: "Room name"},
-					LineEdit{AssignTo: &a.roomName, Text: defaultRoomName, CueBanner: defaultRoomName, ColumnSpan: 2},
+					LineEdit{AssignTo: &a.roomName, Text: firstNonEmpty(startup.Room, defaultRoomName), CueBanner: defaultRoomName, ReadOnly: a.sharedProfile, ColumnSpan: 2},
 
 					Label{Text: "Relay service base URLs"},
 					Composite{
@@ -164,7 +218,7 @@ func (a *app) run(smokeTest bool) error {
 								Layout: Grid{Columns: 3, Spacing: 6},
 								Children: []Widget{
 									Label{Text: "Selected URL"},
-									LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultAzureRelayBase, ColumnSpan: 2},
+									LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultAzureRelayBase, ReadOnly: a.sharedProfile, ColumnSpan: 2},
 								},
 							},
 							Composite{
@@ -183,14 +237,16 @@ func (a *app) run(smokeTest bool) error {
 					LineEdit{AssignTo: &a.roomPassword, PasswordMode: true, CueBanner: "blank keeps the current password", ColumnSpan: 2},
 					Label{Text: "Password options"},
 					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM, SMB, and screen viewing)", ColumnSpan: 2},
+					Label{Text: "Proxy"},
+					LineEdit{AssignTo: &a.proxy, Text: firstNonEmpty(startup.Proxy, "env"), CueBanner: "env, direct, or http(s)://host:port", ReadOnly: a.sharedProfile, ColumnSpan: 2},
 					Label{Text: "Screen viewing"},
-					CheckBox{AssignTo: &a.screenView, Text: "Allow authenticated screenshots and delta streaming", ColumnSpan: 2},
-					Label{Text: "WinRM target"},
-					LineEdit{AssignTo: &a.winrmAddr, Text: "127.0.0.1:5985", CueBanner: "blank disables WinRM", ColumnSpan: 2},
-					Label{Text: "SMB target"},
-					LineEdit{AssignTo: &a.smbAddr, Text: "127.0.0.1:445", CueBanner: "blank disables SMB", ColumnSpan: 2},
+					CheckBox{AssignTo: &a.screenView, Text: "Allow authenticated screenshots and delta streaming", Checked: installedOpts.ScreenView, ColumnSpan: 2},
+					CheckBox{AssignTo: &a.winrmEnabled, Text: "WinRM", Checked: installedOpts.WinRMAddr != "", OnCheckedChanged: a.updateCapabilityControls},
+					LineEdit{AssignTo: &a.winrmAddr, Text: firstNonEmpty(installedOpts.WinRMAddr, "127.0.0.1:5985"), CueBanner: "local Windows WinRM listener", ColumnSpan: 2},
+					CheckBox{AssignTo: &a.smbEnabled, Text: "SMB", Checked: installedOpts.SMBAddr != "", OnCheckedChanged: a.updateCapabilityControls},
+					LineEdit{AssignTo: &a.smbAddr, Text: firstNonEmpty(installedOpts.SMBAddr, "127.0.0.1:445"), CueBanner: "local Windows SMB listener", ColumnSpan: 2},
 					Label{Text: "SMB server alias"},
-					LineEdit{AssignTo: &a.smbAlias, Text: defaultSMBAlias, CueBanner: defaultSMBAlias, ColumnSpan: 2},
+					LineEdit{AssignTo: &a.smbAlias, Text: firstNonEmpty(installedOpts.SMBAlias, defaultSMBAlias), CueBanner: defaultSMBAlias, ColumnSpan: 2},
 				},
 			},
 			GroupBox{
@@ -201,11 +257,11 @@ func (a *app) run(smokeTest bool) error {
 					Composite{
 						Layout: Flow{Spacing: 6},
 						Children: []Widget{
-							PushButton{Text: "Install / Update", OnClicked: func() { a.runAction("install") }},
-							PushButton{Text: "Start", OnClicked: func() { a.runAction("start") }},
-							PushButton{Text: "Stop", OnClicked: func() { a.runAction("stop") }},
-							PushButton{Text: "Restart", OnClicked: func() { a.runAction("restart") }},
-							PushButton{Text: "Uninstall", OnClicked: func() { a.runAction("uninstall") }},
+							PushButton{AssignTo: &a.installButton, Text: "Install", OnClicked: func() { a.runAction("install") }},
+							PushButton{AssignTo: &a.startButton, Text: "Start", OnClicked: func() { a.runAction("start") }},
+							PushButton{AssignTo: &a.stopButton, Text: "Stop", OnClicked: func() { a.runAction("stop") }},
+							PushButton{AssignTo: &a.restartButton, Text: "Restart", OnClicked: func() { a.runAction("restart") }},
+							PushButton{AssignTo: &a.uninstallButton, Text: "Remove", OnClicked: func() { a.runAction("uninstall") }},
 							PushButton{Text: "Self-test", OnClicked: a.runSelfTest},
 							PushButton{Text: "Open Folder", OnClicked: a.openInstallFolder},
 							PushButton{Text: "Refresh", OnClicked: a.refreshStatus},
@@ -219,7 +275,12 @@ func (a *app) run(smokeTest bool) error {
 	if err := window.Create(); err != nil {
 		return err
 	}
-	a.setRelayURLList([]string{defaultAzureRelayBase, defaultOCIRelayBase}, 0)
+	initialRelays := startup.RelayBases
+	if len(initialRelays) == 0 {
+		initialRelays = []string{defaultAzureRelayBase, defaultOCIRelayBase}
+	}
+	a.setRelayURLList(initialRelays, 0)
+	a.updateCapabilityControls()
 	if smokeTest {
 		time.AfterFunc(250*time.Millisecond, func() {
 			a.mw.Synchronize(func() {
@@ -236,7 +297,65 @@ func (a *app) run(smokeTest bool) error {
 }
 
 func appTitle() string {
-	return "DeskFerry Agent Configurator " + buildinfo.Version
+	return "DeskFerry Work Services " + buildinfo.Version
+}
+
+func appTitleWithProfile(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return appTitle()
+	}
+	return appTitle() + " - " + strings.TrimSpace(name)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func roomFromRelayURLs(value string) string {
+	urls := splitRelayURLs(value)
+	if len(urls) == 0 {
+		return ""
+	}
+	return tunnel.RelayRoomToken(urls[0], "")
+}
+
+func installedServiceOptions() (actionOptions, bool) {
+	commandLine, installed, err := winservice.CommandLine(serviceName)
+	if err != nil || !installed {
+		return actionOptions{}, false
+	}
+	opts := actionOptions{
+		InstallDir: defaultInstallDir(),
+		AgentPath:  defaultAgentPath(),
+		RelayURL:   serviceCommandLineOption(commandLine, "-relay-url"),
+		Proxy:      firstNonEmpty(serviceCommandLineOption(commandLine, "-proxy"), "env"),
+		WinRMAddr:  serviceCommandLineOption(commandLine, "-winrm"),
+		SMBAddr:    serviceCommandLineOption(commandLine, "-smb"),
+		ScreenView: serviceCommandLineHasFlag(commandLine, "-screen-view"),
+		SMBAlias:   defaultSMBAlias,
+	}
+	if args := serviceCommandLineArgs(commandLine); len(args) > 0 {
+		if dir := filepath.Dir(args[0]); dir != "." {
+			if data, readErr := os.ReadFile(filepath.Join(dir, "smb-alias.txt")); readErr == nil && strings.TrimSpace(string(data)) != "" {
+				opts.SMBAlias = strings.TrimSpace(string(data))
+			}
+		}
+	}
+	return opts, true
+}
+
+func serviceCommandLineHasFlag(commandLine, option string) bool {
+	for _, arg := range serviceCommandLineArgs(commandLine) {
+		if strings.EqualFold(arg, option) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *app) browseInstallDir() {
@@ -308,7 +427,10 @@ func (a *app) updateRelayButtons() {
 		return
 	}
 	index := a.relayList.CurrentIndex()
-	hasSelection := index >= 0 && index < len(a.relayURLs)
+	hasSelection := index >= 0 && index < len(a.relayURLs) && !a.sharedProfile
+	if a.relayAdd != nil {
+		a.relayAdd.SetEnabled(!a.sharedProfile)
+	}
 	if a.relayUpdate != nil {
 		a.relayUpdate.SetEnabled(hasSelection)
 	}
@@ -320,6 +442,20 @@ func (a *app) updateRelayButtons() {
 	}
 	if a.relayDown != nil {
 		a.relayDown.SetEnabled(hasSelection && index < len(a.relayURLs)-1)
+	}
+}
+
+func (a *app) updateCapabilityControls() {
+	winrmEnabled := a.winrmEnabled != nil && a.winrmEnabled.Checked()
+	smbEnabled := a.smbEnabled != nil && a.smbEnabled.Checked()
+	if a.winrmAddr != nil {
+		a.winrmAddr.SetEnabled(winrmEnabled)
+	}
+	if a.smbAddr != nil {
+		a.smbAddr.SetEnabled(smbEnabled)
+	}
+	if a.smbAlias != nil {
+		a.smbAlias.SetEnabled(smbEnabled)
 	}
 }
 
@@ -526,6 +662,9 @@ func (a *app) runSelfTest() {
 			a.appendLog("Installed agent.exe differs from the selected agent executable. Click Install / Update to copy the selected executable before testing it.")
 		}
 		args := []string{"-self-test", "-relay-url", opts.RelayURL}
+		if opts.Proxy != "" {
+			args = append(args, "-proxy", opts.Proxy)
+		}
 		passwordFile := filepath.Join(opts.InstallDir, "room-password.dpapi")
 		if fileExists(passwordFile) {
 			args = append(args, "-room-password-file", passwordFile)
@@ -637,21 +776,76 @@ func (a *app) refreshStatus() {
 		}
 	}
 	if a.status != nil {
+		needsMigration := installedServiceNeedsMigration()
 		a.mw.Synchronize(func() {
 			a.status.SetText(text)
+			installed := err == nil && info.Installed
+			running := installed && info.State == uint32(svc.Running)
+			if a.installButton != nil {
+				label := "Install"
+				if installed {
+					label = "Apply configuration"
+					if needsMigration {
+						label = "Migrate / Update"
+					}
+				}
+				a.installButton.SetText(label)
+				a.installButton.SetVisible(true)
+			}
+			if a.startButton != nil {
+				a.startButton.SetVisible(installed && !running)
+			}
+			if a.stopButton != nil {
+				a.stopButton.SetVisible(running)
+			}
+			if a.restartButton != nil {
+				a.restartButton.SetVisible(running)
+			}
+			if a.uninstallButton != nil {
+				a.uninstallButton.SetVisible(installed)
+			}
 		})
 	}
 }
 
+func installedServiceNeedsMigration() bool {
+	commandLine, installed, err := winservice.CommandLine(serviceName)
+	if err != nil || !installed {
+		return false
+	}
+	args := serviceCommandLineArgs(commandLine)
+	if len(args) == 0 {
+		return true
+	}
+	return !strings.EqualFold(filepath.Base(args[0]), installedAgentName) || !strings.EqualFold(filepath.Dir(args[0]), defaultInstallDir())
+}
+
 func (a *app) options() actionOptions {
+	installDir := defaultInstallDir()
+	if a.installDir != nil {
+		installDir = strings.TrimSpace(a.installDir.Text())
+	}
+	agentPath := defaultAgentPath()
+	if a.agentPath != nil {
+		agentPath = strings.TrimSpace(a.agentPath.Text())
+	}
+	winrmAddr := ""
+	if a.winrmEnabled != nil && a.winrmEnabled.Checked() {
+		winrmAddr = strings.TrimSpace(a.winrmAddr.Text())
+	}
+	smbAddr := ""
+	if a.smbEnabled != nil && a.smbEnabled.Checked() {
+		smbAddr = strings.TrimSpace(a.smbAddr.Text())
+	}
 	return actionOptions{
-		InstallDir:        strings.TrimSpace(a.installDir.Text()),
-		AgentPath:         strings.TrimSpace(a.agentPath.Text()),
+		InstallDir:        installDir,
+		AgentPath:         agentPath,
 		RelayURL:          joinRelayURLs(composeRelayRoomURLs(a.relayURLListValues(), strings.TrimSpace(a.roomName.Text()))),
+		Proxy:             strings.TrimSpace(a.proxy.Text()),
 		RoomPassword:      a.roomPassword.Text(),
 		ClearRoomPassword: a.clearPassword.Checked(),
-		WinRMAddr:         strings.TrimSpace(a.winrmAddr.Text()),
-		SMBAddr:           strings.TrimSpace(a.smbAddr.Text()),
+		WinRMAddr:         winrmAddr,
+		SMBAddr:           smbAddr,
 		SMBAlias:          strings.TrimSpace(a.smbAlias.Text()),
 		ScreenView:        a.screenView.Checked(),
 	}
@@ -704,6 +898,7 @@ func runElevatedAction(args []string) {
 	installDir := fs.String("install-dir", "", "install directory")
 	agentPath := fs.String("agent", "", "agent executable")
 	relayURL := fs.String("relay-url", "", "relay URL")
+	proxy := fs.String("proxy", "", "relay proxy")
 	roomPasswordBlob := fs.String("room-password-blob", "", "DPAPI room password blob")
 	clearRoomPassword := fs.Bool("clear-room-password", false, "clear room password")
 	winrmAddr := fs.String("winrm", "", "WinRM target")
@@ -719,6 +914,7 @@ func runElevatedAction(args []string) {
 		InstallDir:        *installDir,
 		AgentPath:         *agentPath,
 		RelayURL:          *relayURL,
+		Proxy:             *proxy,
 		RoomPasswordBlob:  *roomPasswordBlob,
 		ClearRoomPassword: *clearRoomPassword,
 		WinRMAddr:         *winrmAddr,
@@ -768,7 +964,7 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error)
 	var opts actionOptions
 	var relayURLs relayURLFlags
 	var relayBases relayURLFlags
-	fs := flag.NewFlagSet("deskferry-agent-configurator", flag.ContinueOnError)
+	fs := flag.NewFlagSet("DeskFerry Work Services", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	action := fs.String("cli-action", "", "install, start, stop, restart, uninstall, or status")
 	fs.StringVar(&opts.InstallDir, "install-dir", defaultInstallDir(), "agent installation directory")
@@ -776,6 +972,7 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error)
 	fs.Var(&relayURLs, "relay-url", "relay room URL; repeat to configure multiple relays in priority order")
 	fs.Var(&relayBases, "relay-base-url", "relay service base URL; repeat to configure multiple relays")
 	room := fs.String("room", defaultRoomName, "room name appended to each relay service base URL")
+	fs.StringVar(&opts.Proxy, "proxy", "env", "env, direct, or an HTTP(S) proxy URL")
 	passwordStdin := fs.Bool("room-password-stdin", false, "read the room password from standard input")
 	fs.StringVar(&opts.RoomPasswordBlob, "room-password-blob", "", "machine-scope DPAPI password blob to consume")
 	fs.BoolVar(&opts.ClearRoomPassword, "clear-room-password", false, "remove the stored room password")
@@ -799,7 +996,7 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error)
 	}
 	if *action != "install" {
 		installOnly := map[string]bool{
-			"agent": true, "relay-url": true, "relay-base-url": true, "room": true, "room-password-stdin": true,
+			"agent": true, "relay-url": true, "relay-base-url": true, "room": true, "proxy": true, "room-password-stdin": true,
 			"room-password-blob": true, "clear-room-password": true,
 			"winrm": true, "smb": true, "smb-alias": true, "screen-view": true,
 		}
@@ -901,7 +1098,7 @@ func runCLI(args []string, stdin io.Reader, stdout io.Writer) error {
 }
 
 func printCLIUsage(output io.Writer) {
-	fmt.Fprintln(output, "Usage: deskferry-agent-configurator-windows-amd64.exe -cli-action ACTION [options]")
+	fmt.Fprintln(output, "Usage: DeskFerry.exe -work-configurator -cli-action ACTION [options]")
 	fmt.Fprintln(output, "Actions: install, start, stop, restart, uninstall, status")
 	fmt.Fprintln(output, "Install options:")
 	fmt.Fprintln(output, "  -install-dir PATH          Agent installation directory")
@@ -909,6 +1106,7 @@ func printCLIUsage(output io.Writer) {
 	fmt.Fprintln(output, "  -relay-base-url URL       Relay service base URL; repeat for multiple relays")
 	fmt.Fprintln(output, "  -room NAME                Room name appended to every relay service base URL")
 	fmt.Fprintln(output, "  -relay-url URL             Relay room URL; repeat for multiple relays")
+	fmt.Fprintln(output, "  -proxy VALUE               env, direct, or an HTTP(S) proxy URL")
 	fmt.Fprintln(output, "  -room-password-stdin       Read a new room password from standard input")
 	fmt.Fprintln(output, "  -room-password-blob PATH   Consume a machine-scope DPAPI password blob")
 	fmt.Fprintln(output, "  -clear-room-password       Remove the stored room password")
@@ -960,8 +1158,16 @@ func installOrUpdate(opts actionOptions) (string, error) {
 	defer m.Disconnect()
 
 	existed := false
+	existingPasswordFile := ""
+	existingExecutable := ""
 	if s, err := m.OpenService(serviceName); err == nil {
 		existed = true
+		if currentConfig, configErr := s.Config(); configErr == nil {
+			existingPasswordFile = serviceCommandLineOption(currentConfig.BinaryPathName, "-room-password-file")
+			if args := serviceCommandLineArgs(currentConfig.BinaryPathName); len(args) > 0 {
+				existingExecutable = args[0]
+			}
+		}
 		if err := stopMgrService(s); err != nil {
 			s.Close()
 			return "", fmt.Errorf("stop existing service: %w", err)
@@ -981,11 +1187,18 @@ func installOrUpdate(opts actionOptions) (string, error) {
 		}
 	} else if opts.ClearRoomPassword {
 		_ = os.Remove(passwordDest)
+	} else if !fileExists(passwordDest) && fileExists(existingPasswordFile) {
+		if err := copyFile(existingPasswordFile, passwordDest); err != nil {
+			return "", fmt.Errorf("migrate installed room password: %w", err)
+		}
 	}
 	if (opts.WinRMAddr != "" || opts.SMBAddr != "" || opts.ScreenView) && !fileExists(passwordDest) {
 		return "", errors.New("WinRM, SMB, and screen viewing require a room password")
 	}
 	args := []string{"-service", "-relay-url", opts.RelayURL}
+	if opts.Proxy != "" {
+		args = append(args, "-proxy", opts.Proxy)
+	}
 	if fileExists(passwordDest) {
 		args = append(args, "-room-password-file", passwordDest)
 	}
@@ -1031,6 +1244,7 @@ func installOrUpdate(opts actionOptions) (string, error) {
 	if err := startMgrService(s); err != nil {
 		return "", err
 	}
+	cleanupLegacyWorkInstall(existingExecutable, existingPasswordFile, agentDest, passwordDest)
 	note := ""
 	if opts.SMBAddr != "" {
 		note = fmt.Sprintf(" SMB accepts the alias %s; restart Windows once if the Server service was already running.", opts.SMBAlias)
@@ -1039,6 +1253,57 @@ func installOrUpdate(opts actionOptions) (string, error) {
 		return fmt.Sprintf("Updated and started %s in %s.%s", serviceDisplayName, installDir, note), nil
 	}
 	return fmt.Sprintf("Installed and started %s in %s.%s", serviceDisplayName, installDir, note), nil
+}
+
+func cleanupLegacyWorkInstall(oldExecutable, oldPassword, newExecutable, newPassword string) {
+	oldDir := filepath.Dir(strings.TrimSpace(oldExecutable))
+	newDir := filepath.Dir(strings.TrimSpace(newExecutable))
+	if oldDir == "." || newDir == "." || strings.EqualFold(oldDir, newDir) {
+		return
+	}
+	for _, path := range []string{oldExecutable, oldPassword, filepath.Join(oldDir, "smb-alias.txt")} {
+		path = strings.TrimSpace(path)
+		if path == "" || strings.EqualFold(path, newExecutable) || strings.EqualFold(path, newPassword) {
+			continue
+		}
+		_ = os.Remove(path)
+	}
+	_ = os.Remove(oldDir)
+}
+
+func serviceCommandLineOption(commandLine, option string) string {
+	args := serviceCommandLineArgs(commandLine)
+	for index := 0; index < len(args); index++ {
+		if strings.EqualFold(args[index], option) && index+1 < len(args) {
+			return strings.TrimSpace(args[index+1])
+		}
+		if strings.HasPrefix(strings.ToLower(args[index]), strings.ToLower(option)+"=") {
+			return strings.TrimSpace(strings.SplitN(args[index], "=", 2)[1])
+		}
+	}
+	return ""
+}
+
+func serviceCommandLineArgs(commandLine string) []string {
+	commandLine = strings.TrimSpace(commandLine)
+	if commandLine == "" {
+		return nil
+	}
+	ptr, err := windows.UTF16PtrFromString(commandLine)
+	if err != nil {
+		return nil
+	}
+	var count int32
+	argv, err := windows.CommandLineToArgv(ptr, &count)
+	if err != nil {
+		return nil
+	}
+	defer windows.LocalFree(windows.Handle(unsafe.Pointer(argv)))
+	args := make([]string, 0, count)
+	for index := int32(0); index < count; index++ {
+		args = append(args, windows.UTF16ToString(argv[index][:]))
+	}
+	return args
 }
 
 func startService() (string, error) {
@@ -1235,7 +1500,7 @@ func relaunchElevatedAction(action string, opts actionOptions, noDialog bool) er
 	if err != nil {
 		return err
 	}
-	args := []string{"-elevated-action", action}
+	args := []string{"-work-configurator", "-elevated-action", action}
 	if noDialog {
 		args = append(args, "-no-dialog")
 	}
@@ -1247,6 +1512,9 @@ func relaunchElevatedAction(action string, opts actionOptions, noDialog bool) er
 	}
 	if opts.RelayURL != "" {
 		args = append(args, "-relay-url", opts.RelayURL)
+	}
+	if opts.Proxy != "" {
+		args = append(args, "-proxy", opts.Proxy)
 	}
 	if opts.WinRMAddr != "" {
 		args = append(args, "-winrm", opts.WinRMAddr)
@@ -1301,7 +1569,7 @@ func relaunchCurrentArgsElevated(args []string) error {
 	if err != nil {
 		return err
 	}
-	return shellExecute("runas", exePath, joinWindowsArgs(args), "")
+	return shellExecute("runas", exePath, joinWindowsArgs(append([]string{"-work-configurator"}, args...)), "")
 }
 
 func shellOpen(path string) error {
@@ -1326,16 +1594,13 @@ func isElevated() bool {
 }
 
 func defaultInstallDir() string {
-	if _, err := os.Stat(`D:\`); err == nil {
-		return filepath.Join(`D:\`, "DeskFerry", "Agent")
-	}
 	if programFiles := os.Getenv("ProgramFiles"); programFiles != "" {
-		return filepath.Join(programFiles, "DeskFerry", "Agent")
+		return filepath.Join(programFiles, "DeskFerry")
 	}
 	if systemDrive := os.Getenv("SystemDrive"); systemDrive != "" {
-		return filepath.Join(systemDrive+`\`, "DeskFerry", "Agent")
+		return filepath.Join(systemDrive+`\`, "Program Files", "DeskFerry")
 	}
-	return filepath.Join(`C:\`, "DeskFerry", "Agent")
+	return filepath.Join(`C:\`, "Program Files", "DeskFerry")
 }
 
 func defaultAgentPath() string {
@@ -1343,14 +1608,7 @@ func defaultAgentPath() string {
 	if err != nil {
 		return ""
 	}
-	dir := filepath.Dir(exePath)
-	for _, name := range []string{"agent.exe", "deskferry-agent-windows-amd64.exe"} {
-		path := filepath.Join(dir, name)
-		if _, err := os.Stat(path); err == nil {
-			return path
-		}
-	}
-	return filepath.Join(dir, "deskferry-agent-windows-amd64.exe")
+	return exePath
 }
 
 func installedPath(installDir string) string {

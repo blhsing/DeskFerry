@@ -1,12 +1,29 @@
 //go:build windows
 
-package main
+package workconfigurator
 
 import (
 	"os"
 	"strings"
 	"testing"
 )
+
+func TestServiceCommandLineOption(t *testing.T) {
+	commandLine := `"C:\Program Files\DeskFerry\DeskFerry.exe" -service -room-password-file "D:\DeskFerry\Agent\room-password.dpapi"`
+	if got, want := serviceCommandLineOption(commandLine, "-room-password-file"), `D:\DeskFerry\Agent\room-password.dpapi`; got != want {
+		t.Fatalf("serviceCommandLineOption = %q, want %q", got, want)
+	}
+}
+
+func TestParseStartupProfile(t *testing.T) {
+	profile, err := parseStartupProfile([]string{"-profile-name", "Work", "-relay-base-url", "https://example.test/relay", "-room", "desk", "-proxy", "http://proxy:8080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Name != "Work" || profile.Room != "desk" || profile.Proxy != "http://proxy:8080" || len(profile.RelayBases) != 1 {
+		t.Fatalf("unexpected startup profile: %#v", profile)
+	}
+}
 
 func TestValidSMBAlias(t *testing.T) {
 	for _, value := range []string{"deskferry-work", "WORK10", "work-2"} {

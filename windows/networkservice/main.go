@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package homenetworkservice
 
 import (
 	"bufio"
@@ -32,7 +32,7 @@ import (
 
 const networkServiceName = "DeskFerryHomeNetwork"
 
-func main() {
+func Main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	var configPath string
 	var consoleMode bool

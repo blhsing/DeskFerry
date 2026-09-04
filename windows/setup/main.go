@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package windowssetup
 
 import (
 	"archive/zip"
@@ -32,23 +32,21 @@ import (
 )
 
 const (
-	productName           = "DeskFerry Home"
+	productName           = "DeskFerry"
 	networkServiceName    = "DeskFerryHomeNetwork"
 	networkServiceDisplay = "DeskFerry Home Network"
 	defaultRelayURL       = "https://test-officialwebsite.azurewebsites.net/relay/workdesk"
 	defaultAzureRelayBase = "https://test-officialwebsite.azurewebsites.net/relay"
 	defaultOCIRelayBase   = "http://217.142.228.117/relay"
 	defaultRoomName       = "workdesk"
-	productVersion        = "0.11.4"
-	setupInstallMutexName = `Global\DeskFerryHomeSetupInstall`
+	productVersion        = "0.12.0"
+	setupInstallMutexName = `Global\DeskFerryWindowsComponentsInstall`
 	hostsBeginMarker      = "# BEGIN DeskFerry Home managed alias"
 	hostsEndMarker        = "# END DeskFerry Home managed alias"
 )
 
 var installedFiles = []string{
-	"DeskFerryHome.exe",
-	"DeskFerryHomeNetwork.exe",
-	"DeskFerryHomeSetup.exe",
+	"DeskFerry.exe",
 	"tun2socks.exe",
 	"wintun.dll",
 	"LICENSE-Wintun.txt",
@@ -86,6 +84,8 @@ type setupApp struct {
 	alias           *walk.LineEdit
 	uncPreview      *walk.Label
 	status          *walk.Label
+	installButton   *walk.PushButton
+	uninstallButton *walk.PushButton
 	relayURLs       []string
 	relayDragIndex  int
 	relayDragStartY int
@@ -95,7 +95,7 @@ type setupApp struct {
 	destination     string
 }
 
-func main() {
+func Main() {
 	if hasArg(os.Args[1:], "-cli-action") || hasArg(os.Args[1:], "-cli-help") {
 		if err := runCLI(os.Args[1:], os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -103,10 +103,10 @@ func main() {
 		}
 		return
 	}
-	requestFile := flag.String("elevated-request", "", "DPAPI-protected setup request")
+	requestFile := flag.String("elevated-request", "", "DPAPI-protected component request")
 	networkRequestFile := flag.String("elevated-network-request", "", "DPAPI-protected selected-profile network request")
-	uninstall := flag.Bool("elevated-uninstall", false, "uninstall DeskFerry Home")
-	smokeTest := flag.Bool("ui-smoke-test", false, "open and close the setup UI")
+	uninstall := flag.Bool("elevated-uninstall", false, "uninstall DeskFerry")
+	smokeTest := flag.Bool("ui-smoke-test", false, "open and close the Windows Components UI")
 	noDialog := flag.Bool("no-dialog", false, "write the result to the console instead of displaying a dialog")
 	flag.Parse()
 	if *requestFile != "" || *networkRequestFile != "" || *uninstall {
@@ -134,7 +134,7 @@ func main() {
 	}
 	app := &setupApp{relayDragIndex: -1}
 	if err := app.run(*smokeTest); err != nil {
-		windowsMessageBox(productName+" Setup", err.Error(), windows.MB_OK|windows.MB_ICONERROR)
+		windowsMessageBox(productName+" Windows Components", err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(1)
 	}
 }
@@ -142,7 +142,7 @@ func main() {
 func (a *setupApp) run(smokeTest bool) error {
 	window := MainWindow{
 		AssignTo: &a.mw,
-		Title:    productName + " Setup",
+		Title:    productName + " Windows Components",
 		Size:     Size{Width: 840, Height: 620},
 		MinSize:  Size{Width: 760, Height: 560},
 		Layout:   VBox{Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 12}, Spacing: 8},
@@ -216,9 +216,9 @@ func (a *setupApp) run(smokeTest bool) error {
 					Composite{
 						Layout: Flow{Spacing: 8},
 						Children: []Widget{
-							PushButton{Text: "Install / Update", MinSize: Size{Width: 130, Height: 34}, OnClicked: a.install},
-							PushButton{Text: "Open DeskFerry Home", MinSize: Size{Width: 155, Height: 34}, OnClicked: a.openHome},
-							PushButton{Text: "Uninstall", MinSize: Size{Width: 100, Height: 34}, OnClicked: a.uninstall},
+							PushButton{AssignTo: &a.installButton, Text: "Install", MinSize: Size{Width: 130, Height: 34}, OnClicked: a.install},
+							PushButton{Text: "Open DeskFerry", MinSize: Size{Width: 155, Height: 34}, OnClicked: a.openHome},
+							PushButton{AssignTo: &a.uninstallButton, Text: "Remove", MinSize: Size{Width: 100, Height: 34}, OnClicked: a.uninstall},
 							PushButton{Text: "Refresh", MinSize: Size{Width: 90, Height: 34}, OnClicked: a.refreshStatus},
 							PushButton{Text: "Close", MinSize: Size{Width: 90, Height: 34}, OnClicked: func() { _ = a.mw.Close() }},
 						},
@@ -265,7 +265,7 @@ func (a *setupApp) run(smokeTest bool) error {
 
 func (a *setupApp) browseInstallDir() {
 	dlg := new(walk.FileDialog)
-	dlg.Title = "Choose where to install DeskFerry Home"
+	dlg.Title = "Choose where to install DeskFerry"
 	dlg.InitialDirPath = a.installDir.Text()
 	if ok, err := dlg.ShowBrowseFolder(a.mw); err != nil {
 		a.showError(err)
@@ -336,7 +336,7 @@ func (a *setupApp) install() {
 }
 
 func (a *setupApp) uninstall() {
-	if walk.MsgBox(a.mw, productName+" Setup", "Remove DeskFerry Home and its optional virtual network adapter? Your per-user saved profiles will be kept.", walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+	if walk.MsgBox(a.mw, productName+" Windows Components", "Remove DeskFerry and its Windows services? Your per-user saved profiles will be kept.", walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
 		return
 	}
 	if err := relaunchElevated([]string{"-elevated-uninstall"}); err != nil {
@@ -345,9 +345,9 @@ func (a *setupApp) uninstall() {
 }
 
 func (a *setupApp) openHome() {
-	path := filepath.Join(strings.TrimSpace(a.installDir.Text()), "DeskFerryHome.exe")
+	path := filepath.Join(strings.TrimSpace(a.installDir.Text()), "DeskFerry.exe")
 	if _, err := os.Stat(path); err != nil {
-		a.showError(errors.New("DeskFerry Home is not installed yet"))
+		a.showError(errors.New("DeskFerry is not installed yet"))
 		return
 	}
 	if err := shellExecute("open", path, "", filepath.Dir(path)); err != nil {
@@ -357,11 +357,11 @@ func (a *setupApp) openHome() {
 
 func (a *setupApp) refreshStatus() {
 	installDir := strings.TrimSpace(a.installDir.Text())
-	_, homeErr := os.Stat(filepath.Join(installDir, "DeskFerryHome.exe"))
+	_, homeErr := os.Stat(filepath.Join(installDir, "DeskFerry.exe"))
 	serviceState, serviceErr := queryServiceState()
-	text := "DeskFerry Home: not installed"
+	text := "DeskFerry: not installed"
 	if homeErr == nil {
-		text = "DeskFerry Home: installed"
+		text = "DeskFerry: installed"
 	}
 	if serviceErr == nil && serviceState != 0 {
 		text += "; file access: " + serviceStateText(serviceState)
@@ -369,10 +369,21 @@ func (a *setupApp) refreshStatus() {
 		text += "; file access: not installed"
 	}
 	a.status.SetText(text)
+	installed := homeErr == nil
+	if a.installButton != nil {
+		if installed {
+			a.installButton.SetText("Apply components")
+		} else {
+			a.installButton.SetText("Install")
+		}
+	}
+	if a.uninstallButton != nil {
+		a.uninstallButton.SetVisible(installed)
+	}
 }
 
 func (a *setupApp) showError(err error) {
-	walk.MsgBox(a.mw, productName+" Setup", err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+	walk.MsgBox(a.mw, productName+" Windows Components", err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
 }
 
 func (a *setupApp) setRelayURLList(values []string, index int) {
@@ -546,10 +557,10 @@ func configureNetworkFromRequest(path string) (string, error) {
 	}
 	installedDir := installedLocation()
 	if strings.TrimSpace(installedDir) == "" {
-		return "", errors.New("DeskFerry Home is not installed")
+		return "", errors.New("DeskFerry is not installed")
 	}
 	opts.InstallDir = installedDir
-	for _, name := range []string{"DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll"} {
+	for _, name := range []string{"DeskFerry.exe", "tun2socks.exe", "wintun.dll"} {
 		if _, err := os.Stat(filepath.Join(installedDir, name)); err != nil {
 			return "", fmt.Errorf("installed network component is missing %s", name)
 		}
@@ -577,7 +588,7 @@ func configureNetworkFromRequest(path string) (string, error) {
 	if err := updateHostsAlias(cfg.Alias, cfg.RemoteAddress); err != nil {
 		return "", err
 	}
-	if err := createAndStartNetworkService(filepath.Join(installedDir, "DeskFerryHomeNetwork.exe"), configPath()); err != nil {
+	if err := createAndStartNetworkService(filepath.Join(installedDir, "DeskFerry.exe"), configPath()); err != nil {
 		return "", err
 	}
 	if err := writeInstallMetadata(opts); err != nil {
@@ -644,11 +655,11 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, setupOptions, error) 
 	opts := initial
 	var relayURLs relayURLFlags
 	var relayBases relayURLFlags
-	fs := flag.NewFlagSet("DeskFerryHomeSetup", flag.ContinueOnError)
+	fs := flag.NewFlagSet("DeskFerryWindowsComponents", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	action := fs.String("cli-action", "", "install, configure, uninstall, or status")
 	fs.StringVar(&opts.InstallDir, "install-dir", initial.InstallDir, "installation directory")
-	fs.StringVar(&opts.SourceDir, "source-dir", initial.SourceDir, "setup payload directory")
+	fs.StringVar(&opts.SourceDir, "source-dir", initial.SourceDir, "component payload directory")
 	fs.StringVar(&opts.Destination, "destination", initial.Destination, "Home app destination name to configure")
 	fs.Var(&relayURLs, "relay-url", "relay room URL; repeat for multiple relays")
 	fs.Var(&relayBases, "relay-base-url", "relay service base URL; repeat for multiple relays")
@@ -754,15 +765,15 @@ func runCLI(args []string, stdin io.Reader, stdout io.Writer) error {
 		if err != nil {
 			return err
 		}
-		installed := filepath.Join(installedLocation(), "DeskFerryHome.exe")
+		installed := filepath.Join(installedLocation(), "DeskFerry.exe")
 		if _, err := os.Stat(installed); err != nil {
-			fmt.Fprintln(stdout, "DeskFerry Home is not installed; virtual network adapter is not installed.")
+			fmt.Fprintln(stdout, "DeskFerry is not installed; virtual network adapter is not installed.")
 			return nil
 		}
 		if state == 0 {
-			fmt.Fprintf(stdout, "DeskFerry Home is installed at %s; virtual network adapter is not installed.\n", installedLocation())
+			fmt.Fprintf(stdout, "DeskFerry is installed at %s; virtual network adapter is not installed.\n", installedLocation())
 		} else {
-			fmt.Fprintf(stdout, "DeskFerry Home is installed at %s; virtual network adapter service is %s.\n", installedLocation(), serviceStateText(state))
+			fmt.Fprintf(stdout, "DeskFerry is installed at %s; virtual network adapter service is %s.\n", installedLocation(), serviceStateText(state))
 		}
 		return nil
 	}
@@ -801,7 +812,7 @@ func runCLI(args []string, stdin io.Reader, stdout io.Writer) error {
 }
 
 func printCLIUsage(output io.Writer) {
-	fmt.Fprintln(output, "Usage: DeskFerryHomeSetup.exe -cli-action ACTION [options]")
+	fmt.Fprintln(output, "Usage: DeskFerry.exe -windows-setup -cli-action ACTION [options]")
 	fmt.Fprintln(output, "Actions: install, configure, uninstall, status")
 	fmt.Fprintln(output, "  -install-dir PATH          Installation directory")
 	fmt.Fprintln(output, "  -source-dir PATH           Setup payload directory")
@@ -835,6 +846,7 @@ type homeClientDestination struct {
 	RelayAddrs      []string `json:"relay_addrs"`
 	RelayBases      []string `json:"relay_bases,omitempty"`
 	Room            string   `json:"room,omitempty"`
+	Proxy           string   `json:"proxy,omitempty"`
 	RoomProof       string   `json:"room_proof"`
 	WindowsUser     string   `json:"windows_user,omitempty"`
 	PasswordlessRDP bool     `json:"passwordless_rdp,omitempty"`
@@ -862,7 +874,7 @@ func existingSetupOptions(sourceDir string) setupOptions {
 		EnableNetwork: true,
 	}
 	installedDir := installedLocation()
-	if _, err := os.Stat(filepath.Join(installedDir, "DeskFerryHome.exe")); err == nil {
+	if _, err := os.Stat(filepath.Join(installedDir, "DeskFerry.exe")); err == nil {
 		opts.InstallDir = installedDir
 		opts.EnableNetwork = false
 	}
@@ -903,6 +915,9 @@ func existingSetupOptions(sourceDir string) setupOptions {
 		for _, destination := range settings.Destinations {
 			if destination.Name == settings.SelectedDestination {
 				relays, proof, alias = destination.RelayAddrs, destination.RoomProof, destination.SMBAlias
+				if strings.TrimSpace(destination.Proxy) != "" {
+					opts.Proxy = strings.TrimSpace(destination.Proxy)
+				}
 				break
 			}
 		}
@@ -955,7 +970,7 @@ func setupPackagePathForExecutable(sourceDir, executable string) string {
 	if sourceErr == nil && executableErr == nil && strings.EqualFold(sourceAbs, filepath.Dir(executableAbs)) {
 		return executableAbs
 	}
-	return filepath.Join(sourceDir, "DeskFerryHomeSetup.exe")
+	return filepath.Join(sourceDir, "DeskFerry.exe")
 }
 
 func hasArg(args []string, name string) bool {
@@ -977,10 +992,10 @@ func reportResult(noDialog bool, message string, err error) {
 		return
 	}
 	if err != nil {
-		windowsMessageBox(productName+" Setup", err.Error(), windows.MB_OK|windows.MB_ICONERROR)
+		windowsMessageBox(productName+" Windows Components", err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		return
 	}
-	windowsMessageBox(productName+" Setup", message, windows.MB_OK|windows.MB_ICONINFORMATION)
+	windowsMessageBox(productName+" Windows Components", message, windows.MB_OK|windows.MB_ICONINFORMATION)
 }
 
 func preserveInstalledRoomProof(opts *setupOptions) {
@@ -1003,11 +1018,11 @@ func validateOptions(opts setupOptions) error {
 	}
 	setupPath := setupPackagePath(opts.SourceDir)
 	if _, err := os.Stat(setupPath); err != nil {
-		return errors.New("DeskFerry Home setup package is unavailable")
+		return errors.New("DeskFerry executable is unavailable")
 	}
-	required := []string{"DeskFerryHome.exe"}
+	required := []string{}
 	if opts.EnableNetwork {
-		required = append(required, "DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt")
+		required = append(required, "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt")
 	}
 	missingSibling := false
 	for _, name := range required {
@@ -1063,6 +1078,7 @@ func installProduct(opts setupOptions) (string, error) {
 		_ = windows.ReleaseMutex(installMutex)
 		_ = windows.CloseHandle(installMutex)
 	}()
+	legacyInstallDir := installedLocation()
 	preserveInstalledRoomProof(&opts)
 	if err := validateOptions(opts); err != nil {
 		return "", err
@@ -1081,18 +1097,27 @@ func installProduct(opts setupOptions) (string, error) {
 	if err := os.MkdirAll(installDir, 0755); err != nil {
 		return "", err
 	}
-	for _, name := range []string{"DeskFerryHome.exe", "DeskFerryHomeSetup.exe"} {
+	for _, name := range []string{"DeskFerry.exe"} {
 		target := filepath.Join(installDir, name)
+		current, _ := os.Executable()
+		if currentAbs, currentErr := filepath.Abs(current); currentErr == nil && strings.EqualFold(currentAbs, target) {
+			continue
+		}
 		if err := ensureReplaceable(target); err != nil {
-			return "", fmt.Errorf("prepare to install %s: %w (close DeskFerry Home if it is running)", name, err)
+			return "", fmt.Errorf("prepare to install %s: %w (close DeskFerry if it is running)", name, err)
 		}
 	}
 	if err := stopAndDeleteNetworkService(); err != nil {
 		return "", err
 	}
-	for _, name := range []string{"DeskFerryHome.exe", "DeskFerryHomeSetup.exe"} {
-		if err := copyFile(filepath.Join(opts.SourceDir, name), filepath.Join(installDir, name)); err != nil {
-			return "", fmt.Errorf("install %s: %w (close DeskFerry Home if it is running)", name, err)
+	for _, name := range []string{"DeskFerry.exe"} {
+		target := filepath.Join(installDir, name)
+		current, _ := os.Executable()
+		if currentAbs, currentErr := filepath.Abs(current); currentErr == nil && strings.EqualFold(currentAbs, target) {
+			continue
+		}
+		if err := copyFile(filepath.Join(opts.SourceDir, name), target); err != nil {
+			return "", fmt.Errorf("install %s: %w (close DeskFerry if it is running)", name, err)
 		}
 	}
 	if err := createShortcuts(installDir); err != nil {
@@ -1106,7 +1131,7 @@ func installProduct(opts setupOptions) (string, error) {
 			return "", err
 		}
 		_ = os.Remove(configPath())
-		for _, name := range []string{"DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
+		for _, name := range []string{"tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
 			_ = os.Remove(filepath.Join(installDir, name))
 		}
 		if err := writeInstallMetadata(opts); err != nil {
@@ -1115,9 +1140,11 @@ func installProduct(opts setupOptions) (string, error) {
 		if err := configureHomeClient(opts, networkConfig(opts).RoomProof); err != nil {
 			return "", err
 		}
-		return "DeskFerry Home was installed without the optional virtual network adapter.", nil
+		removeLegacyWindowsBinaries(installDir)
+		removeSupersededInstall(legacyInstallDir, installDir)
+		return "DeskFerry was installed without the optional virtual network adapter.", nil
 	}
-	for _, name := range []string{"DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
+	for _, name := range []string{"tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
 		if err := copyFile(filepath.Join(opts.SourceDir, name), filepath.Join(installDir, name)); err != nil {
 			return "", fmt.Errorf("install %s: %w", name, err)
 		}
@@ -1139,7 +1166,7 @@ func installProduct(opts setupOptions) (string, error) {
 	if err := updateHostsAlias(cfg.Alias, cfg.RemoteAddress); err != nil {
 		return "", err
 	}
-	if err := createAndStartNetworkService(filepath.Join(installDir, "DeskFerryHomeNetwork.exe"), configPath()); err != nil {
+	if err := createAndStartNetworkService(filepath.Join(installDir, "DeskFerry.exe"), configPath()); err != nil {
 		return "", err
 	}
 	if err := writeInstallMetadata(opts); err != nil {
@@ -1148,7 +1175,42 @@ func installProduct(opts setupOptions) (string, error) {
 	if err := configureHomeClient(opts, cfg.RoomProof); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("DeskFerry Home and file access were installed. Open \\\\%s\\sharename after the work agent enables SMB.", cfg.Alias), nil
+	removeLegacyWindowsBinaries(installDir)
+	removeSupersededInstall(legacyInstallDir, installDir)
+	return fmt.Sprintf("DeskFerry and file access were installed. Open \\\\%s\\sharename after the work service enables SMB.", cfg.Alias), nil
+}
+
+func removeLegacyWindowsBinaries(installDir string) {
+	current, _ := os.Executable()
+	for _, name := range []string{
+		"DeskFerryHome.exe",
+		"DeskFerryHomeNetwork.exe",
+		"DeskFerryHomeSetup.exe",
+		"DeskFerryHomeSetup-debug.exe",
+	} {
+		path := filepath.Join(installDir, name)
+		if strings.EqualFold(path, current) {
+			continue
+		}
+		_ = os.Remove(path)
+	}
+}
+
+func removeSupersededInstall(oldDir, newDir string) {
+	oldAbs, oldErr := filepath.Abs(strings.TrimSpace(oldDir))
+	newAbs, newErr := filepath.Abs(strings.TrimSpace(newDir))
+	if oldErr != nil || newErr != nil || oldAbs == "." || strings.EqualFold(oldAbs, newAbs) {
+		return
+	}
+	for _, name := range append(installedFiles,
+		"DeskFerryHome.exe",
+		"DeskFerryHomeNetwork.exe",
+		"DeskFerryHomeSetup.exe",
+		"DeskFerryHomeSetup-debug.exe",
+	) {
+		_ = os.Remove(filepath.Join(oldAbs, name))
+	}
+	_ = os.Remove(oldAbs)
 }
 
 func acquireSetupInstallMutex() (windows.Handle, error) {
@@ -1163,11 +1225,11 @@ func acquireSetupInstallMutex() (windows.Handle, error) {
 	result, err := windows.WaitForSingleObject(handle, uint32((2*time.Minute)/time.Millisecond))
 	if err != nil {
 		_ = windows.CloseHandle(handle)
-		return 0, fmt.Errorf("wait for another DeskFerry Home setup: %w", err)
+		return 0, fmt.Errorf("wait for another DeskFerry component update: %w", err)
 	}
 	if result != windows.WAIT_OBJECT_0 && result != windows.WAIT_ABANDONED {
 		_ = windows.CloseHandle(handle)
-		return 0, errors.New("another DeskFerry Home setup did not finish within two minutes")
+		return 0, errors.New("another DeskFerry component update did not finish within two minutes")
 	}
 	return handle, nil
 }
@@ -1235,6 +1297,7 @@ func configureHomeClient(opts setupOptions, proof string) error {
 	settings.Destinations[index].RelayAddrs = relays
 	settings.Destinations[index].RelayBases = append([]string(nil), opts.RelayBases...)
 	settings.Destinations[index].Room = strings.TrimSpace(opts.Room)
+	settings.Destinations[index].Proxy = strings.TrimSpace(opts.Proxy)
 	if len(settings.Destinations[index].RelayBases) == 0 || settings.Destinations[index].Room == "" {
 		if bases, room, err := tunnel.SplitRelayRoomURLs(relays); err == nil {
 			settings.Destinations[index].RelayBases = bases
@@ -1271,6 +1334,9 @@ func configureHomeClient(opts setupOptions, proof string) error {
 }
 
 func uninstallProduct() (string, error) {
+	if err := stopAndDeleteNamedService("DeskFerryAgent"); err != nil {
+		return "", err
+	}
 	if err := stopAndDeleteNetworkService(); err != nil {
 		return "", err
 	}
@@ -1280,6 +1346,7 @@ func uninstallProduct() (string, error) {
 	_ = os.Remove(configPath())
 	installDir := installedLocation()
 	_ = os.RemoveAll(shortcutDir())
+	_ = registry.DeleteKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Uninstall\DeskFerry`)
 	_ = registry.DeleteKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Uninstall\DeskFerryHome`)
 	_ = os.Remove(installMetadataPath())
 	current, _ := os.Executable()
@@ -1292,14 +1359,38 @@ func uninstallProduct() (string, error) {
 		}
 		_ = os.Remove(path)
 	}
+	removeLegacyWindowsBinaries(installDir)
 	_ = os.Remove(installDir)
-	return "DeskFerry Home and its virtual network components were removed. Saved per-user profiles were kept.", nil
+	return "DeskFerry and its Windows services were removed. Saved per-user profiles were kept.", nil
+}
+
+func stopAndDeleteNamedService(name string) error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(name)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	if status, queryErr := s.Query(); queryErr == nil && status.State != svc.Stopped {
+		_, _ = s.Control(svc.Stop)
+		if err := waitForServiceState(s, svc.Stopped, 30*time.Second); err != nil {
+			return err
+		}
+	}
+	return s.Delete()
 }
 
 func validateEmbeddedPayload(setupPath string, required []string) error {
 	archive, err := zip.OpenReader(setupPath)
 	if err != nil {
-		return fmt.Errorf("setup package is missing its embedded payload: %w", err)
+		return fmt.Errorf("DeskFerry executable is missing its embedded payload: %w", err)
 	}
 	defer archive.Close()
 	found := make(map[string]bool)
@@ -1308,42 +1399,51 @@ func validateEmbeddedPayload(setupPath string, required []string) error {
 	}
 	for _, name := range required {
 		if !found[name] {
-			return fmt.Errorf("setup package is missing %s", name)
+			return fmt.Errorf("DeskFerry executable is missing %s", name)
 		}
 	}
 	return nil
 }
 
 func materializePayload(sourceDir string, networkEnabled bool) (string, func(), error) {
-	required := []string{"DeskFerryHome.exe"}
+	required := []string{}
 	if networkEnabled {
-		required = append(required, "DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll")
-	}
-	hasSiblings := true
-	for _, name := range required {
-		if _, err := os.Stat(filepath.Join(sourceDir, name)); err != nil {
-			hasSiblings = false
-			break
-		}
-	}
-	if hasSiblings {
-		return sourceDir, func() {}, nil
+		required = append(required, "tun2socks.exe", "wintun.dll")
 	}
 	setupPath := setupPackagePath(sourceDir)
-	archive, err := zip.OpenReader(setupPath)
-	if err != nil {
-		return "", func() {}, fmt.Errorf("open embedded setup payload: %w", err)
-	}
-	defer archive.Close()
 	tempDir, err := os.MkdirTemp("", "deskferry-home-payload-")
 	if err != nil {
 		return "", func() {}, err
 	}
 	cleanup := func() { _ = os.RemoveAll(tempDir) }
-	if err := copyFile(setupPath, filepath.Join(tempDir, "DeskFerryHomeSetup.exe")); err != nil {
+	if err := copyFile(setupPath, filepath.Join(tempDir, "DeskFerry.exe")); err != nil {
 		cleanup()
 		return "", func() {}, err
 	}
+	allSiblings := true
+	for _, name := range required {
+		if _, err := os.Stat(filepath.Join(sourceDir, name)); err != nil {
+			allSiblings = false
+			break
+		}
+	}
+	if allSiblings {
+		for _, name := range append(required, "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt") {
+			if _, err := os.Stat(filepath.Join(sourceDir, name)); err == nil {
+				if err := copyFile(filepath.Join(sourceDir, name), filepath.Join(tempDir, name)); err != nil {
+					cleanup()
+					return "", func() {}, err
+				}
+			}
+		}
+		return tempDir, cleanup, nil
+	}
+	archive, err := zip.OpenReader(setupPath)
+	if err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("open embedded component payload: %w", err)
+	}
+	defer archive.Close()
 	allowed := make(map[string]bool)
 	for _, name := range installedFiles {
 		allowed[name] = true
@@ -1414,19 +1514,19 @@ func installedLocation() string {
 }
 
 func registerUninstaller(installDir string) error {
-	key, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Uninstall\DeskFerryHome`, registry.SET_VALUE)
+	key, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Uninstall\DeskFerry`, registry.SET_VALUE)
 	if err != nil {
 		return fmt.Errorf("register uninstaller: %w", err)
 	}
 	defer key.Close()
-	setupPath := filepath.Join(installDir, "DeskFerryHomeSetup.exe")
+	setupPath := filepath.Join(installDir, "DeskFerry.exe")
 	values := map[string]string{
 		"DisplayName":     productName,
 		"DisplayVersion":  productVersion,
 		"Publisher":       "DeskFerry",
 		"InstallLocation": installDir,
 		"DisplayIcon":     setupPath + ",0",
-		"UninstallString": syscall.EscapeArg(setupPath) + " -elevated-uninstall",
+		"UninstallString": syscall.EscapeArg(setupPath) + " -windows-setup -elevated-uninstall",
 	}
 	for name, value := range values {
 		if err := key.SetStringValue(name, value); err != nil {
@@ -1445,7 +1545,7 @@ func createAndStartNetworkService(exePath, cfgPath string) error {
 		return err
 	}
 	defer m.Disconnect()
-	args := []string{"-service", "-config", cfgPath}
+	args := []string{"-home-network-service", "-service", "-config", cfgPath}
 	config := mgr.Config{
 		ServiceType:    windows.SERVICE_WIN32_OWN_PROCESS,
 		StartType:      mgr.StartAutomatic,
@@ -1594,10 +1694,10 @@ func createShortcuts(installDir string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	if err := createShortcut(filepath.Join(dir, "DeskFerry Home.lnk"), filepath.Join(installDir, "DeskFerryHome.exe"), "", installDir, "DeskFerry Home"); err != nil {
+	if err := createShortcut(filepath.Join(dir, "DeskFerry.lnk"), filepath.Join(installDir, "DeskFerry.exe"), "", installDir, "DeskFerry"); err != nil {
 		return err
 	}
-	return createShortcut(filepath.Join(dir, "Uninstall DeskFerry Home.lnk"), filepath.Join(installDir, "DeskFerryHomeSetup.exe"), "-elevated-uninstall", installDir, "Uninstall DeskFerry Home")
+	return createShortcut(filepath.Join(dir, "Remove DeskFerry.lnk"), filepath.Join(installDir, "DeskFerry.exe"), "-windows-setup -elevated-uninstall", installDir, "Remove DeskFerry")
 }
 
 func createShortcut(shortcut, target, args, workDir, description string) error {
@@ -1696,6 +1796,7 @@ func relaunchElevated(args []string) error {
 	if err != nil {
 		return err
 	}
+	args = append([]string{"-windows-setup"}, args...)
 	quoted := make([]string, 0, len(args))
 	for _, arg := range args {
 		quoted = append(quoted, syscall.EscapeArg(arg))

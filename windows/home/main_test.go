@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package homewindows
 
 import (
 	"bytes"
@@ -25,6 +25,16 @@ import (
 	"github.com/lxn/walk"
 	"golang.org/x/sys/windows"
 )
+
+func TestWindowsCommandLineProfileOptions(t *testing.T) {
+	args := windowsCommandLineArgs(`"C:\Program Files\DeskFerry\DeskFerry.exe" -service -relay-url "https://relay.example/relay/work;http://backup.example/relay/work" -proxy http://proxy:8080`)
+	if got := commandLineOption(args, "-proxy"); got != "http://proxy:8080" {
+		t.Fatalf("proxy = %q", got)
+	}
+	if got := commandLineOption(args, "-relay-url"); !strings.Contains(got, "backup.example") {
+		t.Fatalf("relay URL = %q", got)
+	}
+}
 
 func TestProxyCapabilitiesPersistAcrossStarts(t *testing.T) {
 	t.Setenv("APPDATA", t.TempDir())
@@ -455,6 +465,7 @@ func TestEnsureDestinationsMigratesLegacyRelayList(t *testing.T) {
 			"https://primary.example/relay/office",
 			"http://fallback.example/relay/office",
 		},
+		Proxy: "http://proxy.example:8080",
 	}
 	if err := cfg.ensureDestinations(); err != nil {
 		t.Fatal(err)
@@ -470,6 +481,31 @@ func TestEnsureDestinationsMigratesLegacyRelayList(t *testing.T) {
 	}
 	if cfg.Destinations[0].Room != "office" {
 		t.Fatalf("migrated room = %q, want office", cfg.Destinations[0].Room)
+	}
+	if cfg.Destinations[0].Proxy != cfg.Proxy {
+		t.Fatalf("migrated proxy = %q, want %q", cfg.Destinations[0].Proxy, cfg.Proxy)
+	}
+}
+
+func TestEnsureDestinationsKeepsProxyPerProfile(t *testing.T) {
+	cfg := config{
+		RelayAddr:           "https://azure.example/relay/home",
+		RelayAddrs:          []string{"https://azure.example/relay/home"},
+		Proxy:               "env",
+		SelectedDestination: "Home",
+		Destinations: []destinationProfile{
+			{Name: "Office", RelayAddrs: []string{"https://azure.example/relay/office"}, Proxy: "direct"},
+			{Name: "Home", RelayAddrs: []string{"https://old.example/relay/home"}, Proxy: "http://proxy.example:8080"},
+		},
+	}
+	if err := cfg.ensureDestinations(); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Destinations[0].Proxy; got != "direct" {
+		t.Fatalf("Office proxy = %q", got)
+	}
+	if got := cfg.Proxy; got != "http://proxy.example:8080" {
+		t.Fatalf("selected proxy = %q", got)
 	}
 }
 

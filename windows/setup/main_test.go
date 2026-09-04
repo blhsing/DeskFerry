@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package windowssetup
 
 import (
 	"encoding/json"
@@ -103,15 +103,40 @@ func TestSetupPackagePathUsesRenamedRunningInstaller(t *testing.T) {
 		t.Fatalf("setup path = %q, want %q", got, debugSetup)
 	}
 	otherDir := t.TempDir()
-	want := filepath.Join(sourceDir, "DeskFerryHomeSetup.exe")
+	want := filepath.Join(sourceDir, "DeskFerry.exe")
 	if got := setupPackagePathForExecutable(sourceDir, filepath.Join(otherDir, "setup.exe")); got != want {
 		t.Fatalf("fallback setup path = %q, want %q", got, want)
 	}
 }
 
+func TestRemoveSupersededInstallRemovesOnlyLegacyDirectory(t *testing.T) {
+	oldDir := filepath.Join(t.TempDir(), "DeskFerry Home")
+	newDir := filepath.Join(t.TempDir(), "DeskFerry")
+	for _, dir := range []string{oldDir, newDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "DeskFerry.exe"), []byte("test"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(oldDir, "DeskFerryHomeNetwork.exe"), []byte("legacy"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	removeSupersededInstall(oldDir, newDir)
+
+	if _, err := os.Stat(oldDir); !os.IsNotExist(err) {
+		t.Fatalf("superseded directory remains: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(newDir, "DeskFerry.exe")); err != nil {
+		t.Fatalf("merged install was altered: %v", err)
+	}
+}
+
 func TestParseCLIInstall(t *testing.T) {
 	sourceDir := t.TempDir()
-	for _, name := range []string{"DeskFerryHomeSetup.exe", "DeskFerryHome.exe", "DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
+	for _, name := range []string{"DeskFerry.exe", "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
 		if err := os.WriteFile(filepath.Join(sourceDir, name), []byte(name), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -138,7 +163,7 @@ func TestParseCLIInstall(t *testing.T) {
 
 func TestParseCLIComposesRelayBasesWithRoom(t *testing.T) {
 	sourceDir := t.TempDir()
-	for _, name := range []string{"DeskFerryHomeSetup.exe", "DeskFerryHome.exe", "DeskFerryHomeNetwork.exe", "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
+	for _, name := range []string{"DeskFerry.exe", "tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
 		if err := os.WriteFile(filepath.Join(sourceDir, name), []byte(name), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -172,11 +197,11 @@ func TestExistingSetupOptionsLoadsInstalledNetworkConfig(t *testing.T) {
 	appData := t.TempDir()
 	t.Setenv("ProgramData", programData)
 	t.Setenv("APPDATA", appData)
-	installDir := filepath.Join(t.TempDir(), "DeskFerry Home")
+	installDir := filepath.Join(t.TempDir(), "DeskFerry")
 	if err := os.MkdirAll(installDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(installDir, "DeskFerryHome.exe"), []byte("home"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(installDir, "DeskFerry.exe"), []byte("home"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Dir(installMetadataPath()), 0755); err != nil {

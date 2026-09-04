@@ -1,5 +1,13 @@
 # Release Notes
 
+## 0.12.0 - 2026-09-04
+
+- Replace the separate Windows Home, Work agent, Work configurator, Home network, and setup artifacts with one self-contained multi-mode `DeskFerry.exe`.
+- Reuse each named Windows connection profile's room, ordered relay bases, and proxy for Home and Work configuration, migrate an existing Work service connection as a **This PC** profile, and preserve DPAPI-protected room credentials.
+- Add in-app Work Services and Windows Components controls, per-profile proxy settings, optional WinRM/SMB/screenshot switches, and service-aware actions that offer **Install** only when a service is absent.
+- Register the Work and optional Home SMB services against the merged executable, embed the verified Wintun/tun2socks payload, and migrate legacy service paths and files during upgrade.
+- Simplify Windows builds and releases to optimized and debug variants of the single executable.
+
 ## 0.11.4 - 2026-09-02
 
 - Authenticate HTTPS `POST`/`GET` fallback tunnels through NTLM proxies with the current Windows identity, allowing the Azure relay to remain usable when a gateway permits CONNECT but strips WebSocket upgrades.

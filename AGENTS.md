@@ -15,19 +15,20 @@ DeskFerry is a Go + .NET + Python + Android project for outbound-only RDP, WinRM
 - Do not reintroduce generated client files or file-based pairing artifacts for the normal path.
 - The Azure relay WebSocket endpoint is `/relay/ws` for the overview room and `/relay/<room>/ws` for named rooms.
 - URL-only clients should use standard proxy environment variables by default; explicit `http://` and `https://` proxy URLs are supported, and `-proxy direct` is the bypass path. On Windows, both proxy `CONNECT` and plain-HTTP fallback requests use the current identity when the proxy requests NTLM authentication; LocalSystem services use a logged-on interactive user's identity because corporate proxies commonly reject the machine account. When a configured proxy rejects WebSocket `CONNECT`, clients fall back to the relay's paired streaming `POST`/`GET` transport. A standard non-CONNECT proxy can forward that fallback only to a plain-HTTP relay; HTTPS still requires `CONNECT` to establish TLS.
-- The home side can be the Windows home app in `home-agent/windows`, the macOS home agent in `home-agent/macos`, or the Android home app in `home-agent/android/`.
+- The home side can be the merged Windows app in `windows/`, the macOS home agent in `home-agent/macos`, or the Android home app in `home-agent/android/`.
 - The Android app is a home-agent client only: it listens on Android loopback and connects out to the relay; it must not become a phone-hosted relay.
 - The Windows home app may keep a lightweight `home-agent` WebSocket open for dashboard presence, but RDP data uses `client` sockets.
 - The macOS home agent may keep a lightweight `home-agent` WebSocket open for dashboard presence, but RDP data uses `client` sockets.
 - The Android home app may also keep a lightweight `home-agent` WebSocket open for dashboard presence while its foreground service is running.
 - Android relay status should use the relay `dashboard` WebSocket stream, not HTTP polling.
-- The Windows home app should remain control-panel/tray-first. Console mode is debug-only.
+- The merged Windows app should remain control-panel/tray-first. Console mode is debug-only. `DeskFerry.exe` is the only DeskFerry Windows executable and dispatches to the interactive UI, Work service, optional Home SMB network service, setup/component-management actions, and screen-capture helper by mode.
 - The Windows home app should listen on loopback by default, normally `127.0.0.1:3390`.
 - SMB is a separate relay service and must use the same room password as RDP and WinRM.
 - The optional Windows Home network component uses the synthetic `198.18.0.0/30` network and permits only TCP port 445 to the configured work-host alias. It must not become a general-purpose VPN.
-- The Windows Home installer should offer the virtual network adapter as an optional component selected by default.
-- `work-agent/windows/service` must remain Windows-service-first. Console mode is debug-only.
-- `work-agent/windows/configurator` owns the native Windows setup/configurator GUI for the work agent service.
+- The merged Windows UI should offer the virtual network adapter as an optional component selected by default, detect existing services before presenting actions, and offer Install only when a service is absent.
+- `windows/workservice` must remain Windows-service-first. Console mode is debug-only.
+- `windows/workui` owns the native Work service controls inside the merged executable and consumes the selected shared connection profile instead of maintaining a separate relay configuration.
+- Do not reintroduce separate Windows installer, configurator, Work-agent, or Home-network DeskFerry executables. The merged executable self-installs and registers the required service modes; Wintun and tun2socks remain external runtime dependencies extracted only for the optional SMB bridge.
 - Do not add stealth, anti-monitoring, or obfuscation behavior.
 
 ## Sensitive Files
@@ -63,10 +64,10 @@ Build Windows/macOS/relay Go artifacts:
 .\build\build-go.ps1
 ```
 
-Build the self-contained Windows Home installer (including the optional network component):
+Build the self-contained merged Windows executable (including the optional network component payload):
 
 ```powershell
-.\build\build-windows-home-installer.ps1
+.\build\build-windows.ps1
 ```
 
 Build Android home APK:
@@ -75,7 +76,7 @@ Build Android home APK:
 .\build\build-android-home.ps1
 ```
 
-When `work-agent/windows/service`, `work-agent/windows/configurator`, `home-agent/windows`, `home-agent/macos`, `relay/go`, `internal/tunnel`, or shared relay behavior changes, run `go test ./...` and `.\build\build-go.ps1`. When `home-agent/windows/network-service`, `home-agent/windows/installer`, `internal/homenetwork`, or the installer build script changes, also run `.\build\build-windows-home-installer.ps1`. When `relay/azure-dotnet/` changes, run `.\build\build-azure-relay.ps1`. When `relay/python/` changes, run `.\build\build-python-relay.ps1`. When `home-agent/android/` changes, run `.\build\build-android-home.ps1`.
+When `windows/`, `home-agent/macos`, `relay/go`, `internal/tunnel`, or shared relay behavior changes, run `go test ./...` and `.\build\build-go.ps1`. When `windows/networkservice`, `windows/setup`, `internal/homenetwork`, or the Windows packaging script changes, also run `.\build\build-windows.ps1`. When `relay/azure-dotnet/` changes, run `.\build\build-azure-relay.ps1`. When `relay/python/` changes, run `.\build\build-python-relay.ps1`. When `home-agent/android/` changes, run `.\build\build-android-home.ps1`.
 
 ## Tooling Notes
 
@@ -98,18 +99,14 @@ Deployable artifacts:
 - `dist/python-relay/deskferry-python-relay.zip`
 - `dist/python-relay/deskferry-python-relay-linux-cp39-vendored.zip`
 - `dist/bin/deskferry-relay-linux-amd64`
-- `dist/bin/deskferry-agent-windows-amd64.exe`
-- `dist/bin/deskferry-agent-configurator-windows-amd64.exe`
-- `dist/bin/deskferry-home-windows-amd64.exe`
-- `dist/bin/deskferry-home-network-windows-amd64.exe`
-- `dist/windows-home-installer/DeskFerryHomeSetup.exe`
+- `dist/bin/deskferry-windows-amd64.exe`
 - `dist/bin/deskferry-home-macos-arm64`
 - `dist/bin/deskferry-home-macos-amd64`
 - `dist/android/deskferry-home-android-debug.apk`
 
-On this Windows host, build and install Windows Go binaries with the `-DebugWindows` switch to avoid quarantine by Symantec Endpoint Protection (SEP). This includes the Work agent and the Windows Home installer payload, network service, and GUI. Do not replace installed debug binaries with stripped release binaries unless the user explicitly requests it. Every future GitHub release must include separately named debug Windows binaries and a debug-payload Home installer alongside the normal optimized artifacts and include all of them in `SHA256SUMS.txt`.
+On this Windows host, build and install the merged Windows executable with the `-DebugWindows` switch to avoid quarantine by Symantec Endpoint Protection (SEP). Do not replace an installed debug binary with a stripped release binary unless the user explicitly requests it. Every future GitHub release must include separately named optimized and debug merged Windows executables and include both in `SHA256SUMS.txt`.
 
-After code changes, build the relevant artifacts. The user prefers deployment after code changes, but deployment and installation decisions must be made independently for every component: Windows Work agent, Windows Home agent and network service, macOS Home agent, Android Home agent, Azure relay, OCI relay, and Python relay. Inspect the substantive diff for each component. Upgrade a component when it contains an actual functional, reliability, security, protocol, compatibility, or packaging fix that applies to that installation. Do not upgrade or restart any component merely to synchronize or display a new version number. It is acceptable for deployed components to report different versions when their code did not otherwise change.
+After code changes, build the relevant artifacts. The user prefers deployment after code changes, but deployment and installation decisions must be made independently for every component: the merged Windows app and its Work/network service modes, macOS Home agent, Android Home agent, Azure relay, OCI relay, and Python relay. Inspect the substantive diff for each component. Upgrade a component when it contains an actual functional, reliability, security, protocol, compatibility, or packaging fix that applies to that installation. Do not upgrade or restart any component merely to synchronize or display a new version number. It is acceptable for deployed components to report different versions when their code did not otherwise change.
 
 Immediately before stopping or upgrading any component, recheck its active RDP, WinRM, SMB, and screen connections or relay pairs. The check must occur within 10 seconds of the stop; an earlier idle result is stale. Disconnecting or transparently resuming existing connections is acceptable when the target component contains an actual applicable fix and the upgrade requires a restart. When the target component changed only by version metadata, interrupting existing connections is unacceptable and the component must not be upgraded. Record or communicate the expected connection impact before a necessary disruptive upgrade, and prefer a non-disruptive or resumable path when available.
 
@@ -163,6 +160,6 @@ Android lint may need uncached artifacts from `dl.google.com`; if this host cann
 - After making code changes, commit and push the completed, verified changes to the configured upstream branch before finishing the task unless the user explicitly asks to keep them local.
 - Prefer existing package boundaries and helper APIs.
 - Keep `internal/tunnel` focused on current protocol primitives: WebSocket dialing, proxy URL handling, v2 control messages, role constants, resumption, and byte piping.
-- Keep the Windows home app relay-first; it should store relay service bases, a profile room name, and local UI settings, not implement the broker.
+- Keep the merged Windows app relay-first; it should store relay service bases, a profile room name, and local UI settings, not implement the broker.
 - Use `apply_patch` for manual file edits.
 - Avoid committing generated private key material under `dist/` or elsewhere.

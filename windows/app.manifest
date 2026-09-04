@@ -3,9 +3,9 @@
   <assemblyIdentity
     version="1.0.0.0"
     processorArchitecture="*"
-    name="DeskFerry.Home"
+    name="DeskFerry.Windows"
     type="win32" />
-  <description>DeskFerry Home</description>
+  <description>DeskFerry</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>

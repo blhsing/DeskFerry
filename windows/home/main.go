@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package homewindows
 
 import (
 	"context"
@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
@@ -37,6 +38,7 @@ import (
 	"deskferry/internal/tunnel"
 	"deskferry/internal/wincred"
 	"deskferry/internal/winsecret"
+	"deskferry/internal/winservice"
 )
 
 const (
@@ -75,6 +77,7 @@ type destinationProfile struct {
 	RelayAddrs      []string `json:"relay_addrs"`
 	RelayBases      []string `json:"relay_bases,omitempty"`
 	Room            string   `json:"room,omitempty"`
+	Proxy           string   `json:"proxy,omitempty"`
 	RoomProof       string   `json:"room_proof,omitempty"`
 	WindowsUser     string   `json:"windows_user,omitempty"`
 	PasswordlessRDP bool     `json:"passwordless_rdp,omitempty"`
@@ -198,7 +201,7 @@ type relaySummary struct {
 	CheckedAt  time.Time
 }
 
-func main() {
+func Main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	var relayURLs relayURLFlag
@@ -251,7 +254,7 @@ func main() {
 	} else {
 		log.Printf("diagnostic log file: %s retention_days=%d", path, logRetentionDays)
 	}
-	log.Printf("DeskFerry Home Agent version=%s platform=windows", buildinfo.Version)
+	log.Printf("DeskFerry Windows version=%s platform=windows", buildinfo.Version)
 	if setRDPDecodingModeFlag != "" {
 		mode, err := parseRDPDecodingMode(setRDPDecodingModeFlag)
 		if err != nil {
@@ -267,12 +270,12 @@ func main() {
 	if !smokeTest && !commandMode {
 		instance, alreadyRunning, err := acquireNamedInstanceMutex(singleInstanceName)
 		if err != nil {
-			windowsMessageBox(appTitle(), "Check for an existing DeskFerry Home instance: "+err.Error(), windows.MB_OK|windows.MB_ICONERROR)
+			windowsMessageBox(appTitle(), "Check for an existing DeskFerry instance: "+err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 			os.Exit(1)
 		}
 		if alreadyRunning {
 			activateExistingHomeWindow()
-			log.Print("DeskFerry Home is already running")
+			log.Print("DeskFerry is already running")
 			return
 		}
 		defer windows.CloseHandle(instance)
@@ -282,6 +285,13 @@ func main() {
 	if err != nil {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(1)
+	}
+	if imported, importErr := importInstalledWorkProfile(&cfg); importErr != nil {
+		log.Printf("import installed Work profile: %v", importErr)
+	} else if imported {
+		if saveErr := saveSettingsConfig(cfg); saveErr != nil {
+			log.Printf("save imported Work profile: %v", saveErr)
+		}
 	}
 	if err := loadProxyCapabilities(); err != nil {
 		log.Printf("load saved proxy capabilities: %v", err)
@@ -320,7 +330,7 @@ func main() {
 			log.Fatal(err)
 		}
 		if !requested {
-			log.Fatal("the optional DeskFerry Home network component is not installed")
+			log.Fatal("the optional DeskFerry network component is not installed")
 		}
 		fmt.Printf("Requested SMB network profile synchronization for %q.\n", cfg.SelectedDestination)
 		return
@@ -484,7 +494,7 @@ func setHomeLogTargets(cfg config) {
 }
 
 func appTitle() string {
-	return "DeskFerry Home " + buildinfo.Version
+	return "DeskFerry " + buildinfo.Version
 }
 
 func acquireNamedInstanceMutex(name string) (windows.Handle, bool, error) {
@@ -658,6 +668,8 @@ func (a *clientApp) run(smokeTest bool) error {
 											PushButton{Text: "Forget Windows Login", MinSize: Size{Height: 30}, OnClicked: a.forgetWindowsCredentials},
 											PushButton{Text: "Relay Dashboard", MinSize: Size{Height: 30}, OnClicked: a.openDashboard},
 											PushButton{Text: "Screen Viewer", MinSize: Size{Height: 30}, OnClicked: a.openScreenViewer},
+											PushButton{Text: "Work Services", MinSize: Size{Height: 30}, OnClicked: a.openWorkServices},
+											PushButton{Text: "Windows Components", MinSize: Size{Height: 30}, OnClicked: a.openWindowsComponents},
 										},
 									},
 								},
@@ -801,7 +813,7 @@ func destinationNames(values []destinationProfile) []string {
 func cloneDestinations(values []destinationProfile) []destinationProfile {
 	out := make([]destinationProfile, len(values))
 	for i, value := range values {
-		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RelayBases: append([]string(nil), value.RelayBases...), Room: value.Room, RoomProof: value.RoomProof, WindowsUser: value.WindowsUser, PasswordlessRDP: value.PasswordlessRDP, SMBAlias: value.SMBAlias}
+		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RelayBases: append([]string(nil), value.RelayBases...), Room: value.Room, Proxy: value.Proxy, RoomProof: value.RoomProof, WindowsUser: value.WindowsUser, PasswordlessRDP: value.PasswordlessRDP, SMBAlias: value.SMBAlias}
 	}
 	return out
 }
@@ -881,6 +893,9 @@ func (a *clientApp) updateDestinationEditor() {
 		if a.clearRoomPassword != nil {
 			a.clearRoomPassword.SetChecked(false)
 		}
+		if a.proxy != nil {
+			_ = a.proxy.SetText(firstNonEmpty(a.destinations[a.selectedDestination].Proxy, "env"))
+		}
 		if a.rdpUser != nil {
 			_ = a.rdpUser.SetText(a.destinations[a.selectedDestination].WindowsUser)
 		}
@@ -921,6 +936,12 @@ func (a *clientApp) commitDestinationProfile() error {
 		oldRoom := destination.Room
 		destination.RelayBases = a.relayURLListValues()
 		destination.Room = strings.TrimSpace(a.roomName.Text())
+		if a.proxy != nil {
+			destination.Proxy = strings.TrimSpace(a.proxy.Text())
+			if destination.Proxy == "" {
+				destination.Proxy = "env"
+			}
+		}
 		if !strings.EqualFold(oldRoom, destination.Room) {
 			destination.RoomProof = ""
 		}
@@ -1006,7 +1027,7 @@ func (a *clientApp) addDestination() {
 		return
 	}
 	a.destinations = append(a.destinations, destinationProfile{
-		Name: a.uniqueDestinationName(name, -1), RelayBases: defaultRelayBases(), Room: defaultRoomName, RelayAddrs: defaultRelayRoomURLs(), SMBAlias: homenetwork.DefaultAlias,
+		Name: a.uniqueDestinationName(name, -1), RelayBases: defaultRelayBases(), Room: defaultRoomName, Proxy: "env", RelayAddrs: defaultRelayRoomURLs(), SMBAlias: homenetwork.DefaultAlias,
 	})
 	a.selectedDestination = len(a.destinations) - 1
 	a.setDestinations(a.destinations, a.destinations[a.selectedDestination].Name)
@@ -1057,6 +1078,7 @@ func (a *clientApp) persistDestinationSelection() {
 	cfg.SelectedDestination = a.destinations[a.selectedDestination].Name
 	cfg.RDPUser = a.destinations[a.selectedDestination].WindowsUser
 	cfg.RoomProof = a.destinations[a.selectedDestination].RoomProof
+	cfg.Proxy = firstNonEmpty(a.destinations[a.selectedDestination].Proxy, "env")
 	cfg.setRelayAddresses(a.destinations[a.selectedDestination].RelayAddrs)
 	a.mu.Lock()
 	a.cfg = cfg
@@ -1297,7 +1319,7 @@ func (a *clientApp) setupNotifyIcon() error {
 	if err := ni.SetIcon(appIcon()); err != nil {
 		return err
 	}
-	if err := ni.SetToolTip("DeskFerry Home"); err != nil {
+	if err := ni.SetToolTip("DeskFerry"); err != nil {
 		return err
 	}
 	ni.MouseUp().Attach(func(x, y int, button walk.MouseButton) {
@@ -1353,6 +1375,46 @@ func (a *clientApp) showWindow() {
 	}
 	a.mw.Show()
 	_ = a.mw.SetFocus()
+}
+
+func (a *clientApp) openWorkServices() {
+	if err := a.saveFromUI(false); err != nil {
+		a.showError(err)
+		return
+	}
+	cfg := a.currentConfig()
+	profile := cfg.selectedProfile()
+	if profile == nil {
+		a.showError(errors.New("select a connection profile first"))
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		a.showError(err)
+		return
+	}
+	args := []string{"-work-configurator", "-profile-name", profile.Name, "-room", profile.Room, "-proxy", firstNonEmpty(profile.Proxy, cfg.Proxy, "env")}
+	for _, base := range profile.RelayBases {
+		args = append(args, "-relay-base-url", base)
+	}
+	if err := exec.Command(exe, args...).Start(); err != nil {
+		a.showError(err)
+	}
+}
+
+func (a *clientApp) openWindowsComponents() {
+	if err := a.saveFromUI(false); err != nil {
+		a.showError(err)
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		a.showError(err)
+		return
+	}
+	if err := exec.Command(exe, "-windows-setup").Start(); err != nil {
+		a.showError(err)
+	}
 }
 
 func (a *clientApp) connectFromUI() {
@@ -1650,7 +1712,7 @@ func (a *clientApp) refreshLocalState() {
 			_ = a.trayConnect.SetEnabled(false)
 			_ = a.trayStop.SetEnabled(true)
 			_ = a.trayRDP.SetEnabled(true)
-			_ = a.ni.SetToolTip("DeskFerry Home: running")
+			_ = a.ni.SetToolTip("DeskFerry: running")
 		} else {
 			_ = a.tunnelStatus.SetText("Stopped")
 			_ = a.connectButton.SetText("Connect")
@@ -1658,7 +1720,7 @@ func (a *clientApp) refreshLocalState() {
 			_ = a.trayConnect.SetEnabled(true)
 			_ = a.trayStop.SetEnabled(false)
 			_ = a.trayRDP.SetEnabled(false)
-			_ = a.ni.SetToolTip("DeskFerry Home: stopped")
+			_ = a.ni.SetToolTip("DeskFerry: stopped")
 		}
 	})
 }
@@ -2110,6 +2172,94 @@ func loadConfig(relayURL, listenAddr, proxyFlag string) (config, error) {
 	return cfg, cfg.validate()
 }
 
+// importInstalledWorkProfile performs the one-time bridge from the legacy
+// service-command-line configuration into the shared Windows profile list.
+// Work-only targets remain owned by the service configuration.
+func importInstalledWorkProfile(cfg *config) (bool, error) {
+	if cfg == nil {
+		return false, nil
+	}
+	commandLine, installed, err := winservice.CommandLine("DeskFerryAgent")
+	if err != nil {
+		return false, err
+	}
+	if !installed {
+		return false, nil
+	}
+	args := windowsCommandLineArgs(commandLine)
+	relays := splitRelayURLs(commandLineOption(args, "-relay-url"))
+	if len(relays) == 0 {
+		return false, nil
+	}
+	bases, room, err := tunnel.SplitRelayRoomURLs(relays)
+	if err != nil {
+		return false, err
+	}
+	proxy := firstNonEmpty(commandLineOption(args, "-proxy"), "env")
+	for _, profile := range cfg.Destinations {
+		if strings.EqualFold(profile.Room, room) && strings.EqualFold(firstNonEmpty(profile.Proxy, "env"), proxy) && slicesEqualFold(profile.RelayBases, bases) {
+			return false, nil
+		}
+	}
+	name := "This PC"
+	seen := make(map[string]bool, len(cfg.Destinations))
+	for _, profile := range cfg.Destinations {
+		seen[strings.ToLower(profile.Name)] = true
+	}
+	baseName := name
+	for suffix := 2; seen[strings.ToLower(name)]; suffix++ {
+		name = fmt.Sprintf("%s %d", baseName, suffix)
+	}
+	proof := ""
+	if passwordPath := commandLineOption(args, "-room-password-file"); passwordPath != "" {
+		if protected, readErr := os.ReadFile(passwordPath); readErr == nil {
+			if password, unprotectErr := winsecret.Unprotect(protected); unprotectErr == nil {
+				proof = tunnel.RoomPasswordProof(relays[0], "", password)
+			}
+		}
+	}
+	cfg.Destinations = append(cfg.Destinations, destinationProfile{
+		Name:       name,
+		RelayAddrs: relays,
+		RelayBases: bases,
+		Room:       room,
+		Proxy:      proxy,
+		RoomProof:  proof,
+		SMBAlias:   homenetwork.DefaultAlias,
+	})
+	return true, nil
+}
+
+func windowsCommandLineArgs(commandLine string) []string {
+	ptr, err := windows.UTF16PtrFromString(strings.TrimSpace(commandLine))
+	if err != nil {
+		return nil
+	}
+	var count int32
+	argv, err := windows.CommandLineToArgv(ptr, &count)
+	if err != nil {
+		return nil
+	}
+	defer windows.LocalFree(windows.Handle(unsafe.Pointer(argv)))
+	out := make([]string, 0, count)
+	for index := int32(0); index < count; index++ {
+		out = append(out, windows.UTF16ToString(argv[index][:]))
+	}
+	return out
+}
+
+func commandLineOption(args []string, option string) string {
+	for index, arg := range args {
+		if strings.EqualFold(arg, option) && index+1 < len(args) {
+			return strings.TrimSpace(args[index+1])
+		}
+		if strings.HasPrefix(strings.ToLower(arg), strings.ToLower(option)+"=") {
+			return strings.TrimSpace(strings.SplitN(arg, "=", 2)[1])
+		}
+	}
+	return ""
+}
+
 func defaultConfig() config {
 	return config{
 		ListenAddr:          defaultListenAddr,
@@ -2117,7 +2267,7 @@ func defaultConfig() config {
 		RelayAddr:           defaultRelayURL,
 		RelayAddrs:          defaultRelayRoomURLs(),
 		Proxy:               "env",
-		Destinations:        []destinationProfile{{Name: "Work", RelayAddrs: defaultRelayRoomURLs(), RelayBases: defaultRelayBases(), Room: defaultRoomName, SMBAlias: homenetwork.DefaultAlias}},
+		Destinations:        []destinationProfile{{Name: "Work", RelayAddrs: defaultRelayRoomURLs(), RelayBases: defaultRelayBases(), Room: defaultRoomName, Proxy: "env", SMBAlias: homenetwork.DefaultAlias}},
 		SelectedDestination: "Work",
 	}
 }
@@ -2224,7 +2374,7 @@ func (c *config) ensureDestinations() error {
 		if room == "" {
 			room = defaultRoomName
 		}
-		c.Destinations = []destinationProfile{{Name: "Work", RelayAddrs: current, RelayBases: bases, Room: room, RoomProof: c.RoomProof, WindowsUser: c.RDPUser, SMBAlias: homenetwork.DefaultAlias}}
+		c.Destinations = []destinationProfile{{Name: "Work", RelayAddrs: current, RelayBases: bases, Room: room, Proxy: firstNonEmpty(c.Proxy, "env"), RoomProof: c.RoomProof, WindowsUser: c.RDPUser, SMBAlias: homenetwork.DefaultAlias}}
 		c.SelectedDestination = "Work"
 		return nil
 	}
@@ -2274,6 +2424,7 @@ func (c *config) ensureDestinations() error {
 		if destination.Room == "" {
 			destination.Room = defaultRoomName
 		}
+		destination.Proxy = firstNonEmpty(destination.Proxy, c.Proxy, "env")
 		destination.RelayBases = bases
 		alias := strings.TrimSpace(destination.SMBAlias)
 		if alias == "" {
@@ -2282,7 +2433,7 @@ func (c *config) ensureDestinations() error {
 		if err := homenetwork.ValidateAlias(alias); err != nil {
 			return fmt.Errorf("destination %q: %w", name, err)
 		}
-		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RelayBases: destination.RelayBases, Room: destination.Room, RoomProof: destination.RoomProof, WindowsUser: destination.WindowsUser, PasswordlessRDP: destination.PasswordlessRDP, SMBAlias: alias})
+		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RelayBases: destination.RelayBases, Room: destination.Room, Proxy: destination.Proxy, RoomProof: destination.RoomProof, WindowsUser: destination.WindowsUser, PasswordlessRDP: destination.PasswordlessRDP, SMBAlias: alias})
 	}
 	selected := 0
 	for i, destination := range normalized {
@@ -2304,6 +2455,7 @@ func (c *config) ensureDestinations() error {
 	c.Destinations = normalized
 	c.SelectedDestination = normalized[selected].Name
 	c.RDPUser = normalized[selected].WindowsUser
+	c.Proxy = normalized[selected].Proxy
 	return nil
 }
 
@@ -2867,6 +3019,15 @@ func emptyAs(value, fallback string) string {
 	return value
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
 func listenLocalRDP(cfg config) (net.Listener, error) {
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err == nil {
@@ -3075,9 +3236,9 @@ func requestSelectedSMBProfileSync(cfg config, force bool) (bool, error) {
 	if strings.TrimSpace(profile.RoomProof) == "" {
 		return false, errors.New("SMB file access requires a saved room password for the selected profile")
 	}
-	setupPath := filepath.Join(strings.TrimSpace(metadata.InstallDir), "DeskFerryHomeSetup.exe")
+	setupPath := filepath.Join(strings.TrimSpace(metadata.InstallDir), "DeskFerry.exe")
 	if _, err := os.Stat(setupPath); err != nil {
-		return false, errors.New("DeskFerry Home Setup is not installed")
+		return false, errors.New("DeskFerry component manager is not installed")
 	}
 	if !smbProfileSyncPending.CompareAndSwap(false, true) {
 		return false, nil
@@ -3114,7 +3275,7 @@ func requestSelectedSMBProfileSync(cfg config, force bool) (bool, error) {
 		_ = os.Remove(requestPath)
 		return false, err
 	}
-	params := "-elevated-network-request " + syscall.EscapeArg(requestPath) + " -no-dialog"
+	params := "-windows-setup -elevated-network-request " + syscall.EscapeArg(requestPath) + " -no-dialog"
 	if err := shellExecute("runas", setupPath, params, filepath.Dir(setupPath)); err != nil {
 		_ = os.Remove(requestPath)
 		return false, err

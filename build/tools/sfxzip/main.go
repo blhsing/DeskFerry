@@ -10,6 +10,7 @@ import (
 )
 
 const (
+	localSignature   = 0x04034b50
 	centralSignature = 0x02014b50
 	endSignature     = 0x06054b50
 )
@@ -26,6 +27,7 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	stub = stripEmbeddedZip(stub)
 	payload, err := os.ReadFile(*zipPath)
 	if err != nil {
 		fatal(err)
@@ -50,6 +52,43 @@ func main() {
 		fatal(errors.New("verify self-extracting ZIP: payload has no entries"))
 	}
 	fmt.Printf("embedded %d ZIP entries in %s\n", entries, *outputPath)
+}
+
+// stripEmbeddedZip makes packaging idempotent when the output from a previous
+// run is reused as the input stub. A valid trailing ZIP records absolute local
+// offsets, so the first one is also the exact end of the executable prefix.
+func stripEmbeddedZip(data []byte) []byte {
+	end := findEndRecord(data)
+	if end < 0 || end+22 > len(data) {
+		return data
+	}
+	commentLength := int(binary.LittleEndian.Uint16(data[end+20 : end+22]))
+	if end+22+commentLength != len(data) {
+		return data
+	}
+	entryCount := int(binary.LittleEndian.Uint16(data[end+10 : end+12]))
+	position := int(binary.LittleEndian.Uint32(data[end+16 : end+20]))
+	if entryCount == 0 || position < 0 || position >= end {
+		return data
+	}
+	firstLocal := len(data)
+	for entry := 0; entry < entryCount; entry++ {
+		if position+46 > end || binary.LittleEndian.Uint32(data[position:position+4]) != centralSignature {
+			return data
+		}
+		localOffset := int(binary.LittleEndian.Uint32(data[position+42 : position+46]))
+		if localOffset < firstLocal {
+			firstLocal = localOffset
+		}
+		nameLength := int(binary.LittleEndian.Uint16(data[position+28 : position+30]))
+		extraLength := int(binary.LittleEndian.Uint16(data[position+30 : position+32]))
+		commentLength := int(binary.LittleEndian.Uint16(data[position+32 : position+34]))
+		position += 46 + nameLength + extraLength + commentLength
+	}
+	if firstLocal < 0 || firstLocal+4 > len(data) || binary.LittleEndian.Uint32(data[firstLocal:firstLocal+4]) != localSignature {
+		return data
+	}
+	return data[:firstLocal]
 }
 
 func adjustOffsets(payload []byte, prefix uint32) ([]byte, error) {

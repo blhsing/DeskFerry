@@ -56,7 +56,9 @@ jobs:
 
       - name: Build Go artifacts
         shell: pwsh
-        run: .\build\build-go.ps1
+        run: |
+          .\build\build-go.ps1
+          .\build\build-windows.ps1 -SkipGoBuild
 
       - name: Build Azure relay
         shell: pwsh

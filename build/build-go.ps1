@@ -68,10 +68,18 @@ function Build-WindowsResources {
     Ensure-Rsrc
     & (Join-Path $PSScriptRoot 'generate-client-icon.ps1')
     if (-not $?) { throw 'client icon generation failed' }
+    foreach ($legacyResource in @(
+        'work-agent/windows/configurator/rsrc_windows_amd64.syso',
+        'home-agent/windows/rsrc_windows_amd64.syso',
+        'home-agent/windows/installer/rsrc_windows_amd64.syso'
+    )) {
+        $legacyResourcePath = Join-Path $root $legacyResource
+        if (Test-Path -LiteralPath $legacyResourcePath) {
+            [IO.File]::Delete($legacyResourcePath)
+        }
+    }
     $resources = @(
-        @{ Manifest = 'work-agent/windows/configurator/app.manifest'; Output = 'work-agent/windows/configurator/rsrc_windows_amd64.syso'; Name = 'agent configurator' },
-        @{ Manifest = 'home-agent/windows/app.manifest'; Output = 'home-agent/windows/rsrc_windows_amd64.syso'; Name = 'home app'; Icon = 'home-agent/windows/app.ico' },
-        @{ Manifest = 'home-agent/windows/installer/app.manifest'; Output = 'home-agent/windows/installer/rsrc_windows_amd64.syso'; Name = 'home installer'; Icon = 'home-agent/windows/app.ico' }
+        @{ Manifest = 'windows/app.manifest'; Output = 'windows/rsrc_windows_amd64.syso'; Name = 'Windows app'; Icon = 'windows/app.ico' }
     )
     foreach ($resource in $resources) {
         $manifest = Join-Path $root $resource.Manifest
@@ -95,19 +103,20 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'go test failed' }
 
     $targets = @(
-        @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-agent-windows-amd64.exe'; Package = './work-agent/windows/service' },
         # Keep symbols in Windows GUI artifacts. Stripped PE files have repeatedly
         # triggered endpoint-protection false positives on deployment hosts.
-        @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-agent-configurator-windows-amd64.exe'; Package = './work-agent/windows/configurator'; Ldflags = '-H windowsgui' },
-        @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-home-windows-amd64.exe'; Package = './home-agent/windows'; Ldflags = '-H windowsgui' },
-        @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-home-network-windows-amd64.exe'; Package = './home-agent/windows/network-service' },
-        @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-home-setup-windows-amd64.exe'; Package = './home-agent/windows/installer'; Ldflags = '-H windowsgui' },
+        @{ GOOS = 'windows'; GOARCH = 'amd64'; Name = 'deskferry-windows-amd64.exe'; Package = './windows'; Ldflags = '-H windowsgui' },
         @{ GOOS = 'darwin'; GOARCH = 'arm64'; Name = 'deskferry-home-macos-arm64'; Package = './home-agent/macos' },
         @{ GOOS = 'darwin'; GOARCH = 'amd64'; Name = 'deskferry-home-macos-amd64'; Package = './home-agent/macos' },
         @{ GOOS = 'linux'; GOARCH = 'amd64'; Name = 'deskferry-relay-linux-amd64'; Package = './relay/go' }
     )
 
     $legacyArtifactPatterns = @(
+        'deskferry-agent-windows-amd64*.exe',
+        'deskferry-agent-configurator-windows-amd64*.exe',
+        'deskferry-home-windows-amd64*.exe',
+        'deskferry-home-network-windows-amd64*.exe',
+        'deskferry-home-setup-windows-amd64*.exe',
         'agent-installer-windows-amd64.exe',
         'agent-windows-amd64.exe',
         'agent-configurator-windows-amd64.exe',

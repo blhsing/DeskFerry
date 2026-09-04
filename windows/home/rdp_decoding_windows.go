@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package homewindows
 
 import (
 	"encoding/json"
@@ -165,7 +165,7 @@ func setRDPDecodingMode(mode rdpDecodingMode) error {
 func requestRDPDecodingMode(mode rdpDecodingMode) error {
 	executable, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("locate DeskFerry Home executable: %w", err)
+		return fmt.Errorf("locate DeskFerry executable: %w", err)
 	}
 	params := "-set-rdp-decoding-mode " + syscall.EscapeArg(string(mode))
 	if err := shellExecute("runas", executable, params, ""); err != nil {
