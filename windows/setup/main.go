@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,7 +38,7 @@ const (
 	defaultAzureRelayBase = "https://test-officialwebsite.azurewebsites.net/relay"
 	defaultOCIRelayBase   = "http://217.142.228.117/relay"
 	defaultRoomName       = "workdesk"
-	productVersion        = "0.12.0"
+	productVersion        = "0.12.1"
 	setupInstallMutexName = `Global\DeskFerryWindowsComponentsInstall`
 	hostsBeginMarker      = "# BEGIN DeskFerry Home managed alias"
 	hostsEndMarker        = "# END DeskFerry Home managed alias"
@@ -67,6 +66,8 @@ type setupOptions struct {
 	EnableNetwork bool     `json:"enable_network"`
 }
 
+// setupApp is retained only for compatibility with older internal UI helpers.
+// Main no longer creates it; Home and Work now own all user-facing controls.
 type setupApp struct {
 	mw              *walk.MainWindow
 	installDir      *walk.LineEdit
@@ -106,7 +107,6 @@ func Main() {
 	requestFile := flag.String("elevated-request", "", "DPAPI-protected component request")
 	networkRequestFile := flag.String("elevated-network-request", "", "DPAPI-protected selected-profile network request")
 	uninstall := flag.Bool("elevated-uninstall", false, "uninstall DeskFerry")
-	smokeTest := flag.Bool("ui-smoke-test", false, "open and close the Windows Components UI")
 	noDialog := flag.Bool("no-dialog", false, "write the result to the console instead of displaying a dialog")
 	flag.Parse()
 	if *requestFile != "" || *networkRequestFile != "" || *uninstall {
@@ -131,11 +131,6 @@ func Main() {
 		}
 		reportResult(*noDialog, message, nil)
 		return
-	}
-	app := &setupApp{relayDragIndex: -1}
-	if err := app.run(*smokeTest); err != nil {
-		windowsMessageBox(productName+" Windows Components", err.Error(), windows.MB_OK|windows.MB_ICONERROR)
-		os.Exit(1)
 	}
 }
 
@@ -897,18 +892,16 @@ func existingSetupOptions(sourceDir string) setupOptions {
 		settingsLoaded = true
 		opts.Destination = strings.TrimSpace(settings.SelectedDestination)
 	}
+	networkLoaded := false
 	var cfg homenetwork.Config
 	if data, err := os.ReadFile(configPath()); err == nil && json.Unmarshal(data, &cfg) == nil {
+		networkLoaded = true
 		cfg = cfg.WithDefaults(opts.InstallDir)
 		opts.RelayAddrs = cfg.RelayAddrs
 		opts.Proxy = cfg.Proxy
 		opts.RoomProof = cfg.RoomProof
 		opts.Alias = cfg.Alias
 		opts.EnableNetwork = true
-		return finalizeSetupRelayParts(opts)
-	}
-	if metadataLoaded {
-		return finalizeSetupRelayParts(opts)
 	}
 	if settingsLoaded {
 		relays, proof, alias := settings.RelayAddrs, settings.RoomProof, ""
@@ -931,6 +924,10 @@ func existingSetupOptions(sourceDir string) setupOptions {
 		if strings.TrimSpace(alias) != "" {
 			opts.Alias = strings.TrimSpace(alias)
 		}
+		return finalizeSetupRelayParts(opts)
+	}
+	if networkLoaded || metadataLoaded {
+		return finalizeSetupRelayParts(opts)
 	}
 	return finalizeSetupRelayParts(opts)
 }
@@ -1069,7 +1066,7 @@ func networkConfig(opts setupOptions) homenetwork.Config {
 	}).WithDefaults(opts.InstallDir)
 }
 
-func installProduct(opts setupOptions) (string, error) {
+func installProduct(opts setupOptions) (message string, err error) {
 	installMutex, err := acquireSetupInstallMutex()
 	if err != nil {
 		return "", err
@@ -1097,6 +1094,29 @@ func installProduct(opts setupOptions) (string, error) {
 	if err := os.MkdirAll(installDir, 0755); err != nil {
 		return "", err
 	}
+	workWasRunning, err := stopNamedServiceForUpgrade("DeskFerryAgent")
+	if err != nil {
+		return "", fmt.Errorf("stop Work service for upgrade: %w", err)
+	}
+	workRestartPending := workWasRunning
+	defer func() {
+		if workRestartPending {
+			_ = startNamedService("DeskFerryAgent")
+		}
+	}()
+	networkState, err := queryServiceState()
+	if err != nil {
+		return "", err
+	}
+	networkRestorePending := networkState != 0
+	defer func() {
+		if err != nil && networkRestorePending {
+			_ = createAndStartNetworkService(filepath.Join(installDir, "DeskFerry.exe"), configPath())
+		}
+	}()
+	if err := stopAndDeleteNetworkService(); err != nil {
+		return "", err
+	}
 	for _, name := range []string{"DeskFerry.exe"} {
 		target := filepath.Join(installDir, name)
 		current, _ := os.Executable()
@@ -1106,9 +1126,6 @@ func installProduct(opts setupOptions) (string, error) {
 		if err := ensureReplaceable(target); err != nil {
 			return "", fmt.Errorf("prepare to install %s: %w (close DeskFerry if it is running)", name, err)
 		}
-	}
-	if err := stopAndDeleteNetworkService(); err != nil {
-		return "", err
 	}
 	for _, name := range []string{"DeskFerry.exe"} {
 		target := filepath.Join(installDir, name)
@@ -1142,6 +1159,13 @@ func installProduct(opts setupOptions) (string, error) {
 		}
 		removeLegacyWindowsBinaries(installDir)
 		removeSupersededInstall(legacyInstallDir, installDir)
+		networkRestorePending = false
+		if workRestartPending {
+			if err := startNamedService("DeskFerryAgent"); err != nil {
+				return "", fmt.Errorf("restart Work service: %w", err)
+			}
+			workRestartPending = false
+		}
 		return "DeskFerry was installed without the optional virtual network adapter.", nil
 	}
 	for _, name := range []string{"tun2socks.exe", "wintun.dll", "LICENSE-Wintun.txt", "LICENSE-tun2socks.txt"} {
@@ -1169,6 +1193,7 @@ func installProduct(opts setupOptions) (string, error) {
 	if err := createAndStartNetworkService(filepath.Join(installDir, "DeskFerry.exe"), configPath()); err != nil {
 		return "", err
 	}
+	networkRestorePending = false
 	if err := writeInstallMetadata(opts); err != nil {
 		return "", err
 	}
@@ -1177,6 +1202,12 @@ func installProduct(opts setupOptions) (string, error) {
 	}
 	removeLegacyWindowsBinaries(installDir)
 	removeSupersededInstall(legacyInstallDir, installDir)
+	if workRestartPending {
+		if err := startNamedService("DeskFerryAgent"); err != nil {
+			return "", fmt.Errorf("restart Work service: %w", err)
+		}
+		workRestartPending = false
+	}
 	return fmt.Sprintf("DeskFerry and file access were installed. Open \\\\%s\\sharename after the work service enables SMB.", cfg.Alias), nil
 }
 
@@ -1596,6 +1627,58 @@ func stopAndDeleteNetworkService() error {
 	return nil
 }
 
+func stopNamedServiceForUpgrade(name string) (bool, error) {
+	m, err := mgr.Connect()
+	if err != nil {
+		return false, err
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(name)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer s.Close()
+	status, err := s.Query()
+	if err != nil {
+		return false, err
+	}
+	if status.State == svc.Stopped {
+		return false, nil
+	}
+	_, _ = s.Control(svc.Stop)
+	if err := waitForServiceState(s, svc.Stopped, 30*time.Second); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func startNamedService(name string) error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(name)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	status, err := s.Query()
+	if err != nil {
+		return err
+	}
+	if status.State == svc.Running {
+		return nil
+	}
+	if err := s.Start(); err != nil {
+		return err
+	}
+	return waitForServiceState(s, svc.Running, 30*time.Second)
+}
+
 func waitForServiceState(s *mgr.Service, wanted svc.State, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -1871,4 +1954,3 @@ func windowsMessageBox(title, text string, style uint32) {
 
 // Keep net linked in GUI builds and make the intended endpoint explicit to PE
 // analysis tools: this installer never opens a listener itself.
-var _ = net.IPv4len

@@ -20,7 +20,6 @@ import (
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
-	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
@@ -47,13 +46,7 @@ type app struct {
 	mw              *walk.MainWindow
 	installDir      *walk.LineEdit
 	agentPath       *walk.LineEdit
-	relayList       *walk.ListBox
-	relayEdit       *walk.LineEdit
-	relayAdd        *walk.PushButton
-	relayUpdate     *walk.PushButton
-	relayDelete     *walk.PushButton
-	relayUp         *walk.PushButton
-	relayDown       *walk.PushButton
+	workEnabled     *walk.CheckBox
 	roomName        *walk.LineEdit
 	proxy           *walk.LineEdit
 	roomPassword    *walk.LineEdit
@@ -72,10 +65,7 @@ type app struct {
 	restartButton   *walk.PushButton
 	uninstallButton *walk.PushButton
 	relayURLs       []string
-	relayDragIndex  int
-	relayDragStartY int
-	relayDragging   bool
-	sharedProfile   bool
+	activityStop    chan struct{}
 }
 
 type actionOptions struct {
@@ -98,46 +88,9 @@ type serviceInfo struct {
 	ProcessID uint32
 }
 
-type startupProfile struct {
-	Name       string
-	RelayBases []string
-	Room       string
-	Proxy      string
-}
-
-func parseStartupProfile(args []string) (startupProfile, error) {
-	var profile startupProfile
-	var bases relayURLFlags
-	fs := flag.NewFlagSet("DeskFerry Work Services", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	fs.StringVar(&profile.Name, "profile-name", "", "shared connection profile name")
-	fs.Var(&bases, "relay-base-url", "shared relay service base URL")
-	fs.StringVar(&profile.Room, "room", "", "shared room name")
-	fs.StringVar(&profile.Proxy, "proxy", "", "shared relay proxy")
-	_ = fs.Bool("ui-smoke-test", false, "close the UI after a smoke test")
-	if err := fs.Parse(args); err != nil {
-		return startupProfile{}, err
-	}
-	if fs.NArg() != 0 {
-		return startupProfile{}, fmt.Errorf("unexpected Work Services arguments: %s", strings.Join(fs.Args(), " "))
-	}
-	for _, base := range bases {
-		normalized, err := tunnel.RelayServiceBaseURL(base)
-		if err != nil {
-			return startupProfile{}, err
-		}
-		profile.RelayBases = append(profile.RelayBases, normalized)
-	}
-	return profile, nil
-}
-
 func Main() {
 	if hasArg(os.Args[1:], "-ui-smoke-test") {
-		startup, startupErr := parseStartupProfile(os.Args[1:])
-		if startupErr != nil {
-			os.Exit(2)
-		}
-		if err := (&app{}).run(true, startup); err != nil {
+		if err := (&app{}).run(true); err != nil {
 			os.Exit(1)
 		}
 		return
@@ -160,85 +113,43 @@ func Main() {
 		runElevatedAction(os.Args[1:])
 		return
 	}
-	startup, startupErr := parseStartupProfile(os.Args[1:])
-	if startupErr != nil {
-		windowsMessageBox(appTitle(), startupErr.Error(), windows.MB_OK|windows.MB_ICONERROR)
-		return
-	}
-	if err := (&app{}).run(false, startup); err != nil {
+	if err := (&app{}).run(false); err != nil {
 		windowsMessageBox(appTitle(), err.Error(), windows.MB_OK|windows.MB_ICONERROR)
 		os.Exit(1)
 	}
 }
 
-func (a *app) run(smokeTest bool, startup startupProfile) error {
-	a.relayDragIndex = -1
-	a.sharedProfile = strings.TrimSpace(startup.Name) != ""
-	installedOpts, _ := installedServiceOptions()
-	if startup.Room == "" {
-		startup.Room = roomFromRelayURLs(installedOpts.RelayURL)
+func (a *app) run(smokeTest bool) error {
+	installedOpts, installed := installedServiceOptions()
+	relayBases, _, _ := tunnel.SplitRelayRoomURLs(splitRelayURLs(installedOpts.RelayURL))
+	if len(relayBases) == 0 {
+		relayBases = []string{defaultAzureRelayBase, defaultOCIRelayBase}
 	}
-	if len(startup.RelayBases) == 0 {
-		startup.RelayBases, _, _ = tunnel.SplitRelayRoomURLs(splitRelayURLs(installedOpts.RelayURL))
-	}
-	if startup.Proxy == "" {
-		startup.Proxy = installedOpts.Proxy
-	}
+	a.relayURLs = uniqueRelayURLs(relayBases)
 
 	window := MainWindow{
 		AssignTo: &a.mw,
-		Title:    appTitleWithProfile(startup.Name),
-		MinSize:  Size{Width: 760, Height: 560},
-		Size:     Size{Width: 860, Height: 680},
+		Title:    appTitle(),
+		MinSize:  Size{Width: 660, Height: 680},
+		Size:     Size{Width: 660, Height: 680},
 		Layout:   VBox{Margins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10}, Spacing: 8},
-		Visible:  !smokeTest,
+		Visible:  false,
 		Children: []Widget{
 			GroupBox{
-				Title:  "Allow access to this PC",
-				Layout: Grid{Columns: 3, Spacing: 6},
+				Title:   "Allow access to this PC",
+				MaxSize: Size{Height: 295},
+				Layout:  Grid{Columns: 3, Spacing: 6},
 				Children: []Widget{
+					CheckBox{AssignTo: &a.workEnabled, Text: "Install Work services on this PC", Checked: installed, ColumnSpan: 3, OnCheckedChanged: a.refreshStatus},
+					Label{Text: "Optional — leave this unchecked when this PC is used only as a Home client.", ColumnSpan: 3},
 					Label{Text: "Room name"},
-					LineEdit{AssignTo: &a.roomName, Text: firstNonEmpty(startup.Room, defaultRoomName), CueBanner: defaultRoomName, ReadOnly: a.sharedProfile, ColumnSpan: 2},
-
-					Label{Text: "Relay service base URLs"},
-					Composite{
-						ColumnSpan: 2,
-						Layout:     VBox{Spacing: 6},
-						Children: []Widget{
-							ListBox{
-								AssignTo:              &a.relayList,
-								Model:                 []string{defaultAzureRelayBase, defaultOCIRelayBase},
-								MinSize:               Size{Height: 74},
-								OnCurrentIndexChanged: a.relaySelectionChanged,
-								OnMouseDown:           a.relayListMouseDown,
-								OnMouseMove:           a.relayListMouseMove,
-								OnMouseUp:             a.relayListMouseUp,
-							},
-							Composite{
-								Layout: Grid{Columns: 3, Spacing: 6},
-								Children: []Widget{
-									Label{Text: "Selected URL"},
-									LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultAzureRelayBase, ReadOnly: a.sharedProfile, ColumnSpan: 2},
-								},
-							},
-							Composite{
-								Layout: Flow{Spacing: 6},
-								Children: []Widget{
-									PushButton{AssignTo: &a.relayAdd, Text: "Add", MinSize: Size{Width: 72, Height: 30}, OnClicked: a.addRelayURL},
-									PushButton{AssignTo: &a.relayUpdate, Text: "Update", MinSize: Size{Width: 82, Height: 30}, OnClicked: a.updateRelayURL},
-									PushButton{AssignTo: &a.relayDelete, Text: "Delete", MinSize: Size{Width: 78, Height: 30}, OnClicked: a.deleteRelayURL},
-									PushButton{AssignTo: &a.relayUp, Text: "Up", MinSize: Size{Width: 64, Height: 30}, OnClicked: func() { a.moveRelayURL(-1) }},
-									PushButton{AssignTo: &a.relayDown, Text: "Down", MinSize: Size{Width: 64, Height: 30}, OnClicked: func() { a.moveRelayURL(1) }},
-								},
-							},
-						},
-					},
+					LineEdit{AssignTo: &a.roomName, Text: firstNonEmpty(roomFromRelayURLs(installedOpts.RelayURL), defaultRoomName), CueBanner: defaultRoomName, ColumnSpan: 2},
 					Label{Text: "Room password"},
 					LineEdit{AssignTo: &a.roomPassword, PasswordMode: true, CueBanner: "blank keeps the current password", ColumnSpan: 2},
 					Label{Text: "Password options"},
 					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM, SMB, and screen viewing)", ColumnSpan: 2},
 					Label{Text: "Proxy"},
-					LineEdit{AssignTo: &a.proxy, Text: firstNonEmpty(startup.Proxy, "env"), CueBanner: "env, direct, or http(s)://host:port", ReadOnly: a.sharedProfile, ColumnSpan: 2},
+					LineEdit{AssignTo: &a.proxy, Text: firstNonEmpty(installedOpts.Proxy, "env"), CueBanner: "env, direct, or http(s)://host:port", ColumnSpan: 2},
 					Label{Text: "Screen viewing"},
 					CheckBox{AssignTo: &a.screenView, Text: "Allow authenticated screenshots and delta streaming", Checked: installedOpts.ScreenView, ColumnSpan: 2},
 					CheckBox{AssignTo: &a.winrmEnabled, Text: "WinRM", Checked: installedOpts.WinRMAddr != "", OnCheckedChanged: a.updateCapabilityControls},
@@ -250,12 +161,15 @@ func (a *app) run(smokeTest bool, startup startupProfile) error {
 				},
 			},
 			GroupBox{
-				Title:  "Service",
-				Layout: VBox{Spacing: 6},
+				Title:   "Optional Work service",
+				MinSize: Size{Height: 90},
+				MaxSize: Size{Height: 90},
+				Layout:  VBox{Spacing: 6},
 				Children: []Widget{
 					Label{AssignTo: &a.status, Text: "Status: checking..."},
 					Composite{
-						Layout: Flow{Spacing: 6},
+						MaxSize: Size{Height: 32},
+						Layout:  Flow{Spacing: 6},
 						Children: []Widget{
 							PushButton{AssignTo: &a.installButton, Text: "Install", OnClicked: func() { a.runAction("install") }},
 							PushButton{AssignTo: &a.startButton, Text: "Start", OnClicked: func() { a.runAction("start") }},
@@ -269,17 +183,19 @@ func (a *app) run(smokeTest bool, startup startupProfile) error {
 					},
 				},
 			},
-			TextEdit{AssignTo: &a.log, ReadOnly: true, VScroll: true, MinSize: Size{Height: 220}},
+			Label{Text: "Activity"},
+			TextEdit{AssignTo: &a.log, ReadOnly: true, MinSize: Size{Height: 80}, StretchFactor: 10},
 		},
 	}
 	if err := window.Create(); err != nil {
 		return err
 	}
-	initialRelays := startup.RelayBases
-	if len(initialRelays) == 0 {
-		initialRelays = []string{defaultAzureRelayBase, defaultOCIRelayBase}
-	}
-	a.setRelayURLList(initialRelays, 0)
+	a.mw.SetPersistent(false)
+	a.mw.ToolBar().SetVisible(false)
+	a.mw.StatusBar().SetVisible(false)
+	a.mw.Closing().Attach(func(_ *bool, _ walk.CloseReason) {
+		a.stopWorkActivityFollower()
+	})
 	a.updateCapabilityControls()
 	if smokeTest {
 		time.AfterFunc(250*time.Millisecond, func() {
@@ -292,19 +208,15 @@ func (a *app) run(smokeTest bool, startup startupProfile) error {
 	}
 	a.refreshStatus()
 	a.appendLog("Ready.")
+	a.startWorkActivityFollower()
+	a.mw.Show()
 	a.mw.Run()
+	a.stopWorkActivityFollower()
 	return nil
 }
 
 func appTitle() string {
 	return "DeskFerry Work Services " + buildinfo.Version
-}
-
-func appTitleWithProfile(name string) string {
-	if strings.TrimSpace(name) == "" {
-		return appTitle()
-	}
-	return appTitle() + " - " + strings.TrimSpace(name)
 }
 
 func firstNonEmpty(values ...string) string {
@@ -385,66 +297,6 @@ func (a *app) relayURLListValues() []string {
 	return append([]string(nil), a.relayURLs...)
 }
 
-func (a *app) setRelayURLList(values []string, selectIndex int) {
-	a.relayURLs = uniqueRelayURLs(values)
-	if len(a.relayURLs) == 0 {
-		selectIndex = -1
-	} else if selectIndex < 0 {
-		selectIndex = 0
-	} else if selectIndex >= len(a.relayURLs) {
-		selectIndex = len(a.relayURLs) - 1
-	}
-	if a.relayList != nil {
-		_ = a.relayList.SetModel(append([]string(nil), a.relayURLs...))
-		_ = a.relayList.SetCurrentIndex(selectIndex)
-	}
-	a.setRelayEditorFromIndex(selectIndex)
-	a.updateRelayButtons()
-}
-
-func (a *app) setRelayEditorFromIndex(index int) {
-	if a.relayEdit == nil {
-		return
-	}
-	if index >= 0 && index < len(a.relayURLs) {
-		_ = a.relayEdit.SetText(a.relayURLs[index])
-		return
-	}
-	_ = a.relayEdit.SetText("")
-}
-
-func (a *app) relaySelectionChanged() {
-	index := -1
-	if a.relayList != nil {
-		index = a.relayList.CurrentIndex()
-	}
-	a.setRelayEditorFromIndex(index)
-	a.updateRelayButtons()
-}
-
-func (a *app) updateRelayButtons() {
-	if a.relayList == nil {
-		return
-	}
-	index := a.relayList.CurrentIndex()
-	hasSelection := index >= 0 && index < len(a.relayURLs) && !a.sharedProfile
-	if a.relayAdd != nil {
-		a.relayAdd.SetEnabled(!a.sharedProfile)
-	}
-	if a.relayUpdate != nil {
-		a.relayUpdate.SetEnabled(hasSelection)
-	}
-	if a.relayDelete != nil {
-		a.relayDelete.SetEnabled(hasSelection)
-	}
-	if a.relayUp != nil {
-		a.relayUp.SetEnabled(hasSelection && index > 0)
-	}
-	if a.relayDown != nil {
-		a.relayDown.SetEnabled(hasSelection && index < len(a.relayURLs)-1)
-	}
-}
-
 func (a *app) updateCapabilityControls() {
 	winrmEnabled := a.winrmEnabled != nil && a.winrmEnabled.Checked()
 	smbEnabled := a.smbEnabled != nil && a.smbEnabled.Checked()
@@ -457,163 +309,6 @@ func (a *app) updateCapabilityControls() {
 	if a.smbAlias != nil {
 		a.smbAlias.SetEnabled(smbEnabled)
 	}
-}
-
-func (a *app) relayURLFromEditor() (string, error) {
-	if a.relayEdit == nil {
-		return "", errors.New("relay URL editor is not available")
-	}
-	value := strings.TrimSpace(a.relayEdit.Text())
-	if value == "" {
-		return "", errors.New("relay service base URL is required")
-	}
-	return tunnel.RelayServiceBaseURL(value)
-}
-
-func (a *app) addRelayURL() {
-	value, err := a.relayURLFromEditor()
-	if err != nil {
-		a.showError(err)
-		return
-	}
-	values := a.relayURLListValues()
-	for i, existing := range values {
-		if strings.EqualFold(existing, value) {
-			a.setRelayURLList(values, i)
-			return
-		}
-	}
-	values = append(values, value)
-	a.setRelayURLList(values, len(values)-1)
-}
-
-func (a *app) updateRelayURL() {
-	index := -1
-	if a.relayList != nil {
-		index = a.relayList.CurrentIndex()
-	}
-	if index < 0 || index >= len(a.relayURLs) {
-		a.addRelayURL()
-		return
-	}
-	value, err := a.relayURLFromEditor()
-	if err != nil {
-		a.showError(err)
-		return
-	}
-	values := a.relayURLListValues()
-	values[index] = value
-	values = uniqueRelayURLs(values)
-	nextIndex := index
-	for i, existing := range values {
-		if strings.EqualFold(existing, value) {
-			nextIndex = i
-			break
-		}
-	}
-	a.setRelayURLList(values, nextIndex)
-}
-
-func (a *app) deleteRelayURL() {
-	if a.relayList == nil {
-		return
-	}
-	index := a.relayList.CurrentIndex()
-	if index < 0 || index >= len(a.relayURLs) {
-		return
-	}
-	values := a.relayURLListValues()
-	values = append(values[:index], values[index+1:]...)
-	a.setRelayURLList(values, index)
-}
-
-func (a *app) moveRelayURL(delta int) {
-	if a.relayList == nil {
-		return
-	}
-	index := a.relayList.CurrentIndex()
-	a.moveRelayURLTo(index, index+delta)
-}
-
-func (a *app) moveRelayURLTo(from, to int) {
-	if from < 0 || from >= len(a.relayURLs) || to < 0 || to >= len(a.relayURLs) || from == to {
-		return
-	}
-	values := a.relayURLListValues()
-	value := values[from]
-	values = append(values[:from], values[from+1:]...)
-	if to >= len(values) {
-		values = append(values, value)
-	} else {
-		values = append(values[:to], append([]string{value}, values[to:]...)...)
-	}
-	a.setRelayURLList(values, to)
-}
-
-func (a *app) relayListMouseDown(x, y int, button walk.MouseButton) {
-	if button != walk.LeftButton {
-		return
-	}
-	a.relayDragIndex = a.relayListIndexAt(x, y)
-	a.relayDragStartY = y
-	a.relayDragging = false
-	if a.relayDragIndex >= 0 {
-		_ = a.relayList.SetCurrentIndex(a.relayDragIndex)
-	}
-}
-
-func (a *app) relayListMouseMove(_, y int, button walk.MouseButton) {
-	if button&walk.LeftButton == 0 || a.relayDragIndex < 0 {
-		return
-	}
-	if absInt(y-a.relayDragStartY) > 4 {
-		a.relayDragging = true
-	}
-}
-
-func (a *app) relayListMouseUp(x, y int, button walk.MouseButton) {
-	if button != walk.LeftButton {
-		return
-	}
-	from := a.relayDragIndex
-	dragging := a.relayDragging
-	a.relayDragIndex = -1
-	a.relayDragging = false
-	if !dragging || from < 0 {
-		return
-	}
-	to := a.relayListIndexAt(x, y)
-	if to < 0 {
-		if y < 0 {
-			to = 0
-		} else {
-			to = len(a.relayURLs) - 1
-		}
-	}
-	a.moveRelayURLTo(from, to)
-}
-
-func (a *app) relayListIndexAt(x, y int) int {
-	if a.relayList == nil || len(a.relayURLs) == 0 {
-		return -1
-	}
-	lParam := uintptr(uint32(uint16(x)) | uint32(uint16(y))<<16)
-	result := uint32(a.relayList.SendMessage(win.LB_ITEMFROMPOINT, 0, lParam))
-	if win.HIWORD(result) != 0 {
-		return -1
-	}
-	index := int(win.LOWORD(result))
-	if index < 0 || index >= len(a.relayURLs) {
-		return -1
-	}
-	return index
-}
-
-func absInt(value int) int {
-	if value < 0 {
-		return -value
-	}
-	return value
 }
 
 func (a *app) runAction(action string) {
@@ -768,7 +463,7 @@ func (a *app) refreshStatus() {
 	if err != nil {
 		text += err.Error()
 	} else if !info.Installed {
-		text += "not installed"
+		text += "not installed (Home features remain available)"
 	} else {
 		text += serviceStateText(info.State)
 		if info.ProcessID != 0 {
@@ -781,6 +476,7 @@ func (a *app) refreshStatus() {
 			a.status.SetText(text)
 			installed := err == nil && info.Installed
 			running := installed && info.State == uint32(svc.Running)
+			enabled := a.workEnabled == nil || a.workEnabled.Checked()
 			if a.installButton != nil {
 				label := "Install"
 				if installed {
@@ -790,7 +486,7 @@ func (a *app) refreshStatus() {
 					}
 				}
 				a.installButton.SetText(label)
-				a.installButton.SetVisible(true)
+				a.installButton.SetVisible(enabled)
 			}
 			if a.startButton != nil {
 				a.startButton.SetVisible(installed && !running)

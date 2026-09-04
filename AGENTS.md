@@ -27,7 +27,7 @@ DeskFerry is a Go + .NET + Python + Android project for outbound-only RDP, WinRM
 - The optional Windows Home network component uses the synthetic `198.18.0.0/30` network and permits only TCP port 445 to the configured work-host alias. It must not become a general-purpose VPN.
 - The merged Windows UI should offer the virtual network adapter as an optional component selected by default, detect existing services before presenting actions, and offer Install only when a service is absent.
 - `windows/workservice` must remain Windows-service-first. Console mode is debug-only.
-- `windows/workui` owns the native Work service controls inside the merged executable and consumes the selected shared connection profile instead of maintaining a separate relay configuration.
+- `windows/workui` owns the native, optional Work service controls inside the merged executable. Its room and proxy are independent from the Home UI's selected destination: the room is editable, the installed service's relay bases are preserved internally, and relay-base controls are not shown in the Work Services window.
 - Do not reintroduce separate Windows installer, configurator, Work-agent, or Home-network DeskFerry executables. The merged executable self-installs and registers the required service modes; Wintun and tun2socks remain external runtime dependencies extracted only for the optional SMB bridge.
 - Do not add stealth, anti-monitoring, or obfuscation behavior.
 

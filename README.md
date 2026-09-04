@@ -4,7 +4,7 @@
 
 DeskFerry is an outbound-only RDP, WinRM, SMB, and authenticated screen-view rendezvous tunnel for a work PC that cannot accept inbound connections. The current architecture uses an Azure App Service relay at `https://test-officialwebsite.azurewebsites.net/relay/` and an OCI Always Free fallback relay at `http://217.142.228.117/relay/`. The Azure relay implementation is .NET, the OCI relay implementation is a lightweight Go service, and a protocol-compatible Python/FastAPI relay is also available under `relay/python/`. The work-side Windows service and the Windows, macOS, and Android home agents prefer outbound WebSockets and transparently use paired acknowledged HTTP `POST`/`GET` streams when a proxy rejects WebSocket setup.
 
-On Windows, one `DeskFerry.exe` provides the control panel, Home client, Work service, optional SMB network service, component management, and screen-capture helper. Home and Work use the same named connection profiles. Each profile contains a room, ordered relay service base URLs, and its proxy selection. The first service is primary; later services are fallbacks. DeskFerry appends the profile room to each base URL at runtime, and existing full room-URL settings migrate automatically. New profiles are pre-filled with these two known relay services:
+On Windows, one `DeskFerry.exe` provides the control panel, Home client, optional Work service, optional SMB network service, component management, and screen-capture helper. Each Home destination profile contains a room, ordered relay service base URLs, and its proxy selection. The first service is primary; later services are fallbacks. DeskFerry appends the profile room to each base URL at runtime, and existing full room-URL settings migrate automatically. New Home profiles are pre-filled with these two known relay services:
 
 ```text
 https://test-officialwebsite.azurewebsites.net/relay
@@ -174,7 +174,7 @@ https://test-officialwebsite.azurewebsites.net/relay
 http://217.142.228.117/relay
 ```
 
-Pick a room name that is easy for you to remember but not obvious to outsiders, such as `workdesk`, and enter the same room name in the Home and Work profiles. Keep the `http://` scheme for the OCI service. If a home or work log shows `https://217.142.228.117/...`, that client is trying port `443` and will fail before it reaches the relay.
+Pick a room name that is easy for you to remember but not obvious to outsiders, such as `workdesk`. A Home destination must match the room configured by the Work service on the PC it connects to. A PC's own Work room is independent from the Home destination it uses to connect elsewhere, so this host can publish room `b` while its Home profile connects to room `h`. Keep the `http://` scheme for the OCI service. If a home or work log shows `https://217.142.228.117/...`, that client is trying port `443` and will fail before it reaches the relay.
 
 The work agent uses both services at the same time. Home apps treat the first row as primary and later rows as fallbacks.
 
@@ -186,7 +186,7 @@ Build or download the self-contained Windows executable:
 dist\bin\deskferry-windows-amd64.exe
 ```
 
-Launch it normally. The control panel can run as a portable Home client without elevation. Open **Windows Components** to install it under `%ProgramFiles%\DeskFerry\DeskFerry.exe`, manage the optional SMB virtual adapter, or remove it. Open **Work Services** to publish this PC through the selected connection profile.
+Launch it normally. The main control panel owns Home connection settings, including the optional SMB/UNC bridge, and can run as a portable Home client without elevation. Open **Work Services** only when this PC itself should be published through DeskFerry; the Work service is optional. There is no separate Windows Components window.
 
 The application checks Windows Service Manager before presenting actions:
 
@@ -198,11 +198,13 @@ The application checks Windows Service Manager before presenting actions:
 
 The same executable is registered as the automatic `DeskFerryAgent` Work service and, when file access is enabled, as the `DeskFerryHomeNetwork` service. WinRM, Work-side SMB, and authenticated screenshots are optional modules of `DeskFerryAgent`; they are not separate persistent executables. Screenshot capture launches an interactive helper from the same binary only while a user has explicitly shared the screen.
 
-Connection profiles are edited in the main control panel and reused by Work Services. A profile stores its room, ordered relay service bases, and proxy. The Work Services window treats those shared fields as read-only and owns only Work-side settings such as local targets and capability switches. Existing `DeskFerryAgent` command-line configuration is imported as a **This PC** profile on first run. Existing Home profiles and the machine-scope DPAPI room password are preserved during migration.
+Home connection profiles are edited in the main control panel. Work Services has its own editable room and proxy because a PC can connect Home to one room while publishing itself on another. Relay service bases are intentionally not shown in the Work Services window: an existing service's bases are preserved internally, while a new service uses the known Azure and OCI bases. Leave **Install Work services on this PC** unchecked to use DeskFerry only as a Home client. Existing `DeskFerryAgent` settings and the machine-scope DPAPI room password are preserved during migration.
+
+The Work Services Activity pane shows the recent `work-agent-*.log` tail and follows new relay and service-session events while the window is open. The log remains available under `%ProgramData%\DeskFerry` for longer diagnostics.
 
 To enable remote command execution, enable **WinRM** and normally use target `127.0.0.1:5985`. Windows Remote Management must already have a local listener, and a non-empty room password is required.
 
-To enable Windows file sharing on the Work PC, enable **SMB**, normally use target `127.0.0.1:445`, and keep alias `deskferry-work`. DeskFerry registers only that alias; it does not create shares or weaken their NTFS or share permissions. On the Home PC, **Windows Components** installs the optional Wintun/tun2socks bridge for `\\deskferry-work\sharename`.
+To enable Windows file sharing on the Work PC, enable **SMB**, normally use target `127.0.0.1:445`, and keep alias `deskferry-work`. DeskFerry registers only that alias; it does not create shares or weaken their NTFS or share permissions. On the Home PC, the selected Home profile supplies the matching SMB alias and room settings to the optional Wintun/tun2socks bridge.
 
 For screenshots and delta streaming, select **Allow authenticated screenshots and delta streaming**. This requires a room password and remains disabled until explicitly selected.
 
@@ -225,7 +227,7 @@ Read-Host "Room password" -MaskInput | .\DeskFerry.exe -work-configurator `
 .\DeskFerry.exe -status
 .\DeskFerry.exe -self-test -relay-url https://test-officialwebsite.azurewebsites.net/relay/workdesk
 
-# Application and optional Home SMB component
+# Optional Home SMB bridge administration (non-visual backend)
 .\DeskFerry.exe -windows-setup -cli-action install
 .\DeskFerry.exe -windows-setup -cli-action status
 ```
@@ -385,7 +387,7 @@ Normal launch provides:
 - Local RDP and WinRM listeners.
 - Windows Credential Manager integration for RDP, WinRM, and SMB.
 - Relay presence, room status, activity with effective proxy/transport reporting, and screen viewing.
-- **Work Services** and **Windows Components** controls.
+- An optional **Work Services** window; Home settings remain in the main control panel.
 
 The same executable also provides:
 
@@ -395,7 +397,7 @@ The same executable also provides:
 - Elevated self-install, migration, repair, configuration, and removal modes.
 - GUI and CLI service management that checks SCM state and offers **Install** only when the service does not exist.
 
-Existing Home JSON profiles are preserved. On first merged launch, a legacy Work service connection is imported as a **This PC** profile when it does not already match an existing profile. Applying Work configuration migrates the machine-scope DPAPI room password and changes the service executable path to the installed `DeskFerry.exe`.
+Existing Home JSON profiles are preserved. The optional Work service keeps an independent editable room and proxy, preserves its installed relay bases internally, and can be omitted entirely. Applying Work configuration migrates the machine-scope DPAPI room password and changes the service executable path to the installed `DeskFerry.exe`.
 
 The self-contained artifact carries checksum-verified Wintun 0.14.1 and tun2socks 2.6.0 payloads. They are extracted only when the optional Home SMB bridge is enabled.
 
@@ -609,10 +611,10 @@ DeskFerry's locally built Windows executables are unsigned. Some heuristic endpo
 3. Submit the artifact to the security vendor as a false positive.
 4. Build the unoptimized diagnostic binaries described under [Build Commands](#build-commands) to determine whether the verdict is specific to compiler layout.
 
-Stop the interactive Windows app before replacing its executable and verify the new artifact hash before installation. Do not retain renamed copies of old executables after a successful upgrade. Use the merged component controls to migrate legacy services and install the reviewed debug artifact on hosts where SEP rejects the optimized build:
+Stop the interactive Windows app before replacing its executable and verify the new artifact hash before installation. Do not retain renamed copies of old executables after a successful upgrade. Use the merged executable's administrative CLI to migrate legacy services and install the reviewed debug artifact on hosts where SEP rejects the optimized build:
 
 ```powershell
-.\dist\bin\deskferry-windows-amd64-debug.exe -windows-setup
+.\dist\bin\deskferry-windows-amd64-debug.exe -windows-setup -cli-action install
 ```
 
 Verify the installed files with `Get-FileHash` after the endpoint-protection scan completes. A work-service update briefly interrupts active sessions; subsequent sessions use resumption only when the home agent, work agent, and selected relay all support it.
@@ -635,7 +637,7 @@ Check:
 
 - The selected Home profile names the intended file-server work computer and has been applied after approving the elevation request.
 - Work Services has SMB target `127.0.0.1:445`, the alias saved in the selected Home profile, and a room password.
-- The selected Home profile uses the same room name and password, and Windows Components enabled the file-access component.
+- The selected Home profile uses the same room name and password, and the optional `DeskFerryHomeNetwork` file-access service is enabled.
 - The relay dashboard reports that room as protected and shows an SMB-capable work control connection. A work agent exposing only RDP cannot serve file access.
 - The `DeskFerryHomeNetwork` service is running and the `DeskFerry` adapter has address `198.18.0.1`.
 - `Test-NetConnection <profile-alias> -Port 445` reaches `198.18.0.2` on the Home PC.

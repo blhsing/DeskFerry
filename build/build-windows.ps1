@@ -38,10 +38,10 @@ function Get-VerifiedDownload {
 }
 
 if (-not $SkipGoBuild) {
-    $args = @()
-    if ($DebugWindows) { $args += '-DebugWindows' }
-    if ($DebugArtifactSuffix) { $args += '-DebugArtifactSuffix' }
-    & (Join-Path $PSScriptRoot 'build-go.ps1') @args
+    $goBuildParams = @{}
+    if ($DebugWindows) { $goBuildParams.DebugWindows = $true }
+    if ($DebugArtifactSuffix) { $goBuildParams.DebugArtifactSuffix = $true }
+    & (Join-Path $PSScriptRoot 'build-go.ps1') @goBuildParams
     if ($LASTEXITCODE -ne 0) { throw 'Go artifact build failed' }
 }
 

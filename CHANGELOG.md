@@ -1,5 +1,14 @@
 # Release Notes
 
+## 0.12.1 - 2026-09-04
+
+- Preserve the selected Home profile's relay URLs, room proof, SMB alias, and explicit proxy when migrating a legacy Windows network service whose stored settings differ.
+- Keep Work Services optional and independent from the selected Home destination: load its own editable installed room, preserve relay bases internally without showing redundant controls, and make the uninstalled state explicit.
+- Keep the Work Services window compact, use balanced outer margins, and give the remaining window height to its Activity log without an always-visible scrollbar.
+- Remove the redundant Windows Components window and installation-location control; Home SMB/UNC settings remain in the main control panel while setup stays an internal elevated/CLI backend.
+- Shorten the main-window button to **Work Services**, state **admin required** on the RDP decoding apply action, and correctly forward debug-build switches when assembling the self-contained Windows payload.
+- Make the Work Services Activity pane show a recent tail of the Work service diagnostic log and follow live relay, RDP, WinRM, SMB, and screen-session events across log rotation.
+
 ## 0.12.0 - 2026-09-04
 
 - Replace the separate Windows Home, Work agent, Work configurator, Home network, and setup artifacts with one self-contained multi-mode `DeskFerry.exe`.

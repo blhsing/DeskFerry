@@ -630,7 +630,7 @@ func (a *clientApp) run(smokeTest bool) error {
 										Layout:     Grid{Columns: 3, Spacing: 7},
 										Children: []Widget{
 											ComboBox{AssignTo: &a.rdpDecodingMode, Model: rdpDecodingModeLabels, CurrentIndex: rdpDecodingModeIndex(decodingMode), ColumnSpan: 2},
-											PushButton{AssignTo: &a.applyRDPDecoding, Text: "Apply (admin)", MinSize: Size{Height: 30}, OnClicked: a.applyRDPDecodingSelection},
+											PushButton{AssignTo: &a.applyRDPDecoding, Text: "Apply (admin required)", MinSize: Size{Height: 30}, OnClicked: a.applyRDPDecodingSelection},
 											TextLabel{AssignTo: &a.rdpDecodingAdvice, Text: decodingApplied + ". Recommendation: Checking recent RDP stability...", MinSize: Size{Width: 420}, ColumnSpan: 3},
 										},
 									},
@@ -658,7 +658,7 @@ func (a *clientApp) run(smokeTest bool) error {
 									},
 									Composite{
 										ColumnSpan: 2,
-										Layout:     Grid{Columns: 4, Spacing: 6},
+										Layout:     Grid{Columns: 3, Spacing: 6},
 										Children: []Widget{
 											PushButton{AssignTo: &a.connectButton, Text: "Connect", MinSize: Size{Height: 30}, OnClicked: func() { a.connectFromUI() }},
 											PushButton{AssignTo: &a.openRDPButton, Text: "Open Remote Desktop", MinSize: Size{Height: 30}, OnClicked: a.openRemoteDesktop},
@@ -669,7 +669,6 @@ func (a *clientApp) run(smokeTest bool) error {
 											PushButton{Text: "Relay Dashboard", MinSize: Size{Height: 30}, OnClicked: a.openDashboard},
 											PushButton{Text: "Screen Viewer", MinSize: Size{Height: 30}, OnClicked: a.openScreenViewer},
 											PushButton{Text: "Work Services", MinSize: Size{Height: 30}, OnClicked: a.openWorkServices},
-											PushButton{Text: "Windows Components", MinSize: Size{Height: 30}, OnClicked: a.openWindowsComponents},
 										},
 									},
 								},
@@ -1378,41 +1377,12 @@ func (a *clientApp) showWindow() {
 }
 
 func (a *clientApp) openWorkServices() {
-	if err := a.saveFromUI(false); err != nil {
-		a.showError(err)
-		return
-	}
-	cfg := a.currentConfig()
-	profile := cfg.selectedProfile()
-	if profile == nil {
-		a.showError(errors.New("select a connection profile first"))
-		return
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		a.showError(err)
 		return
 	}
-	args := []string{"-work-configurator", "-profile-name", profile.Name, "-room", profile.Room, "-proxy", firstNonEmpty(profile.Proxy, cfg.Proxy, "env")}
-	for _, base := range profile.RelayBases {
-		args = append(args, "-relay-base-url", base)
-	}
-	if err := exec.Command(exe, args...).Start(); err != nil {
-		a.showError(err)
-	}
-}
-
-func (a *clientApp) openWindowsComponents() {
-	if err := a.saveFromUI(false); err != nil {
-		a.showError(err)
-		return
-	}
-	exe, err := os.Executable()
-	if err != nil {
-		a.showError(err)
-		return
-	}
-	if err := exec.Command(exe, "-windows-setup").Start(); err != nil {
+	if err := exec.Command(exe, "-work-configurator").Start(); err != nil {
 		a.showError(err)
 	}
 }

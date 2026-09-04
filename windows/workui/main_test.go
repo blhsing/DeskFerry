@@ -4,6 +4,7 @@ package workconfigurator
 
 import (
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -15,13 +16,11 @@ func TestServiceCommandLineOption(t *testing.T) {
 	}
 }
 
-func TestParseStartupProfile(t *testing.T) {
-	profile, err := parseStartupProfile([]string{"-profile-name", "Work", "-relay-base-url", "https://example.test/relay", "-room", "desk", "-proxy", "http://proxy:8080"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if profile.Name != "Work" || profile.Room != "desk" || profile.Proxy != "http://proxy:8080" || len(profile.RelayBases) != 1 {
-		t.Fatalf("unexpected startup profile: %#v", profile)
+func TestComposeRelayRoomURLsKeepsWorkRoomIndependent(t *testing.T) {
+	got := composeRelayRoomURLs([]string{"https://relay.example/relay", "http://backup.example/relay"}, "b")
+	want := []string{"https://relay.example/relay/b", "http://backup.example/relay/b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("relay URLs = %#v, want %#v", got, want)
 	}
 }
 

@@ -227,6 +227,49 @@ func TestExistingSetupOptionsLoadsInstalledNetworkConfig(t *testing.T) {
 	}
 }
 
+func TestExistingSetupOptionsPrefersSelectedHomeProfile(t *testing.T) {
+	programData := t.TempDir()
+	appData := t.TempDir()
+	t.Setenv("ProgramData", programData)
+	t.Setenv("APPDATA", appData)
+	if err := os.MkdirAll(filepath.Dir(configPath()), 0755); err != nil {
+		t.Fatal(err)
+	}
+	network := (homenetwork.Config{
+		RelayAddrs: []string{"https://network.example/relay/old"},
+		Proxy:      "http://192.9.200.25:3128",
+		RoomProof:  "network-proof",
+		Alias:      "old-files",
+	}).WithDefaults(t.TempDir())
+	networkData, _ := json.Marshal(network)
+	if err := os.WriteFile(configPath(), networkData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	settings := homeClientSettings{
+		Proxy:               "http://192.9.200.22:9090",
+		SelectedDestination: "Work",
+		Destinations: []homeClientDestination{{
+			Name:       "Work",
+			RelayAddrs: []string{"https://relay.example/relay/h"},
+			Proxy:      "http://192.9.200.22:9090",
+			RoomProof:  "home-proof",
+			SMBAlias:   "work-files",
+		}},
+	}
+	if err := os.MkdirAll(filepath.Dir(homeClientSettingsPath()), 0755); err != nil {
+		t.Fatal(err)
+	}
+	settingsData, _ := json.Marshal(settings)
+	if err := os.WriteFile(homeClientSettingsPath(), settingsData, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := existingSetupOptions(t.TempDir())
+	if opts.Proxy != settings.Proxy || opts.RoomProof != "home-proof" || opts.Alias != "work-files" || !reflect.DeepEqual(opts.RelayAddrs, settings.Destinations[0].RelayAddrs) {
+		t.Fatalf("options = %#v", opts)
+	}
+}
+
 func TestConfigureHomeClientUpdatesSelectedDestination(t *testing.T) {
 	appData := t.TempDir()
 	t.Setenv("APPDATA", appData)
