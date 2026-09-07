@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.12.2 - 2026-09-08
+
+- Consolidate bursts of Android connectivity callbacks before proactively replacing relay transports, preventing a mobile network handoff from repeatedly canceling new RDP resume and connection attempts. Transport failures continue to trigger immediate recovery.
+
 ## 0.12.1 - 2026-09-04
 
 - Preserve the selected Home profile's relay URLs, room proof, SMB alias, and explicit proxy when migrating a legacy Windows network service whose stored settings differ.

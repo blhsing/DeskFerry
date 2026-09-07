@@ -13,6 +13,8 @@ import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
@@ -111,6 +113,8 @@ public class TunnelService extends Service {
     private ConnectivityManager.NetworkCallback networkCallback;
     private Network activeNetwork;
     private boolean networkWasLost;
+    private final Handler networkHandler = new Handler(Looper.getMainLooper());
+    private Runnable pendingNetworkTransition;
     private volatile boolean running;
     private volatile String relayUrl = RelayUrls.DEFAULT_RELAY_URL;
     private volatile List<String> relayUrls = Collections.singletonList(RelayUrls.DEFAULT_RELAY_URL);
@@ -312,6 +316,12 @@ public class TunnelService extends Service {
     }
 
     private void unregisterNetworkObserver() {
+        synchronized (networkLock) {
+            if (pendingNetworkTransition != null) {
+                networkHandler.removeCallbacks(pendingNetworkTransition);
+                pendingNetworkTransition = null;
+            }
+        }
         ConnectivityManager manager = connectivityManager;
         ConnectivityManager.NetworkCallback callback = networkCallback;
         networkCallback = null;
@@ -324,10 +334,29 @@ public class TunnelService extends Service {
     }
 
     private void handleNetworkTransition(String reason) {
+        // A handoff can deliver a burst of lost/available callbacks. Canceling
+        // on each callback destroys the replacement sockets we just opened.
+        // Socket failures still start recovery immediately; consolidate only
+        // the proactive replacement triggered by connectivity notifications.
+        synchronized (networkLock) {
+            if (pendingNetworkTransition != null) {
+                networkHandler.removeCallbacks(pendingNetworkTransition);
+            }
+            pendingNetworkTransition = () -> {
+                synchronized (networkLock) {
+                    pendingNetworkTransition = null;
+                }
+                replaceNetworkTransports(reason);
+            };
+            networkHandler.postDelayed(pendingNetworkTransition, 750);
+        }
+    }
+
+    private void replaceNetworkTransports(String reason) {
         if (!running) {
             return;
         }
-        append(reason + "; replacing relay transports immediately.");
+        append(reason + "; replacing relay transports after network callbacks settled.");
         cancelPresenceSocket();
         cancelStatusSocket();
         for (BridgeSession session : sessions) {
