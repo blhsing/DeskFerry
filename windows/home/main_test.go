@@ -157,6 +157,52 @@ func TestRelayStatusClientReusesBoundedConnection(t *testing.T) {
 	}
 }
 
+func TestRelaySummaryIncludesFallbackAndIdleControl(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"rooms":[{"id":"h","home_agent_connected":true}]}`)
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"rooms":[{"id":"h","control_connections":1},{"id":"other","active_pairs":99}]}`)
+	}))
+	defer backup.Close()
+	cfg := config{RelayAddrs: []string{primary.URL + "/relay/h", backup.URL + "/relay/h"}, Proxy: "direct"}
+	client := httpClient(cfg)
+	defer client.CloseIdleConnections()
+	summary, err := queryRelaySummaryWithClient(context.Background(), cfg, client)
+	if err != nil || !summary.WorkOnline || !summary.HomeOnline || summary.Active != 0 || len(summary.RelayDetails) != 2 {
+		t.Fatalf("summary = %#v, error = %v", summary, err)
+	}
+}
+
+func TestRelaySummarySurvivesUnavailablePrimary(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"rooms":[{"id":"h","active_pairs":1}]}`)
+	}))
+	defer backup.Close()
+	cfg := config{RelayAddrs: []string{primary.URL + "/relay/h", backup.URL + "/relay/h"}, Proxy: "direct"}
+	client := httpClient(cfg)
+	defer client.CloseIdleConnections()
+	summary, err := queryRelaySummaryWithClient(context.Background(), cfg, client)
+	if err != nil || !summary.WorkOnline || summary.Active != 1 || !strings.Contains(summary.RelayDetails[0], "unavailable") {
+		t.Fatalf("summary = %#v, error = %v", summary, err)
+	}
+}
+
+func TestActiveRDPRelayText(t *testing.T) {
+	if got := activeRDPRelayText(nil); got != "RDP relay: no connected session" {
+		t.Fatal(got)
+	}
+	routes := map[string]string{"one": "http://backup/relay/h", "two": ""}
+	if got := activeRDPRelayText(routes); got != "RDP relay: http://backup/relay/h (1 connected); 1 establishing" {
+		t.Fatal(got)
+	}
+}
+
 func TestEncodePowerShellCommandUsesUTF16LE(t *testing.T) {
 	encoded := encodePowerShellCommand("Write-Output 'ready'")
 	raw, err := base64.StdEncoding.DecodeString(encoded)

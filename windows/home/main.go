@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -133,6 +134,7 @@ type clientApp struct {
 	workStatus   *walk.Label
 	homeStatus   *walk.Label
 	rdpStatus    *walk.Label
+	relayStatus  *walk.TextLabel
 	details      *walk.TextEdit
 	logView      *walk.TextEdit
 
@@ -157,6 +159,7 @@ type clientApp struct {
 	listener            net.Listener
 	winrmListener       net.Listener
 	activeLocal         int
+	rdpRoutes           map[string]string
 	activeWinRM         int
 	statusCancel        context.CancelFunc
 	statusHTTPClient    *http.Client
@@ -175,6 +178,7 @@ type relaySnapshot struct {
 type relayRoomSnapshot struct {
 	ID                       string    `json:"id"`
 	WaitingAgents            int       `json:"waiting_agents"`
+	ControlConnections       int       `json:"control_connections"`
 	ActivePairs              int       `json:"active_pairs"`
 	TotalPairs               int64     `json:"total_pairs"`
 	LastAgentRemote          string    `json:"last_agent_remote"`
@@ -188,17 +192,18 @@ type relayRoomSnapshot struct {
 }
 
 type relaySummary struct {
-	Room       string
-	RelayAddr  string
-	WorkOnline bool
-	HomeOnline bool
-	Waiting    int
-	Active     int
-	Total      int64
-	LastClient string
-	LastAgent  string
-	LastHome   string
-	CheckedAt  time.Time
+	Room         string
+	RelayAddr    string
+	WorkOnline   bool
+	HomeOnline   bool
+	Waiting      int
+	Active       int
+	Total        int64
+	LastClient   string
+	LastAgent    string
+	LastHome     string
+	CheckedAt    time.Time
+	RelayDetails []string
 }
 
 func Main() {
@@ -562,6 +567,7 @@ func (a *clientApp) run(smokeTest bool) error {
 							statusTile("Work Agent", &a.workStatus, "Checking", statusTileWidth),
 							statusTile("Home App", &a.homeStatus, "Connecting", statusTileWidth),
 							statusTile("RDP", &a.rdpStatus, defaultListenAddr, rdpStatusTileWidth),
+							TextLabel{AssignTo: &a.relayStatus, Text: "RDP relay: no connected session", ColumnSpan: 4},
 						},
 					},
 					Composite{
@@ -1566,6 +1572,7 @@ func (a *clientApp) startTunnel(openRDP bool) error {
 	a.listener = listener
 	a.winrmListener = winrmListener
 	a.activeLocal = 0
+	a.rdpRoutes = make(map[string]string)
 	a.activeWinRM = 0
 	a.mu.Unlock()
 
@@ -1575,7 +1582,7 @@ func (a *clientApp) startTunnel(openRDP bool) error {
 	}
 	a.refreshLocalState()
 	go func() {
-		err := serveListener(ctx, cfg, listener, a.localConnStarted, a.localConnDone, a.appendLog)
+		err := serveListener(ctx, cfg, listener, a.localConnStarted, a.localConnDone, a.appendLog, a.localConnRouted)
 		if err != nil && ctx.Err() == nil {
 			a.appendLog("Listener stopped: %v", err)
 		}
@@ -1584,6 +1591,7 @@ func (a *clientApp) startTunnel(openRDP bool) error {
 			a.listener = nil
 			a.cancel = nil
 			a.activeLocal = 0
+			a.rdpRoutes = nil
 		}
 		a.mu.Unlock()
 		a.refreshLocalState()
@@ -1615,6 +1623,7 @@ func (a *clientApp) stopTunnel() {
 	a.listener = nil
 	a.winrmListener = nil
 	a.activeLocal = 0
+	a.rdpRoutes = nil
 	a.activeWinRM = 0
 	a.mu.Unlock()
 	if cancel != nil {
@@ -1639,14 +1648,52 @@ func (a *clientApp) isTunnelRunning() bool {
 
 func (a *clientApp) localConnStarted(remote string) {
 	a.mu.Lock()
+	if a.rdpRoutes == nil {
+		a.rdpRoutes = make(map[string]string)
+	}
+	a.rdpRoutes[remote] = ""
 	a.activeLocal++
 	a.mu.Unlock()
 	a.appendLog("RDP connection from %s.", remote)
 	a.refreshLocalState()
 }
 
+func (a *clientApp) localConnRouted(remote, relay string) {
+	a.mu.Lock()
+	if _, exists := a.rdpRoutes[remote]; exists {
+		a.rdpRoutes[remote] = relay
+	}
+	a.mu.Unlock()
+	a.refreshLocalState()
+}
+
+func activeRDPRelayText(routes map[string]string) string {
+	counts := make(map[string]int)
+	pending := 0
+	for _, relay := range routes {
+		if relay == "" {
+			pending++
+			continue
+		}
+		counts[relay]++
+	}
+	var labels []string
+	for relay, count := range counts {
+		labels = append(labels, fmt.Sprintf("%s (%d connected)", relay, count))
+	}
+	sort.Strings(labels)
+	if pending > 0 {
+		labels = append(labels, fmt.Sprintf("%d establishing", pending))
+	}
+	if len(labels) == 0 {
+		return "RDP relay: no connected session"
+	}
+	return "RDP relay: " + strings.Join(labels, "; ")
+}
+
 func (a *clientApp) localConnDone(remote string) {
 	a.mu.Lock()
+	delete(a.rdpRoutes, remote)
 	if a.activeLocal > 0 {
 		a.activeLocal--
 	}
@@ -1660,9 +1707,11 @@ func (a *clientApp) refreshLocalState() {
 	running := a.listener != nil
 	active := a.activeLocal
 	cfg := a.cfg
+	routeText := activeRDPRelayText(a.rdpRoutes)
 	a.mu.Unlock()
 
 	a.onUI(func() {
+		_ = a.relayStatus.SetText(routeText)
 		if a.destinationList != nil {
 			a.destinationList.SetEnabled(!running)
 		}
@@ -2493,7 +2542,7 @@ func run(ctx context.Context, cfg config, openMSTSC bool) error {
 	})
 }
 
-func serveListener(ctx context.Context, cfg config, listener net.Listener, started func(string), done func(string), logf func(string, ...any)) error {
+func serveListener(ctx context.Context, cfg config, listener net.Listener, started func(string), done func(string), logf func(string, ...any), routed ...func(string, string)) error {
 	var localSessions tunnel.ConnGroup
 	defer localSessions.Close()
 	go func() {
@@ -2513,12 +2562,12 @@ func serveListener(ctx context.Context, cfg config, listener net.Listener, start
 		connCtx, release := localSessions.Begin(ctx, conn)
 		go func() {
 			defer release()
-			handleLocalConn(connCtx, cfg, conn, remote, done, logf)
+			handleLocalConn(connCtx, cfg, conn, remote, done, logf, routed...)
 		}()
 	}
 }
 
-func handleLocalConn(ctx context.Context, cfg config, localConn net.Conn, remote string, done func(string), logf func(string, ...any)) {
+func handleLocalConn(ctx context.Context, cfg config, localConn net.Conn, remote string, done func(string), logf func(string, ...any), routed ...func(string, string)) {
 	defer done(remote)
 	started := time.Now()
 	relayConn, route, err := dialRelay(ctx, cfg)
@@ -2528,6 +2577,9 @@ func handleLocalConn(ctx context.Context, cfg config, localConn net.Conn, remote
 		return
 	}
 	logf("RDP session remote=%s connected relay=%s proxy=%s protocol=%s relay_protocol=%s local=%s relay_stream=%s dial_duration=%s", remote, route.RelayAddr, route.Proxy, route.Protocol, route.RelayProtocol, localConn.LocalAddr(), relayConn.RemoteAddr(), time.Since(started).Round(time.Millisecond))
+	for _, notify := range routed {
+		notify(remote, route.RelayAddr)
+	}
 	result := tunnel.PipeWithResult(localConn, relayConn)
 	logf("RDP session remote=%s relay=%s ended duration=%s end_initiator=%s local_to_relay_bytes=%d local_to_relay_error=%v local_to_relay_half_close_error=%v relay_to_local_bytes=%d relay_to_local_error=%v relay_to_local_half_close_error=%v local_close_error=%v relay_close_error=%v", remote, route.RelayAddr, result.Duration.Round(time.Millisecond), result.EndInitiator("local_rdp", "relay"), result.AToB.Bytes, result.AToB.CopyErr, result.AToB.CloseWriteErr, result.BToA.Bytes, result.BToA.CopyErr, result.BToA.CloseWriteErr, result.ACloseErr, result.BCloseErr)
 }
@@ -2674,16 +2726,43 @@ func queryRelaySummary(ctx context.Context, cfg config) (relaySummary, error) {
 }
 
 func queryRelaySummaryWithClient(ctx context.Context, cfg config, client *http.Client) (relaySummary, error) {
+	type result struct {
+		summary relaySummary
+		err     error
+	}
+	addresses := cfg.relayAddresses()
+	results := make([]result, len(addresses))
+	var checks sync.WaitGroup
+	for i, addr := range addresses {
+		checks.Add(1)
+		go func() {
+			defer checks.Done()
+			results[i].summary, results[i].err = queryRelaySummaryFor(ctx, cfg.withRelayAddress(addr), client)
+		}()
+	}
+	checks.Wait()
 	var errs []string
-	for _, relayAddr := range cfg.relayAddresses() {
-		summary, err := queryRelaySummaryFor(ctx, cfg.withRelayAddress(relayAddr), client)
-		if err == nil {
-			return summary, nil
+	var combined relaySummary
+	for i, result := range results {
+		if result.err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", addresses[i], result.err))
+			combined.RelayDetails = append(combined.RelayDetails, addresses[i]+": status unavailable")
+			continue
 		}
-		errs = append(errs, fmt.Sprintf("%s: %v", relayAddr, err))
-		if ctx.Err() != nil {
-			break
+		s := result.summary
+		combined.Room = s.Room
+		combined.WorkOnline = combined.WorkOnline || s.WorkOnline
+		combined.HomeOnline = combined.HomeOnline || s.HomeOnline
+		combined.Waiting += s.Waiting
+		combined.Active += s.Active
+		combined.Total += s.Total
+		combined.RelayDetails = append(combined.RelayDetails, fmt.Sprintf("%s: work %s, %d active streams", s.RelayAddr, onlineText(s.WorkOnline), s.Active))
+		if s.CheckedAt.After(combined.CheckedAt) {
+			combined.CheckedAt = s.CheckedAt
 		}
+	}
+	if len(errs) < len(addresses) {
+		return combined, nil
 	}
 	return relaySummary{}, fmt.Errorf("all relay status checks failed: %s", strings.Join(errs, "; "))
 }
@@ -2711,10 +2790,13 @@ func queryRelaySummaryFor(ctx context.Context, cfg config, client *http.Client) 
 	}
 	summary := relaySummary{Room: room, RelayAddr: cfg.RelayAddr, CheckedAt: snapshot.Time}
 	for _, r := range snapshot.Rooms {
+		if room != "" && r.ID != room {
+			continue
+		}
 		summary.Waiting += r.WaitingAgents
 		summary.Active += r.ActivePairs
 		summary.Total += r.TotalPairs
-		summary.WorkOnline = summary.WorkOnline || r.WaitingAgents+r.ActivePairs > 0
+		summary.WorkOnline = summary.WorkOnline || r.ControlConnections+r.WaitingAgents+r.ActivePairs > 0
 		summary.HomeOnline = summary.HomeOnline || r.HomeAgentConnected
 		if summary.Room == "" {
 			summary.Room = r.ID
@@ -2735,13 +2817,14 @@ func queryRelaySummaryFor(ctx context.Context, cfg config, client *http.Client) 
 func formatRelayDetails(summary relaySummary, cfg config) string {
 	lines := []string{
 		"Room: " + emptyAs(summary.Room, "default"),
-		"Relay URL: " + emptyAs(summary.RelayAddr, cfg.primaryRelayAddress()),
+		"Relay status: all configured relays",
 		"Configured relays: " + cfg.relayURLText(),
 		fmt.Sprintf("Work agent: %s (%d waiting sockets)", onlineText(summary.WorkOnline), summary.Waiting),
 		fmt.Sprintf("Home app: %s", onlineText(summary.HomeOnline)),
 		fmt.Sprintf("Active RDP streams: %d (%d total)", summary.Active, summary.Total),
 		"Local RDP address: " + mstscTarget(cfg.ListenAddr),
 	}
+	lines = append(lines, summary.RelayDetails...)
 	if summary.LastAgent != "" {
 		lines = append(lines, "Last work agent: "+summary.LastAgent)
 	}

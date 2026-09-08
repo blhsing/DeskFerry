@@ -769,6 +769,12 @@ sealed class AgentControl
             _ = RelayRoom.CloseQuietlyAsync(Socket, WebSocketCloseStatus.NormalClosure, reason);
         }
     }
+
+    public void Abort()
+    {
+        Interlocked.Exchange(ref _closed, 1);
+        Socket.Abort();
+    }
 }
 
 sealed record AgentDataSocket(WebSocket Socket, string Remote, bool Resumable, TaskCompletionSource Done);
@@ -962,6 +968,10 @@ sealed class RelayHub
             }
             catch (TimeoutException)
             {
+                // Retire a control channel that can send offers but never
+                // delivers answers. Existing data sessions use separate sockets.
+                _log.LogWarning("retiring unresponsive agent control room={Room} agent={Agent} session={Session} agent_data_connected={AgentDataConnected}", room.Id, control.AgentId, pending.Id, pending.Agent.Task.IsCompletedSuccessfully);
+                control.Abort();
                 room.RecordRejection("timeout");
                 await RejectSessionClientAsync(socket, typed, "timeout", pending.Id, "work agent did not answer the offer");
                 return;
@@ -2363,7 +2373,7 @@ sealed class ResumeSession
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.12.1";
+    public const string Version = "0.12.3";
 }
 
 sealed class WaitingAgent

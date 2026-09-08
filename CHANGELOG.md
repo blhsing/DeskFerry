@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.12.3 - 2026-09-08
+
+- Show the actual connected RDP relay prominently in Windows Home, separately from connections still establishing. Combine status from all configured relays and recognize idle protocol-v2 work controls.
+- Retire an Azure work control connection after an unanswered session offer so later attempts can use a fresh control channel, without deliberately terminating separate active data sessions.
+- Recover HTTP-stream clients whose sequence state outlives an Azure restart: deliver an explicit reconnect close at the client's expected sequence instead of repeatedly failing uploads with HTTP 500.
+
 ## 0.12.2 - 2026-09-08
 
 - Consolidate bursts of Android connectivity callbacks before proactively replacing relay transports, preventing a mobile network handoff from repeatedly canceling new RDP resume and connection attempts. Transport failures continue to trigger immediate recovery.

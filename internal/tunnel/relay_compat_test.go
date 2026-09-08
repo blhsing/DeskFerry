@@ -206,6 +206,122 @@ func TestExternalRelayV2OnDemand(t *testing.T) {
 	compatTransfer(t, ctx, clientStream, agentStream, []byte("protocol-v2"))
 }
 
+// TestExternalRelayHTTPStreamLostState verifies recovery across relay state loss.
+func TestExternalRelayHTTPStreamLostState(t *testing.T) {
+	base := strings.TrimRight(os.Getenv("DESKFERRY_COMPAT_RETIRE_CONTROL_URL"), "/")
+	if base == "" {
+		t.Skip("Azure recovery probe URL is not set")
+	}
+	proxy := os.Getenv("DESKFERRY_COMPAT_PROXY")
+	if proxy == "" {
+		proxy = "direct"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	client := httpStreamHTTPClient(base, proxy)
+	id := "compat-reset-" + time.Now().Format("150405000000")
+	endpoint := base + "/relay/compat-reset/stream/" + id
+	headers := http.Header{}
+	AddProtocolV2Header(headers)
+	headers.Set(HeaderHTTPStreamSecret, "compat-reset-secret-at-least-24-bytes")
+	headers.Set(HeaderHTTPStreamBatch, "1")
+	headers.Set("X-DeskFerry-Role", RoleAgentControl)
+	headers.Set(HeaderAgentInstance, id)
+	headers.Set(HeaderAgentServices, ServiceRDP)
+	request := func(method, direction string, body io.Reader) *http.Response {
+		req, err := http.NewRequestWithContext(ctx, method, endpoint+direction, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header = headers.Clone()
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	// The new relay knows at most control-ready (sequence 1), while the
+	// surviving client has already received sequence 100 from the old relay.
+	prime := request(http.MethodGet, "/down", nil)
+	io.Copy(io.Discard, prime.Body)
+	prime.Body.Close()
+	var upload bytes.Buffer
+	if err := writeHTTPStreamRecord(&upload, httpStreamFrame{kind: httpStreamRecordAck, seq: 100}); err != nil {
+		t.Fatal(err)
+	}
+	response := request(http.MethodPost, "/up", &upload)
+	io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("reset POST status = %s", response.Status)
+	}
+	time.Sleep(2 * time.Second) // Must survive the ordinary one-second close grace.
+	down := request(http.MethodGet, "/down", nil)
+	defer down.Body.Close()
+	for {
+		frame, err := readHTTPStreamRecord(down.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if frame.kind == httpStreamRecordAck {
+			continue
+		}
+		if frame.kind != httpStreamRecordClose || frame.seq != 101 {
+			t.Fatalf("reset frame = %#v", frame)
+		}
+		break
+	}
+}
+
+// TestExternalRelayRetiresUnresponsiveControl is an opt-in Azure recovery probe.
+func TestExternalRelayRetiresUnresponsiveControl(t *testing.T) {
+	baseURL := strings.TrimRight(os.Getenv("DESKFERRY_COMPAT_RETIRE_CONTROL_URL"), "/")
+	if baseURL == "" {
+		t.Skip("DESKFERRY_COMPAT_RETIRE_CONTROL_URL is not set")
+	}
+	proxy := os.Getenv("DESKFERRY_COMPAT_PROXY")
+	if proxy == "" {
+		proxy = "direct"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	addr := baseURL + "/relay/compat-retire-" + time.Now().Format("150405.000000")
+	h := http.Header{}
+	AddProtocolV2Header(h)
+	h.Set(HeaderAgentInstance, "retire-test")
+	h.Set(HeaderAgentServices, ServiceRDP)
+	h.Set(HeaderConcurrency, "2")
+	control, err := DialWebSocketWithHeaders(ctx, addr, proxy, RoleAgentControl, "", h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseWebSocket(control)
+	if err := AwaitControlReady(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+	clientHeaders := http.Header{}
+	AddProtocolV2Header(clientHeaders)
+	AddServiceHeader(clientHeaders, ServiceRDP)
+	client, err := DialWebSocketWithHeaders(ctx, addr, proxy, RoleClient, "", clientHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseWebSocket(client)
+	if _, err := ReadControlMessage(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately do not answer the offer. A later request must not be
+	// routed indefinitely through this unresponsive control socket.
+	if _, err := AwaitSessionReady(ctx, client); err == nil {
+		t.Fatal("silent agent was accepted")
+	}
+	readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer readCancel()
+	if _, err := ReadControlMessage(readCtx, control); err == nil || readCtx.Err() != nil {
+		t.Fatalf("control was not retired promptly: %v", err)
+	}
+}
+
 // TestExternalRelayHTTPStreamV2 exercises the non-CONNECT wire protocol
 // directly so every relay implementation is checked against the shared Go
 // client without depending on a particular forward-proxy test harness.

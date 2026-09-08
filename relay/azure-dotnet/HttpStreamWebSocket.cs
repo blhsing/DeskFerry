@@ -133,7 +133,10 @@ sealed class HttpStreamWebSocket : WebSocket
     public override Task CloseAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken) =>
         CloseOutputAsync(closeStatus, statusDescription, cancellationToken);
 
-    public override async Task CloseOutputAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken)
+    public override Task CloseOutputAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken) =>
+        CloseOutputWithGraceAsync(closeStatus, statusDescription, cancellationToken, TimeSpan.FromSeconds(1));
+
+    private async Task CloseOutputWithGraceAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken, TimeSpan grace)
     {
         byte[] reason = System.Text.Encoding.UTF8.GetBytes(statusDescription ?? "");
         if (reason.Length > 123)
@@ -152,7 +155,7 @@ sealed class HttpStreamWebSocket : WebSocket
         }
         _ = Task.Run(async () =>
         {
-            await Task.Delay(TimeSpan.FromSeconds(1));
+            await Task.Delay(grace);
             _lifetime.Cancel();
             _received.Writer.TryComplete();
             lock (_gate)
@@ -306,11 +309,34 @@ sealed class HttpStreamWebSocket : WebSocket
             while (!context.RequestAborted.IsCancellationRequested && generation == Volatile.Read(ref _upGeneration))
             {
                 var frame = await ReadRecordAsync(context.Request.Body, context.RequestAborted);
+                // A relay restart can recreate an existing transport ID with
+                // fresh counters. Older clients keep retrying the old upload
+                // and ignore our lower downstream sequences. Send the close at
+                // the sequence they expect, based on their authenticated ACK.
+                if (frame.Kind == AckRecord && ResetLostSequence(frame.Sequence))
+                {
+                    await CloseOutputWithGraceAsync(WebSocketCloseStatus.EndpointUnavailable, "HTTP stream state lost; reconnect", context.RequestAborted, TimeSpan.FromSeconds(30));
+                    context.Response.StatusCode = StatusCodes.Status409Conflict;
+                    return;
+                }
                 ApplyRecord(frame);
             }
         }
         catch (Exception exception) when (exception is EndOfStreamException or IOException or OperationCanceledException) { }
         context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+
+    private bool ResetLostSequence(ulong acknowledged)
+    {
+        lock (_gate)
+        {
+            if (acknowledged < _nextSend) return false;
+            if (acknowledged == ulong.MaxValue) throw new InvalidDataException("HTTP stream acknowledgement overflow.");
+            _outbound.Clear();
+            _buffered = 0;
+            _nextSend = acknowledged + 1;
+            return true;
+        }
     }
 
     public async Task ServeDownloadAsync(HttpContext context)
