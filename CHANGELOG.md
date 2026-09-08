@@ -5,6 +5,7 @@
 - Show the actual connected RDP relay prominently in Windows Home, separately from connections still establishing. Combine status from all configured relays and recognize idle protocol-v2 work controls.
 - Retire an Azure work control connection after an unanswered session offer so later attempts can use a fresh control channel, without deliberately terminating separate active data sessions.
 - Recover HTTP-stream clients whose sequence state outlives an Azure restart: deliver an explicit reconnect close at the client's expected sequence instead of repeatedly failing uploads with HTTP 500.
+- Reset resumable-session retry backoff as soon as a restarted relay is reachable, so a provisional resume attachment that closes before its peer arrives is retried promptly instead of adding several seconds that can exceed the local RDP client's reconnect tolerance.
 
 ## 0.12.2 - 2026-09-08
 

@@ -250,6 +250,11 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 		candidate, err := c.dialResume(dialCtx)
 		cancelDial()
 		if err == nil {
+			// Reaching the relay proves the path is healthy again. If this
+			// provisional attachment closes before its peer arrives, retry
+			// promptly instead of retaining backoff accumulated while the
+			// relay process was unavailable.
+			backoff = 250 * time.Millisecond
 			// Once the proxy has accepted the WebSocket, keep this attachment at
 			// the relay until its peer arrives. Re-dialing on a short timer would
 			// otherwise leave stale resume sockets queued at the relay.

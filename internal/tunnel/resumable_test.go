@@ -226,6 +226,63 @@ func TestResumableHeartbeatResumesSilentTransport(t *testing.T) {
 	}
 }
 
+func TestResumableSuccessfulDialResetsReconnectBackoff(t *testing.T) {
+	const sessionID = "abcdef0123456789abcdef0123456789"
+	var connections atomic.Int32
+	var firstRetry time.Time
+	var finalRetry time.Time
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		index := connections.Add(1)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if index == 1 {
+			_ = ws.Write(ctx, websocket.MessageText, []byte("start "+sessionID))
+			_, _, _ = ws.Read(ctx)
+			_ = ws.Close(websocket.StatusInternalError, "relay restart")
+			return
+		}
+		if index == 2 {
+			firstRetry = time.Now()
+			// The restarted relay is reachable, but this provisional
+			// attachment disappears before the other side arrives.
+			_ = ws.Close(websocket.StatusServiceRestart, "retry resume")
+			return
+		}
+		finalRetry = time.Now()
+		_ = ws.Write(ctx, websocket.MessageText, []byte("resume "+sessionID))
+		_, _, _ = ws.Read(ctx)
+		_ = ws.Write(ctx, websocket.MessageBinary, makeFrame(resumableFrameData, 0, []byte("ok")))
+		_ = ws.Close(websocket.StatusNormalClosure, "session closed")
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	initial, err := DialWebSocketWithHeaders(ctx, server.URL+"/relay/backoff", "direct", RoleClient, "", http.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AwaitWebSocketStartSession(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	conn := NewResumableWebSocketConn(ctx, initial, ResumableWebSocketOptions{RelayAddr: server.URL + "/relay/backoff", Proxy: "direct", SessionID: sessionID, Side: "client"})
+	defer conn.Close()
+	received := make([]byte, 2)
+	if _, err := io.ReadFull(conn, received); err != nil {
+		t.Fatal(err)
+	}
+	if string(received) != "ok" {
+		t.Fatalf("received %q", received)
+	}
+	if delay := finalRetry.Sub(firstRetry); delay > time.Second {
+		t.Fatalf("successful provisional dial retained stale backoff: %s", delay)
+	}
+}
+
 func TestLogicalSessionCloseRequiresExplicitReason(t *testing.T) {
 	if isLogicalSessionClose(websocket.CloseError{Code: websocket.StatusNormalClosure}) {
 		t.Fatal("normal transport close without marker ended the logical session")
