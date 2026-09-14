@@ -2116,6 +2116,8 @@ sealed record PumpResult(string Direction, long Bytes, long Messages, string End
 
 sealed record ResumeAttachment(WebSocket Socket, string Remote, TaskCompletionSource Done);
 
+sealed record ResumePumpResult(string Direction, string FailedSide, long FailedGeneration, long Bytes, long Messages, string End, WebSocketCloseStatus? CloseStatus, string? CloseReason, string? Error);
+
 sealed class ResumeSession
 {
     private static readonly WebSocketCloseStatus ResumeCloseStatus = (WebSocketCloseStatus)1012;
@@ -2222,61 +2224,106 @@ sealed class ResumeSession
         stateChanged();
         WebSocket agent = initialAgent;
         WebSocket client = initialClient;
+        var agentEndpoint = new ResumableSocketEndpoint(agent);
+        var clientEndpoint = new ResumableSocketEndpoint(client);
+        var pumps = new Dictionary<string, Task<ResumePumpResult>>(StringComparer.Ordinal);
+        void StartPump(string direction)
+        {
+            if (pumps.ContainsKey(direction)) return;
+            if (direction == "agent_to_client")
+            {
+                var source = agentEndpoint.Snapshot();
+                pumps[direction] = PumpResumableAsync(source.Socket, "agent", source.Generation, clientEndpoint, direction);
+            }
+            else
+            {
+                var source = clientEndpoint.Snapshot();
+                pumps[direction] = PumpResumableAsync(source.Socket, "client", source.Generation, agentEndpoint, direction);
+            }
+        }
+        StartPump("agent_to_client");
+        StartPump("client_to_agent");
         try
         {
             while (true)
             {
-                var (first, second) = await BridgeOnceAsync(agent, client);
-                // Only the pump that ended first can initiate a logical stream
-                // close. The other pump is canceled below by BridgeOnceAsync;
-                // its socket can concurrently acquire the peer's close status
-                // and must not turn an otherwise resumable transport failure
-                // into a permanently completed session.
-                if (IsSessionClose(first))
+                var completed = await Task.WhenAny(pumps.Values);
+                var result = await completed;
+                pumps.Remove(result.Direction);
+                if (IsSessionClose(result))
                 {
                     await Task.WhenAll(
-                        RelayRoom.CloseQuietlyAsync(agent, WebSocketCloseStatus.NormalClosure, "session closed"),
-                        RelayRoom.CloseQuietlyAsync(client, WebSocketCloseStatus.NormalClosure, "session closed"));
+                        RelayRoom.CloseQuietlyAsync(agentEndpoint.Snapshot().Socket, WebSocketCloseStatus.NormalClosure, "session closed"),
+                        RelayRoom.CloseQuietlyAsync(clientEndpoint.Snapshot().Socket, WebSocketCloseStatus.NormalClosure, "session closed"));
                     agentAttachment?.Done.TrySetResult();
                     clientAttachment?.Done.TrySetResult();
                     return;
                 }
-
-                _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} trigger_direction={TriggerDirection} trigger_end={TriggerEnd} trigger_close_status={TriggerCloseStatus} trigger_close_reason={TriggerCloseReason} trigger_error={TriggerError} other_direction={OtherDirection} other_end={OtherEnd} other_close_status={OtherCloseStatus} other_close_reason={OtherCloseReason} other_error={OtherError}", Room.Id, pairId, Id, first.Direction, first.End, first.CloseStatus, first.CloseReason, first.Error, second.Direction, second.End, second.CloseStatus, second.CloseReason, second.Error);
-                // Notify the surviving peer before discarding both obsolete
-                // transports. WebSocket.Abort only tears down the server-side
-                // object and IIS/Azure can leave the peer unaware until its
-                // heartbeat expires. A close-output frame with service-restart
-                // status makes both resumable endpoints reconnect immediately.
-                await Task.WhenAll(
-                    InterruptQuietlyAsync(agent),
-                    InterruptQuietlyAsync(client));
-                agentAttachment?.Done.TrySetResult();
-                clientAttachment?.Done.TrySetResult();
+                if (result.FailedSide is not ("agent" or "client"))
+                {
+                    _log.LogWarning("resumable bridge pump stopped without endpoint failure room={Room} pair={PairId} session={Session} direction={Direction} error={Error}", Room.Id, pairId, Id, result.Direction, result.Error);
+                    return;
+                }
+                var failedEndpoint = result.FailedSide == "agent" ? agentEndpoint : clientEndpoint;
+                if (failedEndpoint.Generation != result.FailedGeneration)
+                {
+                    StartPump(result.Direction);
+                    continue;
+                }
+                _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} failed_side={FailedSide} direction={Direction} end={End} close_status={CloseStatus} close_reason={CloseReason} error={Error}", Room.Id, pairId, Id, result.FailedSide, result.Direction, result.End, result.CloseStatus, result.CloseReason, result.Error);
+                failedEndpoint.Abort();
 
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_finished.Token);
                 timeout.CancelAfter(TimeSpan.FromMinutes(5));
-                try
+                if (result.FailedSide == "agent")
                 {
-                    agentAttachment = await _agent.Reader.ReadAsync(timeout.Token);
-                    clientAttachment = await _client.Reader.ReadAsync(timeout.Token);
+                    agentAttachment?.Done.TrySetResult();
+                    agentAttachment = null;
+                    while (true)
+                    {
+                        try
+                        {
+                            agentAttachment = await _agent.Reader.ReadAsync(timeout.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            return;
+                        }
+                        agent = agentAttachment.Socket;
+                        AgentRemote = agentAttachment.Remote;
+                        agentEndpoint.Replace(agent);
+                        if (await TrySendControlAsync(agent, $"resume {Id}")) break;
+                        await RelayRoom.CloseQuietlyAsync(agent, ResumeCloseStatus, "retry resume");
+                        agentAttachment.Done.TrySetResult();
+                        agentAttachment = null;
+                    }
                 }
-                catch (OperationCanceledException)
+                else
                 {
-                    return;
+                    clientAttachment?.Done.TrySetResult();
+                    clientAttachment = null;
+                    while (true)
+                    {
+                        try
+                        {
+                            clientAttachment = await _client.Reader.ReadAsync(timeout.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            return;
+                        }
+                        client = clientAttachment.Socket;
+                        ClientRemote = clientAttachment.Remote;
+                        clientEndpoint.Replace(client);
+                        if (await TrySendControlAsync(client, $"resume {Id}")) break;
+                        await RelayRoom.CloseQuietlyAsync(client, ResumeCloseStatus, "retry resume");
+                        clientAttachment.Done.TrySetResult();
+                        clientAttachment = null;
+                    }
                 }
-                agent = agentAttachment.Socket;
-                client = clientAttachment.Socket;
-                if (!await TrySendControlAsync(agent, $"resume {Id}") || !await TrySendControlAsync(client, $"resume {Id}"))
-                {
-                    await Task.WhenAll(
-                        RelayRoom.CloseQuietlyAsync(agent, ResumeCloseStatus, "retry resume"),
-                        RelayRoom.CloseQuietlyAsync(client, ResumeCloseStatus, "retry resume"));
-                    agentAttachment.Done.TrySetResult();
-                    clientAttachment.Done.TrySetResult();
-                    continue;
-                }
-                _log.LogInformation("resumable bridge resumed room={Room} pair={PairId} session={Session} agent={AgentRemote} client={ClientRemote}", Room.Id, pairId, Id, agentAttachment.Remote, clientAttachment.Remote);
+                StartPump("agent_to_client");
+                StartPump("client_to_agent");
+                _log.LogInformation("resumable bridge resumed room={Room} pair={PairId} session={Session} agent={AgentRemote} client={ClientRemote}", Room.Id, pairId, Id, AgentRemote, ClientRemote);
             }
         }
         catch (Exception ex)
@@ -2285,6 +2332,8 @@ sealed class ResumeSession
         }
         finally
         {
+            agentEndpoint.Abort();
+            clientEndpoint.Abort();
             agentAttachment?.Done.TrySetResult();
             clientAttachment?.Done.TrySetResult();
             Room.PairEnded();
@@ -2307,23 +2356,97 @@ sealed class ResumeSession
         _onFinish(this);
     }
 
-    private static async Task<(PumpResult First, PumpResult Second)> BridgeOnceAsync(WebSocket agent, WebSocket client)
-    {
-        using var cts = new CancellationTokenSource();
-        var left = RelayRoom.PumpAsync(agent, client, "agent_to_client", cts.Token);
-        var right = RelayRoom.PumpAsync(client, agent, "client_to_agent", cts.Token);
-        var firstTask = await Task.WhenAny(left, right);
-        var first = await firstTask;
-        cts.Cancel();
-        var second = await (ReferenceEquals(firstTask, left) ? right : left);
-        return (first, second);
-    }
-
-    private static bool IsSessionClose(PumpResult result)
+    private static bool IsSessionClose(ResumePumpResult result)
     {
         return string.Equals(result.End, "close-frame", StringComparison.Ordinal) &&
             result.CloseStatus == WebSocketCloseStatus.NormalClosure &&
             string.Equals(result.CloseReason, "session closed", StringComparison.Ordinal);
+    }
+
+    private static async Task<ResumePumpResult> PumpResumableAsync(WebSocket source, string sourceSide, long sourceGeneration, ResumableSocketEndpoint destination, string direction)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        long bytes = 0;
+        long messages = 0;
+        try
+        {
+            while (true)
+            {
+                WebSocketReceiveResult received;
+                try
+                {
+                    received = await source.ReceiveAsync(buffer, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    return new ResumePumpResult(direction, sourceSide, sourceGeneration, bytes, messages, "error", source.CloseStatus, source.CloseStatusDescription, ex.ToString());
+                }
+                if (received.MessageType == WebSocketMessageType.Close)
+                {
+                    return new ResumePumpResult(direction, sourceSide, sourceGeneration, bytes, messages, "close-frame", received.CloseStatus, received.CloseStatusDescription, null);
+                }
+                if (received.MessageType != WebSocketMessageType.Binary) continue;
+
+                var target = destination.Snapshot();
+                try
+                {
+                    await target.Socket.SendAsync(new ArraySegment<byte>(buffer, 0, received.Count), WebSocketMessageType.Binary, received.EndOfMessage, target.WriteCancellation);
+                }
+                catch (Exception ex)
+                {
+                    var failedSide = sourceSide == "agent" ? "client" : "agent";
+                    return new ResumePumpResult(direction, failedSide, target.Generation, bytes, messages, "error", target.Socket.CloseStatus, target.Socket.CloseStatusDescription, ex.ToString());
+                }
+                bytes += received.Count;
+                messages++;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private sealed class ResumableSocketEndpoint
+    {
+        private readonly object _gate = new();
+        private WebSocket _socket;
+        private long _generation = 1;
+        private CancellationTokenSource _writeCancellation = new();
+
+        public ResumableSocketEndpoint(WebSocket socket) => _socket = socket;
+
+        public long Generation
+        {
+            get { lock (_gate) return _generation; }
+        }
+
+        public (WebSocket Socket, long Generation, CancellationToken WriteCancellation) Snapshot()
+        {
+            lock (_gate) return (_socket, _generation, _writeCancellation.Token);
+        }
+
+        public void Replace(WebSocket socket)
+        {
+            lock (_gate)
+            {
+                _writeCancellation.Cancel();
+                _writeCancellation = new CancellationTokenSource();
+                _socket = socket;
+                _generation++;
+            }
+        }
+
+        public void Abort()
+        {
+            WebSocket socket;
+            lock (_gate)
+            {
+                _writeCancellation.Cancel();
+                socket = _socket;
+            }
+            AbortQuietly(socket);
+        }
     }
 
     private static void AbortQuietly(WebSocket socket)
@@ -2334,25 +2457,6 @@ sealed class ResumeSession
         }
         catch
         {
-        }
-    }
-
-    private static async Task InterruptQuietlyAsync(WebSocket socket)
-    {
-        try
-        {
-            if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
-            {
-                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
-                await socket.CloseOutputAsync(ResumeCloseStatus, "resume transport", timeout.Token);
-            }
-        }
-        catch
-        {
-        }
-        finally
-        {
-            AbortQuietly(socket);
         }
     }
 

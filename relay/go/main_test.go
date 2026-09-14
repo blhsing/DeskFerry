@@ -397,7 +397,7 @@ func TestLegacyClientPairsThroughV2Control(t *testing.T) {
 	expectBinary(t, ctx, agent, "legacy-smb")
 }
 
-func TestResumablePairReattachesAfterWebSocketDrop(t *testing.T) {
+func TestResumablePairReattachesOnlyDroppedSide(t *testing.T) {
 	server := httptest.NewServer(newServer())
 	defer server.Close()
 
@@ -422,29 +422,24 @@ func TestResumablePairReattachesAfterWebSocketDrop(t *testing.T) {
 	// A proxy can report a transport failure as code 1000 without DeskFerry's
 	// logical-close marker. The session must remain available for resumption.
 	_ = home.Close(websocket.StatusNormalClosure, "")
-	if _, _, err := agent.Read(ctx); err == nil {
-		t.Fatal("agent socket remained open after paired client drop")
-	}
 
-	agentHeaders := http.Header{
-		"X-DeskFerry-Session":      []string{sessionID},
-		"X-DeskFerry-Session-Side": []string{"agent"},
-	}
 	clientHeaders := http.Header{
 		"X-DeskFerry-Session":      []string{sessionID},
 		"X-DeskFerry-Session-Side": []string{"client"},
 	}
-	agent = dialRoleHeaders(t, ctx, server.URL, "/relay/unit-resume/ws", resumeRole, agentHeaders)
 	home = dialRoleHeaders(t, ctx, server.URL, "/relay/unit-resume/ws", resumeRole, clientHeaders)
 	defer agent.Close(websocket.StatusNormalClosure, "session closed")
 	defer home.Close(websocket.StatusNormalClosure, "session closed")
-	expectText(t, ctx, agent, resumeMessage+" "+sessionID)
 	expectText(t, ctx, home, resumeMessage+" "+sessionID)
 
 	if err := agent.Write(ctx, websocket.MessageBinary, []byte("after-resume")); err != nil {
 		t.Fatal(err)
 	}
 	expectBinary(t, ctx, home, "after-resume")
+	if err := home.Write(ctx, websocket.MessageBinary, []byte("reverse-after-resume")); err != nil {
+		t.Fatal(err)
+	}
+	expectBinary(t, ctx, agent, "reverse-after-resume")
 	status := getStatus(t, server.URL, "unit-resume")
 	if len(status.Rooms) != 1 || status.Rooms[0].ActivePairs != 1 || status.Rooms[0].TotalPairs != 1 {
 		t.Fatalf("resumed bridge changed pair counts: %+v", status.Rooms)
@@ -558,6 +553,9 @@ func TestResumableStreamsSurviveForcedRelayTransportLoss(t *testing.T) {
 
 	assertStreamTransfer(t, ctx, clientConn, agentConn, bytes.Repeat([]byte{0xa5}, 64*1024+9))
 	_ = clientWS.CloseNow()
+	// A write from the replaced side blocks until that side has reattached,
+	// giving the assertion below a deterministic post-resume boundary.
+	assertStreamTransfer(t, ctx, clientConn, agentConn, []byte("resume-ready"))
 	assertStreamTransfer(t, ctx, agentConn, clientConn, []byte("after-resume"))
 }
 

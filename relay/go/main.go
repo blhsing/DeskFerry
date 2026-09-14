@@ -1755,12 +1755,34 @@ func (s *ResumeSession) run(agent, client tunnel.MessageConn, clientDone chan st
 		log.Printf("resumable bridge closed room=%s pair=%d session=%s agent=%s client=%s duration=%s", s.Room.ID, pairID, s.ID, s.AgentRemote, s.ClientRemote, time.Since(startedAt).Round(time.Millisecond))
 	}()
 
+	agentEndpoint := newResumableEndpoint(agent)
+	clientEndpoint := newResumableEndpoint(client)
+	pumpDone := make(chan pumpResult, 2)
+	running := map[string]bool{}
+	startPump := func(direction string) {
+		if running[direction] {
+			return
+		}
+		running[direction] = true
+		if direction == "agent_to_client" {
+			source, generation, _ := agentEndpoint.Get()
+			go pumpResumable(source, "agent", generation, clientEndpoint, direction, pumpDone)
+		} else {
+			source, generation, _ := clientEndpoint.Get()
+			go pumpResumable(source, "client", generation, agentEndpoint, direction, pumpDone)
+		}
+	}
+	startPump("agent_to_client")
+	startPump("client_to_agent")
+	defer func() {
+		agentEndpoint.Abort()
+		clientEndpoint.Abort()
+	}()
+
 	for {
-		first, second := bridgeSockets(agent, client)
-		// bridgeSockets cancels the opposite pump after the first one ends.
-		// A close observed by that canceled pump did not initiate shutdown and
-		// must not complete an otherwise resumable session.
-		if isSessionClose(first.Err) {
+		result := <-pumpDone
+		running[result.Direction] = false
+		if isSessionClose(result.Err) {
 			closeQuietly(agent, websocket.StatusNormalClosure, "session closed")
 			closeQuietly(client, websocket.StatusNormalClosure, "session closed")
 			if agentAttachment != nil {
@@ -1771,32 +1793,69 @@ func (s *ResumeSession) run(agent, client tunnel.MessageConn, clientDone chan st
 			}
 			return
 		}
-		log.Printf("resumable bridge interrupted room=%s pair=%d session=%s trigger_direction=%s trigger_error=%v other_direction=%s other_error=%v", s.Room.ID, pairID, s.ID, first.Direction, first.Err, second.Direction, second.Err)
-		abortQuietly(agent)
-		abortQuietly(client)
-		if agentAttachment != nil {
-			closeOnce(agentAttachment.Done)
-		}
-		if clientAttachment != nil {
-			closeOnce(clientAttachment.Done)
-		}
-
-		var ok bool
-		agentAttachment, clientAttachment, ok = s.waitForAttachments()
-		if !ok {
+		if result.FailedSide == "" {
+			log.Printf("resumable bridge pump stopped without endpoint failure room=%s pair=%d session=%s direction=%s error=%v", s.Room.ID, pairID, s.ID, result.Direction, result.Err)
 			return
 		}
-		agent = agentAttachment.Conn
-		client = clientAttachment.Conn
-		if !sendControl(agent, s.Room.ID, agentAttachment.Remote, "agent", resumeMessage+" "+s.ID) ||
-			!sendControl(client, s.Room.ID, clientAttachment.Remote, "client", resumeMessage+" "+s.ID) {
-			closeQuietly(agent, websocket.StatusServiceRestart, "retry resume")
-			closeQuietly(client, websocket.StatusServiceRestart, "retry resume")
-			closeOnce(agentAttachment.Done)
-			closeOnce(clientAttachment.Done)
+		failedEndpoint := clientEndpoint
+		if result.FailedSide == "agent" {
+			failedEndpoint = agentEndpoint
+		}
+		if failedEndpoint.Generation() != result.FailedGeneration {
+			// A pump attached to an obsolete socket reported its expected
+			// shutdown after the replacement was already installed.
+			startPump(result.Direction)
 			continue
 		}
-		log.Printf("resumable bridge resumed room=%s pair=%d session=%s agent=%s client=%s", s.Room.ID, pairID, s.ID, agentAttachment.Remote, clientAttachment.Remote)
+		log.Printf("resumable bridge interrupted room=%s pair=%d session=%s failed_side=%s direction=%s error=%v", s.Room.ID, pairID, s.ID, result.FailedSide, result.Direction, result.Err)
+		failedEndpoint.Abort()
+
+		if result.FailedSide == "agent" {
+			if agentAttachment != nil {
+				closeOnce(agentAttachment.Done)
+				agentAttachment = nil
+			}
+			for {
+				var ok bool
+				agentAttachment, ok = s.waitForAttachment(s.agent)
+				if !ok {
+					return
+				}
+				agent = agentAttachment.Conn
+				s.AgentRemote = agentAttachment.Remote
+				agentEndpoint.Replace(agent)
+				if sendControl(agent, s.Room.ID, agentAttachment.Remote, "agent", resumeMessage+" "+s.ID) {
+					break
+				}
+				closeQuietly(agent, websocket.StatusServiceRestart, "retry resume")
+				closeOnce(agentAttachment.Done)
+				agentAttachment = nil
+			}
+		} else {
+			if clientAttachment != nil {
+				closeOnce(clientAttachment.Done)
+				clientAttachment = nil
+			}
+			for {
+				var ok bool
+				clientAttachment, ok = s.waitForAttachment(s.client)
+				if !ok {
+					return
+				}
+				client = clientAttachment.Conn
+				s.ClientRemote = clientAttachment.Remote
+				clientEndpoint.Replace(client)
+				if sendControl(client, s.Room.ID, clientAttachment.Remote, "client", resumeMessage+" "+s.ID) {
+					break
+				}
+				closeQuietly(client, websocket.StatusServiceRestart, "retry resume")
+				closeOnce(clientAttachment.Done)
+				clientAttachment = nil
+			}
+		}
+		startPump("agent_to_client")
+		startPump("client_to_agent")
+		log.Printf("resumable bridge resumed room=%s pair=%d session=%s agent=%s client=%s", s.Room.ID, pairID, s.ID, s.AgentRemote, s.ClientRemote)
 	}
 }
 
@@ -1840,6 +1899,19 @@ func (s *ResumeSession) waitForAttachments() (*ResumeAttachment, *ResumeAttachme
 	return agent, client, true
 }
 
+func (s *ResumeSession) waitForAttachment(queue <-chan *ResumeAttachment) (*ResumeAttachment, bool) {
+	timer := time.NewTimer(5 * time.Minute)
+	defer timer.Stop()
+	select {
+	case attachment := <-queue:
+		return attachment, true
+	case <-timer.C:
+		return nil, false
+	case <-s.done:
+		return nil, false
+	}
+}
+
 func (s *ResumeSession) Finish() {
 	s.once.Do(func() {
 		close(s.done)
@@ -1847,17 +1919,6 @@ func (s *ResumeSession) Finish() {
 			s.onFinish(s)
 		}
 	})
-}
-
-func bridgeSockets(agent, client tunnel.MessageConn) (pumpResult, pumpResult) {
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan pumpResult, 2)
-	go pumpBinary(ctx, agent, client, "agent_to_client", done)
-	go pumpBinary(ctx, client, agent, "client_to_agent", done)
-	first := <-done
-	cancel()
-	second := <-done
-	return first, second
 }
 
 type DashboardClient struct {
@@ -1928,10 +1989,12 @@ func cleanSessionValue(value string) string {
 }
 
 type pumpResult struct {
-	Direction string
-	Bytes     int64
-	Messages  int64
-	Err       error
+	Direction        string
+	FailedSide       string
+	FailedGeneration uint64
+	Bytes            int64
+	Messages         int64
+	Err              error
 }
 
 func pumpBinary(ctx context.Context, source, destination tunnel.MessageConn, direction string, done chan<- pumpResult) {
@@ -1948,6 +2011,81 @@ func pumpBinary(ctx context.Context, source, destination tunnel.MessageConn, dir
 		}
 		if err := destination.Write(ctx, websocket.MessageBinary, payload); err != nil {
 			result.Err = fmt.Errorf("write: %w", err)
+			return
+		}
+		result.Bytes += int64(len(payload))
+		result.Messages++
+	}
+}
+
+type resumableEndpoint struct {
+	mu          sync.RWMutex
+	conn        tunnel.MessageConn
+	generation  uint64
+	writeCtx    context.Context
+	cancelWrite context.CancelFunc
+}
+
+func newResumableEndpoint(conn tunnel.MessageConn) *resumableEndpoint {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &resumableEndpoint{conn: conn, generation: 1, writeCtx: ctx, cancelWrite: cancel}
+}
+
+func (e *resumableEndpoint) Get() (tunnel.MessageConn, uint64, context.Context) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.conn, e.generation, e.writeCtx
+}
+
+func (e *resumableEndpoint) Generation() uint64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.generation
+}
+
+func (e *resumableEndpoint) Replace(conn tunnel.MessageConn) {
+	e.mu.Lock()
+	e.cancelWrite()
+	ctx, cancel := context.WithCancel(context.Background())
+	e.conn = conn
+	e.generation++
+	e.writeCtx = ctx
+	e.cancelWrite = cancel
+	e.mu.Unlock()
+}
+
+func (e *resumableEndpoint) Abort() {
+	conn, _, _ := e.Get()
+	e.mu.Lock()
+	e.cancelWrite()
+	e.mu.Unlock()
+	abortQuietly(conn)
+}
+
+func pumpResumable(source tunnel.MessageConn, sourceSide string, sourceGeneration uint64, destination *resumableEndpoint, direction string, done chan<- pumpResult) {
+	result := pumpResult{Direction: direction}
+	defer func() { done <- result }()
+	ctx := context.Background()
+	for {
+		typ, payload, err := source.Read(ctx)
+		if err != nil {
+			result.Err = fmt.Errorf("read: %w", err)
+			result.FailedSide = sourceSide
+			result.FailedGeneration = sourceGeneration
+			return
+		}
+		if typ != websocket.MessageBinary {
+			continue
+		}
+		destinationConn, destinationGeneration, writeCtx := destination.Get()
+		if err := destinationConn.Write(writeCtx, websocket.MessageBinary, payload); err != nil {
+			result.Err = fmt.Errorf("write: %w", err)
+			if sourceSide == "agent" {
+				result.FailedSide = "client"
+			} else {
+				result.FailedSide = "agent"
+			}
+			result.FailedGeneration = destinationGeneration
 			return
 		}
 		result.Bytes += int64(len(payload))
