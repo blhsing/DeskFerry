@@ -982,11 +982,41 @@ func (c *HTTPStreamConn) serveUpload(w http.ResponseWriter, r *http.Request) {
 		if !current {
 			return
 		}
+		if frame.kind == httpStreamRecordAck {
+			reset, err := c.resetLostSendSequence(frame.seq)
+			if err != nil {
+				c.closeTerminal(err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if reset {
+				go c.Close(websocket.StatusTryAgainLater, "HTTP stream state lost; reconnect")
+				http.Error(w, "HTTP stream state lost; reconnect", http.StatusConflict)
+				return
+			}
+		}
 		if err := c.applyRecord(frame); err != nil {
 			c.closeTerminal(err)
 			return
 		}
 	}
+}
+
+func (c *HTTPStreamConn) resetLostSendSequence(acknowledged uint64) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if acknowledged < c.nextSend {
+		return false, nil
+	}
+	if acknowledged == ^uint64(0) {
+		return false, errors.New("HTTP stream acknowledgement overflow")
+	}
+	c.sendFrames = nil
+	c.sendBytes = 0
+	c.nextSend = acknowledged + 1
+	c.cond.Broadcast()
+	c.signalLocked()
+	return true, nil
 }
 
 func (c *HTTPStreamConn) serveDownload(w http.ResponseWriter, r *http.Request) {

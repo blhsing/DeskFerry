@@ -19,6 +19,43 @@ import (
 	"nhooyr.io/websocket"
 )
 
+func TestHTTPStreamServerRestartClosesAtClientExpectedSequence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := newHTTPStreamConn(ctx)
+	reset, err := stream.resetLostSendSequence(9)
+	if err != nil || !reset {
+		t.Fatalf("reset = %t, error = %v", reset, err)
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = stream.Close(websocket.StatusTryAgainLater, "HTTP stream state lost; reconnect")
+		close(done)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	var closeFrame httpStreamFrame
+	for time.Now().Before(deadline) {
+		frames, _ := stream.snapshotAfter(0)
+		if len(frames) > 0 {
+			closeFrame = frames[0]
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if closeFrame.kind != httpStreamRecordClose || closeFrame.seq != 10 {
+		t.Fatalf("close frame = kind %d sequence %d, want close at 10", closeFrame.kind, closeFrame.seq)
+	}
+	if err := stream.applyRecord(httpStreamFrame{kind: httpStreamRecordAck, seq: 10}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("graceful close did not finish after acknowledgement")
+	}
+}
+
 func TestHTTPStreamForwardProxyUsesIntegratedAuthentication(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

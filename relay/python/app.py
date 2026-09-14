@@ -19,7 +19,7 @@ from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.12.1"
+RELAY_VERSION = "0.12.3"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -142,23 +142,32 @@ class HTTPStreamWebSocket:
                     return
             await asyncio.sleep(0.01)
 
-    async def apply(self, frame: HTTPStreamFrame) -> None:
+    async def apply(self, frame: HTTPStreamFrame) -> bool:
         async with self.lock:
             self.last_activity = time.monotonic()
             if frame.kind == HTTP_STREAM_ACK:
                 if frame.sequence >= self.next_send:
-                    raise ValueError("HTTP stream acknowledgement exceeds sent sequence")
+                    # A process restart can recreate a transport ID with fresh
+                    # counters while its client keeps retrying an older upload.
+                    # Put the reconnect close at the sequence the client expects.
+                    if frame.sequence == (1 << 64) - 1:
+                        raise ValueError("HTTP stream acknowledgement overflow")
+                    self.outgoing.clear()
+                    self.outgoing_bytes = 0
+                    self.next_send = frame.sequence + 1
+                    return True
                 while self.outgoing and self.outgoing[0].sequence <= frame.sequence:
                     self.outgoing_bytes -= len(self.outgoing.pop(0).payload)
-                return
+                return False
             if frame.sequence < self.next_receive:
                 self.changed.set()
-                return
+                return False
             if frame.sequence != self.next_receive or frame.kind not in {HTTP_STREAM_TEXT, HTTP_STREAM_BINARY, HTTP_STREAM_CLOSE}:
                 raise ValueError("invalid HTTP stream sequence or record type")
             self.next_receive += 1
             self.incoming.put_nowait(frame)
             self.changed.set()
+            return False
 
     async def snapshot(self, last_sequence: int) -> tuple[list[HTTPStreamFrame], int]:
         async with self.lock:
@@ -187,7 +196,9 @@ class HTTPStreamWebSocket:
                         break
                     payload = bytes(buffered[HTTP_STREAM_HEADER:total])
                     del buffered[:total]
-                    await self.apply(HTTPStreamFrame(kind, sequence, payload))
+                    if await self.apply(HTTPStreamFrame(kind, sequence, payload)):
+                        await self.close(1013, "HTTP stream state lost; reconnect")
+                        return Response(status_code=409)
         except (asyncio.CancelledError, ClientDisconnect, ConnectionError):
             pass
         return Response(status_code=204)
@@ -420,6 +431,8 @@ class PumpResult:
     close_code: Any = None
     close_reason: str | None = None
     error: str | None = None
+    failed_side: str | None = None
+    failed_generation: int = 0
 
 
 async def pump_binary(source: WebSocket, destination: WebSocket, direction: str) -> PumpResult:
@@ -450,6 +463,107 @@ async def pump_binary(source: WebSocket, destination: WebSocket, direction: str)
         result.end = "error"
         result.error = repr(exc)
         return result
+
+
+class ResumableEndpoint:
+    def __init__(self, websocket: WebSocket) -> None:
+        self.websocket: WebSocket | None = websocket
+        self.generation = 1
+        self.changed = asyncio.Event()
+        self.ready = asyncio.Event()
+        self.ready.set()
+
+    def snapshot(self) -> tuple[WebSocket | None, int, asyncio.Event]:
+        return self.websocket, self.generation, self.changed
+
+    def invalidate(self) -> WebSocket | None:
+        websocket = self.websocket
+        self.websocket = None
+        self.generation += 1
+        self.changed.set()
+        self.ready.clear()
+        return websocket
+
+    def replace(self, websocket: WebSocket) -> None:
+        self.websocket = websocket
+        self.changed = asyncio.Event()
+        self.ready.set()
+
+
+async def pump_resumable(
+    source: WebSocket,
+    source_side: str,
+    source_generation: int,
+    destination: ResumableEndpoint,
+    direction: str,
+) -> PumpResult:
+    result = PumpResult(direction)
+    while True:
+        try:
+            message = await source.receive()
+        except asyncio.CancelledError:
+            raise
+        except WebSocketDisconnect as exc:
+            result.end = "disconnect"
+            result.close_code = getattr(exc, "code", None)
+            result.close_reason = getattr(exc, "reason", None)
+            result.failed_side = source_side
+            result.failed_generation = source_generation
+            return result
+        except Exception as exc:
+            result.end = "error"
+            result.error = repr(exc)
+            result.failed_side = source_side
+            result.failed_generation = source_generation
+            return result
+
+        if message["type"] == "websocket.disconnect":
+            result.end = "close-frame"
+            result.close_code = message.get("code")
+            result.close_reason = message.get("reason")
+            result.failed_side = source_side
+            result.failed_generation = source_generation
+            return result
+        payload = message.get("bytes")
+        if payload is None:
+            continue
+
+        while True:
+            target, target_generation, changed = destination.snapshot()
+            if target is None:
+                await destination.ready.wait()
+                continue
+            send_task = asyncio.create_task(target.send_bytes(payload))
+            changed_task = asyncio.create_task(changed.wait())
+            done, _ = await asyncio.wait({send_task, changed_task}, return_when=asyncio.FIRST_COMPLETED)
+            if changed_task in done and send_task not in done:
+                send_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await send_task
+                continue
+            changed_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await changed_task
+            try:
+                await send_task
+            except asyncio.CancelledError:
+                raise
+            except WebSocketDisconnect as exc:
+                result.end = "disconnect"
+                result.close_code = getattr(exc, "code", None)
+                result.close_reason = getattr(exc, "reason", None)
+                result.failed_side = "client" if source_side == "agent" else "agent"
+                result.failed_generation = target_generation
+                return result
+            except Exception as exc:
+                result.end = "error"
+                result.error = repr(exc)
+                result.failed_side = "client" if source_side == "agent" else "agent"
+                result.failed_generation = target_generation
+                return result
+            break
+        result.byte_count += len(payload)
+        result.messages += 1
 
 
 async def send_start(websocket: WebSocket, side: str, room: str, remote: str) -> bool:
@@ -862,14 +976,35 @@ class ResumeSession:
         started_at = time.monotonic()
         pair_id = await self.room.pair_started(self.client_remote)
         state_changed()
+        agent_endpoint = ResumableEndpoint(agent)
+        client_endpoint = ResumableEndpoint(client)
+        pumps: dict[str, asyncio.Task[PumpResult]] = {}
+
+        def start_pump(direction: str) -> None:
+            if direction in pumps:
+                return
+            if direction == "agent_to_client":
+                source, generation, _ = agent_endpoint.snapshot()
+                destination = client_endpoint
+                source_side = "agent"
+            else:
+                source, generation, _ = client_endpoint.snapshot()
+                destination = agent_endpoint
+                source_side = "client"
+            if source is not None:
+                pumps[direction] = asyncio.create_task(
+                    pump_resumable(source, source_side, generation, destination, direction)
+                )
+
+        start_pump("agent_to_client")
+        start_pump("client_to_agent")
         try:
             while True:
-                first, second = await bridge_once(agent, client)
-                # bridge_once cancels the opposite pump after the first one
-                # ends. A close observed by that canceled pump did not
-                # initiate shutdown and must not complete an otherwise
-                # resumable session.
-                if is_session_close(first):
+                done, _ = await asyncio.wait(set(pumps.values()), return_when=asyncio.FIRST_COMPLETED)
+                completed = next(iter(done))
+                result = await completed
+                pumps.pop(result.direction, None)
+                if is_session_close(result):
                     await close_quietly(agent, 1000, "session closed")
                     await close_quietly(client, 1000, "session closed")
                     if agent_attachment is not None:
@@ -877,33 +1012,70 @@ class ResumeSession:
                     if client_attachment is not None:
                         try_set_result(client_attachment.done, None)
                     return
-
-                logger.info(
-                    "resumable bridge interrupted room=%s pair=%s session=%s trigger_direction=%s trigger_end=%s trigger_close_code=%s trigger_close_reason=%r trigger_error=%r other_direction=%s other_end=%s other_close_code=%s other_close_reason=%r other_error=%r",
-                    self.room.id, pair_id, self.id, first.direction, first.end, first.close_code, first.close_reason, first.error, second.direction, second.end, second.close_code, second.close_reason, second.error,
-                )
-                await close_quietly(agent, 1012, "resume session")
-                await close_quietly(client, 1012, "resume session")
-                if agent_attachment is not None:
-                    try_set_result(agent_attachment.done, None)
-                if client_attachment is not None:
-                    try_set_result(client_attachment.done, None)
-                try:
-                    agent_attachment, client_attachment = await asyncio.wait_for(
-                        asyncio.gather(self._agent.get(), self._client.get()), timeout=300
+                if result.failed_side not in {"agent", "client"}:
+                    logger.warning(
+                        "resumable bridge pump stopped without endpoint failure room=%s pair=%s session=%s direction=%s error=%r",
+                        self.room.id, pair_id, self.id, result.direction, result.error,
                     )
-                except (asyncio.TimeoutError, asyncio.CancelledError):
                     return
-                agent = agent_attachment.websocket
-                client = client_attachment.websocket
-                if not await send_control(agent, f"resume {self.id}", "agent", self.room.id, agent_attachment.remote) or not await send_control(client, f"resume {self.id}", "client", self.room.id, client_attachment.remote):
-                    await close_quietly(agent, 1012, "retry resume")
-                    await close_quietly(client, 1012, "retry resume")
-                    try_set_result(agent_attachment.done, None)
-                    try_set_result(client_attachment.done, None)
+                failed_endpoint = agent_endpoint if result.failed_side == "agent" else client_endpoint
+                if failed_endpoint.generation != result.failed_generation:
+                    start_pump(result.direction)
                     continue
-                logger.info("resumable bridge resumed room=%s pair=%s session=%s agent=%s client=%s", self.room.id, pair_id, self.id, agent_attachment.remote, client_attachment.remote)
+                logger.info(
+                    "resumable bridge interrupted room=%s pair=%s session=%s failed_side=%s direction=%s end=%s close_code=%s close_reason=%r error=%r",
+                    self.room.id, pair_id, self.id, result.failed_side, result.direction, result.end, result.close_code, result.close_reason, result.error,
+                )
+                failed_socket = failed_endpoint.invalidate()
+                if failed_socket is not None:
+                    await close_quietly(failed_socket, 1012, "resume session")
+
+                if result.failed_side == "agent":
+                    if agent_attachment is not None:
+                        try_set_result(agent_attachment.done, None)
+                        agent_attachment = None
+                    while True:
+                        try:
+                            agent_attachment = await asyncio.wait_for(self._agent.get(), timeout=300)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            return
+                        agent = agent_attachment.websocket
+                        self.agent_remote = agent_attachment.remote
+                        agent_endpoint.replace(agent)
+                        if await send_control(agent, f"resume {self.id}", "agent", self.room.id, agent_attachment.remote):
+                            break
+                        await close_quietly(agent, 1012, "retry resume")
+                        try_set_result(agent_attachment.done, None)
+                        agent_attachment = None
+                else:
+                    if client_attachment is not None:
+                        try_set_result(client_attachment.done, None)
+                        client_attachment = None
+                    while True:
+                        try:
+                            client_attachment = await asyncio.wait_for(self._client.get(), timeout=300)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            return
+                        client = client_attachment.websocket
+                        self.client_remote = client_attachment.remote
+                        client_endpoint.replace(client)
+                        if await send_control(client, f"resume {self.id}", "client", self.room.id, client_attachment.remote):
+                            break
+                        await close_quietly(client, 1012, "retry resume")
+                        try_set_result(client_attachment.done, None)
+                        client_attachment = None
+                start_pump("agent_to_client")
+                start_pump("client_to_agent")
+                logger.info("resumable bridge resumed room=%s pair=%s session=%s agent=%s client=%s", self.room.id, pair_id, self.id, self.agent_remote, self.client_remote)
         finally:
+            for task in pumps.values():
+                task.cancel()
+            if pumps:
+                await asyncio.gather(*pumps.values(), return_exceptions=True)
+            for endpoint in (agent_endpoint, client_endpoint):
+                socket = endpoint.invalidate()
+                if socket is not None:
+                    await close_quietly(socket)
             if agent_attachment is not None:
                 try_set_result(agent_attachment.done, None)
             if client_attachment is not None:
@@ -924,19 +1096,6 @@ class ResumeSession:
 
 def is_session_close(result: PumpResult) -> bool:
     return result.end == "close-frame" and result.close_code == 1000 and result.close_reason == "session closed"
-
-
-async def bridge_once(agent: WebSocket, client: WebSocket) -> tuple[PumpResult, PumpResult]:
-    left = asyncio.create_task(pump_binary(agent, client, "agent_to_client"))
-    right = asyncio.create_task(pump_binary(client, agent, "client_to_agent"))
-    done, _ = await asyncio.wait({left, right}, return_when=asyncio.FIRST_COMPLETED)
-    first_task = next(iter(done))
-    first = await first_task
-    second_task = right if first_task is left else left
-    if not second_task.done():
-        second_task.cancel()
-    second = await second_task
-    return first, second
 
 
 @dataclass
@@ -971,6 +1130,10 @@ class AgentControl:
     async def send(self, message: dict[str, Any]) -> bool:
         async with self.send_lock:
             return not self.closed and await send_v2(self.websocket, message)
+
+    async def abort(self, reason: str) -> None:
+        self.closed = True
+        await close_quietly(self.websocket, 1012, reason)
 
 
 @dataclass
@@ -1125,6 +1288,11 @@ class RelayHub:
             try:
                 response = await asyncio.wait_for(asyncio.shield(pending.response), SESSION_OFFER_SECONDS)
             except asyncio.TimeoutError:
+                logger.warning(
+                    "retiring unresponsive agent control room=%s agent=%s session=%s agent_data_connected=%s",
+                    room.id, control.agent_id, pending.id, pending.agent.done(),
+                )
+                await control.abort("unanswered session offer")
                 await room.record_rejection("timeout")
                 await self._reject_session_client(websocket, typed, "timeout", pending.id, "work agent did not answer the offer")
                 return
@@ -1307,6 +1475,7 @@ class RelayHub:
         side = (side or "").strip().lower()
         room_key = room_id(token)
         if not session_id or side not in {"agent", "client"}:
+            logger.info("resume rejected room=%s session=%s side=%s remote=%s", room_key, session_id, side, remote)
             await close_quietly(websocket, 1008, "unknown resumable session")
             return
         key = f"{room_key}/{session_id}"
@@ -1348,9 +1517,13 @@ class RelayHub:
                 logger.info("reconstructed resumable session room=%s session=%s service=%s first_side=%s remote=%s", room_key, session_id, service, side, remote)
                 asyncio.create_task(self._run_recovered_session(session))
         if session.service != service or not hmac.compare_digest(session.room_proof, proof):
+            logger.info("resume rejected room=%s session=%s side=%s remote=%s", room_key, session_id, side, remote)
             await close_quietly(websocket, 1008, "unknown resumable session")
             return
-        if not await session.attach(side, websocket, remote):
+        logger.info("resume attachment waiting room=%s session=%s side=%s remote=%s", room_key, session_id, side, remote)
+        attached = await session.attach(side, websocket, remote)
+        logger.info("resume attachment released room=%s session=%s side=%s remote=%s attached=%s", room_key, session_id, side, remote, attached)
+        if not attached:
             await close_quietly(websocket, 1013, "resumable session unavailable")
 
     async def _run_recovered_session(self, session: ResumeSession) -> None:

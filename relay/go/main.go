@@ -560,6 +560,13 @@ func (a *AgentControl) Close(reason string) {
 	}
 }
 
+func (a *AgentControl) Abort() {
+	if a.closed.CompareAndSwap(false, true) {
+		close(a.Done)
+		_ = a.Conn.CloseNow()
+	}
+}
+
 type AgentDataSocket struct {
 	Conn      tunnel.MessageConn
 	Remote    string
@@ -729,6 +736,8 @@ func (h *RelayHub) serveOnDemandClient(ctx context.Context, room *RelayRoom, c t
 	select {
 	case response = <-pending.Response:
 	case <-timer.C:
+		log.Printf("retiring unresponsive agent control room=%s agent=%s session=%s agent_data_connected=%t", room.ID, control.AgentID, pending.ID, len(pending.Agent) > 0)
+		control.Abort()
 		room.RecordRejection(tunnel.MessageTimeout)
 		rejectSessionClient(c, typed, tunnel.MessageTimeout, pending.ID, "work agent did not answer the offer")
 		return

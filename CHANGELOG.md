@@ -3,6 +3,8 @@
 ## 0.12.3 - 2026-09-08
 
 - Preserve the unaffected half of a resumable relay bridge when only the Work or Home transport drops, allowing that endpoint alone to reattach without exposing a relay-generated EOF to the still-connected RDP client.
+- Bring the Python relay to the same one-sided resume behavior and diagnostic attachment logging, and make the Go and Python HTTP-stream servers recover stale client sequence state after a relay restart instead of repeatedly rejecting the upload.
+- Retire unresponsive protocol-v2 Work control connections after an unanswered offer in the Go and Python relays, matching the Azure relay while leaving their separate active data sessions untouched.
 - Show the actual connected RDP relay prominently in Windows Home, separately from connections still establishing. Combine status from all configured relays and recognize idle protocol-v2 work controls.
 - Retire an Azure work control connection after an unanswered session offer so later attempts can use a fresh control channel, without deliberately terminating separate active data sessions.
 - Recover HTTP-stream clients whose sequence state outlives an Azure restart: deliver an explicit reconnect close at the client's expected sequence instead of repeatedly failing uploads with HTTP 500.

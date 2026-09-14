@@ -9,6 +9,7 @@ from app import (
     AgentIdentity,
     HTTP_STREAM_ACK,
     HTTP_STREAM_BINARY,
+    HTTP_STREAM_CLOSE,
     HTTP_STREAM_TEXT,
     HTTPStreamFrame,
     HTTPStreamWebSocket,
@@ -124,6 +125,27 @@ def test_http_stream_sequence_ack_and_duplicate_suppression():
     asyncio.run(scenario())
 
 
+def test_http_stream_restart_closes_at_client_expected_sequence():
+    async def scenario():
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/relay/unit/stream/id/down",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 12345),
+            "server": ("127.0.0.1", 80),
+            "scheme": "http",
+        })
+        stream = HTTPStreamWebSocket(request, "s" * 32)
+        assert await stream.apply(HTTPStreamFrame(HTTP_STREAM_ACK, 9)) is True
+        await stream.close(1013, "HTTP stream state lost; reconnect")
+        frames, _ = await stream.snapshot(0)
+        assert [(frame.kind, frame.sequence) for frame in frames] == [(HTTP_STREAM_CLOSE, 10)]
+
+    asyncio.run(scenario())
+
+
 def test_home_agent_status_presence():
     client = TestClient(app)
     headers = {"X-DeskFerry-Role": "home-agent"}
@@ -177,7 +199,7 @@ def test_agent_client_pair_and_bridge_bytes():
             assert status["rooms"][0]["total_pairs"] == 1
 
 
-def test_resumable_pair_reattaches_after_websocket_drop():
+def test_resumable_pair_reattaches_only_dropped_side():
     from app import RelayRoom, ResumeSession
 
     async def scenario():
@@ -199,27 +221,31 @@ def test_resumable_pair_reattaches_after_websocket_drop():
         # Some proxies terminate a transport with a normal close code but no
         # DeskFerry logical-close marker. The logical session must still resume.
         await home._received.put({"type": "websocket.disconnect", "code": 1000, "reason": ""})
-        resumed_agent = FakeWebSocket()
         resumed_home = FakeWebSocket()
-        agent_attach = asyncio.create_task(session.attach("agent", resumed_agent, "work-2"))
         home_attach = asyncio.create_task(session.attach("client", resumed_home, "home-2"))
         for _ in range(50):
-            if resumed_agent.text_messages and resumed_home.text_messages:
+            if resumed_home.text_messages:
                 break
             await asyncio.sleep(0.01)
-        assert resumed_agent.text_messages == ["resume " + session.id]
         assert resumed_home.text_messages == ["resume " + session.id]
 
-        await resumed_agent._received.put({"type": "websocket.receive", "bytes": b"after-resume"})
+        await agent._received.put({"type": "websocket.receive", "bytes": b"after-resume"})
         for _ in range(50):
             if resumed_home.byte_messages:
                 break
             await asyncio.sleep(0.01)
         assert resumed_home.byte_messages == [b"after-resume"]
 
+        await resumed_home._received.put({"type": "websocket.receive", "bytes": b"reverse-after-resume"})
+        for _ in range(50):
+            if agent.byte_messages[-1:] == [b"reverse-after-resume"]:
+                break
+            await asyncio.sleep(0.01)
+        assert agent.byte_messages[-1:] == [b"reverse-after-resume"]
+
         await resumed_home._received.put({"type": "websocket.disconnect", "code": 1000, "reason": "session closed"})
         await asyncio.wait_for(session_task, timeout=2)
-        await asyncio.gather(agent_attach, home_attach)
+        await home_attach
         status = await room.snapshot()
         assert status["active_pairs"] == 0
         assert status["total_pairs"] == 1
