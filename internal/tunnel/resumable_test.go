@@ -2,9 +2,12 @@ package tunnel
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,9 +15,62 @@ import (
 	"nhooyr.io/websocket"
 )
 
+func TestResumableAckStallDiagnostics(t *testing.T) {
+	var lines []string
+	c := &resumableWebSocketConn{
+		opts: ResumableWebSocketOptions{
+			SessionID: "test-session", Side: "client", Service: ServiceRDP,
+			RelayAddr: "https://example.invalid/relay/b",
+			Logf:      func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) },
+		},
+		ws: &HTTPStreamConn{}, generation: 1,
+		sendBuffer: []byte("hello"), sendEnd: 5,
+	}
+	c.cond = sync.NewCond(&c.mu)
+	now := time.Now().Add(-4 * time.Second)
+	c.lastAckProgress = now
+	c.checkAckProgress(now.Add(ackStallThreshold - time.Millisecond))
+	if len(lines) != 0 {
+		t.Fatalf("premature diagnostics: %v", lines)
+	}
+	c.checkAckProgress(now.Add(ackStallThreshold))
+	c.checkAckProgress(now.Add(ackStallThreshold + time.Second))
+	if len(lines) != 1 || !strings.Contains(lines[0], "acknowledgements stalled") || !strings.Contains(lines[0], "pending_bytes=5") {
+		t.Fatalf("stall should be logged once: %v", lines)
+	}
+	if !c.applyAck(5) {
+		t.Fatal("valid acknowledgement rejected")
+	}
+	if len(lines) != 2 || !strings.Contains(lines[1], "acknowledgement progress resumed") || !strings.Contains(lines[1], "pending_bytes=0") {
+		t.Fatalf("recovery diagnostic missing: %v", lines)
+	}
+	c.checkAckProgress(now.Add(10 * time.Second))
+	if len(lines) != 2 {
+		t.Fatalf("idle stream should not log a stall: %v", lines)
+	}
+}
+
+func TestResumableDiagnosticsRedactSecrets(t *testing.T) {
+	var line string
+	c := &resumableWebSocketConn{opts: ResumableWebSocketOptions{
+		SessionID: "test-session", Side: "client", Service: ServiceRDP,
+		RelayAddr: "https://example.invalid/relay/b", Token: "token-secret", RoomProof: "proof-secret",
+		Proxy: "http://user:pass@proxy.invalid:3128",
+		Logf:  func(format string, args ...any) { line = fmt.Sprintf(format, args...) },
+	}}
+	c.diagnostic("dial failed token=%s proof=%s proxy=%s", c.opts.Token, c.opts.RoomProof, c.opts.Proxy)
+	if strings.Contains(line, "token-secret") || strings.Contains(line, "proof-secret") || strings.Contains(line, "user:pass") {
+		t.Fatalf("diagnostic leaked a secret: %s", line)
+	}
+	if !strings.Contains(line, "[redacted]") || !strings.Contains(line, "proxy.invalid:3128") {
+		t.Fatalf("diagnostic removed too much context: %s", line)
+	}
+}
+
 func TestResumableWebSocketConnReplaysUnacknowledgedData(t *testing.T) {
 	const sessionID = "0123456789abcdef0123456789abcdef"
 	serverErrors := make(chan error, 2)
+	diagnostics := make(chan string, 100)
 	var connections atomic.Int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -110,6 +166,7 @@ func TestResumableWebSocketConnReplaysUnacknowledgedData(t *testing.T) {
 		Proxy:     "direct",
 		SessionID: sessionID,
 		Side:      "client",
+		Logf:      func(format string, args ...any) { diagnostics <- fmt.Sprintf(format, args...) },
 	})
 	if _, err := conn.Write([]byte("hello")); err != nil {
 		t.Fatal(err)
@@ -123,6 +180,15 @@ func TestResumableWebSocketConnReplaysUnacknowledgedData(t *testing.T) {
 	}
 	if err := conn.Close(); err != nil {
 		t.Fatal(err)
+	}
+	var lost, resumed bool
+	for len(diagnostics) > 0 {
+		line := <-diagnostics
+		lost = lost || strings.Contains(line, "transport lost generation=1")
+		resumed = resumed || strings.Contains(line, "transport resumed generation=2")
+	}
+	if !lost || !resumed {
+		t.Fatalf("missing transport recovery diagnostics: lost=%t resumed=%t", lost, resumed)
 	}
 
 	select {

@@ -917,7 +917,7 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 	cancel()
 	stream := net.Conn(tunnel.MessageNetConn(parent, ws))
 	if offer.Resumable {
-		stream = tunnel.NewResumableWebSocketConn(parent, ws, tunnel.ResumableWebSocketOptions{RelayAddr: cfg.RelayAddr, Proxy: cfg.Proxy, SessionID: offer.SessionID, Side: "agent", RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword), Service: target.Service, Heartbeat: ready.Heartbeat})
+		stream = tunnel.NewResumableWebSocketConn(parent, ws, tunnel.ResumableWebSocketOptions{RelayAddr: cfg.RelayAddr, Proxy: cfg.Proxy, SessionID: offer.SessionID, Side: "agent", RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword), Service: target.Service, Heartbeat: ready.Heartbeat, Logf: log.Printf})
 	}
 	log.Printf("session ready relay=%s session=%s service=%s target=%s heartbeat=%t setup_duration=%s", cfg.RelayAddr, offer.SessionID, target.Service, target.Address, ready.Heartbeat, time.Since(started).Round(time.Millisecond))
 	pipeStream := stream
@@ -1000,6 +1000,7 @@ func runWebSocketOnce(ctx context.Context, cfg config, slot int, agentID string,
 			Side:      "agent",
 			RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword),
 			Service:   target.Service,
+			Logf:      log.Printf,
 		})
 	}
 	handleStream(ctx, stream, target, cfg.RelayAddr, slot)

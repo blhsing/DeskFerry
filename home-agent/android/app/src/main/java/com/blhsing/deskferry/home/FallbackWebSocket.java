@@ -50,6 +50,10 @@ final class FallbackWebSocket implements WebSocket {
     private volatile boolean fallbackStarted;
     private volatile boolean canceled;
 
+    String protocol() {
+        return fallbackStarted ? "http-stream" : "websocket";
+    }
+
     FallbackWebSocket(OkHttpClient client, Request request, WebSocketListener listener) {
         this.client = client;
         this.request = request;

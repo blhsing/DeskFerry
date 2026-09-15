@@ -473,6 +473,7 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 						RoomProof: roomProof(cfg, relayAddr),
 						Service:   service,
 						Heartbeat: ready.Heartbeat,
+						Logf:      log.Printf,
 					}), relayAddr, nil
 				}
 				return tunnel.MessageNetConn(ctx, ws), relayAddr, nil

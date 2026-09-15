@@ -79,6 +79,7 @@ public class TunnelService extends Service {
     private static final int RESUMABLE_CHUNK_SIZE = 64 * 1024;
     private static final long RESUMABLE_WINDOW_MS = 5L * 60L * 1000L;
     private static final long HEARTBEAT_INTERVAL_MS = 5L * 1000L;
+    private static final long DIAGNOSTIC_STALL_MS = 3L * 1000L;
     private static final long HEARTBEAT_TIMEOUT_MS = 15L * 1000L;
     private static final long RESUME_ATTEMPT_TIMEOUT_MS = 20L * 1000L;
     private static final int MAX_CONCURRENT_BRIDGES_PER_SERVICE = 2;
@@ -1037,6 +1038,10 @@ public class TunnelService extends Service {
 		private long transportGeneration;
 		private long heartbeatNonce;
 		private long heartbeatAcknowledged;
+		private long lastAckProgressMs;
+		private boolean ackStallLogged;
+		private long ackStallAtMs;
+		private long lastTransportLostMs;
 
 		BridgeSession(Socket localSocket, String service) {
             this.localSocket = localSocket;
@@ -1044,7 +1049,32 @@ public class TunnelService extends Service {
 			this.serviceLabel = this.service.toUpperCase(Locale.ROOT);
 			this.permits = "smb".equals(this.service) ? smbBridgePermits : rdpBridgePermits;
 			startLocalWriter();
+			startAckMonitor();
         }
+
+		private void startAckMonitor() {
+			new Thread(() -> {
+				while (!closed.get()) {
+					sleepQuietly(1000);
+					long now = SystemClock.elapsedRealtime();
+					long pending;
+					long generation;
+					long noProgress;
+					synchronized (resumeLock) {
+						pending = sendEnd - sendBase;
+						noProgress = now - lastAckProgressMs;
+						if (pending == 0 || webSocket == null || noProgress < DIAGNOSTIC_STALL_MS || ackStallLogged) {
+							continue;
+						}
+						ackStallLogged = true;
+						ackStallAtMs = now;
+						generation = transportGeneration;
+					}
+					append(serviceLabel + " relay acknowledgements stalled session=" + sessionId + " relay=" + selectedRelay
+							+ " generation=" + generation + " pending_bytes=" + pending + " no_progress_ms=" + noProgress + ".");
+				}
+			}, "DeskFerry-" + serviceLabel + "-AckMonitor").start();
+		}
 
 		private final class ReceivedChunk {
 			final long offset;
@@ -1349,6 +1379,8 @@ public class TunnelService extends Service {
 
         private boolean attachTransport(WebSocket socket) {
 			long generation;
+			int replayBytes;
+			long lostDurationMs;
 			long acknowledgedOffset;
 			synchronized (receiveLock) {
 				acknowledgedOffset = receiveOffset;
@@ -1357,8 +1389,10 @@ public class TunnelService extends Service {
                 if (closed.get()) {
                     return false;
                 }
-                webSocket = socket;
+				webSocket = socket;
 				generation = ++transportGeneration;
+				replayBytes = sendBuffer.length;
+				lostDurationMs = lastTransportLostMs == 0 ? 0 : SystemClock.elapsedRealtime() - lastTransportLostMs;
                 if (!socket.send(frame((byte) 2, acknowledgedOffset, null))) {
                     webSocket = null;
                     return false;
@@ -1375,8 +1409,12 @@ public class TunnelService extends Service {
                     position += size;
                     offset += size;
                 }
-                resumeLock.notifyAll();
+				resumeLock.notifyAll();
             }
+			if (generation > 1) {
+				append(serviceLabel + " relay transport resumed session=" + sessionId + " relay=" + selectedRelay
+						+ " protocol=" + relayProtocol(socket) + " generation=" + generation + " lost_ms=" + lostDurationMs + " replay_bytes=" + replayBytes + ".");
+			}
 			if (heartbeatEnabled) {
 				startHeartbeat(socket, generation);
 			}
@@ -1402,6 +1440,7 @@ public class TunnelService extends Service {
 						markTransportLost(socket, "heartbeat send failed");
 						return;
 					}
+					long pingAt = SystemClock.elapsedRealtime();
 					long deadline = SystemClock.elapsedRealtime() + HEARTBEAT_TIMEOUT_MS;
 					synchronized (resumeLock) {
 						while (!closed.get() && webSocket == socket && transportGeneration == generation
@@ -1425,18 +1464,30 @@ public class TunnelService extends Service {
 							return;
 						}
 					}
+					long roundTripMs = SystemClock.elapsedRealtime() - pingAt;
+					if (roundTripMs >= DIAGNOSTIC_STALL_MS) {
+						append(serviceLabel + " slow relay heartbeat session=" + sessionId + " relay=" + selectedRelay
+								+ " generation=" + generation + " round_trip_ms=" + roundTripMs + ".");
+					}
 				}
 			}, "DeskFerry-" + serviceLabel + "-Heartbeat").start();
 		}
 
         private void markTransportLost(WebSocket socket, String reason) {
+			long pending;
+			long generation;
             synchronized (resumeLock) {
                 if (webSocket != socket || closed.get()) {
                     return;
                 }
                 webSocket = null;
+				lastTransportLostMs = SystemClock.elapsedRealtime();
+				pending = sendEnd - sendBase;
+				generation = transportGeneration;
                 resumeLock.notifyAll();
             }
+			append(serviceLabel + " relay transport lost session=" + sessionId + " relay=" + selectedRelay
+					+ " protocol=" + relayProtocol(socket) + " generation=" + generation + " pending_bytes=" + pending + " reason=" + reason + ".");
 			append(serviceLabel + " relay stream interrupted; retrying transparently: " + reason);
             startReconnectLoop();
         }
@@ -1445,12 +1496,19 @@ public class TunnelService extends Service {
             WebSocket active;
             WebSocket pending;
 			CountDownLatch pendingReady;
+			long pendingBytes;
+			long generation;
             synchronized (resumeLock) {
                 if (closed.get()) {
                     return;
                 }
                 active = webSocket;
                 webSocket = null;
+				if (active != null) {
+					lastTransportLostMs = SystemClock.elapsedRealtime();
+				}
+				pendingBytes = sendEnd - sendBase;
+				generation = transportGeneration;
                 pending = pendingResumeSocket;
                 pendingResumeSocket = null;
 				pendingReady = pendingResumeReady;
@@ -1459,6 +1517,9 @@ public class TunnelService extends Service {
             }
             if (active != null) {
                 active.cancel();
+				append(serviceLabel + " relay transport replaced after network change session=" + sessionId
+						+ " relay=" + selectedRelay + " protocol=" + relayProtocol(active) + " generation=" + generation + " pending_bytes=" + pendingBytes
+						+ " reason=" + reason + ".");
             }
             if (pending != null && pending != active) {
                 pending.cancel();
@@ -1663,7 +1724,10 @@ public class TunnelService extends Service {
             relayToLocalMessages.incrementAndGet();
         }
 
-        private void applyAcknowledgement(long offset) {
+		private void applyAcknowledgement(long offset) {
+			boolean recovered;
+			long stalledMs;
+			long pending;
             synchronized (resumeLock) {
                 if (offset < sendBase || offset > sendEnd) {
                     WebSocket current = webSocket;
@@ -1673,11 +1737,26 @@ public class TunnelService extends Service {
                     return;
                 }
                 int drop = (int) (offset - sendBase);
+				recovered = drop > 0 && ackStallLogged;
+				stalledMs = recovered ? SystemClock.elapsedRealtime() - ackStallAtMs : 0;
                 sendBuffer = Arrays.copyOfRange(sendBuffer, drop, sendBuffer.length);
                 sendBase = offset;
+				if (drop > 0) {
+					lastAckProgressMs = SystemClock.elapsedRealtime();
+					ackStallLogged = false;
+				}
+				pending = sendEnd - sendBase;
                 resumeLock.notifyAll();
             }
+			if (recovered) {
+				append(serviceLabel + " relay acknowledgement progress resumed session=" + sessionId + " relay=" + selectedRelay
+						+ " stalled_ms=" + stalledMs + " pending_bytes=" + pending + ".");
+			}
         }
+
+		private String relayProtocol(WebSocket socket) {
+			return socket instanceof FallbackWebSocket ? ((FallbackWebSocket) socket).protocol() : "websocket";
+		}
 
         private ByteString frame(byte type, long offset, byte[] payload) {
             int length = payload == null ? 0 : payload.length;
@@ -1771,6 +1850,9 @@ public class TunnelService extends Service {
 					throw new IOException(serviceLabel + " bridge closed");
                 }
                 offset = sendEnd;
+				if (sendEnd == sendBase) {
+					lastAckProgressMs = SystemClock.elapsedRealtime();
+				}
                 byte[] combined = Arrays.copyOf(sendBuffer, sendBuffer.length + payload.length);
                 System.arraycopy(payload, 0, combined, sendBuffer.length, payload.length);
                 sendBuffer = combined;

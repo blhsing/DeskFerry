@@ -2666,7 +2666,7 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 				route := relayConnectionRoute{RelayAddr: relayAddr, Proxy: tunnel.ProxyRouteForLog(relayAddr, cfg.Proxy), Protocol: tunnel.MessageConnProtocol(ws), RelayProtocol: relayProtocol}
 				log.Printf("relay attempt selected relay=%s service=%s proxy=%s protocol=%s relay_protocol=%s heartbeat=%t elapsed=%s", route.RelayAddr, service, route.Proxy, route.Protocol, route.RelayProtocol, ready.Heartbeat, time.Since(attemptStarted).Round(time.Millisecond))
 				if ready.SessionID != "" && service != tunnel.ServiceScreen {
-					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: ready.SessionID, Side: "client", RoomProof: cfg.roomProof(), Service: service, Heartbeat: ready.Heartbeat}), route, nil
+					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: ready.SessionID, Side: "client", RoomProof: cfg.roomProof(), Service: service, Heartbeat: ready.Heartbeat, Logf: log.Printf}), route, nil
 				}
 				return tunnel.MessageNetConn(ctx, ws), route, nil
 			}

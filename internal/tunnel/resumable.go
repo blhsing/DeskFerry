@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +26,7 @@ const (
 	resumableWindow          = 5 * time.Minute
 	defaultHeartbeatInterval = 5 * time.Second
 	defaultHeartbeatTimeout  = 15 * time.Second
+	ackStallThreshold        = 3 * time.Second
 )
 
 type ResumableWebSocketOptions struct {
@@ -36,6 +38,8 @@ type ResumableWebSocketOptions struct {
 	RoomProof string
 	Service   string
 	Heartbeat bool
+	// Logf receives abnormal transport and data-progress diagnostics only.
+	Logf func(string, ...any)
 
 	heartbeatInterval time.Duration
 	heartbeatTimeout  time.Duration
@@ -63,6 +67,9 @@ func NewResumableWebSocketConn(ctx context.Context, initial MessageConn, opts Re
 	}
 	c.cond = sync.NewCond(&c.mu)
 	go c.connectionLoop(initial)
+	if opts.Logf != nil {
+		go c.watchAckProgress()
+	}
 	return c
 }
 
@@ -79,11 +86,14 @@ type resumableWebSocketConn struct {
 	terminalErr error
 	lostAt      time.Time
 
-	recvBuffer []byte
-	recvOffset uint64
-	sendBuffer []byte
-	sendBase   uint64
-	sendEnd    uint64
+	recvBuffer      []byte
+	recvOffset      uint64
+	sendBuffer      []byte
+	sendBase        uint64
+	sendEnd         uint64
+	lastAckProgress time.Time
+	ackStallLogged  bool
+	ackStallAt      time.Time
 
 	writeMu        sync.Mutex
 	lost           chan struct{}
@@ -158,6 +168,9 @@ func (c *resumableWebSocketConn) queueSend(payload []byte) (uint64, error) {
 		return 0, c.connectionErrorLocked()
 	}
 	offset := c.sendEnd
+	if c.sendEnd == c.sendBase {
+		c.lastAckProgress = time.Now()
+	}
 	c.sendBuffer = append(c.sendBuffer, payload...)
 	c.sendEnd += uint64(len(payload))
 	return offset, nil
@@ -172,8 +185,9 @@ func (c *resumableWebSocketConn) sendDataUntilAccepted(offset uint64, payload []
 		}
 		if err := c.writeFrame(ws, frame); err == nil {
 			return nil
+		} else {
+			c.dropTransport(ws, generation, fmt.Sprintf("data write failed: %v", err))
 		}
-		c.dropTransport(ws, generation)
 	}
 }
 
@@ -197,11 +211,22 @@ func (c *resumableWebSocketConn) connectionErrorLocked() error {
 }
 
 func (c *resumableWebSocketConn) writeFrame(ws MessageConn, frame []byte) error {
+	lockStarted := time.Now()
 	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	lockWait := time.Since(lockStarted)
 	writeCtx, cancel := context.WithTimeout(c.ctx, 20*time.Second)
-	defer cancel()
-	return ws.Write(writeCtx, websocket.MessageBinary, frame)
+	writeStarted := time.Now()
+	err := ws.Write(writeCtx, websocket.MessageBinary, frame)
+	writeDuration := time.Since(writeStarted)
+	c.writeMu.Unlock()
+	cancel()
+	if lockWait >= ackStallThreshold {
+		c.diagnostic("slow transport write lock protocol=%s frame_type=%d bytes=%d wait=%s", MessageConnProtocol(ws), frame[0], len(frame), lockWait.Round(time.Millisecond))
+	}
+	if writeDuration >= ackStallThreshold {
+		c.diagnostic("slow transport write protocol=%s frame_type=%d bytes=%d duration=%s error=%v", MessageConnProtocol(ws), frame[0], len(frame), writeDuration.Round(time.Millisecond), err)
+	}
+	return err
 }
 
 func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
@@ -223,6 +248,7 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 				case <-c.lost:
 				}
 			} else {
+				c.diagnostic("transport attach failed: %v", err)
 				CloseMessageConn(ws)
 			}
 			ws = nil
@@ -269,6 +295,7 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 			ws = candidate
 			continue
 		}
+		c.diagnostic("resume attempt failed after=%s error=%v", time.Since(lostAt).Round(time.Millisecond), err)
 		if IsTerminalSessionError(err) {
 			c.setTerminal(fmt.Errorf("relay session %s is closed: %w", c.opts.SessionID, err))
 			return
@@ -325,15 +352,20 @@ func (c *resumableWebSocketConn) attachTransport(ws MessageConn) error {
 	c.generation++
 	generation := c.generation
 	c.ws = ws
+	lostDuration := time.Since(c.lostAt)
 	c.lostAt = time.Time{}
+	if c.sendEnd > c.sendBase {
+		c.lastAckProgress = time.Now()
+	}
 	recvOffset := c.recvOffset
 	sendBase := c.sendBase
 	replay := append([]byte(nil), c.sendBuffer...)
+	replayBytes := len(replay)
 	c.mu.Unlock()
 
 	if err := writeFrameWithTimeout(c.ctx, ws, makeFrame(resumableFrameAck, recvOffset, nil)); err != nil {
 		c.writeMu.Unlock()
-		c.dropTransport(ws, generation)
+		c.dropTransport(ws, generation, fmt.Sprintf("resume acknowledgement write failed: %v", err))
 		return err
 	}
 	for len(replay) > 0 {
@@ -343,7 +375,7 @@ func (c *resumableWebSocketConn) attachTransport(ws MessageConn) error {
 		}
 		if err := writeFrameWithTimeout(c.ctx, ws, makeFrame(resumableFrameData, sendBase, replay[:size])); err != nil {
 			c.writeMu.Unlock()
-			c.dropTransport(ws, generation)
+			c.dropTransport(ws, generation, fmt.Sprintf("replay write failed: %v", err))
 			return err
 		}
 		sendBase += uint64(size)
@@ -360,6 +392,9 @@ func (c *resumableWebSocketConn) attachTransport(ws MessageConn) error {
 	c.cond.Broadcast()
 	c.mu.Unlock()
 	go c.readTransport(ws, generation)
+	if generation > 1 {
+		c.diagnostic("transport resumed generation=%d protocol=%s after=%s replay_bytes=%d", generation, MessageConnProtocol(ws), lostDuration.Round(time.Millisecond), replayBytes)
+	}
 	if heartbeat != nil {
 		go c.heartbeatTransport(ws, generation, heartbeat)
 	}
@@ -392,9 +427,10 @@ func (c *resumableWebSocketConn) heartbeatTransport(ws MessageConn, generation u
 		nonce := c.heartbeatNonce
 		c.mu.Unlock()
 		if err := c.writeFrame(ws, makeFrame(resumableFramePing, nonce, nil)); err != nil {
-			c.dropTransport(ws, generation)
+			c.dropTransport(ws, generation, fmt.Sprintf("heartbeat ping write failed: %v", err))
 			return
 		}
+		pingAt := time.Now()
 		timeout := time.NewTimer(c.opts.heartbeatTimeout)
 		acknowledged := false
 		for !acknowledged {
@@ -408,9 +444,12 @@ func (c *resumableWebSocketConn) heartbeatTransport(ws MessageConn, generation u
 			case ack := <-state.ack:
 				acknowledged = ack == nonce
 			case <-timeout.C:
-				c.dropTransport(ws, generation)
+				c.dropTransport(ws, generation, fmt.Sprintf("heartbeat timed out after %s", c.opts.heartbeatTimeout))
 				return
 			}
+		}
+		if elapsed := time.Since(pingAt); elapsed >= ackStallThreshold {
+			c.diagnostic("slow heartbeat generation=%d round_trip=%s", generation, elapsed.Round(time.Millisecond))
 		}
 		if !timeout.Stop() {
 			select {
@@ -441,7 +480,7 @@ func (c *resumableWebSocketConn) readTransport(ws MessageConn, generation uint64
 			if isLogicalSessionClose(err) {
 				c.setTerminal(io.EOF)
 			} else {
-				c.dropTransport(ws, generation)
+				c.dropTransport(ws, generation, fmt.Sprintf("transport read failed: %v", err))
 			}
 			return
 		}
@@ -450,34 +489,34 @@ func (c *resumableWebSocketConn) readTransport(ws MessageConn, generation uint64
 		}
 		frameType, offset, data, err := parseFrame(payload)
 		if err != nil {
-			c.dropTransport(ws, generation)
+			c.dropTransport(ws, generation, fmt.Sprintf("invalid resumable frame: %v", err))
 			return
 		}
 		switch frameType {
 		case resumableFrameAck:
 			if !c.applyAck(offset) {
-				c.dropTransport(ws, generation)
+				c.dropTransport(ws, generation, fmt.Sprintf("invalid acknowledgement offset=%d", offset))
 				return
 			}
 		case resumableFrameData:
 			ack, ok := c.applyData(offset, data)
 			if !ok {
-				c.dropTransport(ws, generation)
+				c.dropTransport(ws, generation, fmt.Sprintf("invalid data offset=%d", offset))
 				return
 			}
 			if err := c.writeFrame(ws, makeFrame(resumableFrameAck, ack, nil)); err != nil {
-				c.dropTransport(ws, generation)
+				c.dropTransport(ws, generation, fmt.Sprintf("acknowledgement write failed: %v", err))
 				return
 			}
 		case resumableFramePing:
 			if err := c.writeFrame(ws, makeFrame(resumableFramePong, offset, nil)); err != nil {
-				c.dropTransport(ws, generation)
+				c.dropTransport(ws, generation, fmt.Sprintf("heartbeat pong write failed: %v", err))
 				return
 			}
 		case resumableFramePong:
 			c.signalHeartbeatAck(generation, offset)
 		default:
-			c.dropTransport(ws, generation)
+			c.dropTransport(ws, generation, fmt.Sprintf("unexpected frame type=%d", frameType))
 			return
 		}
 	}
@@ -511,16 +550,74 @@ func isLogicalSessionClose(err error) bool {
 
 func (c *resumableWebSocketConn) applyAck(offset uint64) bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if offset < c.sendBase || offset > c.sendEnd {
+		c.mu.Unlock()
 		return false
 	}
+	advanced := offset > c.sendBase
+	stalled := c.ackStallLogged
+	stallAt := c.ackStallAt
 	drop := int(offset - c.sendBase)
 	copy(c.sendBuffer, c.sendBuffer[drop:])
 	c.sendBuffer = c.sendBuffer[:len(c.sendBuffer)-drop]
 	c.sendBase = offset
+	if advanced {
+		c.lastAckProgress = time.Now()
+		c.ackStallLogged = false
+	}
+	pending := c.sendEnd - c.sendBase
 	c.cond.Broadcast()
+	c.mu.Unlock()
+	if advanced && stalled {
+		c.diagnostic("acknowledgement progress resumed after=%s pending_bytes=%d", time.Since(stallAt).Round(time.Millisecond), pending)
+	}
 	return true
+}
+
+func (c *resumableWebSocketConn) watchAckProgress() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		c.checkAckProgress(time.Now())
+	}
+}
+
+func (c *resumableWebSocketConn) checkAckProgress(now time.Time) {
+	c.mu.Lock()
+	pending := c.sendEnd - c.sendBase
+	elapsed := now.Sub(c.lastAckProgress)
+	if pending == 0 || c.ws == nil || elapsed < ackStallThreshold || c.ackStallLogged {
+		c.mu.Unlock()
+		return
+	}
+	c.ackStallLogged = true
+	c.ackStallAt = now
+	generation := c.generation
+	protocol := MessageConnProtocol(c.ws)
+	c.mu.Unlock()
+	c.diagnostic("acknowledgements stalled generation=%d protocol=%s pending_bytes=%d no_progress=%s", generation, protocol, pending, elapsed.Round(time.Millisecond))
+}
+
+func (c *resumableWebSocketConn) diagnostic(format string, args ...any) {
+	if c.opts.Logf == nil {
+		return
+	}
+	message := fmt.Sprintf(format, args...)
+	for _, secret := range []string{c.opts.Token, c.opts.RoomProof} {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[redacted]")
+		}
+	}
+	if strings.Contains(c.opts.Proxy, "@") {
+		message = strings.ReplaceAll(message, c.opts.Proxy, ProxySpecForLog(c.opts.Proxy))
+	}
+	c.opts.Logf("resumable session=%s side=%s service=%s relay=%s: %s",
+		c.opts.SessionID, c.opts.Side, c.opts.Service, c.opts.RelayAddr, message)
 }
 
 func (c *resumableWebSocketConn) applyData(offset uint64, data []byte) (uint64, bool) {
@@ -549,7 +646,7 @@ func (c *resumableWebSocketConn) applyData(offset uint64, data []byte) (uint64, 
 	return c.recvOffset, true
 }
 
-func (c *resumableWebSocketConn) dropTransport(ws MessageConn, generation uint64) {
+func (c *resumableWebSocketConn) dropTransport(ws MessageConn, generation uint64, reason string) {
 	c.mu.Lock()
 	if c.ws != ws || c.generation != generation || c.closed {
 		c.mu.Unlock()
@@ -561,7 +658,9 @@ func (c *resumableWebSocketConn) dropTransport(ws MessageConn, generation uint64
 		c.lostAt = time.Now()
 	}
 	c.cond.Broadcast()
+	pending := c.sendEnd - c.sendBase
 	c.mu.Unlock()
+	c.diagnostic("transport lost generation=%d protocol=%s pending_bytes=%d reason=%s", generation, MessageConnProtocol(ws), pending, reason)
 	if heartbeat != nil {
 		heartbeat.stop()
 	}

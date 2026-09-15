@@ -370,7 +370,7 @@ func dialSMBRelay(ctx context.Context, cfg homenetwork.Config) (net.Conn, string
 		cancel()
 		log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t heartbeat=%t elapsed=%s", relayAddr, tunnel.ServiceSMB, ready.ProtocolV2, ready.Heartbeat, time.Since(attemptStarted).Round(time.Millisecond))
 		if ready.SessionID != "" {
-			return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: ready.SessionID, Side: "client", RoomProof: cfg.RoomProof, Service: tunnel.ServiceSMB, Heartbeat: ready.Heartbeat}), relayAddr, nil
+			return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{RelayAddr: relayAddr, Proxy: cfg.Proxy, SessionID: ready.SessionID, Side: "client", RoomProof: cfg.RoomProof, Service: tunnel.ServiceSMB, Heartbeat: ready.Heartbeat, Logf: log.Printf}), relayAddr, nil
 		}
 		return tunnel.MessageNetConn(ctx, ws), relayAddr, nil
 	}
