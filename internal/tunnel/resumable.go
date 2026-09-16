@@ -27,6 +27,7 @@ const (
 	defaultHeartbeatInterval = 5 * time.Second
 	defaultHeartbeatTimeout  = 15 * time.Second
 	ackStallThreshold        = 3 * time.Second
+	ackRecoveryThreshold     = 10 * time.Second
 )
 
 type ResumableWebSocketOptions struct {
@@ -67,9 +68,7 @@ func NewResumableWebSocketConn(ctx context.Context, initial MessageConn, opts Re
 	}
 	c.cond = sync.NewCond(&c.mu)
 	go c.connectionLoop(initial)
-	if opts.Logf != nil {
-		go c.watchAckProgress()
-	}
+	go c.watchAckProgress()
 	return c
 }
 
@@ -591,16 +590,26 @@ func (c *resumableWebSocketConn) checkAckProgress(now time.Time) {
 	c.mu.Lock()
 	pending := c.sendEnd - c.sendBase
 	elapsed := now.Sub(c.lastAckProgress)
-	if pending == 0 || c.ws == nil || elapsed < ackStallThreshold || c.ackStallLogged {
+	if pending == 0 || c.ws == nil || elapsed < ackStallThreshold {
 		c.mu.Unlock()
 		return
 	}
-	c.ackStallLogged = true
-	c.ackStallAt = now
+	ws := c.ws
 	generation := c.generation
 	protocol := MessageConnProtocol(c.ws)
+	shouldLog := !c.ackStallLogged
+	if shouldLog {
+		c.ackStallLogged = true
+		c.ackStallAt = now
+	}
+	shouldRecover := elapsed >= ackRecoveryThreshold
 	c.mu.Unlock()
-	c.diagnostic("acknowledgements stalled generation=%d protocol=%s pending_bytes=%d no_progress=%s", generation, protocol, pending, elapsed.Round(time.Millisecond))
+	if shouldLog {
+		c.diagnostic("acknowledgements stalled generation=%d protocol=%s pending_bytes=%d no_progress=%s", generation, protocol, pending, elapsed.Round(time.Millisecond))
+	}
+	if shouldRecover {
+		c.dropTransport(ws, generation, fmt.Sprintf("data acknowledgements made no progress for %s", elapsed.Round(time.Millisecond)))
+	}
 }
 
 func (c *resumableWebSocketConn) diagnostic(format string, args ...any) {

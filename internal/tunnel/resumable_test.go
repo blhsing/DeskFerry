@@ -50,6 +50,53 @@ func TestResumableAckStallDiagnostics(t *testing.T) {
 	}
 }
 
+func TestResumableAckStallReplacesTransportBeforeHeartbeatTimeout(t *testing.T) {
+	var lines []string
+	ws := &recordingMessageConn{}
+	c := &resumableWebSocketConn{
+		opts: ResumableWebSocketOptions{
+			SessionID: "test-session", Side: "client", Service: ServiceRDP,
+			RelayAddr: "https://example.invalid/relay/b",
+			Logf:      func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) },
+		},
+		ws: ws, generation: 1, lost: make(chan struct{}, 1),
+		sendBuffer: []byte("hello"), sendEnd: 5,
+	}
+	c.cond = sync.NewCond(&c.mu)
+	now := time.Now()
+	c.lastAckProgress = now.Add(-ackRecoveryThreshold)
+	c.checkAckProgress(now)
+
+	if c.ws != nil {
+		t.Fatal("stalled transport was not detached")
+	}
+	if !ws.closed.Load() {
+		t.Fatal("stalled transport was not closed")
+	}
+	select {
+	case <-c.lost:
+	default:
+		t.Fatal("stalled transport did not wake the resume loop")
+	}
+	if len(lines) != 2 || !strings.Contains(lines[1], "data acknowledgements made no progress") {
+		t.Fatalf("recovery diagnostics missing: %v", lines)
+	}
+}
+
+type recordingMessageConn struct {
+	closed atomic.Bool
+}
+
+func (*recordingMessageConn) Read(context.Context) (websocket.MessageType, []byte, error) {
+	return 0, nil, io.EOF
+}
+func (*recordingMessageConn) Write(context.Context, websocket.MessageType, []byte) error { return nil }
+func (*recordingMessageConn) Close(websocket.StatusCode, string) error                   { return nil }
+func (c *recordingMessageConn) CloseNow() error {
+	c.closed.Store(true)
+	return nil
+}
+
 func TestResumableDiagnosticsRedactSecrets(t *testing.T) {
 	var line string
 	c := &resumableWebSocketConn{opts: ResumableWebSocketOptions{

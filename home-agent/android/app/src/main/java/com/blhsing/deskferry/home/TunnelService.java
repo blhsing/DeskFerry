@@ -80,6 +80,7 @@ public class TunnelService extends Service {
     private static final long RESUMABLE_WINDOW_MS = 5L * 60L * 1000L;
     private static final long HEARTBEAT_INTERVAL_MS = 5L * 1000L;
     private static final long DIAGNOSTIC_STALL_MS = 3L * 1000L;
+    private static final long ACK_RECOVERY_MS = 10L * 1000L;
     private static final long HEARTBEAT_TIMEOUT_MS = 15L * 1000L;
     private static final long RESUME_ATTEMPT_TIMEOUT_MS = 20L * 1000L;
     private static final int MAX_CONCURRENT_BRIDGES_PER_SERVICE = 2;
@@ -1060,18 +1061,29 @@ public class TunnelService extends Service {
 					long pending;
 					long generation;
 					long noProgress;
+					WebSocket stalledSocket;
+					boolean shouldLog;
 					synchronized (resumeLock) {
 						pending = sendEnd - sendBase;
 						noProgress = now - lastAckProgressMs;
-						if (pending == 0 || webSocket == null || noProgress < DIAGNOSTIC_STALL_MS || ackStallLogged) {
+						if (pending == 0 || webSocket == null || noProgress < DIAGNOSTIC_STALL_MS) {
 							continue;
 						}
-						ackStallLogged = true;
-						ackStallAtMs = now;
+						stalledSocket = webSocket;
+						shouldLog = !ackStallLogged;
+						if (shouldLog) {
+							ackStallLogged = true;
+							ackStallAtMs = now;
+						}
 						generation = transportGeneration;
 					}
-					append(serviceLabel + " relay acknowledgements stalled session=" + sessionId + " relay=" + selectedRelay
-							+ " generation=" + generation + " pending_bytes=" + pending + " no_progress_ms=" + noProgress + ".");
+					if (shouldLog) {
+						append(serviceLabel + " relay acknowledgements stalled session=" + sessionId + " relay=" + selectedRelay
+								+ " generation=" + generation + " pending_bytes=" + pending + " no_progress_ms=" + noProgress + ".");
+					}
+					if (noProgress >= ACK_RECOVERY_MS) {
+						markTransportLost(stalledSocket, "data acknowledgements made no progress for " + noProgress + "ms");
+					}
 				}
 			}, "DeskFerry-" + serviceLabel + "-AckMonitor").start();
 		}
