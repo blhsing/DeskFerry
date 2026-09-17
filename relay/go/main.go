@@ -1819,17 +1819,57 @@ func (s *ResumeSession) run(agent, client tunnel.MessageConn, clientDone chan st
 		log.Printf("resumable bridge interrupted room=%s pair=%d session=%s failed_side=%s direction=%s error=%v", s.Room.ID, pairID, s.ID, result.FailedSide, result.Direction, result.Err)
 		failedEndpoint.Abort()
 
+		replaceAgent := result.FailedSide == "agent"
+		replaceClient := result.FailedSide == "client"
 		if result.FailedSide == "agent" {
 			if agentAttachment != nil {
 				closeOnce(agentAttachment.Done)
 				agentAttachment = nil
 			}
+			var ok bool
+			agentAttachment, ok = s.waitForLatestAttachment(s.agent)
+			if !ok {
+				return
+			}
+		} else {
+			if clientAttachment != nil {
+				closeOnce(clientAttachment.Done)
+				clientAttachment = nil
+			}
+			var ok bool
+			clientAttachment, ok = s.waitForLatestAttachment(s.client)
+			if !ok {
+				return
+			}
+		}
+
+		// If the opposite endpoint also started resuming while this side was
+		// unavailable, replace both sockets before releasing either peer. This
+		// avoids briefly forwarding replay traffic through a stale opposite
+		// generation and creating an unrecoverable sequence-offset gap.
+		if queued := s.latestAvailableAttachment(s.agent); queued != nil {
+			if agentAttachment != nil {
+				closeQuietly(agentAttachment.Conn, websocket.StatusServiceRestart, "replaced resume socket")
+				closeOnce(agentAttachment.Done)
+			} else {
+				agentEndpoint.Abort()
+			}
+			agentAttachment = queued
+			replaceAgent = true
+		}
+		if queued := s.latestAvailableAttachment(s.client); queued != nil {
+			if clientAttachment != nil {
+				closeQuietly(clientAttachment.Conn, websocket.StatusServiceRestart, "replaced resume socket")
+				closeOnce(clientAttachment.Done)
+			} else {
+				clientEndpoint.Abort()
+			}
+			clientAttachment = queued
+			replaceClient = true
+		}
+
+		if replaceAgent {
 			for {
-				var ok bool
-				agentAttachment, ok = s.waitForAttachment(s.agent)
-				if !ok {
-					return
-				}
 				agent = agentAttachment.Conn
 				s.AgentRemote = agentAttachment.Remote
 				agentEndpoint.Replace(agent)
@@ -1838,19 +1878,15 @@ func (s *ResumeSession) run(agent, client tunnel.MessageConn, clientDone chan st
 				}
 				closeQuietly(agent, websocket.StatusServiceRestart, "retry resume")
 				closeOnce(agentAttachment.Done)
-				agentAttachment = nil
-			}
-		} else {
-			if clientAttachment != nil {
-				closeOnce(clientAttachment.Done)
-				clientAttachment = nil
-			}
-			for {
 				var ok bool
-				clientAttachment, ok = s.waitForAttachment(s.client)
+				agentAttachment, ok = s.waitForLatestAttachment(s.agent)
 				if !ok {
 					return
 				}
+			}
+		}
+		if replaceClient {
+			for {
 				client = clientAttachment.Conn
 				s.ClientRemote = clientAttachment.Remote
 				clientEndpoint.Replace(client)
@@ -1859,7 +1895,11 @@ func (s *ResumeSession) run(agent, client tunnel.MessageConn, clientDone chan st
 				}
 				closeQuietly(client, websocket.StatusServiceRestart, "retry resume")
 				closeOnce(clientAttachment.Done)
-				clientAttachment = nil
+				var ok bool
+				clientAttachment, ok = s.waitForLatestAttachment(s.client)
+				if !ok {
+					return
+				}
 			}
 		}
 		startPump("agent_to_client")
@@ -1918,6 +1958,36 @@ func (s *ResumeSession) waitForAttachment(queue <-chan *ResumeAttachment) (*Resu
 		return nil, false
 	case <-s.done:
 		return nil, false
+	}
+}
+
+func (s *ResumeSession) waitForLatestAttachment(queue <-chan *ResumeAttachment) (*ResumeAttachment, bool) {
+	attachment, ok := s.waitForAttachment(queue)
+	if !ok {
+		return nil, false
+	}
+	return s.latestAttachment(queue, attachment), true
+}
+
+func (s *ResumeSession) latestAvailableAttachment(queue <-chan *ResumeAttachment) *ResumeAttachment {
+	select {
+	case attachment := <-queue:
+		return s.latestAttachment(queue, attachment)
+	default:
+		return nil
+	}
+}
+
+func (s *ResumeSession) latestAttachment(queue <-chan *ResumeAttachment, latest *ResumeAttachment) *ResumeAttachment {
+	for {
+		select {
+		case next := <-queue:
+			closeQuietly(latest.Conn, websocket.StatusServiceRestart, "replaced resume socket")
+			closeOnce(latest.Done)
+			latest = next
+		default:
+			return latest
+		}
 	}
 }
 

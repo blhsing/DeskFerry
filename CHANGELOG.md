@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.12.6 - 2026-09-17
+
+- Coalesce overlapping Work and Home resume attachments before restarting a relay bridge, preventing replay traffic from briefly crossing mismatched transport generations and terminating the recovered RDP session with a sequence-offset error.
+- Apply the overlapping-resume fix consistently to the Azure, Go/OCI, and Python relay implementations, with a regression test covering both sides replacing stalled transports in quick succession.
+
 ## 0.12.3 - 2026-09-08
 
 - Preserve the unaffected half of a resumable relay bridge when only the Work or Home transport drops, allowing that endpoint alone to reattach without exposing a relay-generated EOF to the still-connected RDP client.

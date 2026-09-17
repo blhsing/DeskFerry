@@ -21,7 +21,7 @@ from app import (
 
 
 class FakeWebSocket:
-    def __init__(self, fail_text: bool = False):
+    def __init__(self, fail_text: bool = False, label: str = "", control_order=None):
         self.client_state = WebSocketState.CONNECTED
         self.application_state = WebSocketState.CONNECTED
         self.fail_text = fail_text
@@ -32,11 +32,15 @@ class FakeWebSocket:
         self.close_code = None
         self.close_reason = ""
         self._received = asyncio.Queue()
+        self.label = label
+        self.control_order = control_order
 
     async def send_text(self, text):
         if self.fail_text:
             raise RuntimeError("stale websocket")
         self.text_messages.append(text)
+        if self.control_order is not None:
+            self.control_order.append(self.label)
 
     async def send_bytes(self, payload):
         self.byte_messages.append(payload)
@@ -250,6 +254,65 @@ def test_resumable_pair_reattaches_only_dropped_side():
         assert status["active_pairs"] == 0
         assert status["total_pairs"] == 1
         assert removed == [session]
+
+    asyncio.run(scenario())
+
+
+def test_resumable_pair_coalesces_overlapping_side_replacements():
+    from app import RelayRoom, ResumeSession
+
+    async def scenario():
+        room = RelayRoom("unit-overlap")
+        session = ResumeSession("d" * 32, room, "work-1", "home-1", lambda _: None)
+        agent = FakeWebSocket()
+        home = FakeWebSocket()
+        session_task = asyncio.create_task(
+            session.run(agent, home, asyncio.Future(), lambda: None)
+        )
+
+        # Resume the work side once, then fail the home side. While the relay
+        # waits for the new home socket, the current work socket also fails and
+        # its replacement queues. Both queued generations must be installed
+        # before either peer receives its resume control.
+        await agent._received.put({"type": "websocket.disconnect", "code": 1006, "reason": ""})
+        agent_two = FakeWebSocket()
+        agent_two_task = asyncio.create_task(session.attach("agent", agent_two, "work-2"))
+        for _ in range(50):
+            if agent_two.text_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert agent_two.text_messages == ["resume " + session.id]
+
+        await home._received.put({"type": "websocket.disconnect", "code": 1006, "reason": ""})
+        await asyncio.sleep(0.02)
+        await agent_two._received.put({"type": "websocket.disconnect", "code": 1006, "reason": ""})
+        control_order = []
+        agent_three = FakeWebSocket(label="agent-3", control_order=control_order)
+        agent_three_task = asyncio.create_task(session.attach("agent", agent_three, "work-3"))
+        await asyncio.sleep(0.02)
+        home_two = FakeWebSocket(label="home-2", control_order=control_order)
+        home_two_task = asyncio.create_task(session.attach("client", home_two, "home-2"))
+
+        for _ in range(50):
+            if len(control_order) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert control_order == ["agent-3", "home-2"]
+        assert agent_two.closed is True
+
+        await asyncio.sleep(0.05)
+        await home_two._received.put({"type": "websocket.receive", "bytes": b"coalesced"})
+        for _ in range(50):
+            if agent_three.byte_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert agent_three.byte_messages == [b"coalesced"]
+
+        await home_two._received.put(
+            {"type": "websocket.disconnect", "code": 1000, "reason": "session closed"}
+        )
+        await asyncio.wait_for(session_task, timeout=2)
+        await asyncio.gather(agent_two_task, agent_three_task, home_two_task)
 
     asyncio.run(scenario())
 

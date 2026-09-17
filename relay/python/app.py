@@ -19,7 +19,7 @@ from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.12.3"
+RELAY_VERSION = "0.12.6"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -1034,11 +1034,54 @@ class ResumeSession:
                     if agent_attachment is not None:
                         try_set_result(agent_attachment.done, None)
                         agent_attachment = None
+                    try:
+                        agent_attachment = await asyncio.wait_for(
+                            self._latest_attachment(self._agent), timeout=300
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        return
+                    replace_agent = True
+                    replace_client = False
+                else:
+                    if client_attachment is not None:
+                        try_set_result(client_attachment.done, None)
+                        client_attachment = None
+                    try:
+                        client_attachment = await asyncio.wait_for(
+                            self._latest_attachment(self._client), timeout=300
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        return
+                    replace_agent = False
+                    replace_client = True
+
+                # The opposite peer may start recovery while the relay is
+                # waiting for the side that failed first. Replace both sockets
+                # before releasing either peer so replay traffic cannot cross
+                # a stale generation and create a sequence-offset gap.
+                queued_agent = await self._latest_available_attachment(self._agent)
+                if queued_agent is not None:
+                    stale_agent = agent_endpoint.invalidate()
+                    if agent_attachment is not None:
+                        await close_quietly(agent_attachment.websocket, 1012, "replaced resume socket")
+                        try_set_result(agent_attachment.done, None)
+                    elif stale_agent is not None:
+                        await close_quietly(stale_agent, 1012, "resume session")
+                    agent_attachment = queued_agent
+                    replace_agent = True
+                queued_client = await self._latest_available_attachment(self._client)
+                if queued_client is not None:
+                    stale_client = client_endpoint.invalidate()
+                    if client_attachment is not None:
+                        await close_quietly(client_attachment.websocket, 1012, "replaced resume socket")
+                        try_set_result(client_attachment.done, None)
+                    elif stale_client is not None:
+                        await close_quietly(stale_client, 1012, "resume session")
+                    client_attachment = queued_client
+                    replace_client = True
+
+                if replace_agent:
                     while True:
-                        try:
-                            agent_attachment = await asyncio.wait_for(self._agent.get(), timeout=300)
-                        except (asyncio.TimeoutError, asyncio.CancelledError):
-                            return
                         agent = agent_attachment.websocket
                         self.agent_remote = agent_attachment.remote
                         agent_endpoint.replace(agent)
@@ -1046,16 +1089,14 @@ class ResumeSession:
                             break
                         await close_quietly(agent, 1012, "retry resume")
                         try_set_result(agent_attachment.done, None)
-                        agent_attachment = None
-                else:
-                    if client_attachment is not None:
-                        try_set_result(client_attachment.done, None)
-                        client_attachment = None
-                    while True:
                         try:
-                            client_attachment = await asyncio.wait_for(self._client.get(), timeout=300)
+                            agent_attachment = await asyncio.wait_for(
+                                self._latest_attachment(self._agent), timeout=300
+                            )
                         except (asyncio.TimeoutError, asyncio.CancelledError):
                             return
+                if replace_client:
+                    while True:
                         client = client_attachment.websocket
                         self.client_remote = client_attachment.remote
                         client_endpoint.replace(client)
@@ -1063,7 +1104,12 @@ class ResumeSession:
                             break
                         await close_quietly(client, 1012, "retry resume")
                         try_set_result(client_attachment.done, None)
-                        client_attachment = None
+                        try:
+                            client_attachment = await asyncio.wait_for(
+                                self._latest_attachment(self._client), timeout=300
+                            )
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            return
                 start_pump("agent_to_client")
                 start_pump("client_to_agent")
                 logger.info("resumable bridge resumed room=%s pair=%s session=%s agent=%s client=%s", self.room.id, pair_id, self.id, self.agent_remote, self.client_remote)
@@ -1086,6 +1132,37 @@ class ResumeSession:
             self.finish()
             state_changed()
             logger.info("resumable bridge closed room=%s pair=%s session=%s agent=%s client=%s duration_ms=%d", self.room.id, pair_id, self.id, self.agent_remote, self.client_remote, round((time.monotonic() - started_at) * 1000))
+
+    @staticmethod
+    async def _latest_attachment(
+        queue: asyncio.Queue[ResumeAttachment],
+    ) -> ResumeAttachment:
+        latest = await queue.get()
+        while True:
+            try:
+                replacement = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return latest
+            await close_quietly(latest.websocket, 1012, "replaced resume socket")
+            try_set_result(latest.done, None)
+            latest = replacement
+
+    @classmethod
+    async def _latest_available_attachment(
+        cls, queue: asyncio.Queue[ResumeAttachment]
+    ) -> ResumeAttachment | None:
+        try:
+            latest = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+        while True:
+            try:
+                replacement = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return latest
+            await close_quietly(latest.websocket, 1012, "replaced resume socket")
+            try_set_result(latest.done, None)
+            latest = replacement
 
     def finish(self) -> None:
         if self._done.is_set():
