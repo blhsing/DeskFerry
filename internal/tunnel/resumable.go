@@ -27,7 +27,8 @@ const (
 	defaultHeartbeatInterval = 5 * time.Second
 	defaultHeartbeatTimeout  = 15 * time.Second
 	ackStallThreshold        = 3 * time.Second
-	ackRecoveryThreshold     = 10 * time.Second
+	rdpAckRecoveryThreshold  = 5 * time.Second
+	defaultAckRecovery       = 10 * time.Second
 )
 
 type ResumableWebSocketOptions struct {
@@ -602,7 +603,11 @@ func (c *resumableWebSocketConn) checkAckProgress(now time.Time) {
 		c.ackStallLogged = true
 		c.ackStallAt = now
 	}
-	shouldRecover := elapsed >= ackRecoveryThreshold
+	recoveryThreshold := defaultAckRecovery
+	if c.opts.Service == ServiceRDP {
+		recoveryThreshold = rdpAckRecoveryThreshold
+	}
+	shouldRecover := elapsed >= recoveryThreshold
 	c.mu.Unlock()
 	if shouldLog {
 		c.diagnostic("acknowledgements stalled generation=%d protocol=%s pending_bytes=%d no_progress=%s", generation, protocol, pending, elapsed.Round(time.Millisecond))

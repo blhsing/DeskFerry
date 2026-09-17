@@ -64,7 +64,7 @@ func TestResumableAckStallReplacesTransportBeforeHeartbeatTimeout(t *testing.T) 
 	}
 	c.cond = sync.NewCond(&c.mu)
 	now := time.Now()
-	c.lastAckProgress = now.Add(-ackRecoveryThreshold)
+	c.lastAckProgress = now.Add(-rdpAckRecoveryThreshold)
 	c.checkAckProgress(now)
 
 	if c.ws != nil {
@@ -80,6 +80,27 @@ func TestResumableAckStallReplacesTransportBeforeHeartbeatTimeout(t *testing.T) 
 	}
 	if len(lines) != 2 || !strings.Contains(lines[1], "data acknowledgements made no progress") {
 		t.Fatalf("recovery diagnostics missing: %v", lines)
+	}
+}
+
+func TestNonRDPAckStallKeepsConservativeRecoveryDeadline(t *testing.T) {
+	ws := &recordingMessageConn{}
+	c := &resumableWebSocketConn{
+		opts: ResumableWebSocketOptions{SessionID: "test-session", Side: "client", Service: ServiceSMB},
+		ws:   ws, generation: 1, lost: make(chan struct{}, 1),
+		sendBuffer: []byte("hello"), sendEnd: 5,
+	}
+	c.cond = sync.NewCond(&c.mu)
+	now := time.Now()
+	c.lastAckProgress = now.Add(-rdpAckRecoveryThreshold)
+	c.checkAckProgress(now)
+
+	if c.ws == nil || ws.closed.Load() {
+		t.Fatal("non-RDP transport used the shorter RDP recovery deadline")
+	}
+	c.checkAckProgress(now.Add(defaultAckRecovery - rdpAckRecoveryThreshold))
+	if c.ws != nil || !ws.closed.Load() {
+		t.Fatal("non-RDP transport was not replaced at the default recovery deadline")
 	}
 }
 

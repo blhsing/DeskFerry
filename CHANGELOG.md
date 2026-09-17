@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.12.7 - 2026-09-18
+
+- Replace an RDP relay transport after five seconds without acknowledgement progress, while retaining the ten-second deadline for WinRM and SMB. This preserves enough of the RDP client's reconnect window when a replacement relay attachment is itself delayed.
+- Apply the shorter RDP recovery deadline consistently to Windows, macOS, and Android Home agents and Work agents.
+
 ## 0.12.6 - 2026-09-17
 
 - Coalesce overlapping Work and Home resume attachments before restarting a relay bridge, preventing replay traffic from briefly crossing mismatched transport generations and terminating the recovered RDP session with a sequence-offset error.
