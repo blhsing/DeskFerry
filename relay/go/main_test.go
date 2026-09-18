@@ -397,7 +397,7 @@ func TestLegacyClientPairsThroughV2Control(t *testing.T) {
 	expectBinary(t, ctx, agent, "legacy-smb")
 }
 
-func TestResumablePairReattachesOnlyDroppedSide(t *testing.T) {
+func TestResumablePairCoordinatesBothSidesAfterDrop(t *testing.T) {
 	server := httptest.NewServer(newServer())
 	defer server.Close()
 
@@ -422,14 +422,23 @@ func TestResumablePairReattachesOnlyDroppedSide(t *testing.T) {
 	// A proxy can report a transport failure as code 1000 without DeskFerry's
 	// logical-close marker. The session must remain available for resumption.
 	_ = home.Close(websocket.StatusNormalClosure, "")
+	if _, _, err := agent.Read(ctx); err == nil {
+		t.Fatal("agent transport remained open after client-side failure")
+	}
 
 	clientHeaders := http.Header{
 		"X-DeskFerry-Session":      []string{sessionID},
 		"X-DeskFerry-Session-Side": []string{"client"},
 	}
+	agentHeaders := http.Header{
+		"X-DeskFerry-Session":      []string{sessionID},
+		"X-DeskFerry-Session-Side": []string{"agent"},
+	}
+	agent = dialRoleHeaders(t, ctx, server.URL, "/relay/unit-resume/ws", resumeRole, agentHeaders)
 	home = dialRoleHeaders(t, ctx, server.URL, "/relay/unit-resume/ws", resumeRole, clientHeaders)
 	defer agent.Close(websocket.StatusNormalClosure, "session closed")
 	defer home.Close(websocket.StatusNormalClosure, "session closed")
+	expectText(t, ctx, agent, resumeMessage+" "+sessionID)
 	expectText(t, ctx, home, resumeMessage+" "+sessionID)
 
 	if err := agent.Write(ctx, websocket.MessageBinary, []byte("after-resume")); err != nil {

@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.12.8 - 2026-09-19
+
+- Coordinate resumable relay recovery across both endpoints when either transport fails, preventing a stale-but-apparently-connected peer from receiving replay data at an incompatible offset and forcing the underlying RDP session to reconnect.
+- Add relay regression coverage for one-sided transport stalls and repeated attachments while the opposite side is recovering.
+
 ## 0.12.7 - 2026-09-18
 
 - Replace an RDP relay transport after five seconds without acknowledgement progress, while retaining the ten-second deadline for WinRM and SMB. This preserves enough of the RDP client's reconnect window when a replacement relay attachment is itself delayed.

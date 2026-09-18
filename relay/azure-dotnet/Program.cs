@@ -2271,111 +2271,55 @@ sealed class ResumeSession
                     continue;
                 }
                 _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} failed_side={FailedSide} direction={Direction} end={End} close_status={CloseStatus} close_reason={CloseReason} error={Error}", Room.Id, pairId, Id, result.FailedSide, result.Direction, result.End, result.CloseStatus, result.CloseReason, result.Error);
-                failedEndpoint.Abort();
+                // Treat either transport failure as a generation barrier. A
+                // proxy can leave the opposite socket apparently alive after
+                // it has stopped carrying traffic. Releasing one replacement
+                // against that stale peer can cross incompatible replay
+                // offsets, so both endpoints must reattach together.
+                agentEndpoint.Abort();
+                clientEndpoint.Abort();
+                agentAttachment?.Done.TrySetResult();
+                clientAttachment?.Done.TrySetResult();
+                agentAttachment = null;
+                clientAttachment = null;
 
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_finished.Token);
                 timeout.CancelAfter(TimeSpan.FromMinutes(5));
-                var replaceAgent = result.FailedSide == "agent";
-                var replaceClient = result.FailedSide == "client";
-                if (result.FailedSide == "agent")
+                while (true)
                 {
-                    agentAttachment?.Done.TrySetResult();
+                    try
+                    {
+                        var attachments = await Task.WhenAll(
+                            ReadLatestAttachmentAsync(_agent.Reader, timeout.Token),
+                            ReadLatestAttachmentAsync(_client.Reader, timeout.Token));
+                        agentAttachment = TakeLatestAttachment(_agent.Reader, attachments[0]);
+                        clientAttachment = TakeLatestAttachment(_client.Reader, attachments[1]);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+
+                    agent = agentAttachment.Socket;
+                    client = clientAttachment.Socket;
+                    AgentRemote = agentAttachment.Remote;
+                    ClientRemote = clientAttachment.Remote;
+                    agentEndpoint.Replace(agent);
+                    clientEndpoint.Replace(client);
+                    var controls = await Task.WhenAll(
+                        TrySendControlAsync(agent, $"resume {Id}"),
+                        TrySendControlAsync(client, $"resume {Id}"));
+                    if (controls[0] && controls[1]) break;
+
+                    agentEndpoint.Abort();
+                    clientEndpoint.Abort();
+                    await Task.WhenAll(
+                        RelayRoom.CloseQuietlyAsync(agent, ResumeCloseStatus, "retry coordinated resume"),
+                        RelayRoom.CloseQuietlyAsync(client, ResumeCloseStatus, "retry coordinated resume"));
+                    agentAttachment.Done.TrySetResult();
+                    clientAttachment.Done.TrySetResult();
                     agentAttachment = null;
-                    try
-                    {
-                        agentAttachment = await ReadLatestAttachmentAsync(_agent.Reader, timeout.Token);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        return;
-                    }
-                }
-                else
-                {
-                    clientAttachment?.Done.TrySetResult();
                     clientAttachment = null;
-                    try
-                    {
-                        clientAttachment = await ReadLatestAttachmentAsync(_client.Reader, timeout.Token);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        return;
-                    }
-                }
-
-                // A peer can start its own recovery while the relay is waiting
-                // for the side that failed first. Coalesce that queued socket
-                // before releasing either endpoint, otherwise replay traffic
-                // can briefly cross a stale generation and create an offset gap.
-                if (TakeLatestAvailableAttachment(_agent.Reader) is { } queuedAgent)
-                {
-                    if (agentAttachment is not null)
-                    {
-                        await RelayRoom.CloseQuietlyAsync(agentAttachment.Socket, ResumeCloseStatus, "replaced resume socket");
-                        agentAttachment.Done.TrySetResult();
-                    }
-                    else
-                    {
-                        agentEndpoint.Abort();
-                    }
-                    agentAttachment = queuedAgent;
-                    replaceAgent = true;
-                }
-                if (TakeLatestAvailableAttachment(_client.Reader) is { } queuedClient)
-                {
-                    if (clientAttachment is not null)
-                    {
-                        await RelayRoom.CloseQuietlyAsync(clientAttachment.Socket, ResumeCloseStatus, "replaced resume socket");
-                        clientAttachment.Done.TrySetResult();
-                    }
-                    else
-                    {
-                        clientEndpoint.Abort();
-                    }
-                    clientAttachment = queuedClient;
-                    replaceClient = true;
-                }
-
-                if (replaceAgent)
-                {
-                    while (true)
-                    {
-                        agent = agentAttachment!.Socket;
-                        AgentRemote = agentAttachment.Remote;
-                        agentEndpoint.Replace(agent);
-                        if (await TrySendControlAsync(agent, $"resume {Id}")) break;
-                        await RelayRoom.CloseQuietlyAsync(agent, ResumeCloseStatus, "retry resume");
-                        agentAttachment.Done.TrySetResult();
-                        try
-                        {
-                            agentAttachment = await ReadLatestAttachmentAsync(_agent.Reader, timeout.Token);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            return;
-                        }
-                    }
-                }
-                if (replaceClient)
-                {
-                    while (true)
-                    {
-                        client = clientAttachment!.Socket;
-                        ClientRemote = clientAttachment.Remote;
-                        clientEndpoint.Replace(client);
-                        if (await TrySendControlAsync(client, $"resume {Id}")) break;
-                        await RelayRoom.CloseQuietlyAsync(client, ResumeCloseStatus, "retry resume");
-                        clientAttachment.Done.TrySetResult();
-                        try
-                        {
-                            clientAttachment = await ReadLatestAttachmentAsync(_client.Reader, timeout.Token);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            return;
-                        }
-                    }
                 }
                 StartPump("agent_to_client");
                 StartPump("client_to_agent");
@@ -2404,11 +2348,6 @@ sealed class ResumeSession
     {
         var latest = await reader.ReadAsync(cancellationToken);
         return TakeLatestAttachment(reader, latest);
-    }
-
-    private static ResumeAttachment? TakeLatestAvailableAttachment(ChannelReader<ResumeAttachment> reader)
-    {
-        return reader.TryRead(out var attachment) ? TakeLatestAttachment(reader, attachment) : null;
     }
 
     private static ResumeAttachment TakeLatestAttachment(ChannelReader<ResumeAttachment> reader, ResumeAttachment latest)
@@ -2555,7 +2494,7 @@ sealed class ResumeSession
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.12.6";
+    public const string Version = "0.12.8";
 }
 
 sealed class WaitingAgent

@@ -60,6 +60,9 @@ class FakeWebSocket:
         self.close_reason = reason
         self.client_state = WebSocketState.DISCONNECTED
         self.application_state = WebSocketState.DISCONNECTED
+        self._received.put_nowait(
+            {"type": "websocket.disconnect", "code": code, "reason": reason}
+        )
 
 
 def test_room_id_matches_dotnet_normalization():
@@ -203,7 +206,7 @@ def test_agent_client_pair_and_bridge_bytes():
             assert status["rooms"][0]["total_pairs"] == 1
 
 
-def test_resumable_pair_reattaches_only_dropped_side():
+def test_resumable_pair_coordinates_both_sides_after_drop():
     from app import RelayRoom, ResumeSession
 
     async def scenario():
@@ -225,15 +228,24 @@ def test_resumable_pair_reattaches_only_dropped_side():
         # Some proxies terminate a transport with a normal close code but no
         # DeskFerry logical-close marker. The logical session must still resume.
         await home._received.put({"type": "websocket.disconnect", "code": 1000, "reason": ""})
-        resumed_home = FakeWebSocket()
-        home_attach = asyncio.create_task(session.attach("client", resumed_home, "home-2"))
         for _ in range(50):
-            if resumed_home.text_messages:
+            if agent.closed:
                 break
             await asyncio.sleep(0.01)
+        assert agent.closed is True
+
+        resumed_agent = FakeWebSocket()
+        resumed_home = FakeWebSocket()
+        agent_attach = asyncio.create_task(session.attach("agent", resumed_agent, "work-2"))
+        home_attach = asyncio.create_task(session.attach("client", resumed_home, "home-2"))
+        for _ in range(50):
+            if resumed_agent.text_messages and resumed_home.text_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert resumed_agent.text_messages == ["resume " + session.id]
         assert resumed_home.text_messages == ["resume " + session.id]
 
-        await agent._received.put({"type": "websocket.receive", "bytes": b"after-resume"})
+        await resumed_agent._received.put({"type": "websocket.receive", "bytes": b"after-resume"})
         for _ in range(50):
             if resumed_home.byte_messages:
                 break
@@ -242,14 +254,14 @@ def test_resumable_pair_reattaches_only_dropped_side():
 
         await resumed_home._received.put({"type": "websocket.receive", "bytes": b"reverse-after-resume"})
         for _ in range(50):
-            if agent.byte_messages[-1:] == [b"reverse-after-resume"]:
+            if resumed_agent.byte_messages[-1:] == [b"reverse-after-resume"]:
                 break
             await asyncio.sleep(0.01)
-        assert agent.byte_messages[-1:] == [b"reverse-after-resume"]
+        assert resumed_agent.byte_messages[-1:] == [b"reverse-after-resume"]
 
         await resumed_home._received.put({"type": "websocket.disconnect", "code": 1000, "reason": "session closed"})
         await asyncio.wait_for(session_task, timeout=2)
-        await home_attach
+        await asyncio.gather(agent_attach, home_attach)
         status = await room.snapshot()
         assert status["active_pairs"] == 0
         assert status["total_pairs"] == 1
@@ -270,22 +282,13 @@ def test_resumable_pair_coalesces_overlapping_side_replacements():
             session.run(agent, home, asyncio.Future(), lambda: None)
         )
 
-        # Resume the work side once, then fail the home side. While the relay
-        # waits for the new home socket, the current work socket also fails and
-        # its replacement queues. Both queued generations must be installed
-        # before either peer receives its resume control.
+        # Once either side fails, the relay closes both transports and waits
+        # for a coordinated pair. If one side connects more than once while
+        # the opposite side is still absent, only its newest socket is used.
         await agent._received.put({"type": "websocket.disconnect", "code": 1006, "reason": ""})
         agent_two = FakeWebSocket()
         agent_two_task = asyncio.create_task(session.attach("agent", agent_two, "work-2"))
-        for _ in range(50):
-            if agent_two.text_messages:
-                break
-            await asyncio.sleep(0.01)
-        assert agent_two.text_messages == ["resume " + session.id]
-
-        await home._received.put({"type": "websocket.disconnect", "code": 1006, "reason": ""})
         await asyncio.sleep(0.02)
-        await agent_two._received.put({"type": "websocket.disconnect", "code": 1006, "reason": ""})
         control_order = []
         agent_three = FakeWebSocket(label="agent-3", control_order=control_order)
         agent_three_task = asyncio.create_task(session.attach("agent", agent_three, "work-3"))

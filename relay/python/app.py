@@ -19,7 +19,7 @@ from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.12.6"
+RELAY_VERSION = "0.12.8"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -1026,90 +1026,63 @@ class ResumeSession:
                     "resumable bridge interrupted room=%s pair=%s session=%s failed_side=%s direction=%s end=%s close_code=%s close_reason=%r error=%r",
                     self.room.id, pair_id, self.id, result.failed_side, result.direction, result.end, result.close_code, result.close_reason, result.error,
                 )
-                failed_socket = failed_endpoint.invalidate()
-                if failed_socket is not None:
-                    await close_quietly(failed_socket, 1012, "resume session")
+                # Treat either transport failure as a generation barrier. A
+                # proxy can leave the opposite socket apparently alive after
+                # it has stopped carrying traffic. Releasing one replacement
+                # against that stale peer can cross incompatible replay
+                # offsets, so both endpoints must reattach together.
+                stale_agent = agent_endpoint.invalidate()
+                stale_client = client_endpoint.invalidate()
+                await asyncio.gather(
+                    close_quietly(stale_agent, 1012, "coordinated resume") if stale_agent is not None else asyncio.sleep(0),
+                    close_quietly(stale_client, 1012, "coordinated resume") if stale_client is not None else asyncio.sleep(0),
+                )
+                if agent_attachment is not None:
+                    try_set_result(agent_attachment.done, None)
+                    agent_attachment = None
+                if client_attachment is not None:
+                    try_set_result(client_attachment.done, None)
+                    client_attachment = None
 
-                if result.failed_side == "agent":
-                    if agent_attachment is not None:
-                        try_set_result(agent_attachment.done, None)
-                        agent_attachment = None
+                while True:
                     try:
-                        agent_attachment = await asyncio.wait_for(
-                            self._latest_attachment(self._agent), timeout=300
+                        agent_attachment, client_attachment = await asyncio.wait_for(
+                            asyncio.gather(
+                                self._latest_attachment(self._agent),
+                                self._latest_attachment(self._client),
+                            ),
+                            timeout=300,
                         )
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         return
-                    replace_agent = True
-                    replace_client = False
-                else:
-                    if client_attachment is not None:
-                        try_set_result(client_attachment.done, None)
-                        client_attachment = None
-                    try:
-                        client_attachment = await asyncio.wait_for(
-                            self._latest_attachment(self._client), timeout=300
-                        )
-                    except (asyncio.TimeoutError, asyncio.CancelledError):
-                        return
-                    replace_agent = False
-                    replace_client = True
-
-                # The opposite peer may start recovery while the relay is
-                # waiting for the side that failed first. Replace both sockets
-                # before releasing either peer so replay traffic cannot cross
-                # a stale generation and create a sequence-offset gap.
-                queued_agent = await self._latest_available_attachment(self._agent)
-                if queued_agent is not None:
-                    stale_agent = agent_endpoint.invalidate()
-                    if agent_attachment is not None:
-                        await close_quietly(agent_attachment.websocket, 1012, "replaced resume socket")
-                        try_set_result(agent_attachment.done, None)
-                    elif stale_agent is not None:
-                        await close_quietly(stale_agent, 1012, "resume session")
-                    agent_attachment = queued_agent
-                    replace_agent = True
-                queued_client = await self._latest_available_attachment(self._client)
-                if queued_client is not None:
-                    stale_client = client_endpoint.invalidate()
-                    if client_attachment is not None:
-                        await close_quietly(client_attachment.websocket, 1012, "replaced resume socket")
-                        try_set_result(client_attachment.done, None)
-                    elif stale_client is not None:
-                        await close_quietly(stale_client, 1012, "resume session")
-                    client_attachment = queued_client
-                    replace_client = True
-
-                if replace_agent:
-                    while True:
-                        agent = agent_attachment.websocket
-                        self.agent_remote = agent_attachment.remote
-                        agent_endpoint.replace(agent)
-                        if await send_control(agent, f"resume {self.id}", "agent", self.room.id, agent_attachment.remote):
-                            break
-                        await close_quietly(agent, 1012, "retry resume")
-                        try_set_result(agent_attachment.done, None)
-                        try:
-                            agent_attachment = await asyncio.wait_for(
-                                self._latest_attachment(self._agent), timeout=300
-                            )
-                        except (asyncio.TimeoutError, asyncio.CancelledError):
-                            return
-                if replace_client:
-                    while True:
-                        client = client_attachment.websocket
-                        self.client_remote = client_attachment.remote
-                        client_endpoint.replace(client)
-                        if await send_control(client, f"resume {self.id}", "client", self.room.id, client_attachment.remote):
-                            break
-                        await close_quietly(client, 1012, "retry resume")
-                        try_set_result(client_attachment.done, None)
-                        try:
-                            client_attachment = await asyncio.wait_for(
-                                self._latest_attachment(self._client), timeout=300
-                            )
-                        except (asyncio.TimeoutError, asyncio.CancelledError):
-                            return
+                    agent_attachment = await self._latest_from(
+                        self._agent, agent_attachment
+                    )
+                    client_attachment = await self._latest_from(
+                        self._client, client_attachment
+                    )
+                    agent = agent_attachment.websocket
+                    client = client_attachment.websocket
+                    self.agent_remote = agent_attachment.remote
+                    self.client_remote = client_attachment.remote
+                    agent_endpoint.replace(agent)
+                    client_endpoint.replace(client)
+                    agent_ready, client_ready = await asyncio.gather(
+                        send_control(agent, f"resume {self.id}", "agent", self.room.id, agent_attachment.remote),
+                        send_control(client, f"resume {self.id}", "client", self.room.id, client_attachment.remote),
+                    )
+                    if agent_ready and client_ready:
+                        break
+                    retry_agent = agent_endpoint.invalidate()
+                    retry_client = client_endpoint.invalidate()
+                    await asyncio.gather(
+                        close_quietly(retry_agent, 1012, "retry coordinated resume") if retry_agent is not None else asyncio.sleep(0),
+                        close_quietly(retry_client, 1012, "retry coordinated resume") if retry_client is not None else asyncio.sleep(0),
+                    )
+                    try_set_result(agent_attachment.done, None)
+                    try_set_result(client_attachment.done, None)
+                    agent_attachment = None
+                    client_attachment = None
                 start_pump("agent_to_client")
                 start_pump("client_to_agent")
                 logger.info("resumable bridge resumed room=%s pair=%s session=%s agent=%s client=%s", self.room.id, pair_id, self.id, self.agent_remote, self.client_remote)
@@ -1138,23 +1111,12 @@ class ResumeSession:
         queue: asyncio.Queue[ResumeAttachment],
     ) -> ResumeAttachment:
         latest = await queue.get()
-        while True:
-            try:
-                replacement = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return latest
-            await close_quietly(latest.websocket, 1012, "replaced resume socket")
-            try_set_result(latest.done, None)
-            latest = replacement
+        return await ResumeSession._latest_from(queue, latest)
 
-    @classmethod
-    async def _latest_available_attachment(
-        cls, queue: asyncio.Queue[ResumeAttachment]
-    ) -> ResumeAttachment | None:
-        try:
-            latest = queue.get_nowait()
-        except asyncio.QueueEmpty:
-            return None
+    @staticmethod
+    async def _latest_from(
+        queue: asyncio.Queue[ResumeAttachment], latest: ResumeAttachment
+    ) -> ResumeAttachment:
         while True:
             try:
                 replacement = queue.get_nowait()
