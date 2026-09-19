@@ -158,6 +158,7 @@ Android lint may need uncached artifacts from `dl.google.com`; if this host cann
 ## Coding Guidance
 
 - After making code changes, commit and push the completed, verified changes to the configured upstream branch before finishing the task unless the user explicitly asks to keep them local.
+- Whenever a new versioned build is produced, create and publish the corresponding GitHub Release with the repository's complete required artifact set and checksums. Pushing the code or tag without publishing the GitHub Release is not considered complete.
 - Prefer existing package boundaries and helper APIs.
 - Keep `internal/tunnel` focused on current protocol primitives: WebSocket dialing, proxy URL handling, v2 control messages, role constants, resumption, and byte piping.
 - Keep the merged Windows app relay-first; it should store relay service bases, a profile room name, and local UI settings, not implement the broker.
