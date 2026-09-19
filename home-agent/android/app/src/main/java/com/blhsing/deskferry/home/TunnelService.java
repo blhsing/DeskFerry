@@ -15,6 +15,7 @@ import android.os.Build;
 import android.os.IBinder;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
@@ -99,6 +100,7 @@ public class TunnelService extends Service {
 	private final Semaphore rdpBridgePermits = new Semaphore(MAX_CONCURRENT_BRIDGES_PER_SERVICE, true);
 	private final Semaphore smbBridgePermits = new Semaphore(MAX_CONCURRENT_BRIDGES_PER_SERVICE, true);
     private final Object networkLock = new Object();
+    private final Object powerLock = new Object();
     private final Object remoteLogLock = new Object();
     private final ArrayDeque<RemoteLogLine> remoteLogLines = new ArrayDeque<>();
     private final List<DiagnosticUploader> diagnosticUploaders = new ArrayList<>();
@@ -116,6 +118,8 @@ public class TunnelService extends Service {
     private ConnectivityManager.NetworkCallback networkCallback;
     private Network activeNetwork;
     private boolean networkWasLost;
+    private PowerManager.WakeLock activeBridgeWakeLock;
+    private int activeBridgeWakeLockUsers;
     private final Handler networkHandler = new Handler(Looper.getMainLooper());
     private Runnable pendingNetworkTransition;
     private volatile boolean running;
@@ -209,7 +213,6 @@ public class TunnelService extends Service {
                 roomProof = requestedRoomProof == null ? "" : requestedRoomProof.trim();
                 logRetentionDays = HomePrefs.sanitizeLogRetentionDays(requestedLogRetentionDays);
                 OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
-                        .pingInterval(10, TimeUnit.SECONDS)
                         .readTimeout(30, TimeUnit.SECONDS)
                         .retryOnConnectionFailure(true);
                 ProxySettings.apply(clientBuilder, requestedProxy);
@@ -393,6 +396,55 @@ public class TunnelService extends Service {
         sessions.clear();
         activeConnections = 0;
     }
+
+	private boolean acquireActiveBridgeWakeLock() {
+		boolean firstUser = false;
+		try {
+			synchronized (powerLock) {
+				if (activeBridgeWakeLock == null) {
+					PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+					if (powerManager == null) {
+						return false;
+					}
+					activeBridgeWakeLock = powerManager.newWakeLock(
+							PowerManager.PARTIAL_WAKE_LOCK, "DeskFerry:ActiveBridge");
+					activeBridgeWakeLock.setReferenceCounted(false);
+				}
+				firstUser = activeBridgeWakeLockUsers++ == 0;
+				if (firstUser && !activeBridgeWakeLock.isHeld()) {
+					activeBridgeWakeLock.acquire();
+				}
+			}
+			if (firstUser) {
+				append("Android partial wake lock acquired for active relay bridge recovery.");
+			}
+			return true;
+		} catch (RuntimeException failure) {
+			synchronized (powerLock) {
+				if (firstUser && activeBridgeWakeLockUsers > 0) {
+					activeBridgeWakeLockUsers--;
+				}
+			}
+			append("Could not acquire Android partial wake lock: " + throwableText(failure) + ".");
+			return false;
+		}
+	}
+
+	private void releaseActiveBridgeWakeLock() {
+		boolean lastUser = false;
+		synchronized (powerLock) {
+			if (activeBridgeWakeLockUsers <= 0) {
+				return;
+			}
+			lastUser = --activeBridgeWakeLockUsers == 0;
+			if (lastUser && activeBridgeWakeLock != null && activeBridgeWakeLock.isHeld()) {
+				activeBridgeWakeLock.release();
+			}
+		}
+		if (lastUser) {
+			append("Android partial wake lock released; no active relay bridges remain.");
+		}
+	}
 
 	private void startAcceptLoop(ServerSocket listener, String service) {
 		Thread thread = new Thread(() -> {
@@ -1147,6 +1199,7 @@ public class TunnelService extends Service {
         public void run() {
             String remote = String.valueOf(localSocket.getRemoteSocketAddress());
             boolean permitAcquired = false;
+			boolean wakeLockAcquired = acquireActiveBridgeWakeLock();
             activeConnections++;
             totalConnections++;
             updateState("Running", null, null, null);
@@ -1202,8 +1255,14 @@ public class TunnelService extends Service {
                 if (permitAcquired) {
 					permits.release();
                 }
-                close();
-				append(serviceLabel + " session remote=" + remote + " relay=" + selectedRelay + " ended duration_ms=" + elapsedMillis(startedAt) + " termination=" + termination.get() + " local_to_relay_bytes=" + localToRelayBytes.get() + " local_to_relay_messages=" + localToRelayMessages.get() + " relay_to_local_bytes=" + relayToLocalBytes.get() + " relay_to_local_messages=" + relayToLocalMessages.get() + ".");
+				try {
+					close();
+					append(serviceLabel + " session remote=" + remote + " relay=" + selectedRelay + " ended duration_ms=" + elapsedMillis(startedAt) + " termination=" + termination.get() + " local_to_relay_bytes=" + localToRelayBytes.get() + " local_to_relay_messages=" + localToRelayMessages.get() + " relay_to_local_bytes=" + relayToLocalBytes.get() + " relay_to_local_messages=" + relayToLocalMessages.get() + ".");
+				} finally {
+					if (wakeLockAcquired) {
+						releaseActiveBridgeWakeLock();
+					}
+				}
             }
         }
 

@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.12.9 - 2026-09-19
+
+- Keep the Android CPU awake only while an RDP or SMB bridge is active so its heartbeat and resume workers are not suspended during an ongoing remote session.
+- Remove OkHttp's redundant ten-second WebSocket ping deadline on Android; DeskFerry's end-to-end heartbeat remains responsible for detecting a stalled relay path without dropping mobile links after one delayed pong.
+
 ## 0.12.8 - 2026-09-19
 
 - Coordinate resumable relay recovery across both endpoints when either transport fails, preventing a stale-but-apparently-connected peer from receiving replay data at an incompatible offset and forcing the underlying RDP session to reconnect.
