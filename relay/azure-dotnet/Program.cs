@@ -859,7 +859,7 @@ sealed class RelayHub
         NotifyDashboards();
         try
         {
-            if (!await control.SendAsync(new ControlMessage("control-ready", AgentId: agentId, ProtocolVersion: ProtocolVersion), abort))
+            if (!await control.SendAsync(new ControlMessage("control-ready", AgentId: agentId, ProtocolVersion: ProtocolVersion, Heartbeat: true), abort))
             {
                 return;
             }
@@ -867,6 +867,14 @@ sealed class RelayHub
             while (!abort.IsCancellationRequested && socket.State == WebSocketState.Open)
             {
                 var message = await ReceiveV2Async(socket, abort);
+                if (message.Type == "control-ping")
+                {
+                    if (!await control.SendAsync(new ControlMessage("control-pong"), abort))
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 var sessionId = CleanSessionValue(message.SessionId);
                 if (sessionId.Length == 0)
                 {
@@ -2494,7 +2502,7 @@ sealed class ResumeSession
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.12.8";
+    public const string Version = "0.12.10";
 }
 
 sealed class WaitingAgent

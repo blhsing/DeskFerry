@@ -19,7 +19,7 @@ from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.12.8"
+RELAY_VERSION = "0.12.10"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -1234,7 +1234,7 @@ class RelayHub:
             await close_quietly(previous.websocket, 1000, "replaced by newer control connection")
         self.notify_dashboards()
         try:
-            if not await control.send({"type": "control-ready", "agent_id": agent_id}):
+            if not await control.send({"type": "control-ready", "agent_id": agent_id, "protocol_version": 2, "heartbeat": True}):
                 return
             logger.info("agent control connected room=%s agent=%s services=%s concurrency=%s remote=%s removed_legacy_slots=%s", room.id, agent_id, sorted(services), concurrency, remote, removed_legacy)
             while websocket_is_connected(websocket):
@@ -1242,6 +1242,10 @@ class RelayHub:
                 if not isinstance(message, dict):
                     continue
                 message_type = str(message.get("type", "")).strip().lower()
+                if message_type == "control-ping":
+                    if not await control.send({"type": "control-pong"}):
+                        return
+                    continue
                 session_id = clean_session_value(str(message.get("session_id", "")))
                 if not session_id:
                     continue

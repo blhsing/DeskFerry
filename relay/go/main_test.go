@@ -244,8 +244,19 @@ func TestV2OnDemandSessionPairingAndBusyRejection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tunnel.CloseWebSocket(control)
-	if err := tunnel.AwaitControlReady(ctx, control); err != nil {
+	heartbeat, err := tunnel.AwaitControlReadyInfo(ctx, control)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !heartbeat {
+		t.Fatal("control channel omitted heartbeat capability")
+	}
+	if err := tunnel.WriteControlMessage(ctx, control, tunnel.ControlMessage{Type: tunnel.MessageControlPing}); err != nil {
+		t.Fatal(err)
+	}
+	pong, err := tunnel.ReadControlMessage(ctx, control)
+	if err != nil || pong.Type != tunnel.MessageControlPong {
+		t.Fatalf("control heartbeat response=%#v error=%v", pong, err)
 	}
 
 	clientHeaders := http.Header{}

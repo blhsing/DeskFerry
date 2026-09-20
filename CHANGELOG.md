@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.12.10 - 2026-09-20
+
+- Add negotiated application-level heartbeats to Work-agent control channels so Azure, OCI, and Python relays can promptly replace connections that a proxy keeps open after their data path has stalled.
+- Preserve compatibility with older relays by enabling control heartbeats only when the relay advertises support in its protocol-v2 greeting.
+
 ## 0.12.9 - 2026-09-19
 
 - Keep the Android CPU awake only while an RDP or SMB bridge is active so its heartbeat and resume workers are not suspended during an ongoing remote session.

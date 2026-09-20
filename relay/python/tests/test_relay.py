@@ -548,6 +548,8 @@ def test_v2_on_demand_pairing_and_busy_rejection():
                 break
             await asyncio.sleep(0.01)
         assert control.json_messages[0]["type"] == "control-ready"
+        assert control.json_messages[0]["protocol_version"] == 2
+        assert control.json_messages[0]["heartbeat"] is True
 
         home_task = asyncio.create_task(
             hub.serve_v2_client("unit-v2", home, "home", True, "", "screen", heartbeat=True)
@@ -596,6 +598,34 @@ def test_v2_on_demand_pairing_and_busy_rejection():
         for task in (home_task, agent_task, control_task):
             task.cancel()
         await asyncio.gather(home_task, agent_task, control_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_v2_control_heartbeat():
+    async def scenario():
+        hub = RelayHub()
+        control = FakeWebSocket()
+        control_task = asyncio.create_task(
+            hub.serve_agent_control("unit-heartbeat", control, "work", "unit-agent", {"rdp"}, 1)
+        )
+        for _ in range(50):
+            if control.json_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert control.json_messages[0]["type"] == "control-ready"
+        assert control.json_messages[0]["protocol_version"] == 2
+        assert control.json_messages[0]["heartbeat"] is True
+
+        await control._received.put({"type": "control-ping"})
+        for _ in range(50):
+            if len(control.json_messages) > 1:
+                break
+            await asyncio.sleep(0.01)
+        assert control.json_messages[1]["type"] == "control-pong"
+
+        control_task.cancel()
+        await asyncio.gather(control_task, return_exceptions=True)
 
     asyncio.run(scenario())
 

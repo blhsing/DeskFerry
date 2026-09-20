@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,6 +40,11 @@ const serviceName = "DeskFerryAgent"
 const defaultRelayURL = "https://test-officialwebsite.azurewebsites.net/relay/workdesk;http://217.142.228.117/relay/workdesk"
 const agentIDHeader = "X-DeskFerry-Agent-Instance"
 const agentSlotHeader = "X-DeskFerry-Agent-Slot"
+
+const (
+	controlHeartbeatInterval = 3 * time.Second
+	controlHeartbeatTimeout  = 10 * time.Second
+)
 
 var relayLogs = remotelog.New("work-agent")
 
@@ -810,6 +816,33 @@ func (w *controlWriter) send(ctx context.Context, message tunnel.ControlMessage)
 	return tunnel.WriteControlMessage(writeCtx, w.ws, message)
 }
 
+func monitorControlHeartbeat(ctx context.Context, relayAddr string, ws tunnel.MessageConn, writer *controlWriter, lastInbound *atomic.Int64) {
+	monitorControlHeartbeatWithTiming(ctx, relayAddr, ws, writer, lastInbound, controlHeartbeatInterval, controlHeartbeatTimeout)
+}
+
+func monitorControlHeartbeatWithTiming(ctx context.Context, relayAddr string, ws tunnel.MessageConn, writer *controlWriter, lastInbound *atomic.Int64, interval, timeout time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		last := time.Unix(0, lastInbound.Load())
+		if elapsed := time.Since(last); elapsed >= timeout {
+			log.Printf("agent control relay=%s heartbeat timed out after=%s; replacing stale connection", relayAddr, elapsed.Round(time.Millisecond))
+			tunnel.CloseMessageConn(ws)
+			return
+		}
+		if err := writer.send(ctx, tunnel.ControlMessage{Type: tunnel.MessageControlPing}); err != nil {
+			log.Printf("agent control relay=%s heartbeat write failed: %v", relayAddr, err)
+			tunnel.CloseMessageConn(ws)
+			return
+		}
+	}
+}
+
 func runAgentControlOnce(ctx context.Context, cfg config, agentID string, targets []serviceTarget, limiter chan struct{}) (bool, error) {
 	headers := http.Header{}
 	tunnel.AddProtocolV2Header(headers)
@@ -829,7 +862,7 @@ func runAgentControlOnce(ctx context.Context, cfg config, agentID string, target
 	}
 	defer tunnel.CloseMessageConn(ws)
 	readyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err = tunnel.AwaitControlReady(readyCtx, ws)
+	heartbeatSupported, err := tunnel.AwaitControlReadyInfo(readyCtx, ws)
 	cancel()
 	if err != nil {
 		if tunnel.IsTerminalSessionError(err) && strings.Contains(strings.ToLower(err.Error()), "missing relay role") {
@@ -838,11 +871,22 @@ func runAgentControlOnce(ctx context.Context, cfg config, agentID string, target
 		return false, err
 	}
 	writer := &controlWriter{ws: ws}
-	log.Printf("agent control connected relay=%s room=%s services=%s concurrency=%d via=%s", cfg.RelayAddr, tunnel.RelayRoomToken(cfg.RelayAddr, ""), strings.Join(services, ","), cfg.ConcurrencyLimit, tunnel.ProxySpecForLog(cfg.Proxy))
+	var lastInbound atomic.Int64
+	lastInbound.Store(time.Now().UnixNano())
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	defer stopHeartbeat()
+	if heartbeatSupported {
+		go monitorControlHeartbeat(heartbeatCtx, cfg.RelayAddr, ws, writer, &lastInbound)
+	}
+	log.Printf("agent control connected relay=%s room=%s services=%s concurrency=%d heartbeat=%t via=%s", cfg.RelayAddr, tunnel.RelayRoomToken(cfg.RelayAddr, ""), strings.Join(services, ","), cfg.ConcurrencyLimit, heartbeatSupported, tunnel.ProxySpecForLog(cfg.Proxy))
 	for {
 		message, err := tunnel.ReadControlMessage(ctx, ws)
 		if err != nil {
 			return true, err
+		}
+		lastInbound.Store(time.Now().UnixNano())
+		if message.Type == tunnel.MessageControlPong {
+			continue
 		}
 		if message.Type != tunnel.MessageSessionOffer {
 			continue

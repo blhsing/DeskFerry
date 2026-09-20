@@ -1,12 +1,66 @@
 package workservice
 
 import (
+	"context"
+	"io"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/windows"
+	"nhooyr.io/websocket"
+
+	"deskferry/internal/tunnel"
 )
+
+type staleControlConn struct {
+	closed atomic.Bool
+	writes atomic.Int32
+}
+
+func (*staleControlConn) Read(context.Context) (websocket.MessageType, []byte, error) {
+	return 0, nil, io.EOF
+}
+func (c *staleControlConn) Write(context.Context, websocket.MessageType, []byte) error {
+	c.writes.Add(1)
+	return nil
+}
+func (c *staleControlConn) Close(websocket.StatusCode, string) error {
+	c.closed.Store(true)
+	return nil
+}
+func (c *staleControlConn) CloseNow() error {
+	c.closed.Store(true)
+	return nil
+}
+
+func TestControlHeartbeatClosesUnresponsiveProxyTunnel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn := &staleControlConn{}
+	writer := &controlWriter{ws: conn}
+	var lastInbound atomic.Int64
+	lastInbound.Store(time.Now().UnixNano())
+	done := make(chan struct{})
+	go func() {
+		monitorControlHeartbeatWithTiming(ctx, "https://relay.example/relay/test", conn, writer, &lastInbound, 10*time.Millisecond, 35*time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("control heartbeat did not terminate")
+	}
+	if !conn.closed.Load() {
+		t.Fatal("unresponsive control transport was not closed")
+	}
+	if conn.writes.Load() == 0 {
+		t.Fatal("control heartbeat did not probe the transport")
+	}
+}
+
+var _ tunnel.MessageConn = (*staleControlConn)(nil)
 
 func TestOrderedActiveSessionIDsPrefersActiveConsoleThenRemoteSessions(t *testing.T) {
 	sessions := []windows.WTS_SESSION_INFO{

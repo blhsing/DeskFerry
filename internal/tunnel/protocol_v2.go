@@ -22,6 +22,8 @@ const (
 	HeaderHeartbeat       = "X-DeskFerry-Heartbeat"
 
 	MessageControlReady       = "control-ready"
+	MessageControlPing        = "control-ping"
+	MessageControlPong        = "control-pong"
 	MessageSessionOffer       = "session-offer"
 	MessageAccept             = "accept"
 	MessageBusy               = "busy"
@@ -116,14 +118,23 @@ func ReadControlMessage(ctx context.Context, c MessageConn) (ControlMessage, err
 }
 
 func AwaitControlReady(ctx context.Context, c MessageConn) error {
+	_, err := AwaitControlReadyInfo(ctx, c)
+	return err
+}
+
+// AwaitControlReadyInfo waits for the relay control-channel greeting and
+// reports whether the relay supports application-level control heartbeats.
+// Older protocol-v2 relays omit Heartbeat, allowing upgraded agents to remain
+// compatible without repeatedly replacing otherwise healthy control sockets.
+func AwaitControlReadyInfo(ctx context.Context, c MessageConn) (bool, error) {
 	message, err := ReadControlMessage(ctx, c)
 	if err != nil {
-		return fmt.Errorf("wait for control channel: %w", err)
+		return false, fmt.Errorf("wait for control channel: %w", err)
 	}
 	if message.Type != MessageControlReady || message.ProtocolVersion != ProtocolVersion2 {
-		return fmt.Errorf("relay returned unexpected control response %q", message.Type)
+		return false, fmt.Errorf("relay returned unexpected control response %q", message.Type)
 	}
-	return nil
+	return message.Heartbeat, nil
 }
 
 func AwaitSessionReady(ctx context.Context, c MessageConn) (string, error) {

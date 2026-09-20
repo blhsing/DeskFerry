@@ -631,7 +631,7 @@ func (h *RelayHub) ServeAgentControl(ctx context.Context, token string, c tunnel
 		h.NotifyDashboards()
 		log.Printf("agent control disconnected room=%s agent=%s remote=%s", room.ID, agentID, remote)
 	}()
-	if !control.Send(tunnel.ControlMessage{Type: tunnel.MessageControlReady, AgentID: agentID, ProtocolVersion: tunnel.ProtocolVersion2}) {
+	if !control.Send(tunnel.ControlMessage{Type: tunnel.MessageControlReady, AgentID: agentID, ProtocolVersion: tunnel.ProtocolVersion2, Heartbeat: true}) {
 		return
 	}
 	log.Printf("agent control connected room=%s agent=%s services=%v concurrency=%d remote=%s removed_legacy_slots=%d", room.ID, agentID, sortedServices(services), concurrency, remote, removedLegacy)
@@ -640,6 +640,12 @@ func (h *RelayHub) ServeAgentControl(ctx context.Context, token string, c tunnel
 		message, err := tunnel.ReadControlMessage(ctx, c)
 		if err != nil {
 			return
+		}
+		if message.Type == tunnel.MessageControlPing {
+			if !control.Send(tunnel.ControlMessage{Type: tunnel.MessageControlPong}) {
+				return
+			}
+			continue
 		}
 		if cleanSessionValue(message.SessionID) == "" {
 			continue
