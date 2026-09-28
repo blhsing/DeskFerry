@@ -9,7 +9,7 @@ import org.junit.Test;
 public class TunnelServiceTest {
     @Test
     public void resumeAttemptDoesNotConsumeRecoveryWindow() {
-        assertEquals(20_000L, TunnelService.resumeAttemptWaitMillis(300_000L));
+        assertEquals(8_000L, TunnelService.resumeAttemptWaitMillis(300_000L));
     }
 
     @Test

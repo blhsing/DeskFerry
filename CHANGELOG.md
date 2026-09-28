@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.12.11 - 2026-09-28
+
+- Limit each resumable relay dial attempt to eight seconds so a half-open TCP or proxy attempt cannot consume nearly the entire Windows RDP automatic-reconnect window.
+- Apply the shorter retry cadence consistently to Windows, macOS, Work, and Android agents while retaining the five-minute logical-session recovery window.
+
 ## 0.12.10 - 2026-09-20
 
 - Add negotiated application-level heartbeats to Work-agent control channels so Azure, OCI, and Python relays can promptly replace connections that a proxy keeps open after their data path has stalled.

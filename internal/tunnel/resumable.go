@@ -16,19 +16,20 @@ import (
 )
 
 const (
-	resumableFrameData       = byte(1)
-	resumableFrameAck        = byte(2)
-	resumableFramePing       = byte(3)
-	resumableFramePong       = byte(4)
-	resumableHeaderLen       = 9
-	resumableChunkSize       = 64 * 1024
-	resumableMaxBuffer       = 8 * 1024 * 1024
-	resumableWindow          = 5 * time.Minute
-	defaultHeartbeatInterval = 5 * time.Second
-	defaultHeartbeatTimeout  = 15 * time.Second
-	ackStallThreshold        = 3 * time.Second
-	rdpAckRecoveryThreshold  = 5 * time.Second
-	defaultAckRecovery       = 10 * time.Second
+	resumableFrameData        = byte(1)
+	resumableFrameAck         = byte(2)
+	resumableFramePing        = byte(3)
+	resumableFramePong        = byte(4)
+	resumableHeaderLen        = 9
+	resumableChunkSize        = 64 * 1024
+	resumableMaxBuffer        = 8 * 1024 * 1024
+	resumableWindow           = 5 * time.Minute
+	defaultHeartbeatInterval  = 5 * time.Second
+	defaultHeartbeatTimeout   = 15 * time.Second
+	ackStallThreshold         = 3 * time.Second
+	rdpAckRecoveryThreshold   = 5 * time.Second
+	defaultAckRecovery        = 10 * time.Second
+	resumableDialAttemptLimit = 8 * time.Second
 )
 
 type ResumableWebSocketOptions struct {
@@ -268,10 +269,7 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 		}
 
 		remaining := resumableWindow - time.Since(lostAt)
-		dialTimeout := 20 * time.Second
-		if remaining < dialTimeout {
-			dialTimeout = remaining
-		}
+		dialTimeout := resumableDialAttemptTimeout(remaining)
 		dialCtx, cancelDial := context.WithTimeout(c.ctx, dialTimeout)
 		candidate, err := c.dialResume(dialCtx)
 		cancelDial()
@@ -314,6 +312,13 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 			}
 		}
 	}
+}
+
+func resumableDialAttemptTimeout(remaining time.Duration) time.Duration {
+	if remaining < resumableDialAttemptLimit {
+		return remaining
+	}
+	return resumableDialAttemptLimit
 }
 
 func (c *resumableWebSocketConn) drainLostSignal() {
