@@ -11,7 +11,47 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestDirectResumeFallsBackBeforeStalledWebSocketConsumesDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	winner := &recordingMessageConn{}
+	started := time.Now()
+	conn, err := dialResumeWithHTTPStreamFallback(ctx, 20*time.Millisecond,
+		func(ctx context.Context) (MessageConn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		func(context.Context) (MessageConn, error) { return winner, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn != winner {
+		t.Fatalf("selected %T, want HTTP-stream fallback candidate", conn)
+	}
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("fallback took %s; stalled WebSocket was not bounded", elapsed)
+	}
+}
+
+func TestDirectResumeKeepsFastWebSocket(t *testing.T) {
+	winner := &recordingMessageConn{}
+	streamCalled := false
+	conn, err := dialResumeWithHTTPStreamFallback(context.Background(), time.Second,
+		func(context.Context) (MessageConn, error) { return winner, nil },
+		func(context.Context) (MessageConn, error) {
+			streamCalled = true
+			return nil, errors.New("unexpected HTTP stream dial")
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn != winner || streamCalled {
+		t.Fatalf("fast WebSocket was not retained: conn=%T stream_called=%t", conn, streamCalled)
+	}
+}
 
 func TestRoomPasswordProofIsScopedToRoomAndDoesNotExposePassword(t *testing.T) {
 	first := RoomPasswordProof("https://relay.example/relay/alpha", "", "correct horse")

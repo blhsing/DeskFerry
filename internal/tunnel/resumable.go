@@ -339,7 +339,7 @@ func (c *resumableWebSocketConn) dialResume(ctx context.Context) (MessageConn, e
 		headers.Set(HeaderRoomProof, c.opts.RoomProof)
 	}
 	AddServiceHeader(headers, c.opts.Service)
-	ws, err := DialMessageConnWithHeaders(ctx, c.opts.RelayAddr, c.opts.Proxy, RoleResume, c.opts.Token, headers)
+	ws, err := DialResumeMessageConnWithHeaders(ctx, c.opts.RelayAddr, c.opts.Proxy, c.opts.Token, headers)
 	if err != nil {
 		return nil, err
 	}

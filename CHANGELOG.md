@@ -1,5 +1,12 @@
 # Release Notes
 
+## 0.12.12 - 2026-10-01
+
+- Hedge direct resumable-session recovery across transports: after a two-second
+  WebSocket resume probe, Windows and macOS clients now try the relay's HTTPS
+  streaming transport instead of letting one half-open WebSocket handshake
+  consume most of the RDP automatic-reconnect window.
+
 ## 0.12.11 - 2026-09-28
 
 - Limit each resumable relay dial attempt to eight seconds so a half-open TCP or proxy attempt cannot consume nearly the entire Windows RDP automatic-reconnect window.

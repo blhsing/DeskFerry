@@ -34,6 +34,7 @@ const (
 	webSocketFallbackProbeTimeout = 4 * time.Second
 	httpStreamFallbackReserve     = 2 * time.Second
 	httpStreamPreferredDialLimit  = 6 * time.Second
+	directResumeWebSocketProbe    = 2 * time.Second
 )
 
 var (
@@ -420,6 +421,45 @@ func DialMessageConnWithHeaders(ctx context.Context, relayAddr, proxySpec, role,
 		// POST/GET exchange validates both halves of this capability.
 		MarkProxyCONNECTUnsupported(proxySpec)
 		clearProxyCONNECTRejectedCandidate(proxySpec)
+	}
+	return stream, nil
+}
+
+// DialResumeMessageConnWithHeaders gives a direct WebSocket resume a short
+// head start, then tries the relay's HTTP-stream transport. A half-open
+// WebSocket handshake can otherwise consume most of an RDP client's automatic
+// reconnect window even while ordinary HTTPS requests still reach the relay.
+// The WebSocket attempt is cancelled before HTTP stream setup begins so the
+// relay never sees competing attachments for the same resumable side.
+func DialResumeMessageConnWithHeaders(ctx context.Context, relayAddr, proxySpec, token string, extraHeaders http.Header) (MessageConn, error) {
+	spec := strings.TrimSpace(proxySpec)
+	if !strings.EqualFold(spec, "direct") {
+		return DialMessageConnWithHeaders(ctx, relayAddr, proxySpec, RoleResume, token, extraHeaders)
+	}
+	return dialResumeWithHTTPStreamFallback(ctx, directResumeWebSocketProbe,
+		func(dialCtx context.Context) (MessageConn, error) {
+			return DialWebSocketWithHeaders(dialCtx, relayAddr, proxySpec, RoleResume, token, extraHeaders)
+		},
+		func(dialCtx context.Context) (MessageConn, error) {
+			return DialHTTPStreamWithHeaders(dialCtx, relayAddr, proxySpec, RoleResume, token, extraHeaders)
+		})
+}
+
+type messageConnDialFunc func(context.Context) (MessageConn, error)
+
+func dialResumeWithHTTPStreamFallback(ctx context.Context, webSocketProbe time.Duration, dialWebSocket, dialHTTPStream messageConnDialFunc) (MessageConn, error) {
+	probeCtx, cancelProbe := context.WithTimeout(ctx, webSocketProbe)
+	ws, wsErr := dialWebSocket(probeCtx)
+	cancelProbe()
+	if wsErr == nil {
+		return ws, nil
+	}
+	if ctx.Err() != nil {
+		return nil, wsErr
+	}
+	stream, streamErr := dialHTTPStream(ctx)
+	if streamErr != nil {
+		return nil, fmt.Errorf("websocket resume probe failed (%v); HTTP stream resume failed: %w", wsErr, streamErr)
 	}
 	return stream, nil
 }
