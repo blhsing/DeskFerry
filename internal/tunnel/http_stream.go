@@ -61,6 +61,8 @@ const (
 	// Out-of-order records a receiver holds while an earlier batch is late.
 	httpStreamReorderLimit = 4096
 	httpStreamResendAfter  = 3 * time.Second
+	// Downstream GETs kept waiting at a relay that supports pipelining.
+	httpStreamDownloadPipeline = 2
 )
 
 type httpStreamFrame struct {
@@ -109,8 +111,13 @@ type HTTPStreamConn struct {
 	// pipelined uploads can complete out of order.
 	recvAhead      map[uint64]httpStreamFrame
 	recvAheadBytes int
-	started        sync.Once
-	closeOnce      sync.Once
+	// Pipelined downloads: the highest sequence a response has carried, and
+	// when unacknowledged dispatched records last made progress.
+	downDispatched   uint64
+	downStallSince   time.Time
+	downPipelineOnce sync.Once
+	started          sync.Once
+	closeOnce        sync.Once
 }
 
 func newHTTPStreamConn(ctx context.Context) *HTTPStreamConn {
@@ -567,9 +574,14 @@ func (c *HTTPStreamConn) applyRecord(frame httpStreamFrame) error {
 		if frame.seq >= c.nextSend {
 			return errors.New("HTTP stream acknowledgement exceeds sent sequence")
 		}
+		trimmed := false
 		for len(c.sendFrames) > 0 && c.sendFrames[0].seq <= frame.seq {
 			c.sendBytes -= len(c.sendFrames[0].payload)
 			c.sendFrames = c.sendFrames[1:]
+			trimmed = true
+		}
+		if trimmed {
+			c.noteSendProgressLocked()
 		}
 		c.cond.Broadcast()
 		return nil
@@ -815,9 +827,14 @@ func (c *HTTPStreamConn) applyDownstreamAck(acknowledged uint64) {
 		return
 	}
 	c.lastActive = time.Now()
+	trimmed := false
 	for len(c.sendFrames) > 0 && c.sendFrames[0].seq <= acknowledged {
 		c.sendBytes -= len(c.sendFrames[0].payload)
 		c.sendFrames = c.sendFrames[1:]
+		trimmed = true
+	}
+	if trimmed {
+		c.noteSendProgressLocked()
 	}
 	c.cond.Broadcast()
 }
@@ -837,47 +854,21 @@ func (c *HTTPStreamConn) clientDownLoop() {
 	lostAt := time.Time{}
 	first := true
 	for c.ctx.Err() == nil {
-		attemptCtx, cancel := context.WithCancel(c.ctx)
-		req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, c.endpoint+"/down", nil)
-		if err != nil {
-			cancel()
-			c.readyOnce.Do(func() { c.ready <- err })
-			c.closeTerminal(err)
-			return
-		}
-		req.Header = c.headers.Clone()
-		req.Header.Set("Accept", "application/octet-stream")
-		req.Header.Set(HeaderHTTPStreamAck, strconv.FormatUint(c.receivedSequence(), 10))
-		resp, err := c.client.Do(req)
-		if err == nil && resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-			_ = resp.Body.Close()
-			err = fmt.Errorf("HTTP stream GET failed: HTTP %s: %s", resp.Status, strings.TrimSpace(string(body)))
-		}
-		if err == nil {
+		ok, records, err := c.downloadOnce()
+		if ok {
 			if first {
 				c.readyOnce.Do(func() { c.ready <- nil })
 				first = false
 			}
 			lostAt = time.Time{}
 			backoff = 250 * time.Millisecond
-			if resp.Header.Get(HeaderHTTPStreamAck) != "" {
-				c.mu.Lock()
-				c.downAcks = true
-				c.mu.Unlock()
-			}
-			var records int
-			records, err = c.readDownload(attemptCtx, cancel, resp.Body)
-			_ = resp.Body.Close()
 			// A finite batch that ended cleanly is the normal long-poll cycle,
 			// not a lost transport. Poll again at once; any delay here adds
 			// directly to downstream latency.
 			if c.batch && records > 0 && errors.Is(err, io.EOF) {
-				cancel()
 				continue
 			}
 		}
-		cancel()
 		if c.ctx.Err() != nil {
 			return
 		}
@@ -901,6 +892,66 @@ func (c *HTTPStreamConn) clientDownLoop() {
 		}
 		backoff = nextHTTPStreamBackoff(backoff)
 	}
+}
+
+// clientDownPipelineLoop keeps an additional GET waiting at a relay that
+// confirmed pipelined downloads, so new records need not wait for the next
+// poll while another response is in transit. clientDownLoop alone decides when
+// the transport has failed.
+func (c *HTTPStreamConn) clientDownPipelineLoop() {
+	backoff := 250 * time.Millisecond
+	for c.ctx.Err() == nil {
+		ok, records, err := c.downloadOnce()
+		if ok {
+			backoff = 250 * time.Millisecond
+			if records > 0 && errors.Is(err, io.EOF) {
+				continue
+			}
+		}
+		if !sleepHTTPStream(c.ctx, backoff) {
+			return
+		}
+		backoff = nextHTTPStreamBackoff(backoff)
+	}
+}
+
+// downloadOnce issues one downstream GET and applies its records. It reports
+// whether the relay accepted the request and how many records arrived.
+func (c *HTTPStreamConn) downloadOnce() (bool, int, error) {
+	attemptCtx, cancel := context.WithCancel(c.ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, c.endpoint+"/down", nil)
+	if err != nil {
+		return false, 0, err
+	}
+	req.Header = c.headers.Clone()
+	req.Header.Set("Accept", "application/octet-stream")
+	req.Header.Set(HeaderHTTPStreamAck, strconv.FormatUint(c.receivedSequence(), 10))
+	req.Header.Set(HeaderHTTPStreamPipeline, "1")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return false, 0, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		_ = resp.Body.Close()
+		return false, 0, fmt.Errorf("HTTP stream GET failed: HTTP %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	if resp.Header.Get(HeaderHTTPStreamAck) != "" {
+		c.mu.Lock()
+		c.downAcks = true
+		c.mu.Unlock()
+	}
+	if resp.Header.Get(HeaderHTTPStreamPipeline) != "" {
+		c.downPipelineOnce.Do(func() {
+			for i := 1; i < httpStreamDownloadPipeline; i++ {
+				go c.clientDownPipelineLoop()
+			}
+		})
+	}
+	records, err := c.readDownload(attemptCtx, cancel, resp.Body)
+	_ = resp.Body.Close()
+	return true, records, err
 }
 
 // readDownload applies downstream records until the body ends and reports how
@@ -1132,7 +1183,7 @@ func (c *HTTPStreamConn) serveDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	c.mu.Unlock()
 	if batchMode {
-		c.serveDownloadBatch(w, r, generation, primeBatch)
+		c.serveDownloadBatch(w, r, generation, primeBatch, r.Header.Get(HeaderHTTPStreamPipeline) != "")
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -1217,47 +1268,143 @@ func (c *HTTPStreamConn) serveDownload(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (c *HTTPStreamConn) serveDownloadBatch(w http.ResponseWriter, r *http.Request, generation uint64, prime bool) {
+func (c *HTTPStreamConn) serveDownloadBatch(w http.ResponseWriter, r *http.Request, generation uint64, prime, pipelined bool) {
+	if pipelined {
+		w.Header().Set(HeaderHTTPStreamPipeline, "1")
+	}
 	timer := time.NewTimer(httpStreamKeepalive)
 	defer timer.Stop()
 	var coalesce <-chan time.Time
+	var coalesceTimer *time.Timer
+	defer func() {
+		if coalesceTimer != nil {
+			coalesceTimer.Stop()
+		}
+	}()
 	for {
 		c.mu.Lock()
-		current := c.downGen == generation && !c.closed
-		c.mu.Unlock()
-		if !current {
+		// A newer GET supersedes a legacy one; pipelined GETs wait together.
+		if (!pipelined && c.downGen != generation) || c.closed {
+			c.mu.Unlock()
 			return
 		}
-		frames, ack := c.snapshotAfter(0)
-		if prime || len(frames) > 0 {
+		frames, ack, send := c.claimDownloadLocked(pipelined, prime)
+		ackAdvanced := ack > c.downAckSent
+		resendIn := c.downloadResendDelayLocked(pipelined)
+		c.mu.Unlock()
+		if send {
 			c.writeDownloadBatch(w, ack, frames)
 			return
 		}
 		// Answer an advanced acknowledgement promptly so the sender can free
 		// its buffer, but give the reply that usually follows a received
 		// message a moment to share this batch instead of the next poll.
-		c.mu.Lock()
-		ackAdvanced := ack > c.downAckSent
-		c.mu.Unlock()
 		if ackAdvanced && coalesce == nil {
-			coalesceTimer := time.NewTimer(httpStreamAckCoalesce)
-			defer coalesceTimer.Stop()
+			coalesceTimer = time.NewTimer(httpStreamAckCoalesce)
 			coalesce = coalesceTimer.C
+		}
+		var resend <-chan time.Time
+		var resendTimer *time.Timer
+		if resendIn > 0 {
+			resendTimer = time.NewTimer(resendIn)
+			resend = resendTimer.C
 		}
 		select {
 		case <-r.Context().Done():
-			return
 		case <-c.ctx.Done():
-			return
 		case <-c.wake:
+		case <-resend:
 		case <-coalesce:
-			frames, ack = c.snapshotAfter(0)
-			c.writeDownloadBatch(w, ack, frames)
-			return
+			c.mu.Lock()
+			frames, ack, send = c.claimDownloadLocked(pipelined, c.recvNext-1 > c.downAckSent)
+			c.mu.Unlock()
+			if send {
+				c.writeDownloadBatch(w, ack, frames)
+				if resendTimer != nil {
+					resendTimer.Stop()
+				}
+				return
+			}
+			// Another waiting GET already carried the acknowledgement.
+			coalesce = nil
 		case <-timer.C:
-			c.writeDownloadBatch(w, ack, nil)
+			c.mu.Lock()
+			frames, ack, _ = c.claimDownloadLocked(pipelined, true)
+			c.mu.Unlock()
+			c.writeDownloadBatch(w, ack, frames)
+			if resendTimer != nil {
+				resendTimer.Stop()
+			}
 			return
 		}
+		if resendTimer != nil {
+			resendTimer.Stop()
+		}
+		if r.Context().Err() != nil || c.ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+// claimDownloadLocked chooses the records for a downstream batch and reports
+// whether to answer now. A legacy GET carries every unacknowledged record.
+// Pipelined GETs each carry only records no other response has carried, so
+// concurrently waiting GETs never duplicate data, unless dispatched records
+// stayed unacknowledged long enough that their response was probably lost.
+func (c *HTTPStreamConn) claimDownloadLocked(pipelined, force bool) ([]httpStreamFrame, uint64, bool) {
+	ack := c.recvNext - 1
+	after := uint64(0)
+	if pipelined {
+		if c.downloadResendDelayLocked(true) < 0 {
+			c.downDispatched = c.sendFrames[0].seq - 1
+			c.downStallSince = time.Time{}
+		}
+		after = c.downDispatched
+	}
+	var frames []httpStreamFrame
+	for _, frame := range c.sendFrames {
+		if frame.seq > after {
+			frames = append(frames, frame)
+		}
+	}
+	if len(frames) == 0 && !force {
+		return nil, ack, false
+	}
+	if pipelined && len(frames) > 0 {
+		if !c.downloadOutstandingLocked() {
+			c.downStallSince = time.Now()
+		}
+		c.downDispatched = frames[len(frames)-1].seq
+	}
+	if ack > c.downAckSent {
+		c.downAckSent = ack
+	}
+	return frames, ack, true
+}
+
+func (c *HTTPStreamConn) downloadOutstandingLocked() bool {
+	return len(c.sendFrames) > 0 && c.sendFrames[0].seq <= c.downDispatched
+}
+
+// downloadResendDelayLocked reports how long until outstanding pipelined
+// records count as lost: zero when nothing is outstanding, negative once due.
+func (c *HTTPStreamConn) downloadResendDelayLocked(pipelined bool) time.Duration {
+	if !pipelined || !c.downloadOutstandingLocked() || c.downStallSince.IsZero() {
+		return 0
+	}
+	if remaining := httpStreamResendAfter - time.Since(c.downStallSince); remaining > 0 {
+		return remaining
+	}
+	return -1
+}
+
+// noteSendProgressLocked restarts the lost-response clock after
+// acknowledgements trim the send queue.
+func (c *HTTPStreamConn) noteSendProgressLocked() {
+	if c.downloadOutstandingLocked() {
+		c.downStallSince = time.Now()
+	} else {
+		c.downStallSince = time.Time{}
 	}
 }
 

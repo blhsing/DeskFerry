@@ -56,6 +56,7 @@ HTTP_STREAM_BUFFER = 8 * 1024 * 1024
 HTTP_STREAM_KEEPALIVE = 10
 HTTP_STREAM_ACK_COALESCE = 0.02
 HTTP_STREAM_REORDER_LIMIT = 4096
+HTTP_STREAM_RESEND_AFTER = 3.0
 HTTP_STREAM_RETENTION = 300
 
 
@@ -94,6 +95,10 @@ class HTTPStreamWebSocket:
         # can complete out of order.
         self.receive_ahead: dict[int, HTTPStreamFrame] = {}
         self.receive_ahead_bytes = 0
+        # Pipelined downloads: the highest sequence a response has carried, and
+        # when unacknowledged dispatched records last made progress.
+        self.down_dispatched = 0
+        self.down_stall_since: float | None = None
         self.last_activity = time.monotonic()
         self.closed = asyncio.Event()
 
@@ -165,8 +170,12 @@ class HTTPStreamWebSocket:
                     self.outgoing_bytes = 0
                     self.next_send = frame.sequence + 1
                     return True
+                trimmed = False
                 while self.outgoing and self.outgoing[0].sequence <= frame.sequence:
                     self.outgoing_bytes -= len(self.outgoing.pop(0).payload)
+                    trimmed = True
+                if trimmed:
+                    self.note_send_progress()
                 return False
             if frame.sequence < self.next_receive:
                 self.changed.set()
@@ -200,8 +209,53 @@ class HTTPStreamWebSocket:
             if acknowledged >= self.next_send:
                 return
             self.last_activity = time.monotonic()
+            trimmed = False
             while self.outgoing and self.outgoing[0].sequence <= acknowledged:
                 self.outgoing_bytes -= len(self.outgoing.pop(0).payload)
+                trimmed = True
+            if trimmed:
+                self.note_send_progress()
+
+    def download_outstanding(self) -> bool:
+        return bool(self.outgoing) and self.outgoing[0].sequence <= self.down_dispatched
+
+    def download_resend_at(self, pipelined: bool) -> float | None:
+        """When outstanding pipelined records count as lost. Callers hold the lock."""
+        if not pipelined or not self.download_outstanding() or self.down_stall_since is None:
+            return None
+        return self.down_stall_since + HTTP_STREAM_RESEND_AFTER
+
+    def note_send_progress(self) -> None:
+        """Restart the lost-response clock after acknowledgements trim the queue."""
+        self.down_stall_since = time.monotonic() if self.download_outstanding() else None
+
+    async def claim_download(self, pipelined: bool, force: bool) -> tuple[list[HTTPStreamFrame] | None, int, float | None]:
+        """Choose the records for a downstream batch, or None to keep waiting.
+
+        A legacy GET carries every unacknowledged record. Pipelined GETs each
+        carry only records no other response has carried, so concurrently
+        waiting GETs never duplicate data, unless dispatched records stayed
+        unacknowledged long enough that their response was probably lost.
+        """
+        async with self.lock:
+            self.changed.clear()
+            ack = self.next_receive - 1
+            after = 0
+            if pipelined:
+                resend_at = self.download_resend_at(True)
+                if resend_at is not None and resend_at <= time.monotonic():
+                    self.down_dispatched = self.outgoing[0].sequence - 1
+                    self.down_stall_since = None
+                after = self.down_dispatched
+            frames = [frame for frame in self.outgoing if frame.sequence > after]
+            if not frames and not force:
+                return None, ack, self.download_resend_at(pipelined)
+            if pipelined and frames:
+                if not self.download_outstanding():
+                    self.down_stall_since = time.monotonic()
+                self.down_dispatched = frames[-1].sequence
+            self.down_ack_sent = max(self.down_ack_sent, ack)
+            return frames, ack, None
 
     async def snapshot(self, last_sequence: int) -> tuple[list[HTTPStreamFrame], int]:
         async with self.lock:
@@ -256,12 +310,14 @@ class HTTPStreamWebSocket:
         if self.down_batch:
             prime = not self.down_primed
             self.down_primed = True
+            pipelined = bool(request.headers.get("x-deskferry-stream-pipeline", "").strip())
+            if pipelined:
+                ack_headers["X-DeskFerry-Stream-Pipeline"] = "1"
             loop = asyncio.get_running_loop()
             keepalive_deadline = loop.time() + HTTP_STREAM_KEEPALIVE
             coalesce_deadline: float | None = None
 
             def batch(ack: int, frames: list[HTTPStreamFrame]) -> Response:
-                self.down_ack_sent = max(self.down_ack_sent, ack)
                 payload = encode_http_stream_record(HTTPStreamFrame(HTTP_STREAM_ACK, ack))
                 payload += b"".join(encode_http_stream_record(frame) for frame in frames)
                 return Response(payload, media_type="application/octet-stream", headers={
@@ -269,9 +325,10 @@ class HTTPStreamWebSocket:
                     **ack_headers,
                 })
 
-            while generation == self.down_generation and not await request.is_disconnected():
-                frames, ack = await self.snapshot(0)
-                if prime or frames:
+            # A newer GET supersedes a legacy one; pipelined GETs wait together.
+            while (pipelined or generation == self.down_generation) and not await request.is_disconnected():
+                frames, ack, resend_at = await self.claim_download(pipelined, prime)
+                if frames is not None:
                     return batch(ack, frames)
                 # Answer an advanced acknowledgement promptly so the sender can
                 # free its buffer, but give the reply that usually follows a
@@ -279,11 +336,22 @@ class HTTPStreamWebSocket:
                 if ack > self.down_ack_sent and coalesce_deadline is None:
                     coalesce_deadline = loop.time() + HTTP_STREAM_ACK_COALESCE
                 deadline = min(keepalive_deadline, coalesce_deadline or keepalive_deadline)
+                if resend_at is not None:
+                    deadline = min(deadline, loop.time() + max(0.0, resend_at - time.monotonic()))
                 try:
                     await asyncio.wait_for(self.changed.wait(), timeout=max(0.0, deadline - loop.time()))
+                    continue
                 except asyncio.TimeoutError:
-                    frames, ack = await self.snapshot(0)
+                    pass
+                now = loop.time()
+                coalesce_due = coalesce_deadline is not None and now >= coalesce_deadline
+                force = now >= keepalive_deadline or (coalesce_due and self.next_receive - 1 > self.down_ack_sent)
+                frames, ack, _ = await self.claim_download(pipelined, force)
+                if frames is not None:
                     return batch(ack, frames)
+                if coalesce_due:
+                    # Another waiting GET already carried the acknowledgement.
+                    coalesce_deadline = None
             return Response(status_code=204)
 
         async def records():

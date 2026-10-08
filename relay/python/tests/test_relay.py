@@ -223,6 +223,65 @@ def test_http_stream_reorders_pipelined_records():
     asyncio.run(scenario())
 
 
+def test_http_stream_pipelined_downloads_split_and_resend(monkeypatch):
+    import app as relay_app
+
+    def download_request(ack: int) -> Request:
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        return Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/relay/unit/stream/id/down",
+            "headers": [
+                (b"x-deskferry-stream-ack", str(ack).encode()),
+                (b"x-deskferry-stream-pipeline", b"1"),
+            ],
+            "query_string": b"",
+            "client": ("127.0.0.1", 12345),
+            "server": ("127.0.0.1", 80),
+            "scheme": "http",
+        }, receive)
+
+    def data_sequences(body: bytes) -> list[int]:
+        result = []
+        while body:
+            kind, sequence, length = struct.unpack(">BQI", body[:13])
+            if kind != HTTP_STREAM_ACK:
+                result.append(sequence)
+            body = body[13 + length:]
+        return result
+
+    async def scenario():
+        stream = HTTPStreamWebSocket(download_request(0), "s" * 32)
+        stream.down_batch = True
+        stream.down_primed = True
+
+        # Two GETs wait together; each new record goes to exactly one of them.
+        first = asyncio.create_task(stream.serve_download(download_request(0)))
+        second = asyncio.create_task(stream.serve_download(download_request(0)))
+        await asyncio.sleep(0.05)
+        await stream.send_bytes(b"one")
+        done, pending = await asyncio.wait({first, second}, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+        response = done.pop().result()
+        assert response.headers["x-deskferry-stream-pipeline"] == "1"
+        assert data_sequences(response.body) == [1]
+        waiting = pending.pop()
+        await stream.send_bytes(b"two")
+        response = await asyncio.wait_for(waiting, timeout=1)
+        assert data_sequences(response.body) == [2]
+
+        # Neither response was acknowledged: once the resend delay passes, the
+        # next GET carries both again from the client's acknowledged point.
+        monkeypatch.setattr(relay_app, "HTTP_STREAM_RESEND_AFTER", 0.1)
+        await asyncio.sleep(0.15)
+        response = await asyncio.wait_for(stream.serve_download(download_request(0)), timeout=1)
+        assert data_sequences(response.body) == [1, 2]
+
+    asyncio.run(scenario())
+
+
 def test_home_agent_status_presence():
     client = TestClient(app)
     headers = {"X-DeskFerry-Role": "home-agent"}

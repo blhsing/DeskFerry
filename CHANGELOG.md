@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.12.16 - 2026-10-09
+
+- Pipeline downloads on the POST/GET streaming fallback. Once the relay confirms support on a GET (`X-DeskFerry-Stream-Pipeline`), clients keep two GETs waiting, so records produced while one response is in transit leave on the other instead of waiting for the next poll.
+- Each waiting pipelined GET carries only records no other response has carried. A relay re-sends records that stay unacknowledged for three seconds, in case their response was lost.
+- Older clients and relays keep the single-GET behavior.
+
 ## 0.12.15 - 2026-10-09
 
 - Pipeline uploads on the POST/GET streaming fallback. Once the relay confirms support (`X-DeskFerry-Stream-Pipeline`), clients keep up to three finite upload batches in flight, splitting large bursts into 256 KiB batches, so data queued during an upload no longer waits a full round trip for its response. Relays reorder overlapping uploads by sequence. Older relays keep receiving one batch at a time.

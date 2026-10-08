@@ -601,3 +601,125 @@ func TestHTTPStreamReordersEarlyRecords(t *testing.T) {
 		t.Fatalf("reorder buffer not drained: %d records, %d bytes", len(stream.recvAhead), stream.recvAheadBytes)
 	}
 }
+
+// pipelinedDownloadOrigin serves an HTTP stream relay whose handler sends
+// count numbered messages after receiving "go", and records how many GETs
+// were waiting at once. dropDown, when set, decides whether to discard a
+// downstream response that carried data.
+func pipelinedDownloadOrigin(t *testing.T, count int, dropDown func(body []byte) bool) (*httptest.Server, *atomic.Int32, func()) {
+	t.Helper()
+	streams := NewHTTPStreamServer(func(ctx context.Context, conn MessageConn, _ *http.Request, _ string) {
+		if _, _, err := conn.Read(ctx); err != nil {
+			return
+		}
+		for i := 0; i < count; i++ {
+			if err := conn.Write(ctx, websocket.MessageBinary, []byte(fmt.Sprintf("message-%03d", i))); err != nil {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		<-ctx.Done()
+	})
+	var active, maxActive atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) != 5 || parts[0] != "relay" || parts[2] != "stream" {
+			http.NotFound(w, r)
+			return
+		}
+		if parts[4] != "down" {
+			streams.Serve(w, r, parts[1], parts[3], parts[4])
+			return
+		}
+		now := active.Add(1)
+		defer active.Add(-1)
+		for {
+			seen := maxActive.Load()
+			if now <= seen || maxActive.CompareAndSwap(seen, now) {
+				break
+			}
+		}
+		recorder := httptest.NewRecorder()
+		streams.Serve(recorder, r, parts[1], parts[3], parts[4])
+		body := recorder.Body.Bytes()
+		// Deliver each batch a little late, as a proxy hop would, so the
+		// next records find another GET already waiting.
+		time.Sleep(20 * time.Millisecond)
+		if dropDown != nil && dropDown(body) {
+			if hijacker, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hijacker.Hijack(); err == nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+		for name, values := range recorder.Header() {
+			w.Header()[name] = values
+		}
+		w.WriteHeader(recorder.Code)
+		_, _ = w.Write(body)
+	}))
+	return origin, &maxActive, func() {
+		origin.Close()
+		streams.Close()
+	}
+}
+
+func readNumberedMessages(t *testing.T, ctx context.Context, conn MessageConn, count int) {
+	t.Helper()
+	for i := 0; i < count; i++ {
+		_, payload, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if want := fmt.Sprintf("message-%03d", i); string(payload) != want {
+			t.Fatalf("message %d = %q, want %q", i, payload, want)
+		}
+	}
+}
+
+func TestHTTPStreamPipelinedDownloadsArriveInOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	const messages = 300
+	origin, maxActive, closeOrigin := pipelinedDownloadOrigin(t, messages, nil)
+	defer closeOrigin()
+
+	conn, err := DialHTTPStreamWithHeaders(ctx, origin.URL+"/relay/unit", "direct", RoleProbe, "", nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer CloseMessageConn(conn)
+	if err := conn.Write(ctx, websocket.MessageText, []byte("go")); err != nil {
+		t.Fatal(err)
+	}
+	readNumberedMessages(t, ctx, conn, messages)
+	if got := maxActive.Load(); got < 2 {
+		t.Fatalf("at most %d GET was waiting; downloads were not pipelined", got)
+	}
+}
+
+func TestHTTPStreamPipelinedDownloadRecoversLostResponse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	const messages = 40
+	var dropped atomic.Bool
+	origin, _, closeOrigin := pipelinedDownloadOrigin(t, messages, func(body []byte) bool {
+		// Drop the first response that carries a data record.
+		return bytes.Contains(body, []byte("message-")) && dropped.CompareAndSwap(false, true)
+	})
+	defer closeOrigin()
+
+	conn, err := DialHTTPStreamWithHeaders(ctx, origin.URL+"/relay/unit", "direct", RoleProbe, "", nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer CloseMessageConn(conn)
+	if err := conn.Write(ctx, websocket.MessageText, []byte("go")); err != nil {
+		t.Fatal(err)
+	}
+	readNumberedMessages(t, ctx, conn, messages)
+	if !dropped.Load() {
+		t.Fatal("test proxy never dropped a response")
+	}
+}

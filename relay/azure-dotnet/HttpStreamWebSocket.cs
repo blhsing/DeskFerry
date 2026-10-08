@@ -67,6 +67,7 @@ sealed class HttpStreamWebSocket : WebSocket
     private const int ReorderLimit = 4096;
     private static readonly TimeSpan Keepalive = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan AckCoalesce = TimeSpan.FromMilliseconds(20);
+    private static readonly TimeSpan ResendAfter = TimeSpan.FromSeconds(3);
 
     private sealed record Frame(byte Kind, ulong Sequence, byte[] Payload);
 
@@ -91,6 +92,10 @@ sealed class HttpStreamWebSocket : WebSocket
     // can complete out of order.
     private readonly Dictionary<ulong, Frame> _receiveAhead = [];
     private int _receiveAheadBytes;
+    // Pipelined downloads: the highest sequence a response has carried, and
+    // when unacknowledged dispatched records last made progress.
+    private ulong _downDispatched;
+    private DateTimeOffset? _downStallSince;
     private WebSocketState _state = WebSocketState.Open;
     private WebSocketCloseStatus? _closeStatus;
     private string? _closeDescription;
@@ -385,7 +390,7 @@ sealed class HttpStreamWebSocket : WebSocket
         }
         if (batchMode)
         {
-            await ServeDownloadBatchAsync(context, generation, primeBatch);
+            await ServeDownloadBatchAsync(context, generation, primeBatch, !string.IsNullOrEmpty(context.Request.Headers["X-DeskFerry-Stream-Pipeline"].FirstOrDefault()));
             return;
         }
         context.Response.StatusCode = StatusCodes.Status200OK;
@@ -436,23 +441,29 @@ sealed class HttpStreamWebSocket : WebSocket
         catch (Exception exception) when (exception is IOException or OperationCanceledException) { }
     }
 
-    private async Task ServeDownloadBatchAsync(HttpContext context, long generation, bool prime)
+    private async Task ServeDownloadBatchAsync(HttpContext context, long generation, bool prime, bool pipelined)
     {
+        if (pipelined)
+        {
+            context.Response.Headers["X-DeskFerry-Stream-Pipeline"] = "1";
+        }
         var keepaliveDeadline = DateTimeOffset.UtcNow + Keepalive;
         DateTimeOffset? coalesceDeadline = null;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, _lifetime.Token);
-        while (!context.RequestAborted.IsCancellationRequested && !_lifetime.IsCancellationRequested && generation == Volatile.Read(ref _downGeneration))
+        // A newer GET supersedes a legacy one; pipelined GETs wait together.
+        while (!context.RequestAborted.IsCancellationRequested && !_lifetime.IsCancellationRequested && (pipelined || generation == Volatile.Read(ref _downGeneration)))
         {
-            List<Frame> frames;
+            List<Frame>? frames;
             ulong ack;
             bool ackAdvanced;
+            DateTimeOffset? resendAt;
             lock (_gate)
             {
-                frames = _outbound.ToList();
-                ack = _nextReceive - 1;
+                frames = ClaimDownload(pipelined, prime, out ack);
                 ackAdvanced = ack > _downAckSent;
+                resendAt = DownloadResendAt(pipelined);
             }
-            if (prime || frames.Count > 0)
+            if (frames is not null)
             {
                 await WriteDownloadBatchAsync(context, ack, frames);
                 return;
@@ -464,19 +475,90 @@ sealed class HttpStreamWebSocket : WebSocket
             {
                 coalesceDeadline = DateTimeOffset.UtcNow + AckCoalesce;
             }
-            var deadline = coalesceDeadline is { } coalesce && coalesce < keepaliveDeadline ? coalesce : keepaliveDeadline;
-            var wait = deadline - DateTimeOffset.UtcNow;
-            if (wait <= TimeSpan.Zero || !await _changed.WaitAsync(wait, linked.Token))
+            var deadline = keepaliveDeadline;
+            if (coalesceDeadline is { } coalesce && coalesce < deadline)
             {
-                lock (_gate)
-                {
-                    frames = _outbound.ToList();
-                    ack = _nextReceive - 1;
-                }
+                deadline = coalesce;
+            }
+            if (resendAt is { } resend && resend < deadline)
+            {
+                deadline = resend;
+            }
+            var wait = deadline - DateTimeOffset.UtcNow;
+            if (wait > TimeSpan.Zero && await _changed.WaitAsync(wait, linked.Token))
+            {
+                continue;
+            }
+            var now = DateTimeOffset.UtcNow;
+            var keepaliveDue = now >= keepaliveDeadline;
+            var coalesceDue = coalesceDeadline is { } due && now >= due;
+            lock (_gate)
+            {
+                frames = ClaimDownload(pipelined, keepaliveDue || (coalesceDue && _nextReceive - 1 > _downAckSent), out ack);
+            }
+            if (frames is not null)
+            {
                 await WriteDownloadBatchAsync(context, ack, frames);
                 return;
             }
+            if (coalesceDue)
+            {
+                // Another waiting GET already carried the acknowledgement.
+                coalesceDeadline = null;
+            }
         }
+    }
+
+    // Chooses the records for a downstream batch, or returns null to keep
+    // waiting. A legacy GET carries every unacknowledged record. Pipelined GETs
+    // each carry only records no other response has carried, so concurrently
+    // waiting GETs never duplicate data, unless dispatched records stayed
+    // unacknowledged long enough that their response was probably lost.
+    // Callers hold _gate.
+    private List<Frame>? ClaimDownload(bool pipelined, bool force, out ulong ack)
+    {
+        ack = _nextReceive - 1;
+        ulong after = 0;
+        if (pipelined)
+        {
+            if (DownloadResendAt(true) is { } resendAt && resendAt <= DateTimeOffset.UtcNow)
+            {
+                _downDispatched = _outbound[0].Sequence - 1;
+                _downStallSince = null;
+            }
+            after = _downDispatched;
+        }
+        var frames = _outbound.Where(frame => frame.Sequence > after).ToList();
+        if (frames.Count == 0 && !force)
+        {
+            return null;
+        }
+        if (pipelined && frames.Count > 0)
+        {
+            if (!DownloadOutstanding())
+            {
+                _downStallSince = DateTimeOffset.UtcNow;
+            }
+            _downDispatched = frames[^1].Sequence;
+        }
+        if (ack > _downAckSent)
+        {
+            _downAckSent = ack;
+        }
+        return frames;
+    }
+
+    private bool DownloadOutstanding() => _outbound.Count > 0 && _outbound[0].Sequence <= _downDispatched;
+
+    // When outstanding pipelined records count as lost. Callers hold _gate.
+    private DateTimeOffset? DownloadResendAt(bool pipelined) =>
+        pipelined && DownloadOutstanding() && _downStallSince is { } since ? since + ResendAfter : null;
+
+    // Restarts the lost-response clock after acknowledgements trim the send
+    // queue. Callers hold _gate.
+    private void NoteSendProgress()
+    {
+        _downStallSince = DownloadOutstanding() ? DateTimeOffset.UtcNow : null;
     }
 
     private void ApplyDownstreamAck(ulong acknowledged)
@@ -490,10 +572,16 @@ sealed class HttpStreamWebSocket : WebSocket
                 return;
             }
             LastActivity = DateTimeOffset.UtcNow;
+            var trimmed = false;
             while (_outbound.Count > 0 && _outbound[0].Sequence <= acknowledged)
             {
                 _buffered -= _outbound[0].Payload.Length;
                 _outbound.RemoveAt(0);
+                trimmed = true;
+            }
+            if (trimmed)
+            {
+                NoteSendProgress();
             }
         }
     }
@@ -532,10 +620,16 @@ sealed class HttpStreamWebSocket : WebSocket
                 {
                     throw new InvalidDataException("HTTP stream acknowledgement exceeds the sent sequence.");
                 }
+                var trimmed = false;
                 while (_outbound.Count > 0 && _outbound[0].Sequence <= frame.Sequence)
                 {
                     _buffered -= _outbound[0].Payload.Length;
                     _outbound.RemoveAt(0);
+                    trimmed = true;
+                }
+                if (trimmed)
+                {
+                    NoteSendProgress();
                 }
                 return;
             }
