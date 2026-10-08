@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.12.18 - 2026-10-09
+
+- Bring the Android Home agent's POST/GET streaming fallback in line with the Go clients. Uploads are now finite batches instead of one never-ending POST, which buffering proxies such as Skyhigh held for about 1.5 seconds each. Up to three uploads and two waiting GETs overlap once the relay confirms pipelining, finished download batches are re-polled at once, records that arrive out of order are delivered in sequence, and upload connections are opened up front. Through a buffering proxy with a 100 ms round trip, Android's idle round trip dropped from about 1.6 s to 103 ms and its sustained median to about 165 ms.
+- Raise the Android HTTP client's per-host request limit and idle connection pool so several fallback sockets' long-poll GETs and pipelined uploads do not queue behind each other.
+- Report the Android app version as the current release.
+
 ## 0.12.17 - 2026-10-09
 
 - Cut the Azure relay's per-request CPU cost. ASP.NET Core's per-request Information logs (four lines for every HTTP-stream GET and POST) are now filtered to warnings and errors, and the App Service file logger queues lines for one background writer instead of opening the log file on App Service's network storage for every line under a lock that request threads waited on. Locally, relay CPU per ping round trip dropped from 6.97 ms to 0.89 ms, and the round trip itself from 3.34 ms to 0.32 ms.

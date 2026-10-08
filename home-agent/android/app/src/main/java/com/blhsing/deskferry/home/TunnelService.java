@@ -51,6 +51,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import okhttp3.ConnectionPool;
+import okhttp3.Dispatcher;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -212,7 +214,16 @@ public class TunnelService extends Service {
 				}
                 roomProof = requestedRoomProof == null ? "" : requestedRoomProof.trim();
                 logRetentionDays = HomePrefs.sanitizeLogRetentionDays(requestedLogRetentionDays);
+                // Every relay socket shares this client. Over the HTTP-stream
+                // fallback each socket keeps up to two GETs waiting and three
+                // uploads in flight, so OkHttp's default of five concurrent
+                // requests per host would queue new calls behind long polls.
+                Dispatcher dispatcher = new Dispatcher();
+                dispatcher.setMaxRequests(256);
+                dispatcher.setMaxRequestsPerHost(128);
                 OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
+                        .dispatcher(dispatcher)
+                        .connectionPool(new ConnectionPool(32, 5, TimeUnit.MINUTES))
                         .readTimeout(30, TimeUnit.SECONDS)
                         .retryOnConnectionFailure(true);
                 ProxySettings.apply(clientBuilder, requestedProxy);
