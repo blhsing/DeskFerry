@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.12.17 - 2026-10-09
+
+- Cut the Azure relay's per-request CPU cost. ASP.NET Core's per-request Information logs (four lines for every HTTP-stream GET and POST) are now filtered to warnings and errors, and the App Service file logger queues lines for one background writer instead of opening the log file on App Service's network storage for every line under a lock that request threads waited on. Locally, relay CPU per ping round trip dropped from 6.97 ms to 0.89 ms, and the round trip itself from 3.34 ms to 0.32 ms.
+- Report the Azure relay's version as the current release.
+
 ## 0.12.16 - 2026-10-09
 
 - Pipeline downloads on the POST/GET streaming fallback. Once the relay confirms support on a GET (`X-DeskFerry-Stream-Pipeline`), clients keep two GETs waiting, so records produced while one response is in transit leave on the other instead of waiting for the next poll.

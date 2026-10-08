@@ -10,6 +10,10 @@ using System.Threading.Channels;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.ClearProviders();
+// ASP.NET Core logs several Information lines for every request. HTTP-stream
+// clients make many short requests, so those lines dominated the relay's CPU
+// time and its log files; keep only framework warnings and errors.
+builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
 builder.Logging.AddSimpleConsole(options =>
 {
     options.SingleLine = true;
@@ -2502,7 +2506,7 @@ sealed class ResumeSession
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.12.12";
+    public const string Version = "0.12.17";
 }
 
 sealed class WaitingAgent

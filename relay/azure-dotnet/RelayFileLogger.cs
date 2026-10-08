@@ -1,3 +1,5 @@
+using System.Text;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 
 sealed class RelayFileLoggerProvider : ILoggerProvider
@@ -54,78 +56,151 @@ sealed class RelayFileLogger(string category, RelayFileLogSink sink) : ILogger
     }
 }
 
+// Writes log lines from a single background task. App Service keeps HOME on
+// network storage, so opening the file per line under a lock made every
+// logging request thread wait on a remote file operation. Callers now only
+// format a line and queue it; the writer keeps the file open and flushes once
+// the queue drains, at most about once a second.
 sealed class RelayFileLogSink : IDisposable
 {
     private const long RotateAtBytes = 8 * 1024 * 1024;
-    private readonly object _gate = new();
+    private const int QueueLimit = 10_000;
+    private static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(1);
+
     private readonly string _path;
-    private bool _disposed;
+    private readonly Channel<string> _lines = Channel.CreateBounded<string>(new BoundedChannelOptions(QueueLimit)
+    {
+        // Dropping the newest lines under a flood keeps logging from ever
+        // blocking or growing without bound.
+        FullMode = BoundedChannelFullMode.DropWrite,
+        SingleReader = true,
+    });
+    private readonly Task _writer;
 
     public RelayFileLogSink(string path)
     {
         _path = path;
         Write(LogLevel.Information, "DeskFerry.Relay", default, "direct file logging initialized", null);
+        _writer = Task.Run(WriteLinesAsync);
     }
 
     public void Write(LogLevel level, string category, EventId eventId, string message, Exception? exception)
     {
-        lock (_gate)
+        var line = new StringBuilder(64 + category.Length + message.Length);
+        line.Append(DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))
+            .Append(' ')
+            .Append(level.ToString().ToUpperInvariant())
+            .Append(' ')
+            .Append(category);
+        if (eventId.Id != 0)
         {
-            if (_disposed)
-            {
-                return;
-            }
-
-            try
-            {
-                RotateIfNeeded();
-                using var writer = new StreamWriter(new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite));
-                writer.Write(DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"));
-                writer.Write(' ');
-                writer.Write(level.ToString().ToUpperInvariant());
-                writer.Write(' ');
-                writer.Write(category);
-                if (eventId.Id != 0)
-                {
-                    writer.Write(" event=");
-                    writer.Write(eventId.Id);
-                }
-                writer.Write(' ');
-                writer.WriteLine(message.Replace("\r", " ").Replace("\n", " "));
-                if (exception is not null)
-                {
-                    writer.WriteLine(exception.ToString().Replace("\r", " ").Replace("\n", " "));
-                }
-            }
-            catch (IOException)
-            {
-                // Logging must never take down the relay when App Service storage is unavailable.
-            }
-            catch (UnauthorizedAccessException)
-            {
-                // App Service can transiently remount its persistent HOME volume.
-            }
+            line.Append(" event=").Append(eventId.Id);
         }
+        line.Append(' ').Append(message.Replace("\r", " ").Replace("\n", " ")).Append('\n');
+        if (exception is not null)
+        {
+            line.Append(exception.ToString().Replace("\r", " ").Replace("\n", " ")).Append('\n');
+        }
+        _lines.Writer.TryWrite(line.ToString());
     }
 
     public void Dispose()
     {
-        lock (_gate)
+        _lines.Writer.TryComplete();
+        try
         {
-            _disposed = true;
+            _writer.Wait(TimeSpan.FromSeconds(2));
+        }
+        catch (AggregateException)
+        {
         }
     }
 
-    private void RotateIfNeeded()
+    private async Task WriteLinesAsync()
     {
-        var file = new FileInfo(_path);
-        if (!file.Exists || file.Length < RotateAtBytes)
+        StreamWriter? writer = null;
+        long size = 0;
+        var reader = _lines.Reader;
+        try
         {
-            return;
+            while (await reader.WaitToReadAsync())
+            {
+                var flushAt = DateTime.UtcNow + FlushInterval;
+                while (reader.TryRead(out var line))
+                {
+                    try
+                    {
+                        if (writer is null)
+                        {
+                            (writer, size) = Open();
+                        }
+                        else if (size >= RotateAtBytes)
+                        {
+                            await writer.DisposeAsync();
+                            writer = null;
+                            Rotate();
+                            (writer, size) = Open();
+                        }
+                        await writer.WriteAsync(line);
+                        size += Encoding.UTF8.GetByteCount(line);
+                        if (DateTime.UtcNow >= flushAt)
+                        {
+                            await writer.FlushAsync();
+                            flushAt = DateTime.UtcNow + FlushInterval;
+                        }
+                    }
+                    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                    {
+                        // App Service can transiently remount its persistent
+                        // HOME volume; reopen on the next line and never let
+                        // logging take down the relay.
+                        writer = await CloseQuietlyAsync(writer);
+                    }
+                }
+                try
+                {
+                    if (writer is not null)
+                    {
+                        await writer.FlushAsync();
+                    }
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                    writer = await CloseQuietlyAsync(writer);
+                }
+            }
         }
+        finally
+        {
+            await CloseQuietlyAsync(writer);
+        }
+    }
 
+    private (StreamWriter Writer, long Size) Open()
+    {
+        var stream = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+        return (new StreamWriter(stream, new UTF8Encoding(false)), stream.Length);
+    }
+
+    private void Rotate()
+    {
         var rotated = _path + ".old";
         File.Delete(rotated);
         File.Move(_path, rotated);
+    }
+
+    private static async Task<StreamWriter?> CloseQuietlyAsync(StreamWriter? writer)
+    {
+        if (writer is not null)
+        {
+            try
+            {
+                await writer.DisposeAsync();
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+        return null;
     }
 }
