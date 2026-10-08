@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.12.14 - 2026-10-08
+
+- Cut latency on the POST/GET streaming fallback used through proxies that reject WebSocket upgrades. Clients now re-poll a finished downstream batch immediately instead of waiting out a 250 ms reconnect backoff (which Android let grow to five seconds), and no longer pay an `Expect: 100-continue` round trip on each upload.
+- Report the received sequence on each downstream GET (`X-DeskFerry-Stream-Ack`). Updated Azure, OCI, and Python relays apply it, so batches no longer resend records the client already has, and clients skip ack-only POSTs that delayed real upstream data by a round trip.
+- Relays answer a parked batch GET when their receive acknowledgement advances, after a 20 ms window that lets an immediate reply share the batch, so senders free their buffers promptly and graceful closes finish without waiting for a timeout.
+
 ## 0.12.12 - 2026-10-01
 
 - Hedge direct resumable-session recovery across transports: after a two-second

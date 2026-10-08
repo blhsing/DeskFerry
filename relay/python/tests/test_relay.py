@@ -1,5 +1,6 @@
 import json
 import asyncio
+import struct
 
 from fastapi.testclient import TestClient
 from starlette.requests import Request
@@ -149,6 +150,53 @@ def test_http_stream_restart_closes_at_client_expected_sequence():
         await stream.close(1013, "HTTP stream state lost; reconnect")
         frames, _ = await stream.snapshot(0)
         assert [(frame.kind, frame.sequence) for frame in frames] == [(HTTP_STREAM_CLOSE, 10)]
+
+    asyncio.run(scenario())
+
+
+def test_http_stream_batch_applies_get_ack_and_answers_ack_advance():
+    def download_request(ack: int) -> Request:
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        return Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/relay/unit/stream/id/down",
+            "headers": [(b"x-deskferry-stream-ack", str(ack).encode())],
+            "query_string": b"",
+            "client": ("127.0.0.1", 12345),
+            "server": ("127.0.0.1", 80),
+            "scheme": "http",
+        }, receive)
+
+    def records(body: bytes) -> list[tuple[int, int]]:
+        result = []
+        while body:
+            kind, sequence, length = struct.unpack(">BQI", body[:13])
+            result.append((kind, sequence))
+            body = body[13 + length:]
+        return result
+
+    async def scenario():
+        stream = HTTPStreamWebSocket(download_request(0), "s" * 32)
+        stream.down_batch = True
+        stream.down_primed = True
+        await stream.send_bytes(b"one")
+        await stream.send_bytes(b"two")
+
+        response = await stream.serve_download(download_request(1))
+        assert response.headers["x-deskferry-stream-ack"] == "1"
+        assert records(response.body) == [(HTTP_STREAM_ACK, 0), (HTTP_STREAM_BINARY, 2)]
+
+        # Once the client has everything, a parked batch answers as soon as the
+        # relay's own receive acknowledgement advances.
+        download = asyncio.create_task(stream.serve_download(download_request(2)))
+        await asyncio.sleep(0.05)
+        assert not download.done()
+        await stream.apply(HTTPStreamFrame(HTTP_STREAM_TEXT, 1, b"up"))
+        response = await asyncio.wait_for(download, timeout=1)
+        assert records(response.body) == [(HTTP_STREAM_ACK, 1)]
 
     asyncio.run(scenario())
 

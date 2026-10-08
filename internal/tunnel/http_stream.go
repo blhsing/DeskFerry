@@ -27,6 +27,11 @@ import (
 const (
 	HeaderHTTPStreamSecret = "X-DeskFerry-Stream-Secret"
 	HeaderHTTPStreamBatch  = "X-DeskFerry-Stream-Batch"
+	// HeaderHTTPStreamAck carries the client's received sequence on each
+	// downstream GET. Relays that apply it echo the header, which lets the
+	// client stop spending serial upload round trips on ack-only POSTs and
+	// lets batches omit records the client already has.
+	HeaderHTTPStreamAck = "X-DeskFerry-Stream-Ack"
 
 	httpStreamRecordAck    = byte(0)
 	httpStreamRecordText   = byte(1)
@@ -43,6 +48,7 @@ const (
 	httpStreamGracefulCloseTimeout = httpStreamUploadProbeTimeout + time.Second
 	httpStreamStallTimeout         = 30 * time.Second
 	httpStreamRetryWindow          = 5 * time.Minute
+	httpStreamAckCoalesce          = 20 * time.Millisecond
 	httpStreamReadLimit            = 1 << 20
 )
 
@@ -84,8 +90,12 @@ type HTTPStreamConn struct {
 	downGen    uint64
 	downBatch  bool
 	downPrimed bool
-	started    sync.Once
-	closeOnce  sync.Once
+	downAcks   bool
+	// downAckSent is the receive acknowledgement the last downstream batch
+	// carried, so a parked batch GET can answer as soon as it advances.
+	downAckSent uint64
+	started     sync.Once
+	closeOnce   sync.Once
 }
 
 func newHTTPStreamConn(ctx context.Context) *HTTPStreamConn {
@@ -598,7 +608,6 @@ func (c *HTTPStreamConn) clientUpLoop() {
 		req.Header = c.headers.Clone()
 		req.Header.Set("Content-Type", "application/octet-stream")
 		req.Header.Set("Cache-Control", "no-store")
-		req.Header.Set("Expect", "100-continue")
 		result := make(chan error, 1)
 		go func() {
 			resp, err := c.client.Do(req)
@@ -653,9 +662,6 @@ func (c *HTTPStreamConn) clientUpLoop() {
 				deliveredSequence = attemptSequence
 			}
 			backoff = 250 * time.Millisecond
-			if !sleepHTTPStream(c.ctx, 25*time.Millisecond) {
-				return
-			}
 			continue
 		}
 		if !sleepHTTPStream(c.ctx, backoff) {
@@ -678,7 +684,10 @@ func (c *HTTPStreamConn) writeUploadBatch(ctx context.Context, writer *io.PipeWr
 	defer ticker.Stop()
 	for {
 		frames, ack := c.snapshotAfter(deliveredSequence)
-		if ack > deliveredAck || len(frames) > 0 {
+		// When the relay takes acknowledgements from downstream GETs, an
+		// ack-only POST would only delay the next data batch by a round trip.
+		ackOnly := ack > deliveredAck && !c.downstreamCarriesAcks()
+		if ackOnly || len(frames) > 0 {
 			if err := writeHTTPStreamRecord(writer, httpStreamFrame{kind: httpStreamRecordAck, seq: ack}); err != nil {
 				return deliveredAck, deliveredSequence, err
 			}
@@ -761,6 +770,35 @@ func (c *HTTPStreamConn) writePersistentUpload(ctx context.Context, writer *io.P
 	}
 }
 
+func (c *HTTPStreamConn) downstreamCarriesAcks() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.downAcks
+}
+
+func (c *HTTPStreamConn) receivedSequence() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.recvNext - 1
+}
+
+// applyDownstreamAck trims frames the client reported on its GET. Unlike an
+// upload ack record, an ack beyond the sent sequence is ignored here; the
+// upload path owns lost-state recovery after a relay restart.
+func (c *HTTPStreamConn) applyDownstreamAck(acknowledged uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if acknowledged >= c.nextSend {
+		return
+	}
+	c.lastActive = time.Now()
+	for len(c.sendFrames) > 0 && c.sendFrames[0].seq <= acknowledged {
+		c.sendBytes -= len(c.sendFrames[0].payload)
+		c.sendFrames = c.sendFrames[1:]
+	}
+	c.cond.Broadcast()
+}
+
 func (c *HTTPStreamConn) sendSequenceAcknowledged(sequence uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -786,6 +824,7 @@ func (c *HTTPStreamConn) clientDownLoop() {
 		}
 		req.Header = c.headers.Clone()
 		req.Header.Set("Accept", "application/octet-stream")
+		req.Header.Set(HeaderHTTPStreamAck, strconv.FormatUint(c.receivedSequence(), 10))
 		resp, err := c.client.Do(req)
 		if err == nil && resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
@@ -799,8 +838,21 @@ func (c *HTTPStreamConn) clientDownLoop() {
 			}
 			lostAt = time.Time{}
 			backoff = 250 * time.Millisecond
-			err = c.readDownload(attemptCtx, cancel, resp.Body)
+			if resp.Header.Get(HeaderHTTPStreamAck) != "" {
+				c.mu.Lock()
+				c.downAcks = true
+				c.mu.Unlock()
+			}
+			var records int
+			records, err = c.readDownload(attemptCtx, cancel, resp.Body)
 			_ = resp.Body.Close()
+			// A finite batch that ended cleanly is the normal long-poll cycle,
+			// not a lost transport. Poll again at once; any delay here adds
+			// directly to downstream latency.
+			if c.batch && records > 0 && errors.Is(err, io.EOF) {
+				cancel()
+				continue
+			}
 		}
 		cancel()
 		if c.ctx.Err() != nil {
@@ -828,9 +880,12 @@ func (c *HTTPStreamConn) clientDownLoop() {
 	}
 }
 
-func (c *HTTPStreamConn) readDownload(ctx context.Context, cancel context.CancelFunc, body io.Reader) error {
+// readDownload applies downstream records until the body ends and reports how
+// many it applied.
+func (c *HTTPStreamConn) readDownload(ctx context.Context, cancel context.CancelFunc, body io.Reader) (int, error) {
 	activity := make(chan struct{}, 1)
 	readErr := make(chan error, 1)
+	records := 0
 	go func() {
 		for {
 			frame, err := readHTTPStreamRecord(body)
@@ -842,6 +897,7 @@ func (c *HTTPStreamConn) readDownload(ctx context.Context, cancel context.Cancel
 				readErr <- err
 				return
 			}
+			records++
 			select {
 			case activity <- struct{}{}:
 			default:
@@ -853,9 +909,9 @@ func (c *HTTPStreamConn) readDownload(ctx context.Context, cancel context.Cancel
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		case err := <-readErr:
-			return err
+			return records, err
 		case <-activity:
 			if !timer.Stop() {
 				select {
@@ -866,7 +922,7 @@ func (c *HTTPStreamConn) readDownload(ctx context.Context, cancel context.Cancel
 			timer.Reset(httpStreamStallTimeout)
 		case <-timer.C:
 			cancel()
-			return errors.New("HTTP stream downstream stalled")
+			return 0, errors.New("HTTP stream downstream stalled")
 		}
 	}
 }
@@ -954,6 +1010,12 @@ func (s *HTTPStreamServer) Serve(w http.ResponseWriter, r *http.Request, room, i
 	if direction == "up" {
 		c.serveUpload(w, r)
 	} else {
+		if value := strings.TrimSpace(r.Header.Get(HeaderHTTPStreamAck)); value != "" {
+			if acknowledged, err := strconv.ParseUint(value, 10, 64); err == nil {
+				c.applyDownstreamAck(acknowledged)
+				w.Header().Set(HeaderHTTPStreamAck, value)
+			}
+		}
 		c.serveDownload(w, r)
 	}
 }
@@ -1129,6 +1191,7 @@ func (c *HTTPStreamConn) serveDownload(w http.ResponseWriter, r *http.Request) {
 func (c *HTTPStreamConn) serveDownloadBatch(w http.ResponseWriter, r *http.Request, generation uint64, prime bool) {
 	timer := time.NewTimer(httpStreamKeepalive)
 	defer timer.Stop()
+	var coalesce <-chan time.Time
 	for {
 		c.mu.Lock()
 		current := c.downGen == generation && !c.closed
@@ -1141,12 +1204,27 @@ func (c *HTTPStreamConn) serveDownloadBatch(w http.ResponseWriter, r *http.Reque
 			c.writeDownloadBatch(w, ack, frames)
 			return
 		}
+		// Answer an advanced acknowledgement promptly so the sender can free
+		// its buffer, but give the reply that usually follows a received
+		// message a moment to share this batch instead of the next poll.
+		c.mu.Lock()
+		ackAdvanced := ack > c.downAckSent
+		c.mu.Unlock()
+		if ackAdvanced && coalesce == nil {
+			coalesceTimer := time.NewTimer(httpStreamAckCoalesce)
+			defer coalesceTimer.Stop()
+			coalesce = coalesceTimer.C
+		}
 		select {
 		case <-r.Context().Done():
 			return
 		case <-c.ctx.Done():
 			return
 		case <-c.wake:
+		case <-coalesce:
+			frames, ack = c.snapshotAfter(0)
+			c.writeDownloadBatch(w, ack, frames)
+			return
 		case <-timer.C:
 			c.writeDownloadBatch(w, ack, nil)
 			return
@@ -1155,6 +1233,11 @@ func (c *HTTPStreamConn) serveDownloadBatch(w http.ResponseWriter, r *http.Reque
 }
 
 func (c *HTTPStreamConn) writeDownloadBatch(w http.ResponseWriter, ack uint64, frames []httpStreamFrame) {
+	c.mu.Lock()
+	if ack > c.downAckSent {
+		c.downAckSent = ack
+	}
+	c.mu.Unlock()
 	var payload bytes.Buffer
 	if err := writeHTTPStreamRecord(&payload, httpStreamFrame{kind: httpStreamRecordAck, seq: ack}); err != nil {
 		return

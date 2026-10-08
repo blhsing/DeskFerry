@@ -54,6 +54,7 @@ HTTP_STREAM_HEADER = 13
 HTTP_STREAM_LIMIT = 1 << 20
 HTTP_STREAM_BUFFER = 8 * 1024 * 1024
 HTTP_STREAM_KEEPALIVE = 10
+HTTP_STREAM_ACK_COALESCE = 0.02
 HTTP_STREAM_RETENTION = 300
 
 
@@ -85,6 +86,9 @@ class HTTPStreamWebSocket:
         self.down_generation = 0
         self.down_batch = False
         self.down_primed = False
+        # Receive acknowledgement carried by the last downstream batch, so a
+        # parked batch GET can answer as soon as it advances.
+        self.down_ack_sent = 0
         self.last_activity = time.monotonic()
         self.closed = asyncio.Event()
 
@@ -169,6 +173,16 @@ class HTTPStreamWebSocket:
             self.changed.set()
             return False
 
+    async def apply_downstream_ack(self, acknowledged: int) -> None:
+        async with self.lock:
+            # Lost-state recovery for acknowledgements beyond the sent sequence
+            # belongs to the upload path.
+            if acknowledged >= self.next_send:
+                return
+            self.last_activity = time.monotonic()
+            while self.outgoing and self.outgoing[0].sequence <= acknowledged:
+                self.outgoing_bytes -= len(self.outgoing.pop(0).payload)
+
     async def snapshot(self, last_sequence: int) -> tuple[list[HTTPStreamFrame], int]:
         async with self.lock:
             # Clear while holding the same lock used by producers so a frame
@@ -204,27 +218,48 @@ class HTTPStreamWebSocket:
         return Response(status_code=204)
 
     async def serve_download(self, request: Request) -> Response:
+        # Clients report their received sequence on each GET. Applying it keeps
+        # batches free of records the client already has and spares it ack-only
+        # POSTs; echoing the header advertises that support.
+        ack_headers: dict[str, str] = {}
+        ack_header = request.headers.get("x-deskferry-stream-ack", "").strip()
+        if ack_header.isdigit() and int(ack_header) < 1 << 64:
+            await self.apply_downstream_ack(int(ack_header))
+            ack_headers["X-DeskFerry-Stream-Ack"] = ack_header
         self.down_generation += 1
         generation = self.down_generation
 
         if self.down_batch:
             prime = not self.down_primed
             self.down_primed = True
+            loop = asyncio.get_running_loop()
+            keepalive_deadline = loop.time() + HTTP_STREAM_KEEPALIVE
+            coalesce_deadline: float | None = None
+
+            def batch(ack: int, frames: list[HTTPStreamFrame]) -> Response:
+                self.down_ack_sent = max(self.down_ack_sent, ack)
+                payload = encode_http_stream_record(HTTPStreamFrame(HTTP_STREAM_ACK, ack))
+                payload += b"".join(encode_http_stream_record(frame) for frame in frames)
+                return Response(payload, media_type="application/octet-stream", headers={
+                    "Cache-Control": "no-store, no-transform",
+                    **ack_headers,
+                })
+
             while generation == self.down_generation and not await request.is_disconnected():
                 frames, ack = await self.snapshot(0)
                 if prime or frames:
-                    payload = encode_http_stream_record(HTTPStreamFrame(HTTP_STREAM_ACK, ack))
-                    payload += b"".join(encode_http_stream_record(frame) for frame in frames)
-                    return Response(payload, media_type="application/octet-stream", headers={
-                        "Cache-Control": "no-store, no-transform",
-                    })
+                    return batch(ack, frames)
+                # Answer an advanced acknowledgement promptly so the sender can
+                # free its buffer, but give the reply that usually follows a
+                # received message a moment to share this batch.
+                if ack > self.down_ack_sent and coalesce_deadline is None:
+                    coalesce_deadline = loop.time() + HTTP_STREAM_ACK_COALESCE
+                deadline = min(keepalive_deadline, coalesce_deadline or keepalive_deadline)
                 try:
-                    await asyncio.wait_for(self.changed.wait(), timeout=HTTP_STREAM_KEEPALIVE)
+                    await asyncio.wait_for(self.changed.wait(), timeout=max(0.0, deadline - loop.time()))
                 except asyncio.TimeoutError:
-                    payload = encode_http_stream_record(HTTPStreamFrame(HTTP_STREAM_ACK, ack))
-                    return Response(payload, media_type="application/octet-stream", headers={
-                        "Cache-Control": "no-store, no-transform",
-                    })
+                    frames, ack = await self.snapshot(0)
+                    return batch(ack, frames)
             return Response(status_code=204)
 
         async def records():
@@ -248,6 +283,7 @@ class HTTPStreamWebSocket:
         return StreamingResponse(records(), media_type="application/octet-stream", headers={
             "Cache-Control": "no-store, no-transform",
             "X-Accel-Buffering": "no",
+            **ack_headers,
         })
 
 

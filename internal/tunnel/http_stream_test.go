@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -407,5 +408,102 @@ func TestHTTPStreamFallbackWithoutProxyCONNECT(t *testing.T) {
 	case <-serverClosed:
 	case <-ctx.Done():
 		t.Fatal("graceful close did not reach the relay through the buffered upload")
+	}
+}
+
+func TestHTTPStreamBatchesRepollImmediatelyAndCarryAcksOnGET(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	streams := NewHTTPStreamServer(func(ctx context.Context, conn MessageConn, _ *http.Request, _ string) {
+		for {
+			typ, payload, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			if err := conn.Write(ctx, typ, payload); err != nil {
+				return
+			}
+		}
+	})
+	defer streams.Close()
+
+	var ackOnlyPosts, resentRecords atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) != 5 || parts[0] != "relay" || parts[2] != "stream" {
+			http.NotFound(w, r)
+			return
+		}
+		if parts[4] == "up" {
+			body, _ := io.ReadAll(r.Body)
+			dataRecords := 0
+			for reader := bytes.NewReader(body); ; {
+				frame, err := readHTTPStreamRecord(reader)
+				if err != nil {
+					break
+				}
+				if frame.kind != httpStreamRecordAck {
+					dataRecords++
+				}
+			}
+			if dataRecords == 0 {
+				ackOnlyPosts.Add(1)
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			streams.Serve(w, r, parts[1], parts[3], parts[4])
+			return
+		}
+		acknowledged, _ := strconv.ParseUint(r.Header.Get(HeaderHTTPStreamAck), 10, 64)
+		recorder := httptest.NewRecorder()
+		streams.Serve(recorder, r, parts[1], parts[3], parts[4])
+		for reader := bytes.NewReader(recorder.Body.Bytes()); ; {
+			frame, err := readHTTPStreamRecord(reader)
+			if err != nil {
+				break
+			}
+			if frame.kind != httpStreamRecordAck && frame.seq <= acknowledged {
+				resentRecords.Add(1)
+			}
+		}
+		for name, values := range recorder.Header() {
+			w.Header()[name] = values
+		}
+		w.WriteHeader(recorder.Code)
+		_, _ = w.Write(recorder.Body.Bytes())
+	}))
+	defer origin.Close()
+
+	conn, err := DialHTTPStreamWithHeaders(ctx, origin.URL+"/relay/unit", "direct", RoleProbe, "", nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer CloseMessageConn(conn)
+
+	var slowest time.Duration
+	for i := 0; i < 10; i++ {
+		started := time.Now()
+		message := []byte(fmt.Sprintf("message-%d", i))
+		if err := conn.Write(ctx, websocket.MessageBinary, message); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		_, payload, err := conn.Read(ctx)
+		if err != nil || string(payload) != string(message) {
+			t.Fatalf("echo %d = %q, %v", i, payload, err)
+		}
+		if elapsed := time.Since(started); elapsed > slowest {
+			slowest = elapsed
+		}
+	}
+	// Before re-polling at once, every finished batch waited out a 250 ms
+	// reconnect backoff before the next GET could deliver anything.
+	if slowest >= 200*time.Millisecond {
+		t.Fatalf("slowest local echo took %s; downstream batches are not re-polled immediately", slowest)
+	}
+	if got := resentRecords.Load(); got != 0 {
+		t.Fatalf("downstream batches re-sent %d records the GET already acknowledged", got)
+	}
+	if got := ackOnlyPosts.Load(); got != 0 {
+		t.Fatalf("client sent %d ack-only POSTs although GETs carry acknowledgements", got)
 	}
 }

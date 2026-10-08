@@ -65,6 +65,7 @@ sealed class HttpStreamWebSocket : WebSocket
     private const int ReadLimit = 1 << 20;
     private const int MaxBuffered = 8 * 1024 * 1024;
     private static readonly TimeSpan Keepalive = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan AckCoalesce = TimeSpan.FromMilliseconds(20);
 
     private sealed record Frame(byte Kind, ulong Sequence, byte[] Payload);
 
@@ -82,6 +83,9 @@ sealed class HttpStreamWebSocket : WebSocket
     private long _downGeneration;
     private bool _downBatch;
     private bool _downPrimed;
+    // Receive acknowledgement carried by the last downstream batch, so a parked
+    // batch GET can answer as soon as it advances.
+    private ulong _downAckSent;
     private WebSocketState _state = WebSocketState.Open;
     private WebSocketCloseStatus? _closeStatus;
     private string? _closeDescription;
@@ -346,6 +350,15 @@ sealed class HttpStreamWebSocket : WebSocket
             context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed;
             return;
         }
+        // Clients report their received sequence on each GET. Applying it here
+        // keeps batches free of records the client already has and spares it
+        // ack-only POSTs; echoing the header advertises that support.
+        var ackHeader = context.Request.Headers["X-DeskFerry-Stream-Ack"].FirstOrDefault()?.Trim();
+        if (ulong.TryParse(ackHeader, out var downstreamAck))
+        {
+            ApplyDownstreamAck(downstreamAck);
+            context.Response.Headers["X-DeskFerry-Stream-Ack"] = ackHeader;
+        }
         var generation = Interlocked.Increment(ref _downGeneration);
         bool batchMode;
         bool primeBatch;
@@ -413,37 +426,75 @@ sealed class HttpStreamWebSocket : WebSocket
 
     private async Task ServeDownloadBatchAsync(HttpContext context, long generation, bool prime)
     {
+        var keepaliveDeadline = DateTimeOffset.UtcNow + Keepalive;
+        DateTimeOffset? coalesceDeadline = null;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, _lifetime.Token);
         while (!context.RequestAborted.IsCancellationRequested && !_lifetime.IsCancellationRequested && generation == Volatile.Read(ref _downGeneration))
         {
             List<Frame> frames;
             ulong ack;
+            bool ackAdvanced;
             lock (_gate)
             {
                 frames = _outbound.ToList();
                 ack = _nextReceive - 1;
+                ackAdvanced = ack > _downAckSent;
             }
             if (prime || frames.Count > 0)
             {
                 await WriteDownloadBatchAsync(context, ack, frames);
                 return;
             }
-
-            using var timeout = new CancellationTokenSource(Keepalive);
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, _lifetime.Token, timeout.Token);
-            try
+            // Answer an advanced acknowledgement promptly so the sender can free
+            // its buffer, but give the reply that usually follows a received
+            // message a moment to share this batch instead of the next poll.
+            if (ackAdvanced && coalesceDeadline is null)
             {
-                await _changed.WaitAsync(linked.Token);
+                coalesceDeadline = DateTimeOffset.UtcNow + AckCoalesce;
             }
-            catch (OperationCanceledException) when (timeout.IsCancellationRequested && !context.RequestAborted.IsCancellationRequested && !_lifetime.IsCancellationRequested)
+            var deadline = coalesceDeadline is { } coalesce && coalesce < keepaliveDeadline ? coalesce : keepaliveDeadline;
+            var wait = deadline - DateTimeOffset.UtcNow;
+            if (wait <= TimeSpan.Zero || !await _changed.WaitAsync(wait, linked.Token))
             {
-                await WriteDownloadBatchAsync(context, ack, []);
+                lock (_gate)
+                {
+                    frames = _outbound.ToList();
+                    ack = _nextReceive - 1;
+                }
+                await WriteDownloadBatchAsync(context, ack, frames);
                 return;
             }
         }
     }
 
-    private static async Task WriteDownloadBatchAsync(HttpContext context, ulong ack, List<Frame> frames)
+    private void ApplyDownstreamAck(ulong acknowledged)
     {
+        lock (_gate)
+        {
+            // Lost-state recovery for acknowledgements beyond the sent sequence
+            // belongs to the upload path.
+            if (acknowledged >= _nextSend)
+            {
+                return;
+            }
+            LastActivity = DateTimeOffset.UtcNow;
+            while (_outbound.Count > 0 && _outbound[0].Sequence <= acknowledged)
+            {
+                _buffered -= _outbound[0].Payload.Length;
+                _outbound.RemoveAt(0);
+            }
+        }
+    }
+
+    private async Task WriteDownloadBatchAsync(HttpContext context, ulong ack, List<Frame> frames)
+    {
+        lock (_gate)
+        {
+            if (ack > _downAckSent)
+            {
+                _downAckSent = ack;
+            }
+        }
         await using var payload = new MemoryStream();
         await WriteRecordAsync(payload, new Frame(AckRecord, ack, []), context.RequestAborted);
         foreach (var frame in frames)

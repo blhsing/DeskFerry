@@ -222,7 +222,12 @@ final class FallbackWebSocket implements WebSocket {
 
         private void startDown() {
             if (stopped) return;
-            Request request = requestBase.url(directionUrl("down")).get().build();
+            long received;
+            synchronized (gate) { received = nextReceive - 1; }
+            // Report what has arrived so relays can omit it from the next batch.
+            Request request = requestBase.url(directionUrl("down"))
+                    .header("X-DeskFerry-Stream-Ack", Long.toString(received))
+                    .get().build();
             downCall = client.newCall(request);
             downCall.enqueue(new Callback() {
                 @Override public void onFailure(Call call, IOException failure) { retryDown(failure, null); }
@@ -237,11 +242,20 @@ final class FallbackWebSocket implements WebSocket {
                         retryMillis = 250;
                         listener.onOpen(HTTPStreamSocket.this, response);
                     }
+                    int records = 0;
                     try (Response ignored = response) {
                         BufferedSource source = response.body().source();
                         while (!stopped) {
+                            if (records > 0 && source.exhausted()) {
+                                // A finished batch is the normal long-poll cycle;
+                                // poll again at once instead of backing off.
+                                synchronized (HTTPStreamSocket.this) { retryMillis = 250; }
+                                startDown();
+                                return;
+                            }
                             Frame frame = readFrame(source);
                             applyDownstream(frame);
+                            records++;
                         }
                     } catch (IOException failure) {
                         retryDown(failure, null);
