@@ -181,7 +181,7 @@ func TestRelaySummarySurvivesUnavailablePrimary(t *testing.T) {
 	}))
 	defer primary.Close()
 	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"rooms":[{"id":"h","active_pairs":1}]}`)
+		fmt.Fprint(w, `{"rooms":[{"id":"h","control_connections":1,"active_pairs":1}]}`)
 	}))
 	defer backup.Close()
 	cfg := config{RelayAddrs: []string{primary.URL + "/relay/h", backup.URL + "/relay/h"}, Proxy: "direct"}

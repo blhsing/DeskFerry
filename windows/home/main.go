@@ -37,6 +37,7 @@ import (
 	"deskferry/internal/remotelog"
 	"deskferry/internal/screenview"
 	"deskferry/internal/tunnel"
+	"deskferry/internal/uiproxy"
 	"deskferry/internal/wincred"
 	"deskferry/internal/winsecret"
 	"deskferry/internal/winservice"
@@ -162,9 +163,8 @@ type clientApp struct {
 	rdpRoutes           map[string]string
 	activeWinRM         int
 	statusCancel        context.CancelFunc
-	statusHTTPClient    *http.Client
-	statusHTTPProxy     string
-	statusRefreshActive bool
+	dashboardCancel     context.CancelFunc
+	connectChecking     bool
 	winRMSession        *winRMSessionManager
 	exiting             bool
 }
@@ -741,7 +741,6 @@ func (a *clientApp) run(smokeTest bool) error {
 	a.refreshLocalState()
 	a.restartHomePresence()
 	a.refreshRelayStatusAsync()
-	a.startStatusPoller()
 	if !smokeTest {
 		if err := a.startTunnel(false); err != nil {
 			a.appendLog("Could not restore local RDP listener: %v", err)
@@ -1402,11 +1401,7 @@ func (a *clientApp) connectFromUI() {
 		a.showError(err)
 		return
 	}
-	if err := a.startTunnel(true); err != nil {
-		a.showError(err)
-		a.appendLog("Connect failed: %v", err)
-		return
-	}
+	a.startTunnelFromUI(true)
 }
 
 func (a *clientApp) saveFromUI(showMessage bool) error {
@@ -1745,21 +1740,13 @@ func (a *clientApp) refreshLocalState() {
 }
 
 func (a *clientApp) openRemoteDesktop() {
-	cfg := a.currentConfig()
 	if !a.isTunnelRunning() {
 		if err := a.saveFromUI(false); err != nil {
 			a.showError(err)
 			return
 		}
-		if err := a.startTunnel(false); err != nil {
-			a.showError(err)
-			return
-		}
-		cfg = a.currentConfig()
 	}
-	if err := launchMSTSC(cfg); err != nil {
-		a.showError(err)
-	}
+	a.startTunnelFromUI(true)
 }
 
 func (a *clientApp) copyRDPAddress() {
@@ -2049,63 +2036,18 @@ func (a *clientApp) setHomePresence(text string) {
 
 func (a *clientApp) refreshRelayStatusAsync() {
 	a.mu.Lock()
-	if a.exiting || a.statusRefreshActive {
+	if a.exiting {
 		a.mu.Unlock()
 		return
 	}
 	cfg := a.cfg
-	proxyKey := strings.TrimSpace(cfg.Proxy)
-	retiredClient := (*http.Client)(nil)
-	if a.statusHTTPClient == nil || !strings.EqualFold(a.statusHTTPProxy, proxyKey) {
-		retiredClient = a.statusHTTPClient
-		a.statusHTTPClient = httpClient(cfg)
-		a.statusHTTPProxy = proxyKey
+	if a.dashboardCancel != nil {
+		a.dashboardCancel()
 	}
-	client := a.statusHTTPClient
-	a.statusRefreshActive = true
+	ctx, cancel := context.WithCancel(context.Background())
+	a.dashboardCancel = cancel
 	a.mu.Unlock()
-	if retiredClient != nil {
-		retiredClient.CloseIdleConnections()
-	}
-	go func() {
-		defer func() {
-			a.mu.Lock()
-			a.statusRefreshActive = false
-			a.mu.Unlock()
-		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
-		defer cancel()
-		summary, err := queryRelaySummaryWithClient(ctx, cfg, client)
-		a.onUI(func() {
-			if err != nil {
-				_ = a.workStatus.SetText("Check relay")
-				_ = a.details.SetText("Relay status: " + err.Error())
-				return
-			}
-			if summary.WorkOnline {
-				_ = a.workStatus.SetText("Connected")
-			} else {
-				_ = a.workStatus.SetText("Waiting")
-			}
-			if summary.HomeOnline {
-				_ = a.homeStatus.SetText("Online")
-			}
-			_ = a.details.SetText(formatRelayDetails(summary, cfg))
-		})
-	}()
-}
-
-func (a *clientApp) startStatusPoller() {
-	go func() {
-		ticker := time.NewTicker(4 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			if a.mw == nil {
-				return
-			}
-			a.refreshRelayStatusAsync()
-		}
-	}()
+	go a.followRelayStatus(ctx, cfg)
 }
 
 func (a *clientApp) appendLog(format string, args ...any) {
@@ -2138,15 +2080,15 @@ func (a *clientApp) shutdown() {
 	a.exiting = true
 	cancel := a.statusCancel
 	a.statusCancel = nil
-	statusClient := a.statusHTTPClient
-	a.statusHTTPClient = nil
+	dashboardCancel := a.dashboardCancel
+	a.dashboardCancel = nil
 	a.mu.Unlock()
 	a.stopTunnel()
 	if cancel != nil {
 		cancel()
 	}
-	if statusClient != nil {
-		statusClient.CloseIdleConnections()
+	if dashboardCancel != nil {
+		dashboardCancel()
 	}
 	if a.ni != nil {
 		_ = a.ni.SetVisible(false)
@@ -2332,7 +2274,7 @@ func saveSettingsConfig(cfg config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0600)
+	return uiproxy.Write(path, append(data, '\n'))
 }
 
 func settingsPath() (string, error) {
@@ -2788,7 +2730,11 @@ func queryRelaySummaryFor(ctx context.Context, cfg config, client *http.Client) 
 	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
 		return relaySummary{}, err
 	}
-	summary := relaySummary{Room: room, RelayAddr: cfg.RelayAddr, CheckedAt: snapshot.Time}
+	return summarizeRelaySnapshot(snapshot, cfg.RelayAddr, room), nil
+}
+
+func summarizeRelaySnapshot(snapshot relaySnapshot, relayAddr, room string) relaySummary {
+	summary := relaySummary{Room: room, RelayAddr: relayAddr, CheckedAt: snapshot.Time}
 	for _, r := range snapshot.Rooms {
 		if room != "" && r.ID != room {
 			continue
@@ -2796,7 +2742,7 @@ func queryRelaySummaryFor(ctx context.Context, cfg config, client *http.Client) 
 		summary.Waiting += r.WaitingAgents
 		summary.Active += r.ActivePairs
 		summary.Total += r.TotalPairs
-		summary.WorkOnline = summary.WorkOnline || r.ControlConnections+r.WaitingAgents+r.ActivePairs > 0
+		summary.WorkOnline = summary.WorkOnline || r.ControlConnections+r.WaitingAgents > 0
 		summary.HomeOnline = summary.HomeOnline || r.HomeAgentConnected
 		if summary.Room == "" {
 			summary.Room = r.ID
@@ -2811,7 +2757,7 @@ func queryRelaySummaryFor(ctx context.Context, cfg config, client *http.Client) 
 			summary.LastHome = r.HomeAgentRemote
 		}
 	}
-	return summary, nil
+	return summary
 }
 
 func formatRelayDetails(summary relaySummary, cfg config) string {

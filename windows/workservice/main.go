@@ -672,7 +672,7 @@ type agentService struct {
 }
 
 func (s *agentService) Execute(_ []string, requests <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
-	const accepts = svc.AcceptStop | svc.AcceptShutdown
+	const accepts = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange
 	changes <- svc.Status{State: svc.StartPending}
 	cfg, err := loadConfig(s.relayURL, s.proxyFlag, s.rdpFlag, s.screenView, s.winrmFlag, s.smbFlag, s.roomPasswordFile)
 	if err != nil {
@@ -680,9 +680,10 @@ func (s *agentService) Execute(_ []string, requests <-chan svc.ChangeRequest, ch
 		return false, 1
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	sessions := make(chan struct{}, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- run(ctx, cfg)
+		errCh <- runFollowingUIProxy(ctx, cfg, sessions)
 	}()
 	changes <- svc.Status{State: svc.Running, Accepts: accepts}
 	for {
@@ -696,6 +697,11 @@ func (s *agentService) Execute(_ []string, requests <-chan svc.ChangeRequest, ch
 				return false, 0
 			case svc.Interrogate:
 				changes <- req.CurrentStatus
+			case svc.SessionChange:
+				select {
+				case sessions <- struct{}{}:
+				default:
+				}
 			}
 		case err := <-errCh:
 			cancel()
@@ -713,6 +719,10 @@ func run(ctx context.Context, cfg config) error {
 }
 
 func runWebSocketPools(ctx context.Context, cfg config) error {
+	return runWebSocketPoolsWithSessions(ctx, ctx, cfg, make(chan struct{}, cfg.ConcurrencyLimit))
+}
+
+func runWebSocketPoolsWithSessions(ctx, sessionCtx context.Context, cfg config, limiter chan struct{}) error {
 	targets := []serviceTarget{{Service: tunnel.ServiceRDP, Address: cfg.RDPAddr}}
 	if cfg.WinRMAddr != "" {
 		targets = append(targets, serviceTarget{Service: tunnel.ServiceWinRM, Address: cfg.WinRMAddr})
@@ -734,16 +744,15 @@ func runWebSocketPools(ctx context.Context, cfg config) error {
 	}
 	relayLogs.SetInstance(agentID)
 	for _, relayAddr := range relayAddrs {
-		relayLogs.AddTarget(ctx, remotelog.Target{RelayAddr: relayAddr, Proxy: cfg.Proxy, RoomPassword: cfg.RoomPassword})
+		relayLogs.StartTarget(ctx, remotelog.Target{RelayAddr: relayAddr, Proxy: cfg.Proxy, RoomPassword: cfg.RoomPassword})
 	}
-	limiter := make(chan struct{}, cfg.ConcurrencyLimit)
 	log.Printf("starting websocket agent controls for %d relay URL(s), %d service(s), concurrency=%d legacy=%t", len(relayAddrs), len(targets), cfg.ConcurrencyLimit, cfg.LegacyMode)
 	for _, relayAddr := range relayAddrs {
 		relayCfg := cfg.withRelayAddress(relayAddr)
 		wg.Add(1)
 		go func(slotCfg config) {
 			defer wg.Done()
-			runRelayAgent(ctx, slotCfg, agentID, targets, limiter)
+			runRelayAgent(ctx, sessionCtx, slotCfg, agentID, targets, limiter)
 		}(relayCfg)
 	}
 	<-ctx.Done()
@@ -753,7 +762,7 @@ func runWebSocketPools(ctx context.Context, cfg config) error {
 
 var errControlUnsupported = errors.New("relay does not support protocol v2 control channels")
 
-func runRelayAgent(ctx context.Context, cfg config, agentID string, targets []serviceTarget, limiter chan struct{}) {
+func runRelayAgent(ctx, sessionCtx context.Context, cfg config, agentID string, targets []serviceTarget, limiter chan struct{}) {
 	if cfg.LegacyMode {
 		runLegacyPools(ctx, cfg, agentID, targets)
 		return
@@ -762,7 +771,7 @@ func runRelayAgent(ctx context.Context, cfg config, agentID string, targets []se
 	maxBackoff, _ := time.ParseDuration(cfg.MaxBackoff)
 	backoff := minBackoff
 	for ctx.Err() == nil {
-		connected, err := runAgentControlOnce(ctx, cfg, agentID, targets, limiter)
+		connected, err := runAgentControlOnce(ctx, sessionCtx, cfg, agentID, targets, limiter)
 		if errors.Is(err, errControlUnsupported) {
 			log.Printf("relay %s does not support protocol v2; using legacy slots for rollback compatibility", cfg.RelayAddr)
 			runLegacyPools(ctx, cfg, agentID, targets)
@@ -843,7 +852,7 @@ func monitorControlHeartbeatWithTiming(ctx context.Context, relayAddr string, ws
 	}
 }
 
-func runAgentControlOnce(ctx context.Context, cfg config, agentID string, targets []serviceTarget, limiter chan struct{}) (bool, error) {
+func runAgentControlOnce(ctx, sessionCtx context.Context, cfg config, agentID string, targets []serviceTarget, limiter chan struct{}) (bool, error) {
 	headers := http.Header{}
 	tunnel.AddProtocolV2Header(headers)
 	headers.Set(tunnel.HeaderAgentInstance, agentID)
@@ -906,7 +915,7 @@ func runAgentControlOnce(ctx context.Context, cfg config, agentID string, target
 		}
 		select {
 		case limiter <- struct{}{}:
-			go serveOfferedSession(ctx, cfg, agentID, target, message, writer, limiter)
+			go serveOfferedSession(sessionCtx, cfg, agentID, target, message, writer, limiter)
 		default:
 			_ = writer.send(ctx, tunnel.ControlMessage{Type: tunnel.MessageBusy, SessionID: message.SessionID, Reason: "work agent concurrency limit reached"})
 			log.Printf("session rejected busy relay=%s session=%s service=%s concurrency=%d", cfg.RelayAddr, message.SessionID, message.Service, cfg.ConcurrencyLimit)

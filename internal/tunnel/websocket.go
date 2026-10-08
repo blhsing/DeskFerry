@@ -109,6 +109,7 @@ const (
 	RoleHomeAgent     = "home-agent"
 	RoleResume        = "resume"
 	RoleDiagnosticLog = "diagnostic-log"
+	RoleDashboard     = "dashboard"
 
 	webSocketStartMessage  = "start"
 	webSocketResumeMessage = "resume"
@@ -951,7 +952,7 @@ func proxyFunc(relayAddr, proxySpec string) func(*http.Request) (*url.URL, error
 
 func validateWebSocketRole(role string) error {
 	switch role {
-	case RoleAgent, RoleClient, RoleAgentControl, RoleAgentSession, RoleProbe, RoleHomeAgent, RoleResume, RoleDiagnosticLog:
+	case RoleAgent, RoleClient, RoleAgentControl, RoleAgentSession, RoleProbe, RoleHomeAgent, RoleResume, RoleDiagnosticLog, RoleDashboard:
 		return nil
 	default:
 		return fmt.Errorf("invalid websocket role %q", role)

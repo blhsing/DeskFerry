@@ -28,6 +28,7 @@ import (
 
 	"deskferry/internal/buildinfo"
 	"deskferry/internal/tunnel"
+	"deskferry/internal/uiproxy"
 	"deskferry/internal/winsecret"
 	"deskferry/internal/winservice"
 )
@@ -48,7 +49,6 @@ type app struct {
 	agentPath       *walk.LineEdit
 	workEnabled     *walk.CheckBox
 	roomName        *walk.LineEdit
-	proxy           *walk.LineEdit
 	roomPassword    *walk.LineEdit
 	clearPassword   *walk.CheckBox
 	screenView      *walk.CheckBox
@@ -149,7 +149,7 @@ func (a *app) run(smokeTest bool) error {
 					Label{Text: "Password options"},
 					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM, SMB, and screen viewing)", ColumnSpan: 2},
 					Label{Text: "Proxy"},
-					LineEdit{AssignTo: &a.proxy, Text: firstNonEmpty(installedOpts.Proxy, "env"), CueBanner: "env, direct, or http(s)://host:port", ColumnSpan: 2},
+					Label{Text: "Uses the proxy saved in the main DeskFerry window.", ColumnSpan: 2},
 					Label{Text: "Screen viewing"},
 					CheckBox{AssignTo: &a.screenView, Text: "Allow authenticated screenshots and delta streaming", Checked: installedOpts.ScreenView, ColumnSpan: 2},
 					CheckBox{AssignTo: &a.winrmEnabled, Text: "WinRM", Checked: installedOpts.WinRMAddr != "", OnCheckedChanged: a.updateCapabilityControls},
@@ -537,7 +537,7 @@ func (a *app) options() actionOptions {
 		InstallDir:        installDir,
 		AgentPath:         agentPath,
 		RelayURL:          joinRelayURLs(composeRelayRoomURLs(a.relayURLListValues(), strings.TrimSpace(a.roomName.Text()))),
-		Proxy:             strings.TrimSpace(a.proxy.Text()),
+		Proxy:             uiproxy.Current("env"),
 		RoomPassword:      a.roomPassword.Text(),
 		ClearRoomPassword: a.clearPassword.Checked(),
 		WinRMAddr:         winrmAddr,
