@@ -32,6 +32,10 @@ const (
 	// client stop spending serial upload round trips on ack-only POSTs and
 	// lets batches omit records the client already has.
 	HeaderHTTPStreamAck = "X-DeskFerry-Stream-Ack"
+	// HeaderHTTPStreamPipeline marks an upload POST that may overlap others.
+	// Relays that reorder overlapping uploads echo it, which lets the client
+	// keep several upload batches in flight.
+	HeaderHTTPStreamPipeline = "X-DeskFerry-Stream-Pipeline"
 
 	httpStreamRecordAck    = byte(0)
 	httpStreamRecordText   = byte(1)
@@ -50,6 +54,13 @@ const (
 	httpStreamRetryWindow          = 5 * time.Minute
 	httpStreamAckCoalesce          = 20 * time.Millisecond
 	httpStreamReadLimit            = 1 << 20
+	// Upload batches in flight at once, and the payload size at which a
+	// pipelined batch is split so large bursts spread across them.
+	httpStreamUploadPipeline     = 3
+	httpStreamPipelineBatchBytes = 256 << 10
+	// Out-of-order records a receiver holds while an earlier batch is late.
+	httpStreamReorderLimit = 4096
+	httpStreamResendAfter  = 3 * time.Second
 )
 
 type httpStreamFrame struct {
@@ -94,8 +105,12 @@ type HTTPStreamConn struct {
 	// downAckSent is the receive acknowledgement the last downstream batch
 	// carried, so a parked batch GET can answer as soon as it advances.
 	downAckSent uint64
-	started     sync.Once
-	closeOnce   sync.Once
+	// recvAhead holds records that arrived before an earlier sequence, as
+	// pipelined uploads can complete out of order.
+	recvAhead      map[uint64]httpStreamFrame
+	recvAheadBytes int
+	started        sync.Once
+	closeOnce      sync.Once
 }
 
 func newHTTPStreamConn(ctx context.Context) *HTTPStreamConn {
@@ -219,6 +234,10 @@ func httpStreamHTTPClientWithAuth(relayAddr, proxySpec string, authFactory integ
 		ResponseHeaderTimeout: 20 * time.Second,
 		IdleConnTimeout:       30 * time.Second,
 		ExpectContinueTimeout: 2 * time.Second,
+		// Pipelined uploads plus the downstream GET use several connections
+		// at once. Keep them all reusable so an authenticating proxy does not
+		// renegotiate on fresh connections.
+		MaxIdleConnsPerHost: httpStreamUploadPipeline + 2,
 	}
 	// HTTPS requests still need CONNECT before their ordinary POST/GET traffic
 	// can reach the relay. Use the same integrated-authentication tunnel dialer
@@ -559,14 +578,34 @@ func (c *HTTPStreamConn) applyRecord(frame httpStreamFrame) error {
 		c.signalLocked()
 		return nil
 	}
-	if frame.seq != c.recvNext {
-		return fmt.Errorf("HTTP stream received sequence %d after %d", frame.seq, c.recvNext-1)
-	}
 	if frame.kind != httpStreamRecordText && frame.kind != httpStreamRecordBinary && frame.kind != httpStreamRecordClose {
 		return fmt.Errorf("HTTP stream received invalid record type %d", frame.kind)
 	}
-	c.recvNext++
-	c.recvQueue = append(c.recvQueue, frame)
+	if frame.seq > c.recvNext {
+		if _, held := c.recvAhead[frame.seq]; held {
+			return nil
+		}
+		if len(c.recvAhead) >= httpStreamReorderLimit || c.recvAheadBytes+len(frame.payload) > httpStreamMaxBuffered {
+			return fmt.Errorf("HTTP stream received sequence %d too far after %d", frame.seq, c.recvNext-1)
+		}
+		if c.recvAhead == nil {
+			c.recvAhead = make(map[uint64]httpStreamFrame)
+		}
+		c.recvAhead[frame.seq] = frame
+		c.recvAheadBytes += len(frame.payload)
+		return nil
+	}
+	for {
+		c.recvNext++
+		c.recvQueue = append(c.recvQueue, frame)
+		next, held := c.recvAhead[c.recvNext]
+		if !held {
+			break
+		}
+		delete(c.recvAhead, c.recvNext)
+		c.recvAheadBytes -= len(next.payload)
+		frame = next
+	}
 	c.cond.Broadcast()
 	c.signalLocked()
 	return nil
@@ -592,182 +631,166 @@ func (c *HTTPStreamConn) snapshotAfter(lastSeq uint64) ([]httpStreamFrame, uint6
 	return frames, ack
 }
 
+// clientUpLoop sends queued frames as finite POST batches. Once the relay
+// confirms that it reorders pipelined uploads, up to httpStreamUploadPipeline
+// batches travel at once, so data queued while a batch is in flight does not
+// wait a full round trip for its response. Older relays get one batch at a
+// time, matching their single-upload semantics.
 func (c *HTTPStreamConn) clientUpLoop() {
+	type uploadResult struct {
+		first     uint64 // first claimed data sequence; zero for an ack-only batch
+		ack       uint64
+		pipelined bool
+		err       error
+	}
+	results := make(chan uploadResult, httpStreamUploadPipeline)
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
 	backoff := 250 * time.Millisecond
+	retryAt := time.Time{}
+	nextClaim := uint64(1)
 	deliveredAck := uint64(0)
-	deliveredSequence := uint64(0)
+	inFlight := 0
+	pipelined := false
+	// Each new proxy connection costs an authentication round trip. Open the
+	// upload connection at once with an ack-only batch, and the remaining
+	// pipeline connections as soon as the relay confirms pipelining, so the
+	// first data batches find warm connections.
+	warmups := 1
+	lastStart := time.Now()
 	for c.ctx.Err() == nil {
-		attemptCtx, cancel := context.WithCancel(c.ctx)
-		reader, writer := io.Pipe()
-		req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, c.endpoint+"/up", reader)
-		if err != nil {
-			cancel()
-			c.closeTerminal(err)
-			return
+		window, batchLimit := 1, httpStreamMaxBuffered
+		if pipelined {
+			window, batchLimit = httpStreamUploadPipeline, httpStreamPipelineBatchBytes
 		}
-		req.Header = c.headers.Clone()
-		req.Header.Set("Content-Type", "application/octet-stream")
-		req.Header.Set("Cache-Control", "no-store")
-		result := make(chan error, 1)
-		go func() {
-			resp, err := c.client.Do(req)
-			if err == nil {
-				_, _ = io.Copy(io.Discard, resp.Body)
-				_ = resp.Body.Close()
-				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-					err = fmt.Errorf("HTTP stream POST failed: HTTP %s", resp.Status)
-				} else {
-					err = io.EOF
+		// A batch the relay accepted but never acknowledged, for example one
+		// a proxy truncated, is sent again once nothing else is in flight.
+		if inFlight == 0 && time.Since(lastStart) >= httpStreamResendAfter {
+			if first := c.firstUnacknowledged(); first != 0 && first < nextClaim {
+				nextClaim = first
+			}
+		}
+		for inFlight < window && !time.Now().Before(retryAt) {
+			frames, ack := c.framesFrom(nextClaim, batchLimit)
+			// When the relay takes acknowledgements from downstream GETs, an
+			// ack-only POST would only occupy an upload slot.
+			ackOnly := inFlight == 0 && ack > deliveredAck && !c.downstreamCarriesAcks()
+			keepaliveDue := inFlight == 0 && time.Since(lastStart) >= httpStreamKeepalive
+			if len(frames) == 0 && !ackOnly && !keepaliveDue && warmups == 0 {
+				break
+			}
+			if len(frames) == 0 && warmups > 0 {
+				warmups--
+			}
+			first := uint64(0)
+			if len(frames) > 0 {
+				first = frames[0].seq
+				nextClaim = frames[len(frames)-1].seq + 1
+			}
+			inFlight++
+			lastStart = time.Now()
+			go func() {
+				confirmed, err := c.postUpload(ack, frames)
+				results <- uploadResult{first: first, ack: ack, pipelined: confirmed, err: err}
+			}()
+		}
+		var retry <-chan time.Time
+		var retryTimer *time.Timer
+		if wait := time.Until(retryAt); wait > 0 {
+			retryTimer = time.NewTimer(wait)
+			retry = retryTimer.C
+		}
+		select {
+		case <-c.ctx.Done():
+		case <-c.wake:
+		case <-tick.C:
+		case <-retry:
+		case result := <-results:
+			inFlight--
+			if result.err != nil {
+				// Resend from the failed batch. Batches still in flight may
+				// overlap the resend; the relay discards duplicate sequences.
+				if result.first != 0 && result.first < nextClaim {
+					nextClaim = result.first
+				}
+				retryAt = time.Now().Add(backoff)
+				backoff = nextHTTPStreamBackoff(backoff)
+			} else {
+				backoff = 250 * time.Millisecond
+				if result.ack > deliveredAck {
+					deliveredAck = result.ack
+				}
+				if result.pipelined && !pipelined {
+					pipelined = true
+					warmups = httpStreamUploadPipeline - 1
 				}
 			}
-			result <- err
-		}()
-		type uploadWriteResult struct {
-			ack      uint64
-			sequence uint64
-			err      error
 		}
-		writeDone := make(chan uploadWriteResult, 1)
-		go func() {
-			ack, sequence, writeErr := c.writeUpload(attemptCtx, writer, deliveredAck, deliveredSequence)
-			writeDone <- uploadWriteResult{ack: ack, sequence: sequence, err: writeErr}
-		}()
-		var attemptErr error
-		normalRotation := false
-		attemptAck := deliveredAck
-		attemptSequence := deliveredSequence
-		select {
-		case attemptErr = <-result:
-		case writeResult := <-writeDone:
-			attemptAck = writeResult.ack
-			attemptSequence = writeResult.sequence
-			if writeResult.err != nil {
-				_ = writer.CloseWithError(writeResult.err)
-			}
-			attemptErr = <-result
-			normalRotation = writeResult.err == nil && errors.Is(attemptErr, io.EOF)
-		case <-c.ctx.Done():
-			cancel()
-			_ = writer.CloseWithError(c.ctx.Err())
-			return
+		if retryTimer != nil {
+			retryTimer.Stop()
 		}
-		cancel()
-		_ = writer.CloseWithError(attemptErr)
-		if c.ctx.Err() != nil {
-			return
-		}
-		if normalRotation {
-			if c.batch {
-				deliveredAck = attemptAck
-				deliveredSequence = attemptSequence
-			}
-			backoff = 250 * time.Millisecond
+	}
+}
+
+func (c *HTTPStreamConn) firstUnacknowledged() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.sendFrames) == 0 {
+		return 0
+	}
+	return c.sendFrames[0].seq
+}
+
+// framesFrom returns unacknowledged frames from sequence first onward, up to
+// roughly limit payload bytes but always at least one frame.
+func (c *HTTPStreamConn) framesFrom(first uint64, limit int) ([]httpStreamFrame, uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var frames []httpStreamFrame
+	size := 0
+	for _, frame := range c.sendFrames {
+		if frame.seq < first {
 			continue
 		}
-		if !sleepHTTPStream(c.ctx, backoff) {
-			return
+		if len(frames) > 0 && size+len(frame.payload) > limit {
+			break
 		}
-		backoff = nextHTTPStreamBackoff(backoff)
+		frames = append(frames, frame)
+		size += len(frame.payload)
 	}
+	return frames, c.recvNext - 1
 }
 
-func (c *HTTPStreamConn) writeUpload(ctx context.Context, writer *io.PipeWriter, deliveredAck, deliveredSequence uint64) (uint64, uint64, error) {
-	if c.batch {
-		return c.writeUploadBatch(ctx, writer, deliveredAck, deliveredSequence)
+// postUpload sends one finite batch and reports whether the relay confirmed
+// pipelined uploads.
+func (c *HTTPStreamConn) postUpload(ack uint64, frames []httpStreamFrame) (bool, error) {
+	var body bytes.Buffer
+	if err := writeHTTPStreamRecord(&body, httpStreamFrame{kind: httpStreamRecordAck, seq: ack}); err != nil {
+		return false, err
 	}
-	return deliveredAck, deliveredSequence, c.writePersistentUpload(ctx, writer)
-}
-
-func (c *HTTPStreamConn) writeUploadBatch(ctx context.Context, writer *io.PipeWriter, deliveredAck, deliveredSequence uint64) (uint64, uint64, error) {
-	defer writer.Close()
-	ticker := time.NewTicker(httpStreamKeepalive)
-	defer ticker.Stop()
-	for {
-		frames, ack := c.snapshotAfter(deliveredSequence)
-		// When the relay takes acknowledgements from downstream GETs, an
-		// ack-only POST would only delay the next data batch by a round trip.
-		ackOnly := ack > deliveredAck && !c.downstreamCarriesAcks()
-		if ackOnly || len(frames) > 0 {
-			if err := writeHTTPStreamRecord(writer, httpStreamFrame{kind: httpStreamRecordAck, seq: ack}); err != nil {
-				return deliveredAck, deliveredSequence, err
-			}
-			sequence := deliveredSequence
-			for _, frame := range frames {
-				if err := writeHTTPStreamRecord(writer, frame); err != nil {
-					return deliveredAck, deliveredSequence, err
-				}
-				sequence = frame.seq
-			}
-			return ack, sequence, nil
-		}
-		select {
-		case <-ctx.Done():
-			return deliveredAck, deliveredSequence, ctx.Err()
-		case <-c.wake:
-		case <-ticker.C:
-			if err := writeHTTPStreamRecord(writer, httpStreamFrame{kind: httpStreamRecordAck, seq: ack}); err != nil {
-				return deliveredAck, deliveredSequence, err
-			}
-			return ack, deliveredSequence, nil
+	for _, frame := range frames {
+		if err := writeHTTPStreamRecord(&body, frame); err != nil {
+			return false, err
 		}
 	}
-}
-
-func (c *HTTPStreamConn) writePersistentUpload(ctx context.Context, writer *io.PipeWriter) error {
-	defer writer.Close()
-	lastSeq, lastAck := uint64(0), uint64(0)
-	forceAck := true
-	unacknowledgedSince := time.Time{}
-	ticker := time.NewTicker(httpStreamKeepalive)
-	defer ticker.Stop()
-	for {
-		frames, ack := c.snapshotAfter(lastSeq)
-		if forceAck || ack > lastAck {
-			if err := writeHTTPStreamRecord(writer, httpStreamFrame{kind: httpStreamRecordAck, seq: ack}); err != nil {
-				return err
-			}
-			lastAck = ack
-			forceAck = false
-		}
-		for _, frame := range frames {
-			if err := writeHTTPStreamRecord(writer, frame); err != nil {
-				return err
-			}
-			lastSeq = frame.seq
-		}
-		if lastSeq > 0 && !c.sendSequenceAcknowledged(lastSeq) {
-			if unacknowledgedSince.IsZero() {
-				unacknowledgedSince = time.Now()
-			}
-		} else {
-			unacknowledgedSince = time.Time{}
-		}
-		var rotate <-chan time.Time
-		var rotateTimer *time.Timer
-		if !unacknowledgedSince.IsZero() {
-			remaining := httpStreamUploadProbeTimeout - time.Since(unacknowledgedSince)
-			if remaining <= 0 {
-				return nil
-			}
-			rotateTimer = time.NewTimer(remaining)
-			rotate = rotateTimer.C
-		}
-		select {
-		case <-ctx.Done():
-			if rotateTimer != nil {
-				rotateTimer.Stop()
-			}
-			return ctx.Err()
-		case <-c.wake:
-		case <-ticker.C:
-			forceAck = true
-		case <-rotate:
-			return nil
-		}
-		if rotateTimer != nil {
-			rotateTimer.Stop()
-		}
+	req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, c.endpoint+"/up", bytes.NewReader(body.Bytes()))
+	if err != nil {
+		return false, err
 	}
+	req.Header = c.headers.Clone()
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Cache-Control", "no-store")
+	req.Header.Set(HeaderHTTPStreamPipeline, "1")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, fmt.Errorf("HTTP stream POST failed: HTTP %s", resp.Status)
+	}
+	return resp.Header.Get(HeaderHTTPStreamPipeline) != "", nil
 }
 
 func (c *HTTPStreamConn) downstreamCarriesAcks() bool {
@@ -1026,12 +1049,18 @@ func (c *HTTPStreamConn) serveUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "HTTP stream upstream requires POST", http.StatusMethodNotAllowed)
 		return
 	}
+	// Pipelined uploads overlap by design, and out-of-order records are
+	// reordered on receipt. Only a legacy upload is superseded by a newer one.
+	pipelined := r.Header.Get(HeaderHTTPStreamPipeline) != ""
 	c.mu.Lock()
 	c.upGen++
 	generation := c.upGen
 	c.lastActive = time.Now()
 	c.mu.Unlock()
 	w.Header().Set("Cache-Control", "no-store")
+	if pipelined {
+		w.Header().Set(HeaderHTTPStreamPipeline, "1")
+	}
 	for {
 		frame, err := readHTTPStreamRecord(r.Body)
 		if err != nil {
@@ -1039,7 +1068,7 @@ func (c *HTTPStreamConn) serveUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		c.mu.Lock()
-		current := c.upGen == generation && !c.closed
+		current := (pipelined || c.upGen == generation) && !c.closed
 		c.mu.Unlock()
 		if !current {
 			return

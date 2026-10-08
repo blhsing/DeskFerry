@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.12.15 - 2026-10-09
+
+- Pipeline uploads on the POST/GET streaming fallback. Once the relay confirms support (`X-DeskFerry-Stream-Pipeline`), clients keep up to three finite upload batches in flight, splitting large bursts into 256 KiB batches, so data queued during an upload no longer waits a full round trip for its response. Relays reorder overlapping uploads by sequence. Older relays keep receiving one batch at a time.
+- Send upload batches with a known length instead of a streamed body, and pre-open the upload connections so the first data batches skip the proxy authentication round trip.
+- Re-send upload batches the relay accepted but did not acknowledge within three seconds, such as one truncated by a proxy.
+
 ## 0.12.14 - 2026-10-08
 
 - Cut latency on the POST/GET streaming fallback used through proxies that reject WebSocket upgrades. Clients now re-poll a finished downstream batch immediately instead of waiting out a 250 ms reconnect backoff (which Android let grow to five seconds), and no longer pay an `Expect: 100-continue` round trip on each upload.

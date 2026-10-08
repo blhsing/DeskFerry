@@ -55,6 +55,7 @@ HTTP_STREAM_LIMIT = 1 << 20
 HTTP_STREAM_BUFFER = 8 * 1024 * 1024
 HTTP_STREAM_KEEPALIVE = 10
 HTTP_STREAM_ACK_COALESCE = 0.02
+HTTP_STREAM_REORDER_LIMIT = 4096
 HTTP_STREAM_RETENTION = 300
 
 
@@ -89,6 +90,10 @@ class HTTPStreamWebSocket:
         # Receive acknowledgement carried by the last downstream batch, so a
         # parked batch GET can answer as soon as it advances.
         self.down_ack_sent = 0
+        # Records that arrived before an earlier sequence, as pipelined uploads
+        # can complete out of order.
+        self.receive_ahead: dict[int, HTTPStreamFrame] = {}
+        self.receive_ahead_bytes = 0
         self.last_activity = time.monotonic()
         self.closed = asyncio.Event()
 
@@ -166,10 +171,25 @@ class HTTPStreamWebSocket:
             if frame.sequence < self.next_receive:
                 self.changed.set()
                 return False
-            if frame.sequence != self.next_receive or frame.kind not in {HTTP_STREAM_TEXT, HTTP_STREAM_BINARY, HTTP_STREAM_CLOSE}:
-                raise ValueError("invalid HTTP stream sequence or record type")
-            self.next_receive += 1
-            self.incoming.put_nowait(frame)
+            if frame.kind not in {HTTP_STREAM_TEXT, HTTP_STREAM_BINARY, HTTP_STREAM_CLOSE}:
+                raise ValueError("invalid HTTP stream record type")
+            if frame.sequence > self.next_receive:
+                if frame.sequence in self.receive_ahead:
+                    return False
+                if (len(self.receive_ahead) >= HTTP_STREAM_REORDER_LIMIT
+                        or self.receive_ahead_bytes + len(frame.payload) > HTTP_STREAM_BUFFER):
+                    raise ValueError("HTTP stream sequence is too far ahead")
+                self.receive_ahead[frame.sequence] = frame
+                self.receive_ahead_bytes += len(frame.payload)
+                return False
+            while True:
+                self.next_receive += 1
+                self.incoming.put_nowait(frame)
+                following = self.receive_ahead.pop(self.next_receive, None)
+                if following is None:
+                    break
+                self.receive_ahead_bytes -= len(following.payload)
+                frame = following
             self.changed.set()
             return False
 
@@ -193,12 +213,16 @@ class HTTPStreamWebSocket:
     async def serve_upload(self, request: Request) -> Response:
         if request.method != "POST":
             return Response("HTTP stream upstream requires POST", status_code=405)
+        # Pipelined uploads overlap by design, and out-of-order records are
+        # reordered on receipt. Only a legacy upload is superseded by a newer one.
+        pipelined = bool(request.headers.get("x-deskferry-stream-pipeline", "").strip())
+        response_headers = {"X-DeskFerry-Stream-Pipeline": "1"} if pipelined else {}
         self.up_generation += 1
         generation = self.up_generation
         buffered = bytearray()
         try:
             async for chunk in request.stream():
-                if generation != self.up_generation:
+                if not pipelined and generation != self.up_generation:
                     break
                 buffered.extend(chunk)
                 while len(buffered) >= HTTP_STREAM_HEADER:
@@ -215,7 +239,7 @@ class HTTPStreamWebSocket:
                         return Response(status_code=409)
         except (asyncio.CancelledError, ClientDisconnect, ConnectionError):
             pass
-        return Response(status_code=204)
+        return Response(status_code=204, headers=response_headers)
 
     async def serve_download(self, request: Request) -> Response:
         # Clients report their received sequence on each GET. Applying it keeps

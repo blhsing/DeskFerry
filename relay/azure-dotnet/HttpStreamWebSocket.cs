@@ -64,6 +64,7 @@ sealed class HttpStreamWebSocket : WebSocket
     private const int HeaderLength = 13;
     private const int ReadLimit = 1 << 20;
     private const int MaxBuffered = 8 * 1024 * 1024;
+    private const int ReorderLimit = 4096;
     private static readonly TimeSpan Keepalive = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan AckCoalesce = TimeSpan.FromMilliseconds(20);
 
@@ -86,6 +87,10 @@ sealed class HttpStreamWebSocket : WebSocket
     // Receive acknowledgement carried by the last downstream batch, so a parked
     // batch GET can answer as soon as it advances.
     private ulong _downAckSent;
+    // Records that arrived before an earlier sequence, as pipelined uploads
+    // can complete out of order.
+    private readonly Dictionary<ulong, Frame> _receiveAhead = [];
+    private int _receiveAheadBytes;
     private WebSocketState _state = WebSocketState.Open;
     private WebSocketCloseStatus? _closeStatus;
     private string? _closeDescription;
@@ -307,10 +312,17 @@ sealed class HttpStreamWebSocket : WebSocket
             context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed;
             return;
         }
+        // Pipelined uploads overlap by design, and out-of-order records are
+        // reordered on receipt. Only a legacy upload is superseded by a newer one.
+        var pipelined = !string.IsNullOrEmpty(context.Request.Headers["X-DeskFerry-Stream-Pipeline"].FirstOrDefault());
+        if (pipelined)
+        {
+            context.Response.Headers["X-DeskFerry-Stream-Pipeline"] = "1";
+        }
         var generation = Interlocked.Increment(ref _upGeneration);
         try
         {
-            while (!context.RequestAborted.IsCancellationRequested && generation == Volatile.Read(ref _upGeneration))
+            while (!context.RequestAborted.IsCancellationRequested && (pipelined || generation == Volatile.Read(ref _upGeneration)))
             {
                 var frame = await ReadRecordAsync(context.Request.Body, context.RequestAborted);
                 // A relay restart can recreate an existing transport ID with
@@ -532,12 +544,35 @@ sealed class HttpStreamWebSocket : WebSocket
                 SignalChanged();
                 return;
             }
-            if (frame.Sequence != _nextReceive || frame.Kind is not (TextRecord or BinaryRecord or CloseRecord))
+            if (frame.Kind is not (TextRecord or BinaryRecord or CloseRecord))
             {
-                throw new InvalidDataException("HTTP stream sequence or record type is invalid.");
+                throw new InvalidDataException("HTTP stream record type is invalid.");
             }
-            _nextReceive++;
-            _received.Writer.TryWrite(frame);
+            if (frame.Sequence > _nextReceive)
+            {
+                if (_receiveAhead.ContainsKey(frame.Sequence))
+                {
+                    return;
+                }
+                if (_receiveAhead.Count >= ReorderLimit || _receiveAheadBytes + frame.Payload.Length > MaxBuffered)
+                {
+                    throw new InvalidDataException("HTTP stream sequence is too far ahead.");
+                }
+                _receiveAhead[frame.Sequence] = frame;
+                _receiveAheadBytes += frame.Payload.Length;
+                return;
+            }
+            while (true)
+            {
+                _nextReceive++;
+                _received.Writer.TryWrite(frame);
+                if (!_receiveAhead.Remove(_nextReceive, out var next))
+                {
+                    break;
+                }
+                _receiveAheadBytes -= next.Payload.Length;
+                frame = next;
+            }
             SignalChanged();
         }
     }

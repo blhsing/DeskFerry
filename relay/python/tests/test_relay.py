@@ -201,6 +201,28 @@ def test_http_stream_batch_applies_get_ack_and_answers_ack_advance():
     asyncio.run(scenario())
 
 
+def test_http_stream_reorders_pipelined_records():
+    async def scenario():
+        request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/relay/unit/stream/id/up",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 12345),
+            "server": ("127.0.0.1", 80),
+            "scheme": "http",
+        })
+        stream = HTTPStreamWebSocket(request, "s" * 32)
+        for sequence in (3, 2, 3, 1, 4):
+            await stream.apply(HTTPStreamFrame(HTTP_STREAM_TEXT, sequence, str(sequence).encode()))
+        assert [await stream.receive_text() for _ in range(4)] == ["1", "2", "3", "4"]
+        assert stream.incoming.empty()
+        assert stream.receive_ahead == {} and stream.receive_ahead_bytes == 0
+
+    asyncio.run(scenario())
+
+
 def test_home_agent_status_presence():
     client = TestClient(app)
     headers = {"X-DeskFerry-Role": "home-agent"}

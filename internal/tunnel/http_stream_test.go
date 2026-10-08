@@ -503,7 +503,101 @@ func TestHTTPStreamBatchesRepollImmediatelyAndCarryAcksOnGET(t *testing.T) {
 	if got := resentRecords.Load(); got != 0 {
 		t.Fatalf("downstream batches re-sent %d records the GET already acknowledged", got)
 	}
-	if got := ackOnlyPosts.Load(); got != 0 {
+	// The only ack-only POSTs allowed are the connection warm-ups: one at
+	// connect and the rest of the pipeline once the relay confirms it.
+	if got := ackOnlyPosts.Load(); got > httpStreamUploadPipeline {
 		t.Fatalf("client sent %d ack-only POSTs although GETs carry acknowledgements", got)
+	}
+}
+
+func TestHTTPStreamPipelinedUploadsArriveInOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	streams := NewHTTPStreamServer(func(ctx context.Context, conn MessageConn, _ *http.Request, _ string) {
+		for {
+			typ, payload, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			if err := conn.Write(ctx, typ, payload); err != nil {
+				return
+			}
+		}
+	})
+	defer streams.Close()
+
+	var active, maxActive atomic.Int32
+	var delays atomic.Int64
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) != 5 || parts[0] != "relay" || parts[2] != "stream" {
+			http.NotFound(w, r)
+			return
+		}
+		if parts[4] == "up" {
+			now := active.Add(1)
+			defer active.Add(-1)
+			for {
+				seen := maxActive.Load()
+				if now <= seen || maxActive.CompareAndSwap(seen, now) {
+					break
+				}
+			}
+			body, _ := io.ReadAll(r.Body)
+			// Hold each upload for a varying time, as a buffering proxy with
+			// several connections would, so later batches can land first.
+			time.Sleep(time.Duration(delays.Add(37)%60) * time.Millisecond)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		streams.Serve(w, r, parts[1], parts[3], parts[4])
+	}))
+	defer origin.Close()
+
+	conn, err := DialHTTPStreamWithHeaders(ctx, origin.URL+"/relay/unit", "direct", RoleProbe, "", nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer CloseMessageConn(conn)
+
+	const messages = 200
+	go func() {
+		for i := 0; i < messages; i++ {
+			if err := conn.Write(ctx, websocket.MessageBinary, []byte(fmt.Sprintf("message-%03d", i))); err != nil {
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	for i := 0; i < messages; i++ {
+		_, payload, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if want := fmt.Sprintf("message-%03d", i); string(payload) != want {
+			t.Fatalf("message %d = %q, want %q", i, payload, want)
+		}
+	}
+	if got := maxActive.Load(); got < 2 {
+		t.Fatalf("at most %d upload was in flight; uploads were not pipelined", got)
+	}
+}
+
+func TestHTTPStreamReordersEarlyRecords(t *testing.T) {
+	stream := newHTTPStreamConn(context.Background())
+	defer stream.CloseNow()
+	for _, seq := range []uint64{3, 2, 3, 1, 4} {
+		if err := stream.applyRecord(httpStreamFrame{kind: httpStreamRecordText, seq: seq, payload: []byte{byte('0' + seq)}}); err != nil {
+			t.Fatalf("apply %d: %v", seq, err)
+		}
+	}
+	for want := byte('1'); want <= '4'; want++ {
+		_, payload, err := stream.Read(context.Background())
+		if err != nil || len(payload) != 1 || payload[0] != want {
+			t.Fatalf("read = %q, %v; want %q", payload, err, want)
+		}
+	}
+	if len(stream.recvAhead) != 0 || stream.recvAheadBytes != 0 {
+		t.Fatalf("reorder buffer not drained: %d records, %d bytes", len(stream.recvAhead), stream.recvAheadBytes)
 	}
 }
