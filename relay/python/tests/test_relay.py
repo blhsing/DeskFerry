@@ -315,11 +315,14 @@ def test_legacy_role_header_is_still_accepted():
 
 
 def test_agent_client_pair_and_bridge_bytes():
-    client = TestClient(app)
     agent_headers = {"X-DeskFerry-Role": "agent"}
     client_headers = {"X-DeskFerry-Role": "client"}
 
-    with client.websocket_connect("/relay/unit-bridge/ws", headers=agent_headers) as agent:
+    # Entering the TestClient context shares one event loop across both
+    # WebSockets. Without it, each websocket_connect gets its own portal thread
+    # and loop, so the client handler resolves the agent's asyncio pairing
+    # future from a foreign thread and the agent loop may never wake.
+    with TestClient(app) as client, client.websocket_connect("/relay/unit-bridge/ws", headers=agent_headers) as agent:
         with client.websocket_connect("/relay/unit-bridge/ws", headers=client_headers) as home:
             assert agent.receive_text() == "start"
             assert home.receive_text() == "start"
