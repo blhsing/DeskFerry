@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"deskferry/internal/buildinfo"
+	"deskferry/internal/relaydashboard"
 	"deskferry/internal/tunnel"
 
 	"nhooyr.io/websocket"
@@ -2146,120 +2147,13 @@ func randomID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// relayKind labels this relay implementation on the shared dashboard.
+const relayKind = "Go relay"
+
 func iconSVG() string {
-	return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">
-  <defs>
-    <linearGradient id="bg" x1="12" y1="12" x2="96" y2="96" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#13324d"/><stop offset="1" stop-color="#40b5ae"/>
-    </linearGradient>
-    <clipPath id="clip"><rect x="6" y="6" width="96" height="96" rx="22"/></clipPath>
-  </defs>
-  <rect x="6" y="6" width="96" height="96" rx="22" fill="url(#bg)"/>
-  <g clip-path="url(#clip)">
-    <path d="M6 34c22-17 61-14 97-24l3 12c-32 12-70 9-99 23z" fill="#fff" opacity=".08"/>
-    <path d="M0 78q13-7 27 0t28 0t28 0q13 7 25-2v32H0z" fill="#69d2c7"/>
-    <path d="M4 86q18-7 36 0t36 0q16-6 28-2v4q-13-2-28 3q-18 7-36 0q-18-7-36 0z" fill="#fff" opacity=".48"/>
-  </g>
-  <path d="M27 25q0-7 7-7h40q7 0 7 7v28q0 7-7 7H34q-7 0-7-7z" fill="#fff"/>
-  <path d="M34 27q0-3 3-3h34q3 0 3 3v20q0 3-3 3H37q-3 0-3-3z" fill="#17324d"/>
-  <path d="M49 59h10l3 8H46zM39 68q0-3 3-3h24q3 0 3 3v3H39z" fill="#fff"/>
-  <path d="M20 64h68l-8 11q-9 7-42 4q-9-2-18-15z" fill="#e66d4f"/>
-  <path d="M31 66h43q2 0 2 2t-2 2H31q-2 0-2-2t2-2z" fill="#fff" opacity=".76"/>
-</svg>`
+	return relaydashboard.IconSVG()
 }
 
 func dashboardHTML(room string) string {
-	roomJSON, _ := json.Marshal(room)
-	return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DeskFerry Relay</title>
-  <link rel="icon" href="/relay/icon.svg" type="image/svg+xml">
-  <style>
-    :root { color-scheme: light; --bg:#f5f7f8; --panel:#fff; --ink:#1f2933; --muted:#65717d; --line:#d7dee3; --accent:#2f6f73; --ok:#287d52; --warn:#9a6a12; --bad:#a94343; }
-    * { box-sizing:border-box; }
-    body { margin:0; font-family:"Segoe UI",system-ui,-apple-system,BlinkMacSystemFont,sans-serif; background:var(--bg); color:var(--ink); }
-    header { padding:28px 24px 18px; border-bottom:1px solid var(--line); background:var(--panel); }
-    main { width:min(1120px, calc(100% - 32px)); margin:22px auto 40px; }
-    h1 { margin:0 0 6px; font-size:clamp(26px,4vw,38px); letter-spacing:0; }
-    .brand { display:flex; align-items:center; gap:14px; }
-    .brand-icon { width:58px; height:58px; flex:0 0 58px; border-radius:13px; }
-    .brand-text { min-width:0; }
-    .subtle { color:var(--muted); }
-    .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:16px; }
-    .toolbar input { flex:1 1 360px; min-width:0; height:40px; border:1px solid var(--line); border-radius:8px; padding:0 12px; color:var(--ink); background:#fbfcfd; font:13px ui-monospace,SFMono-Regular,Consolas,monospace; }
-    .toolbar button { height:40px; border:1px solid var(--accent); border-radius:8px; padding:0 14px; color:var(--accent); background:#fff; font-weight:700; cursor:pointer; }
-    .grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; margin-bottom:18px; }
-    .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; min-height:128px; }
-    .label { color:var(--muted); font-size:13px; font-weight:700; text-transform:uppercase; }
-    .value { margin-top:10px; font-size:28px; font-weight:700; line-height:1.1; }
-    .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
-    table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
-    th,td { padding:12px 14px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top; font-size:14px; }
-    th { color:var(--muted); font-size:12px; text-transform:uppercase; background:#fbfcfd; }
-    tr:last-child td { border-bottom:0; }
-    code { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:13px; }
-    .pill { display:inline-block; padding:3px 8px; border-radius:999px; border:1px solid var(--line); font-size:12px; font-weight:700; background:#f9fafb; }
-    .pill.ok { border-color:#bfe4cf; background:#edf8f1; } .pill.bad { border-color:#efc5c5; background:#fff0f0; }
-    @media (max-width:760px) { .grid { grid-template-columns:1fr; } th:nth-child(5),td:nth-child(5){display:none;} .brand-icon{width:48px;height:48px;flex-basis:48px;} }
-  </style>
-</head>
-<body>
-  <header>
-    <div class="brand">
-      <img class="brand-icon" src="/relay/icon.svg" alt="">
-      <div class="brand-text">
-        <h1>DeskFerry Relay</h1>
-        <div class="subtle">DeskFerry Relay v` + buildinfo.Version + ` · Go WebSocket relay at <code>/relay/ws</code>. Status updates stream live over WebSocket.</div>
-      </div>
-    </div>
-    <div class="toolbar"><input id="roomUrl" readonly aria-label="Relay room URL"><button id="copyRoom" type="button">Copy</button></div>
-  </header>
-  <main>
-    <section class="grid">
-      <div class="card"><div class="label">Work agent</div><div id="workStatus" class="value warn">Checking</div><p id="workDetail" class="subtle">Waiting for status.</p></div>
-      <div class="card"><div class="label">Home side</div><div id="homeStatus" class="value warn">Checking</div><p id="homeDetail" class="subtle">Waiting for status.</p></div>
-      <div class="card"><div class="label">RDP streams</div><div id="streamStatus" class="value">0</div><p id="streamDetail" class="subtle">No active pairs.</p></div>
-    </section>
-    <table>
-      <thead><tr><th>Room</th><th>Work Agent</th><th>Home Side</th><th>Active Pairs</th><th>Last Client</th></tr></thead>
-      <tbody id="rooms"><tr><td colspan="5" class="subtle">Loading relay status...</td></tr></tbody>
-    </table>
-  </main>
-  <script>
-    const roomsBody=document.getElementById("rooms"),workStatus=document.getElementById("workStatus"),workDetail=document.getElementById("workDetail"),homeStatus=document.getElementById("homeStatus"),homeDetail=document.getElementById("homeDetail"),streamStatus=document.getElementById("streamStatus"),streamDetail=document.getElementById("streamDetail"),roomUrl=document.getElementById("roomUrl"),copyRoom=document.getElementById("copyRoom");
-    const pageRoom=` + string(roomJSON) + `;
-    function pill(ok,text){return '<span class="pill '+(ok?'ok':'bad')+'">'+text+'</span>'}
-    function esc(value){return String(value??"").replace(/[&<>"']/g,char=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]))}
-    function fmt(value){return value?new Date(value).toLocaleString():""}
-    function setValue(node,text,cls){node.className="value "+cls;node.textContent=text}
-    function relayRoomUrl(room){return room?location.origin+'/relay/'+encodeURIComponent(room):location.origin+'/relay/'}
-    function render(data){
-      const rooms=data.rooms||[],controls=rooms.reduce((s,r)=>s+(r.control_connections||0),0),waitingAgents=rooms.reduce((s,r)=>s+(r.waiting_agents||0),0),activePairs=rooms.reduce((s,r)=>s+(r.active_pairs||0),0),homeAgents=rooms.filter(r=>r.home_agent_connected).length,homeActiveRooms=rooms.filter(r=>r.home_agent_connected||(r.active_pairs||0)>0).length;
-      setValue(workStatus,controls+waitingAgents+activePairs>0?"Connected":"Waiting",controls+waitingAgents+activePairs>0?"ok":"warn");
-      workDetail.textContent=controls+' control connections, '+activePairs+' active sessions.';
-      setValue(homeStatus,homeActiveRooms>0?"Active":"Waiting",homeActiveRooms>0?"ok":"warn");
-      homeDetail.textContent=homeAgents+' presence socket'+(homeAgents===1?'':'s')+', '+activePairs+' active RDP stream'+(activePairs===1?'':'s')+'.';
-      streamStatus.textContent=activePairs.toString();
-      streamDetail.textContent=activePairs===0?'No active RDP streams.':activePairs+' RDP stream'+(activePairs===1?'':'s')+' bridged.';
-      if(rooms.length===0){roomsBody.innerHTML='<tr><td colspan="5" class="subtle">No rooms have connected yet.</td></tr>';return}
-      roomsBody.innerHTML=rooms.map(r=>{
-        const workConnected=(r.control_connections||0)+(r.waiting_agents||0)+(r.active_pairs||0)>0,homePresence=!!r.home_agent_connected,streamActive=(r.active_pairs||0)>0,homeState=homePresence?'presence':(streamActive?'active stream':'waiting'),homeInfo=homePresence?esc(r.home_agent_remote||'')+'<br>'+esc(fmt(r.home_agent_connected_at)):(r.active_pairs||0)+' active<br>'+esc(fmt(r.last_client_connected_at));
-        return '<tr><td><code>'+esc(r.id)+'</code></td><td>'+pill(workConnected,workConnected?'connected':'waiting')+'<br><span class="subtle">'+(r.control_connections||0)+' controls<br>'+esc(fmt(r.last_agent_connected_at))+'</span></td><td>'+pill(homePresence||streamActive,homeState)+'<br><span class="subtle">'+homeInfo+'</span></td><td>'+(r.active_pairs||0)+'<br><span class="subtle">'+(r.total_pairs||0)+' total</span></td><td><span class="subtle">'+esc(r.last_client_remote||'')+'<br>'+esc(fmt(r.last_client_connected_at))+'</span></td></tr>';
-      }).join("");
-    }
-    function connectDashboard(){
-      const scheme=location.protocol==="https:"?"wss:":"ws:",roomPath=pageRoom?'/relay/'+encodeURIComponent(pageRoom)+'/ws':"/relay/ws",socket=new WebSocket(scheme+'//'+location.host+roomPath+'?role=dashboard');
-      socket.onmessage=event=>render(JSON.parse(event.data));
-      socket.onclose=()=>{setValue(workStatus,"Reconnecting","warn");setValue(homeStatus,"Reconnecting","warn");setTimeout(connectDashboard,1500)};
-      socket.onerror=()=>socket.close();
-    }
-    roomUrl.value=relayRoomUrl(pageRoom);
-    copyRoom.addEventListener("click",async()=>{roomUrl.select();await navigator.clipboard.writeText(roomUrl.value)});
-    connectDashboard();
-  </script>
-</body>
-</html>`
+	return relaydashboard.HTML(buildinfo.Version, room, relayKind)
 }

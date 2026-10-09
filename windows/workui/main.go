@@ -31,6 +31,7 @@ import (
 	"deskferry/internal/uiproxy"
 	"deskferry/internal/winsecret"
 	"deskferry/internal/winservice"
+	"deskferry/windows/uikit"
 )
 
 const (
@@ -41,6 +42,8 @@ const (
 	defaultOCIRelayBase   = "http://217.142.228.117/relay"
 	defaultRoomName       = "workdesk"
 	defaultSMBAlias       = "deskferry-work"
+	workWindowWidth       = 760
+	workWindowHeight      = 800
 )
 
 type app struct {
@@ -58,8 +61,9 @@ type app struct {
 	smbAddr         *walk.LineEdit
 	smbAlias        *walk.LineEdit
 	status          *walk.Label
+	serviceChip     *uikit.StatusChip
 	log             *walk.TextEdit
-	installButton   *walk.PushButton
+	installButton   *uikit.AccentButton
 	startButton     *walk.PushButton
 	stopButton      *walk.PushButton
 	restartButton   *walk.PushButton
@@ -128,69 +132,79 @@ func (a *app) run(smokeTest bool) error {
 	a.relayURLs = uniqueRelayURLs(relayBases)
 
 	window := MainWindow{
-		AssignTo: &a.mw,
-		Title:    appTitle(),
-		MinSize:  Size{Width: 660, Height: 680},
-		Size:     Size{Width: 660, Height: 680},
-		Layout:   VBox{Margins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10}, Spacing: 8},
-		Visible:  false,
+		AssignTo:   &a.mw,
+		Title:      appTitle(),
+		Icon:       uikit.AppIcon(),
+		Font:       uikit.BodyFont(),
+		Background: uikit.WindowBackground(),
+		MinSize:    Size{Width: 740, Height: 600},
+		Size:       Size{Width: workWindowWidth, Height: workWindowHeight},
+		Layout:     VBox{Margins: Margins{Left: uikit.Space20, Top: uikit.Space12, Right: uikit.Space20, Bottom: uikit.Space16}, Spacing: uikit.Space12},
+		Visible:    false,
 		Children: []Widget{
-			GroupBox{
-				Title:   "Allow access to this PC",
-				MaxSize: Size{Height: 295},
-				Layout:  Grid{Columns: 3, Spacing: 6},
+			uikit.Header("Work services", "Let a Home PC reach this computer · version "+buildinfo.Version,
+				uikit.Chip{AssignTo: &a.serviceChip, Text: "Checking", Alignment: AlignHFarVCenter},
+			),
+			uikit.Card{
+				Title:       "Allow access to this PC",
+				Description: "Optional; leave off on a Home-only PC. Uses the proxy saved in the main DeskFerry window.",
+				Layout:      Grid{Columns: 2, MarginsZero: true, Spacing: uikit.FieldGap},
 				Children: []Widget{
-					CheckBox{AssignTo: &a.workEnabled, Text: "Install Work services on this PC", Checked: installed, ColumnSpan: 3, OnCheckedChanged: a.refreshStatus},
-					Label{Text: "Optional — leave this unchecked when this PC is used only as a Home client.", ColumnSpan: 3},
-					Label{Text: "Room name"},
-					LineEdit{AssignTo: &a.roomName, Text: firstNonEmpty(roomFromRelayURLs(installedOpts.RelayURL), defaultRoomName), CueBanner: defaultRoomName, ColumnSpan: 2},
-					Label{Text: "Room password"},
-					LineEdit{AssignTo: &a.roomPassword, PasswordMode: true, CueBanner: "blank keeps the current password", ColumnSpan: 2},
-					Label{Text: "Password options"},
-					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM, SMB, and screen viewing)", ColumnSpan: 2},
-					Label{Text: "Proxy"},
-					Label{Text: "Uses the proxy saved in the main DeskFerry window.", ColumnSpan: 2},
-					Label{Text: "Screen viewing"},
-					CheckBox{AssignTo: &a.screenView, Text: "Allow authenticated screenshots and delta streaming", Checked: installedOpts.ScreenView, ColumnSpan: 2},
-					CheckBox{AssignTo: &a.winrmEnabled, Text: "WinRM", Checked: installedOpts.WinRMAddr != "", OnCheckedChanged: a.updateCapabilityControls},
-					LineEdit{AssignTo: &a.winrmAddr, Text: firstNonEmpty(installedOpts.WinRMAddr, "127.0.0.1:5985"), CueBanner: "local Windows WinRM listener", ColumnSpan: 2},
-					CheckBox{AssignTo: &a.smbEnabled, Text: "SMB", Checked: installedOpts.SMBAddr != "", OnCheckedChanged: a.updateCapabilityControls},
-					LineEdit{AssignTo: &a.smbAddr, Text: firstNonEmpty(installedOpts.SMBAddr, "127.0.0.1:445"), CueBanner: "local Windows SMB listener", ColumnSpan: 2},
-					Label{Text: "SMB server alias"},
-					LineEdit{AssignTo: &a.smbAlias, Text: firstNonEmpty(installedOpts.SMBAlias, defaultSMBAlias), CueBanner: defaultSMBAlias, ColumnSpan: 2},
+					CheckBox{AssignTo: &a.workEnabled, Text: "Install Work services on this PC", Checked: installed, ColumnSpan: 2, OnCheckedChanged: a.refreshStatus},
+					uikit.FieldLabel("Room name"),
+					LineEdit{AssignTo: &a.roomName, Text: firstNonEmpty(roomFromRelayURLs(installedOpts.RelayURL), defaultRoomName), CueBanner: defaultRoomName},
+					uikit.FieldLabel("Room password"),
+					LineEdit{AssignTo: &a.roomPassword, PasswordMode: true, CueBanner: "blank keeps the current password"},
+					Label{},
+					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM, SMB, and screen viewing)"},
+					uikit.FieldLabel("Screen viewing"),
+					CheckBox{AssignTo: &a.screenView, Text: "Allow authenticated screenshots and delta streaming", Checked: installedOpts.ScreenView},
+					CheckBox{AssignTo: &a.winrmEnabled, Text: "WinRM", Checked: installedOpts.WinRMAddr != "", OnCheckedChanged: a.updateCapabilityControls, MinSize: Size{Width: uikit.LabelColumnWidth}},
+					LineEdit{AssignTo: &a.winrmAddr, Text: firstNonEmpty(installedOpts.WinRMAddr, "127.0.0.1:5985"), CueBanner: "local Windows WinRM listener"},
+					CheckBox{AssignTo: &a.smbEnabled, Text: "SMB", Checked: installedOpts.SMBAddr != "", OnCheckedChanged: a.updateCapabilityControls, MinSize: Size{Width: uikit.LabelColumnWidth}},
+					LineEdit{AssignTo: &a.smbAddr, Text: firstNonEmpty(installedOpts.SMBAddr, "127.0.0.1:445"), CueBanner: "local Windows SMB listener"},
+					uikit.FieldLabel("SMB server alias"),
+					LineEdit{AssignTo: &a.smbAlias, Text: firstNonEmpty(installedOpts.SMBAlias, defaultSMBAlias), CueBanner: defaultSMBAlias},
 				},
 			},
-			GroupBox{
-				Title:   "Optional Work service",
-				MinSize: Size{Height: 90},
-				MaxSize: Size{Height: 90},
-				Layout:  VBox{Spacing: 6},
+			uikit.Card{
+				Title: "Work service",
+				TitleTrailing: []Widget{
+					Label{AssignTo: &a.status, Text: "Checking the service...", TextColor: uikit.ColorTextSecondary, EllipsisMode: EllipsisEnd, StretchFactor: 1},
+					uikit.Button(nil, "Self-test", a.runSelfTest),
+					uikit.Button(nil, "Open folder", a.openInstallFolder),
+					uikit.Button(nil, "Refresh", a.refreshStatus),
+				},
 				Children: []Widget{
-					Label{AssignTo: &a.status, Text: "Status: checking..."},
 					Composite{
-						MaxSize: Size{Height: 32},
-						Layout:  Flow{Spacing: 6},
+						Layout: HBox{MarginsZero: true, Spacing: uikit.Space8},
 						Children: []Widget{
-							PushButton{AssignTo: &a.installButton, Text: "Install", OnClicked: func() { a.runAction("install") }},
-							PushButton{AssignTo: &a.startButton, Text: "Start", OnClicked: func() { a.runAction("start") }},
-							PushButton{AssignTo: &a.stopButton, Text: "Stop", OnClicked: func() { a.runAction("stop") }},
-							PushButton{AssignTo: &a.restartButton, Text: "Restart", OnClicked: func() { a.runAction("restart") }},
-							PushButton{AssignTo: &a.uninstallButton, Text: "Remove", OnClicked: func() { a.runAction("uninstall") }},
-							PushButton{Text: "Self-test", OnClicked: a.runSelfTest},
-							PushButton{Text: "Open Folder", OnClicked: a.openInstallFolder},
-							PushButton{Text: "Refresh", OnClicked: a.refreshStatus},
+							uikit.PrimaryButton{AssignTo: &a.installButton, Text: "Install", OnClicked: func() { a.runAction("install") }},
+							uikit.Button(&a.startButton, "Start", func() { a.runAction("start") }),
+							uikit.Button(&a.stopButton, "Stop", func() { a.runAction("stop") }),
+							uikit.Button(&a.restartButton, "Restart", func() { a.runAction("restart") }),
+							uikit.Button(&a.uninstallButton, "Remove", func() { a.runAction("uninstall") }),
+							HSpacer{},
 						},
 					},
 				},
 			},
-			Label{Text: "Activity"},
-			TextEdit{AssignTo: &a.log, ReadOnly: true, MinSize: Size{Height: 80}, StretchFactor: 10},
+			uikit.Card{
+				Title:         "Activity",
+				StretchFactor: 1,
+				Children: []Widget{
+					TextEdit{AssignTo: &a.log, ReadOnly: true, VScroll: true, Font: uikit.MonoFont(), Background: SolidColorBrush{Color: uikit.ColorSurfaceSubtle}, MinSize: Size{Height: 40}, StretchFactor: 1},
+				},
+			},
 		},
 	}
 	if err := window.Create(); err != nil {
 		return err
 	}
 	a.mw.SetPersistent(false)
+	// walk applies the declarative Size before the first layout pass; apply
+	// the preferred size again once the layout minimum is known.
+	uikit.ResizeWindow(a.mw, workWindowWidth, workWindowHeight)
 	a.mw.ToolBar().SetVisible(false)
 	a.mw.StatusBar().SetVisible(false)
 	a.mw.Closing().Attach(func(_ *bool, _ walk.CloseReason) {
@@ -459,21 +473,14 @@ func (a *app) openInstallFolder() {
 
 func (a *app) refreshStatus() {
 	info, err := queryServiceInfo()
-	text := "Status: "
-	if err != nil {
-		text += err.Error()
-	} else if !info.Installed {
-		text += "not installed (Home features remain available)"
-	} else {
-		text += serviceStateText(info.State)
-		if info.ProcessID != 0 {
-			text += fmt.Sprintf(" (pid %d)", info.ProcessID)
-		}
-	}
+	text, chip := serviceStatusTexts(info, err)
 	if a.status != nil {
 		needsMigration := installedServiceNeedsMigration()
 		a.mw.Synchronize(func() {
 			a.status.SetText(text)
+			if a.serviceChip != nil {
+				_ = a.serviceChip.SetText(chip)
+			}
 			installed := err == nil && info.Installed
 			running := installed && info.State == uint32(svc.Running)
 			enabled := a.workEnabled == nil || a.workEnabled.Checked()
@@ -1504,4 +1511,37 @@ func windowsMessageBox(title, text string, style uint32) {
 	titlePtr, _ := windows.UTF16PtrFromString(title)
 	textPtr, _ := windows.UTF16PtrFromString(text)
 	_, _ = windows.MessageBox(0, textPtr, titlePtr, style)
+}
+
+// serviceStatusTexts returns the status sentence and the short chip word for
+// the Work service.
+func serviceStatusTexts(info serviceInfo, err error) (string, string) {
+	if err != nil {
+		return "Could not query the service: " + err.Error(), "Error"
+	}
+	if !info.Installed {
+		return "Not installed. Home features remain available.", "Not installed"
+	}
+	text := "Service " + serviceStateText(info.State)
+	if info.ProcessID != 0 {
+		text += fmt.Sprintf(" (pid %d)", info.ProcessID)
+	}
+	return text + ".", serviceChipText(info.State)
+}
+
+func serviceChipText(state uint32) string {
+	switch state {
+	case windows.SERVICE_RUNNING:
+		return "Running"
+	case windows.SERVICE_STOPPED:
+		return "Stopped"
+	case windows.SERVICE_START_PENDING, windows.SERVICE_CONTINUE_PENDING:
+		return "Starting"
+	case windows.SERVICE_STOP_PENDING:
+		return "Stopping"
+	case windows.SERVICE_PAUSE_PENDING, windows.SERVICE_PAUSED:
+		return "Paused"
+	default:
+		return "Unknown"
+	}
 }

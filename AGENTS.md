@@ -31,6 +31,7 @@ DeskFerry is a Go + .NET + Python + Android project for outbound-only RDP, WinRM
 - `windows/workui` owns the native, optional Work service controls inside the merged executable. Its room is independent from the Home UI's selected destination: the room is editable, the installed service's relay bases are preserved internally, and relay-base controls are not shown in the Work Services window. The Work service always follows the proxy saved in the main DeskFerry UI for the Windows user whose identity it uses for integrated proxy authentication. Apply saved proxy changes through native change notifications, without polling or requiring elevation; do not expose an independent Work proxy field. Preserve established v2 data sessions while replacing control connections for a proxy change.
 - Do not reintroduce separate Windows installer, configurator, Work-agent, or Home-network DeskFerry executables. The merged executable self-installs and registers the required service modes; Wintun and tun2socks remain external runtime dependencies extracted only for the optional SMB bridge.
 - Do not add stealth, anti-monitoring, or obfuscation behavior.
+- All user interfaces (the Windows app windows, the macOS Home page, the Android Home app, and the relay dashboard) follow `docs/design-system.md`. The three relays serve one shared dashboard page and icon from `internal/relaydashboard`; edit those files rather than adding relay-specific copies.
 
 ## Sensitive Files
 
@@ -104,6 +105,8 @@ Deployable artifacts:
 - `dist/bin/deskferry-home-macos-arm64`
 - `dist/bin/deskferry-home-macos-amd64`
 - `dist/android/deskferry-home-android-debug.apk`
+
+Android APKs attached to releases must be signed with the DeskFerry Android release key (certificate SHA-256 `3937cc8abfe00eefccdcfd7a4c519ee2768008cf3bd87d1d5529e393e5d34d10`) so they upgrade existing installations. The key exists only as repository secrets, so build release artifacts with the `Release Artifacts` GitHub workflow (`gh workflow run release-artifacts.yml -f tag=<tag>`), and verify the APK certificate with `apksigner verify --print-certs` before announcing the release. Never attach a locally debug-signed APK to a release.
 
 On this Windows host, build and install the merged Windows executable with the `-DebugWindows` switch to avoid quarantine by Symantec Endpoint Protection (SEP). Do not replace an installed debug binary with a stripped release binary unless the user explicitly requests it. Every future GitHub release must include separately named optimized and debug merged Windows executables and include both in `SHA256SUMS.txt`.
 

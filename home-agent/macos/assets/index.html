@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>DeskFerry Home {{VERSION}}</title>
+<link rel="icon" href="static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="static/app.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-grip" viewBox="0 0 16 16"><g fill="currentColor"><circle cx="6" cy="4" r="1.2"/><circle cx="10" cy="4" r="1.2"/><circle cx="6" cy="8" r="1.2"/><circle cx="10" cy="8" r="1.2"/><circle cx="6" cy="12" r="1.2"/><circle cx="10" cy="12" r="1.2"/></g></symbol>
+  <symbol id="i-up" viewBox="0 0 16 16"><path d="M4 10l4-4 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-down" viewBox="0 0 16 16"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 16 16"><path d="M10.5 3.5l2 2L6 12H4v-2zM9.5 4.5l2 2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 16 16"><path d="M3.5 4.5h9M6.5 4.5V3h3v1.5M5 4.5l.5 8.5h5l.5-8.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-x" viewBox="0 0 16 16"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4"><rect x="5.5" y="5.5" width="7" height="7" rx="1.5"/><path d="M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"/></g></symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3.5v9M3.5 8h9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+  <symbol id="i-play" viewBox="0 0 16 16"><path d="M5 3.5v9l7.5-4.5z" fill="currentColor"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="8.5" rx="1.5"/><path d="M6 14h4M8 11v3"/></g></symbol>
+  <symbol id="i-eye" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/></g></symbol>
+  <symbol id="i-chev" viewBox="0 0 16 16"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-key" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="5.5" cy="10.5" r="3"/><path d="M7.7 8.3L13 3M11 5l1.5 1.5"/></g></symbol>
+  <symbol id="i-term" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M4.5 6l2 2-2 2M8.5 10.5h3"/></g></symbol>
+</svg>
+
+<div class="page">
+  <header class="app-header">
+    <div class="brand">
+      <img class="brand-mark" src="static/icon.svg" alt="">
+      <div class="brand-text">
+        <div class="brand-title"><h1>DeskFerry Home</h1><span class="version" title="This page is served only to this Mac.">macOS · v{{VERSION}}</span></div>
+        <p class="summary" id="summary" aria-live="polite">Checking the tunnel and relay status…</p>
+      </div>
+    </div>
+    <span class="chip lg warning" id="overallChip" role="status">Checking</span>
+  </header>
+
+  <section class="tiles" aria-label="Status overview">
+    <div class="tile" id="tileTunnelBox">
+      <div class="tile-main"><span class="tile-caption">Tunnel</span><span class="metric" id="tileTunnel">Checking</span></div>
+      <span class="chip warning" id="tileTunnelChip">Starting</span>
+      <span class="sr-only" id="tileTunnelNote">Local RDP listener</span>
+    </div>
+    <div class="tile" id="tileWorkBox">
+      <div class="tile-main"><span class="tile-caption">Work agent</span><span class="metric" id="tileWork">Checking</span></div>
+      <span class="chip warning" id="tileWorkChip">Checking</span>
+      <span class="sr-only" id="tileWorkNote">Waiting for relay status</span>
+    </div>
+    <div class="tile">
+      <div class="tile-main"><span class="tile-caption">Local RDP address</span><span class="metric mono" id="tileAddr">—</span></div>
+      <button type="button" class="icon" id="copyAddr" title="Copy address" aria-label="Copy local RDP address"><svg class="ico"><use href="#i-copy"/></svg></button>
+    </div>
+    <div class="tile" id="tileSessionsBox">
+      <div class="tile-main"><span class="tile-caption">Sessions</span><span class="metric" id="tileSessions">—</span></div>
+      <span class="chip" id="tileSessionsChip">Idle</span>
+      <span class="sr-only" id="tileSessionsNote">Active Remote Desktop streams</span>
+    </div>
+  </section>
+
+  <main class="layout">
+    <section class="card fill dest" aria-labelledby="destTitle">
+      <div class="card-head">
+        <h2 id="destTitle">Destination</h2>
+        <div class="picker">
+          <label for="profile" class="sr-only">Profile</label>
+          <select id="profile" title="The selected profile is the one the tunnel uses after you save"></select>
+          <button type="button" class="icon-btn" id="addProfileBtn" title="Add a profile" aria-label="Add a profile"><svg class="ico"><use href="#i-plus"/></svg></button>
+          <button type="button" class="icon-btn" id="deleteProfileBtn" title="Delete this profile" aria-label="Delete this profile"><svg class="ico"><use href="#i-trash"/></svg><span>Delete</span></button>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="name">Profile name</label>
+          <input type="text" id="name" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="room">Room name</label>
+          <input type="text" id="room" autocomplete="off" spellcheck="false" title="Must match the room on the Work computer">
+        </div>
+      </div>
+
+      <div class="relays">
+        <div class="label-row"><span class="label" id="relayLabel">Relay services</span><span class="help" id="relayCount" title="DeskFerry tries the primary relay first, then each fallback in order."></span></div>
+        <ul class="relay-list" id="relays" aria-labelledby="relayLabel"></ul>
+        <form class="relay-add" id="relayAddForm">
+          <label for="relayEdit" class="sr-only">New relay service URL</label>
+          <input type="text" id="relayEdit" placeholder="https://host/relay" autocomplete="off" spellcheck="false">
+          <button type="submit"><svg class="ico"><use href="#i-plus"/></svg>Add relay</button>
+        </form>
+        <p class="inline-status danger" id="relayError" role="alert" hidden></p>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="listen">Local RDP address</label>
+          <input type="text" id="listen" class="mono" autocomplete="off" spellcheck="false" placeholder="127.0.0.1:3390" title="Loopback address Remote Desktop connects to">
+        </div>
+        <div class="field">
+          <label for="proxy">Proxy</label>
+          <input type="text" id="proxy" class="mono" autocomplete="off" spellcheck="false" placeholder="env" title="env, direct, or http(s)://host:port">
+        </div>
+      </div>
+
+      <div class="field">
+        <div class="label-row"><label for="password">Room password</label><span class="chip" id="roomCredChip">Not saved</span></div>
+        <div class="inline-field">
+          <input type="password" id="password" autocomplete="new-password" placeholder="Blank keeps the saved password" title="The same password the Work computer uses for this room">
+          <label class="check"><input type="checkbox" id="clear"> Clear saved</label>
+        </div>
+      </div>
+
+      <div class="card-foot">
+        <span class="chip warning" id="dirtyChip" hidden>Unsaved changes</span>
+        <span class="inline-status" id="saveStatus" aria-live="polite"></span>
+        <span class="spacer"></span>
+        <button type="button" id="revertBtn" class="quiet" hidden>Discard</button>
+        <button type="button" class="primary" id="saveBtn"><svg class="ico"><use href="#i-check"/></svg>Save destination</button>
+      </div>
+    </section>
+
+    <div class="column">
+      <section class="card" aria-labelledby="connTitle">
+        <div class="card-head">
+          <div><h2 id="connTitle">Connection</h2><p class="card-desc">Start the tunnel, then open Remote Desktop.</p></div>
+        </div>
+        <div class="conn-status" id="connStatus">
+          <span class="dot" aria-hidden="true"></span>
+          <div class="conn-text">
+            <div class="headline" id="connHeadline">Checking</div>
+            <p id="tunnel" aria-live="polite">Waiting for the tunnel status…</p>
+          </div>
+        </div>
+        <button type="button" class="primary lg block" id="connectBtn"><svg class="ico"><use href="#i-play"/></svg><span>Connect</span></button>
+        <div class="btn-grid">
+          <button type="button" id="rdpBtn" aria-label="Open Remote Desktop"><svg class="ico"><use href="#i-monitor"/></svg><span class="trunc">Remote Desktop</span></button>
+          <button type="button" id="screenBtn"><svg class="ico"><use href="#i-eye"/></svg><span class="trunc">Screen viewer</span></button>
+        </div>
+      </section>
+
+      <section class="card fill" aria-labelledby="winTitle">
+        <div class="card-head">
+          <div><h2 id="winTitle">Windows login</h2><p class="card-desc">For Remote Desktop sign-in and WinRM.</p></div>
+          <span class="chip" id="winCredChip">Not saved</span>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="windowsUser">Username</label>
+            <input type="text" id="windowsUser" autocomplete="off" spellcheck="false" placeholder="DOMAIN\user">
+          </div>
+          <div class="field">
+            <label for="windowsPassword">Password</label>
+            <input type="password" id="windowsPassword" autocomplete="new-password" placeholder="Optional" title="Stored in the macOS Keychain. Saving replaces the stored password.">
+          </div>
+        </div>
+        <label class="check"><input type="checkbox" id="clearWindows"> Forget the saved Windows login</label>
+        <div class="card-foot">
+          <span class="inline-status" id="winSaveStatus" aria-live="polite"></span>
+          <span class="spacer"></span>
+          <button type="button" class="primary" id="saveWinBtn"><svg class="ico"><use href="#i-key"/></svg>Save Windows login</button>
+        </div>
+      </section>
+    </div>
+
+    <section class="card fill tools" aria-label="Tools">
+      <div class="tabs" role="tablist" aria-label="Tools">
+        <button type="button" role="tab" class="tab" id="tabWinrm" aria-controls="winrmCard" aria-selected="true"><svg class="ico"><use href="#i-term"/></svg>WinRM console</button>
+        <button type="button" role="tab" class="tab" id="tabDiag" aria-controls="diagCard" aria-selected="false" tabindex="-1"><span class="tab-dot warning" id="diagDot"></span>Relay diagnostics</button>
+      </div>
+
+      <div class="pane" id="winrmCard" role="tabpanel" aria-labelledby="tabWinrm">
+        <label for="winrmCommand" class="sr-only">PowerShell command</label>
+        <textarea id="winrmCommand" class="mono" rows="3" spellcheck="false" placeholder="PowerShell command to run on the Work computer">Get-ComputerInfo | Select-Object CsName, WindowsProductName, WindowsVersion</textarea>
+        <div class="console-meta">
+          <span class="help" title="Commands time out after 2 minutes."><kbd id="runKey">Ctrl</kbd> + <kbd>Enter</kbd> to run</span>
+          <span class="spacer"></span>
+          <button type="button" class="quiet" id="clearOutputBtn">Clear</button>
+          <button type="button" class="primary" id="runBtn"><svg class="ico"><use href="#i-play"/></svg>Run</button>
+        </div>
+        <pre class="console-out muted" id="winrmOutput" aria-live="polite">Output from the Work computer appears here.</pre>
+      </div>
+
+      <div class="pane" id="diagCard" role="tabpanel" aria-labelledby="tabDiag" hidden>
+        <div class="diag-head">
+          <p class="card-desc" id="diagSummary">Room, relay and socket details, refreshed every few seconds.</p>
+          <span class="chip warning" id="relayChip">Connecting</span>
+        </div>
+        <div class="diag-body" id="relay" aria-live="off"><pre class="diag-raw">Checking…</pre></div>
+        <div class="diag-foot">
+          <span class="help" id="diagChecked"></span>
+          <button type="button" class="quiet" id="copyDiagBtn"><svg class="ico"><use href="#i-copy"/></svg>Copy details</button>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script src="static/app.js"></script>
+</body>
+</html>

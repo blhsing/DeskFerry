@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- DeskFerry design system tokens (docs/design-system.md). Ui.java mirrors these. -->
+    <color name="df_bg">#F5F7FB</color>
+    <color name="df_surface">#FFFFFF</color>
+    <color name="df_text">#101828</color>
+    <color name="df_primary">#2563EB</color>
+    <color name="df_primary_pressed">#1D4ED8</color>
+    <bool name="df_light_system_bars">true</bool>
+</resources>

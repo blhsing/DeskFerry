@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="df_bg">#0B1220</color>
+    <color name="df_surface">#111A2E</color>
+    <color name="df_text">#F2F4F7</color>
+    <color name="df_primary">#4F8BFF</color>
+    <color name="df_primary_pressed">#3B76F0</color>
+    <bool name="df_light_system_bars">false</bool>
+</resources>

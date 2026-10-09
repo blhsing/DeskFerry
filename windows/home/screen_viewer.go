@@ -26,6 +26,7 @@ import (
 	"deskferry/internal/buildinfo"
 	"deskferry/internal/screenview"
 	"deskferry/internal/tunnel"
+	"deskferry/windows/uikit"
 )
 
 type screenViewer struct {
@@ -132,87 +133,13 @@ func (a *clientApp) openScreenViewer() {
 		return
 	}
 	viewer := &screenViewer{owner: a}
-	window := MainWindow{
-		AssignTo: &viewer.mw,
-		Title:    "DeskFerry " + buildinfo.Version + " Screen Viewer - " + cfg.SelectedDestination,
-		MinSize:  Size{Width: 720, Height: 500},
-		Size:     Size{Width: 1100, Height: 760},
-		Layout:   VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 7},
-		Children: []Widget{
-			Composite{MaxSize: Size{Height: 30}, Layout: HBox{MarginsZero: true, Spacing: 7}, Children: []Widget{
-				PushButton{Text: "Capture Once", OnClicked: func() { viewer.start(false) }},
-				PushButton{Text: "Start Stream", OnClicked: func() { viewer.start(true) }},
-				PushButton{Text: "Stop", OnClicked: viewer.stop},
-				Label{Text: "Interval"},
-				ComboBox{AssignTo: &viewer.interval, Model: []string{"0.5 seconds", "1 second", "2 seconds", "5 seconds"}, CurrentIndex: 1},
-				Label{Text: "Zoom"},
-				ComboBox{
-					AssignTo:              &viewer.zoomBox,
-					Editable:              true,
-					Model:                 []string{"Auto Fit", "25%", "50%", "75%", "100%", "125%", "150%", "200%", "300%", "400%"},
-					CurrentIndex:          0,
-					MinSize:               Size{Width: 95},
-					StretchFactor:         1,
-					OnCurrentIndexChanged: viewer.applyZoomSelection,
-					OnEditingFinished:     viewer.applyZoomSelection,
-				},
-				PushButton{Text: "Full Screen", OnClicked: viewer.toggleFullscreen},
-				PushButton{Text: "Save PNG", OnClicked: viewer.savePNG},
-			}},
-			Label{AssignTo: &viewer.status, Text: "Ready. Work-side screen viewing must be enabled."},
-			ScrollView{
-				AssignTo:      &viewer.viewport,
-				StretchFactor: 1,
-				Background:    SolidColorBrush{Color: walk.RGB(0, 0, 0)},
-				Layout:        Grid{MarginsZero: true},
-				OnSizeChanged: viewer.layoutScreen,
-				Children: []Widget{
-					CustomWidget{
-						AssignTo:            &viewer.canvas,
-						Alignment:           AlignHCenterVCenter,
-						Background:          SolidColorBrush{Color: walk.RGB(0, 0, 0)},
-						MinSize:             Size{Width: 1, Height: 1},
-						PaintPixels:         viewer.paintScreen,
-						InvalidatesOnResize: true,
-					},
-				},
-			},
-		},
-	}
-	if err := window.Create(); err != nil {
+	title := "DeskFerry " + buildinfo.Version + " Screen Viewer - " + cfg.SelectedDestination
+	if err := viewer.createWindow(title, a.mw); err != nil {
 		a.showError(err)
 		return
 	}
-	win.SetWindowLongPtr(viewer.mw.Handle(), win.GWLP_HWNDPARENT, uintptr(a.mw.Handle()))
-	zoomCanvas := &screenZoomCanvas{CustomWidget: viewer.canvas, viewer: viewer}
-	if err := walk.InitWrapperWindow(zoomCanvas); err != nil {
-		viewer.mw.Dispose()
-		a.showError(err)
-		return
-	}
-	zoomViewport := &screenZoomScrollView{ScrollView: viewer.viewport, viewer: viewer}
-	if err := walk.InitWrapperWindow(zoomViewport); err != nil {
-		viewer.mw.Dispose()
-		a.showError(err)
-		return
-	}
-	enableScreenZoomGesture(viewer.canvas.Handle())
-	enableScreenZoomGesture(viewer.viewport.Handle())
 	win.EnableWindow(a.mw.Handle(), false)
 	viewer.mw.Closing().Attach(func(_ *bool, _ walk.CloseReason) {
-		viewer.mu.Lock()
-		viewer.closed = true
-		cancel := viewer.cancel
-		viewer.cancel = nil
-		bitmap := viewer.bitmap
-		viewer.bitmap = nil
-		viewer.mu.Unlock()
-		if cancel != nil {
-			cancel()
-		}
-		if bitmap != nil {
-			bitmap.Dispose()
-		}
 		win.EnableWindow(a.mw.Handle(), true)
 		win.SetForegroundWindow(a.mw.Handle())
 	})
@@ -220,6 +147,118 @@ func (a *clientApp) openScreenViewer() {
 	win.ShowWindow(viewer.mw.Handle(), win.SW_MAXIMIZE)
 	viewer.activateWindow()
 	viewer.start(false)
+}
+
+// createWindow builds the viewer window with its dark toolbar strip.
+func (v *screenViewer) createWindow(title string, owner *walk.MainWindow) error {
+	toolbarLabel := func(text string) Widget {
+		return Label{Text: text, TextColor: uikit.ColorDarkTextSecondary, Alignment: AlignHNearVCenter}
+	}
+	toolButton := func(text string, onClicked walk.EventHandler) Widget {
+		return PushButton{Text: text, OnClicked: onClicked, MinSize: Size{Width: 84, Height: uikit.ButtonHeight}, MaxSize: Size{Height: uikit.ButtonHeight}}
+	}
+	window := MainWindow{
+		AssignTo:   &v.mw,
+		Title:      title,
+		Icon:       appIcon(),
+		Font:       uikit.BodyFont(),
+		Background: SolidColorBrush{Color: uikit.ColorDarkBg},
+		MinSize:    Size{Width: 720, Height: 500},
+		Size:       Size{Width: 1100, Height: 760},
+		Layout:     VBox{MarginsZero: true, Spacing: 0},
+		Children: []Widget{
+			Composite{
+				Background: SolidColorBrush{Color: uikit.ColorDarkSurface},
+				Layout:     HBox{Margins: Margins{Left: uikit.Space12, Top: uikit.Space8, Right: uikit.Space12, Bottom: uikit.Space8}, Spacing: uikit.Space8},
+				Children: []Widget{
+					uikit.AppMark{Size: 20},
+					Label{Text: "Screen viewer", Font: uikit.TitleFont(), TextColor: uikit.ColorDarkText, Alignment: AlignHNearVCenter},
+					HSpacer{Size: uikit.Space8, MinSize: Size{Width: uikit.Space8}, MaxSize: Size{Width: uikit.Space8}},
+					toolButton("Capture once", func() { v.start(false) }),
+					toolButton("Start stream", func() { v.start(true) }),
+					toolButton("Stop", v.stop),
+					HSpacer{Size: uikit.Space8, MinSize: Size{Width: uikit.Space8}, MaxSize: Size{Width: uikit.Space8}},
+					toolbarLabel("Interval"),
+					ComboBox{AssignTo: &v.interval, Model: []string{"0.5 seconds", "1 second", "2 seconds", "5 seconds"}, CurrentIndex: 1, Alignment: AlignHNearVCenter},
+					toolbarLabel("Zoom"),
+					ComboBox{
+						AssignTo:              &v.zoomBox,
+						Editable:              true,
+						Model:                 []string{"Auto Fit", "25%", "50%", "75%", "100%", "125%", "150%", "200%", "300%", "400%"},
+						CurrentIndex:          0,
+						MinSize:               Size{Width: 110},
+						MaxSize:               Size{Width: 130},
+						Alignment:             AlignHNearVCenter,
+						OnCurrentIndexChanged: v.applyZoomSelection,
+						OnEditingFinished:     v.applyZoomSelection,
+					},
+					HSpacer{},
+					toolButton("Full screen", v.toggleFullscreen),
+					toolButton("Save PNG", v.savePNG),
+				},
+			},
+			ScrollView{
+				AssignTo:      &v.viewport,
+				StretchFactor: 1,
+				Background:    SolidColorBrush{Color: walk.RGB(0, 0, 0)},
+				Layout:        Grid{MarginsZero: true},
+				OnSizeChanged: v.layoutScreen,
+				Children: []Widget{
+					CustomWidget{
+						AssignTo:            &v.canvas,
+						Alignment:           AlignHCenterVCenter,
+						Background:          SolidColorBrush{Color: walk.RGB(0, 0, 0)},
+						MinSize:             Size{Width: 1, Height: 1},
+						PaintPixels:         v.paintScreen,
+						InvalidatesOnResize: true,
+					},
+				},
+			},
+			Composite{
+				Background: SolidColorBrush{Color: uikit.ColorDarkSurfaceSubtle},
+				Layout:     HBox{Margins: Margins{Left: uikit.Space12, Top: uikit.Space4, Right: uikit.Space12, Bottom: uikit.Space4}},
+				Children: []Widget{
+					Label{AssignTo: &v.status, Text: "Ready. Work-side screen viewing must be enabled.", Font: uikit.CaptionFont(), TextColor: uikit.ColorDarkTextMuted, EllipsisMode: EllipsisEnd},
+				},
+			},
+		},
+	}
+	if err := window.Create(); err != nil {
+		return err
+	}
+	// Never open larger than the monitor work area.
+	uikit.ResizeWindow(v.mw, 1100, 760)
+	if owner != nil {
+		win.SetWindowLongPtr(v.mw.Handle(), win.GWLP_HWNDPARENT, uintptr(owner.Handle()))
+	}
+	zoomCanvas := &screenZoomCanvas{CustomWidget: v.canvas, viewer: v}
+	if err := walk.InitWrapperWindow(zoomCanvas); err != nil {
+		v.mw.Dispose()
+		return err
+	}
+	zoomViewport := &screenZoomScrollView{ScrollView: v.viewport, viewer: v}
+	if err := walk.InitWrapperWindow(zoomViewport); err != nil {
+		v.mw.Dispose()
+		return err
+	}
+	enableScreenZoomGesture(v.canvas.Handle())
+	enableScreenZoomGesture(v.viewport.Handle())
+	v.mw.Closing().Attach(func(_ *bool, _ walk.CloseReason) {
+		v.mu.Lock()
+		v.closed = true
+		cancel := v.cancel
+		v.cancel = nil
+		bitmap := v.bitmap
+		v.bitmap = nil
+		v.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if bitmap != nil {
+			bitmap.Dispose()
+		}
+	})
+	return nil
 }
 
 func (v *screenViewer) selectedInterval() int {

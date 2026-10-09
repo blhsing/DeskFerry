@@ -18,6 +18,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.MediaStore;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -29,6 +30,8 @@ import android.view.inputmethod.EditorInfo;
 import android.widget.AdapterView;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.Spinner;
@@ -74,6 +77,13 @@ public class ScreenViewerActivity extends Activity {
     private Spinner zoomPreset;
     private EditText zoomInput;
     private TextView zoomValue;
+    private Ui ui;
+    private TextView statusChip;
+    private TextView emptyView;
+    private ImageButton fullscreenButton;
+    private Button captureSegment;
+    private Button streamSegment;
+    private Button stopSegment;
     private OkHttpClient client;
     private WebSocket socket;
     private Bitmap current;
@@ -96,6 +106,7 @@ public class ScreenViewerActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        setTheme(R.style.ViewerTheme);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         buildUi();
         try {
@@ -126,44 +137,59 @@ public class ScreenViewerActivity extends Activity {
     }
 
     private void buildUi() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.rgb(22, 25, 31));
+        ui = Ui.darkTheme(this);
+        LinearLayout root = ui.vertical();
+        root.setBackgroundColor(ui.surface);
 
-        LinearLayout controls = new LinearLayout(this);
-        controls.setOrientation(LinearLayout.HORIZONTAL);
-        controls.setGravity(Gravity.CENTER_VERTICAL);
-        controls.setPadding(dp(8), dp(8), dp(8), dp(8));
-        controls.setBackgroundColor(Color.rgb(38, 43, 52));
-        TextView version = new TextView(this);
-        version.setText("v" + BuildConfig.VERSION_NAME);
-        version.setTextColor(Color.WHITE);
-        version.setPadding(0, 0, dp(6), 0);
-        controls.addView(version);
-        addButton(controls, "Capture", v -> startCapture("single"));
-        addButton(controls, "Stream", v -> startCapture("stream"));
-        addButton(controls, "Stop", v -> stopCapture(true));
-        interval = new Spinner(this);
-        interval.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
-                new String[]{"0.5 s", "1 s", "2 s", "5 s"}));
+        LinearLayout bar = ui.vertical();
+        bar.setBackgroundColor(ui.surface);
+        bar.setPadding(dp(12), dp(10), dp(12), dp(10));
+        root.addView(bar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout header = ui.horizontal();
+        LinearLayout titles = ui.vertical();
+        TextView title = ui.text("Screen viewer", Ui.Type.TITLE);
+        title.setSingleLine(true);
+        title.setEllipsize(TextUtils.TruncateAt.END);
+        titles.addView(title);
+        String destination = empty(getIntent().getStringExtra(EXTRA_DESTINATION));
+        TextView version = ui.text((destination.isEmpty() ? "" : destination + " \u00b7 ") + "v" + BuildConfig.VERSION_NAME, Ui.Type.CAPTION);
+        version.setSingleLine(true);
+        version.setEllipsize(TextUtils.TruncateAt.END);
+        titles.addView(version);
+        header.addView(titles, ui.weighted(ViewGroup.LayoutParams.WRAP_CONTENT, 1f, 0));
+        statusChip = ui.chip(Ui.Tone.NEUTRAL, "Ready");
+        header.addView(statusChip, ui.fixed(-1, -1, 8));
+        fullscreenButton = ui.iconButton(R.drawable.ic_df_fullscreen, "Full screen", false);
+        fullscreenButton.setOnClickListener(v -> toggleFullscreen());
+        header.addView(fullscreenButton, ui.fixed(40, 40, 4));
+        ImageButton save = ui.iconButton(R.drawable.ic_df_save, "Save PNG", false);
+        save.setOnClickListener(v -> savePNG());
+        header.addView(save, ui.fixed(40, 40, 0));
+        bar.addView(header, ui.matchWrap(10));
+
+        LinearLayout controls = ui.horizontal();
+        LinearLayout segments = ui.horizontal();
+        segments.setBackground(ui.shape(ui.surfaceSubtle, ui.borderStrong, 8));
+        segments.setPadding(dp(3), dp(3), dp(3), dp(3));
+        captureSegment = addSegment(segments, "Capture", 0, v -> startCapture("single"));
+        streamSegment = addSegment(segments, "Stream", 0, v -> startCapture("stream"));
+        stopSegment = addSegment(segments, "Stop", 0, v -> stopCapture(true));
+        controls.addView(segments, ui.weighted(dp(42), 1f, 0));
+        interval = ui.spinner();
+        interval.setContentDescription("Stream interval");
+        interval.setPadding(dp(10), 0, dp(30), 0);
+        interval.setAdapter(ui.spinnerAdapter(java.util.Arrays.asList("0.5 s", "1 s", "2 s", "5 s")));
         interval.setSelection(1);
-        controls.addView(interval, new LinearLayout.LayoutParams(dp(90), dp(48)));
-        addButton(controls, "Full", v -> toggleFullscreen());
-        addButton(controls, "Save", v -> savePNG());
-        root.addView(controls, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        controls.addView(interval, ui.fixed(86, 42, 8));
+        bar.addView(controls, ui.matchWrap(8));
 
-        LinearLayout zoomControls = new LinearLayout(this);
-        zoomControls.setOrientation(LinearLayout.HORIZONTAL);
-        zoomControls.setGravity(Gravity.CENTER_VERTICAL);
-        zoomControls.setPadding(dp(8), 0, dp(8), dp(6));
-        zoomControls.setBackgroundColor(Color.rgb(38, 43, 52));
-        TextView zoomLabel = new TextView(this);
-        zoomLabel.setText("Zoom ");
-        zoomLabel.setTextColor(Color.WHITE);
-        zoomControls.addView(zoomLabel);
-        zoomPreset = new Spinner(this);
-        zoomPreset.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
-                new String[]{"Auto Fit", "50%", "75%", "100%", "125%", "150%", "200%", "300%", "400%", "Custom"}));
+        LinearLayout zoomControls = ui.horizontal();
+        zoomPreset = ui.spinner();
+        zoomPreset.setContentDescription("Zoom preset");
+        zoomPreset.setPadding(dp(10), 0, dp(30), 0);
+        zoomPreset.setAdapter(ui.spinnerAdapter(java.util.Arrays.asList(
+                "Auto Fit", "50%", "75%", "100%", "125%", "150%", "200%", "300%", "400%", "Custom")));
         zoomPreset.setSelection(0);
         zoomPreset.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
@@ -173,12 +199,9 @@ public class ScreenViewerActivity extends Activity {
             }
             @Override public void onNothingSelected(AdapterView<?> parent) { }
         });
-        zoomControls.addView(zoomPreset, new LinearLayout.LayoutParams(dp(112), dp(48)));
-        zoomInput = new EditText(this);
-        zoomInput.setSingleLine(true);
-        zoomInput.setHint("10-1600%");
-        zoomInput.setTextColor(Color.WHITE);
-        zoomInput.setHintTextColor(Color.LTGRAY);
+        zoomControls.addView(zoomPreset, ui.fixed(112, 40, 0));
+        zoomInput = ui.field("10-1600%");
+        zoomInput.setContentDescription("Custom zoom percent");
         zoomInput.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
         zoomInput.setImeOptions(EditorInfo.IME_ACTION_DONE);
         zoomInput.setOnEditorActionListener((view, action, event) -> {
@@ -188,34 +211,78 @@ public class ScreenViewerActivity extends Activity {
             }
             return false;
         });
-        zoomControls.addView(zoomInput, new LinearLayout.LayoutParams(dp(104), dp(48)));
-        addButton(zoomControls, "Apply", v -> applyCustomZoom());
-        zoomValue = new TextView(this);
-        zoomValue.setText("Auto Fit");
-        zoomValue.setTextColor(Color.WHITE);
-        zoomValue.setPadding(dp(10), 0, 0, 0);
-        zoomControls.addView(zoomValue);
-        root.addView(zoomControls, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        zoomControls.addView(zoomInput, ui.weighted(dp(40), 1f, 8));
+        Button apply = ui.quietButton("Apply", 0);
+        apply.setPadding(dp(10), 0, dp(10), 0);
+        apply.setOnClickListener(v -> applyCustomZoom());
+        zoomControls.addView(apply, ui.fixed(-1, 40, 4));
+        zoomValue = ui.text("Auto Fit", Ui.Type.CAPTION);
+        zoomValue.setTextColor(ui.textSecondary);
+        zoomValue.setSingleLine(true);
+        zoomValue.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        zoomValue.setMinWidth(dp(52));
+        zoomControls.addView(zoomValue, ui.fixed(-1, -1, 4));
+        bar.addView(zoomControls, ui.matchWrap(0));
 
-        status = new TextView(this);
-        status.setTextColor(Color.WHITE);
-        status.setPadding(dp(10), dp(7), dp(10), dp(7));
-        status.setText("Ready");
+        root.addView(ui.divider(), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1))));
+
+        status = ui.text("Ready", Ui.Type.BODY);
+        status.setTextSize(13);
+        status.setTextColor(ui.textSecondary);
+        status.setMaxLines(2);
+        status.setEllipsize(TextUtils.TruncateAt.END);
+        status.setPadding(dp(14), dp(8), dp(14), dp(8));
+        status.setBackgroundColor(ui.bg);
         root.addView(status, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
+        FrameLayout stage = new FrameLayout(this);
+        stage.setBackgroundColor(Color.BLACK);
         imageView = new ZoomImageView(this);
         imageView.setZoomListener(this::showZoomValue);
         imageView.setBackgroundColor(Color.BLACK);
-        root.addView(imageView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        stage.addView(imageView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        emptyView = ui.text("No screen yet. Tap Capture for a snapshot or Stream for live updates.", Ui.Type.BODY);
+        emptyView.setTextColor(ui.textMuted);
+        emptyView.setGravity(Gravity.CENTER);
+        emptyView.setPadding(dp(32), 0, dp(32), 0);
+        stage.addView(emptyView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        root.addView(stage, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // The window decor (and its insets controller) exists only after setContentView.
         setContentView(root);
+        ui.applySystemBars(this, root, ui.surface);
     }
 
-    private void addButton(LinearLayout parent, String text, View.OnClickListener listener) {
-        Button button = new Button(this);
-        button.setText(text);
-        button.setAllCaps(false);
+    private Button addSegment(LinearLayout parent, String text, int iconRes, View.OnClickListener listener) {
+        Button button = ui.button(text, iconRes);
+        button.setPadding(dp(6), 0, dp(6), 0);
+        button.setTextSize(13);
+        button.setCompoundDrawablePadding(dp(4));
         button.setOnClickListener(listener);
-        parent.addView(button, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        parent.addView(button, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        styleSegment(button, false);
+        return button;
+    }
+
+    private void styleSegment(Button button, boolean selected) {
+        int color = selected ? ui.onPrimary : ui.textSecondary;
+        button.setBackground(new android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(Ui.alpha(ui.primary, 0.25f)),
+                ui.shape(selected ? ui.primary : Color.TRANSPARENT, 0, 6),
+                ui.shape(Color.WHITE, 0, 6)));
+        button.setTextColor(color);
+        button.setCompoundDrawableTintList(android.content.res.ColorStateList.valueOf(color));
+    }
+
+    /** Highlights the segment for the current request: "single", "stream", or null when stopped. */
+    private void markMode(String mode) {
+        runOnUiThread(() -> {
+            if (captureSegment == null) return;
+            styleSegment(captureSegment, "single".equals(mode));
+            styleSegment(streamSegment, "stream".equals(mode));
+            styleSegment(stopSegment, mode == null);
+        });
     }
 
     private int selectedInterval() {
@@ -258,6 +325,7 @@ public class ScreenViewerActivity extends Activity {
         stopCapture(false);
         int run = ++generation;
         requestedMode = mode;
+        markMode(mode);
         requestedInterval = selectedInterval();
         candidateIndex = 0;
         recoveryAttempts = 0;
@@ -467,7 +535,8 @@ public class ScreenViewerActivity extends Activity {
         runOnUiThread(() -> {
             imageView.setImageBitmap(next);
             if (previous != null && previous != next && !previous.isRecycled()) previous.recycle();
-            status.setText("stream".equals(requestedMode)
+            if (emptyView != null) emptyView.setVisibility(View.GONE);
+            showStatus("stream".equals(requestedMode)
                     ? "Streaming frame " + frame.optLong("seq") + " (" + changed + " changed tiles)."
                     : "Screenshot captured.");
         });
@@ -480,7 +549,10 @@ public class ScreenViewerActivity extends Activity {
         WebSocket value = socket;
         socket = null;
         if (value != null) value.cancel();
-        if (announce) setStatus("Screen stream stopped.");
+        if (announce) {
+            markMode(null);
+            setStatus("Screen stream stopped.");
+        }
     }
 
     private void toggleFullscreen() {
@@ -488,6 +560,10 @@ public class ScreenViewerActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(fullscreen
                 ? View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 : View.SYSTEM_UI_FLAG_VISIBLE);
+        if (fullscreenButton != null) {
+            fullscreenButton.setImageResource(fullscreen ? R.drawable.ic_df_fullscreen_exit : R.drawable.ic_df_fullscreen);
+            fullscreenButton.setContentDescription(fullscreen ? "Exit full screen" : "Full screen");
+        }
     }
 
     private void savePNG() {
@@ -536,8 +612,33 @@ public class ScreenViewerActivity extends Activity {
     }
 
     private void setStatus(String value) {
-        runOnUiThread(() -> status.setText(value == null ? "Unknown screen error" : value));
+        runOnUiThread(() -> showStatus(value == null ? "Unknown screen error" : value));
     }
+
+    /** Shows the detailed status line and a short design-system status chip. Main thread only. */
+    private void showStatus(String value) {
+        status.setText(value);
+        if (statusChip == null) return;
+        String lower = (value == null ? "" : value).toLowerCase(java.util.Locale.ROOT);
+        if (lower.contains("retrying")) {
+            ui.setChip(statusChip, Ui.Tone.WARNING, "Retrying");
+        } else if (lower.startsWith("connecting")) {
+            ui.setChip(statusChip, Ui.Tone.WARNING, "Connecting");
+        } else if (lower.startsWith("connected")) {
+            ui.setChip(statusChip, Ui.Tone.SUCCESS, "Connected");
+        } else if (lower.startsWith("streaming")) {
+            ui.setChip(statusChip, Ui.Tone.SUCCESS, "Streaming");
+        } else if (lower.startsWith("screenshot captured")) {
+            ui.setChip(statusChip, Ui.Tone.SUCCESS, "Captured");
+        } else if (lower.contains("stopped")) {
+            ui.setChip(statusChip, Ui.Tone.NEUTRAL, "Stopped");
+        } else if (lower.equals("ready")) {
+            ui.setChip(statusChip, Ui.Tone.NEUTRAL, "Ready");
+        } else {
+            ui.setChip(statusChip, Ui.Tone.DANGER, "Error");
+        }
+    }
+
 
     private static final class ZoomImageView extends ImageView {
         interface ZoomListener { void onZoomChanged(float percent, boolean autoFit); }

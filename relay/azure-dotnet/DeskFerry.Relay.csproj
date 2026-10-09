@@ -5,4 +5,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- Dashboard page and icon shared with the Go and Python relays. -->
+    <EmbeddedResource Include="..\..\internal\relaydashboard\dashboard.html" LogicalName="DeskFerry.Relay.dashboard.html" />
+    <EmbeddedResource Include="..\..\internal\relaydashboard\icon.svg" LogicalName="DeskFerry.Relay.icon.svg" />
+  </ItemGroup>
 </Project>

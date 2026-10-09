@@ -1,11 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:fontFamily">sans</item>
-        <item name="android:windowBackground">#F5F7F8</item>
-        <item name="android:colorAccent">#2F6F73</item>
-        <item name="android:navigationBarColor">#F5F7F8</item>
-        <item name="android:windowLightStatusBar">true</item>
-        <item name="android:statusBarColor">#FFFFFF</item>
+        <item name="android:fontFamily">sans-serif</item>
+        <item name="android:windowBackground">@color/df_bg</item>
+        <item name="android:colorPrimary">@color/df_primary</item>
+        <item name="android:colorPrimaryDark">@color/df_bg</item>
+        <item name="android:colorAccent">@color/df_primary</item>
+        <item name="android:colorControlActivated">@color/df_primary</item>
+        <item name="android:statusBarColor">@color/df_bg</item>
+        <item name="android:navigationBarColor">@color/df_bg</item>
+        <item name="android:windowLightStatusBar">@bool/df_light_system_bars</item>
+    </style>
+
+    <style name="ViewerTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans-serif</item>
+        <item name="android:windowBackground">#FF0B1220</item>
+        <item name="android:colorPrimary">#FF4F8BFF</item>
+        <item name="android:colorAccent">#FF4F8BFF</item>
+        <item name="android:colorControlActivated">#FF4F8BFF</item>
+        <item name="android:statusBarColor">#FF111A2E</item>
+        <item name="android:navigationBarColor">#FF0B1220</item>
     </style>
 </resources>

@@ -66,7 +66,7 @@ func (a *clientApp) startTunnelFromUI(openRDP bool) {
 				a.appendLog("Connect failed: %v", err)
 				return
 			}
-			_ = a.workStatus.SetText("Connected")
+			_ = a.workStatus.SetText("Online")
 			if a.isTunnelRunning() {
 				if openRDP {
 					err = launchMSTSC(cfg)
@@ -181,7 +181,7 @@ func (a *clientApp) followRelayStatus(ctx context.Context, cfg config) {
 					return
 				}
 				if combined.WorkOnline {
-					_ = a.workStatus.SetText("Connected")
+					_ = a.workStatus.SetText("Online")
 				} else {
 					_ = a.workStatus.SetText("Offline")
 				}

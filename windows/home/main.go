@@ -41,6 +41,7 @@ import (
 	"deskferry/internal/wincred"
 	"deskferry/internal/winsecret"
 	"deskferry/internal/winservice"
+	"deskferry/windows/uikit"
 )
 
 const (
@@ -50,10 +51,11 @@ const (
 	defaultRoomName        = "workdesk"
 	defaultListenAddr      = "127.0.0.1:3390"
 	defaultWinRMListenAddr = "127.0.0.1:3391"
+	homeWindowWidth        = 1360
+	homeWindowHeight       = 800
+	homeWindowMinWidth     = 1180
+	homeWindowMinHeight    = 640
 	singleInstanceName     = `Global\DeskFerryHomeAgent`
-	appIconResourceID      = 2
-	statusTileWidth        = 150
-	rdpStatusTileWidth     = 230
 )
 
 var relayLogs = remotelog.New("home-agent-windows")
@@ -123,7 +125,7 @@ type clientApp struct {
 	roomPass           *walk.LineEdit
 	clearRoomPassword  *walk.CheckBox
 	rdpDecodingMode    *walk.ComboBox
-	rdpDecodingAdvice  *walk.TextLabel
+	rdpDecodingAdvice  *walk.TextEdit
 	applyRDPDecoding   *walk.PushButton
 	winrmListen        *walk.LineEdit
 	winrmCommand       *walk.TextEdit
@@ -131,15 +133,18 @@ type clientApp struct {
 	executeWinRMButton *walk.PushButton
 	saveWindowsButton  *walk.PushButton
 
-	tunnelStatus *walk.Label
-	workStatus   *walk.Label
-	homeStatus   *walk.Label
-	rdpStatus    *walk.Label
-	relayStatus  *walk.TextLabel
-	details      *walk.TextEdit
-	logView      *walk.TextEdit
+	overallStatus *uikit.StatusChip
+	tunnelStatus  *uikit.StatusChip
+	workStatus    *uikit.StatusChip
+	homeStatus    *uikit.StatusChip
+	sessionStatus *uikit.StatusChip
+	rdpStatus     *walk.Label
+	workTarget    *walk.Label
+	relayStatus   *walk.Label
+	details       *walk.TextEdit
+	logView       *walk.TextEdit
 
-	connectButton *walk.PushButton
+	connectButton *uikit.AccentButton
 	openRDPButton *walk.PushButton
 
 	trayOpen    *walk.Action
@@ -541,176 +546,245 @@ func activateExistingHomeWindow() {
 	win.SetForegroundWindow(window)
 }
 
-func (a *clientApp) run(smokeTest bool) error {
+// createMainWindow builds the control panel window without starting any
+// network activity.
+func (a *clientApp) createMainWindow(smokeTest bool) error {
 	decodingMode, decodingErr := readRDPDecodingMode()
 	decodingApplied := rdpDecodingAppliedText(decodingMode, decodingErr)
 	if decodingErr != nil {
 		decodingMode = rdpDecodingAutomatic
 	}
 	window := MainWindow{
-		AssignTo: &a.mw,
-		Title:    appTitle(),
-		MinSize:  Size{Width: 1250, Height: 600},
-		Size:     Size{Width: 1320, Height: 680},
-		Icon:     appIcon(),
-		Layout:   VBox{MarginsZero: true},
-		Visible:  !smokeTest,
+		AssignTo:   &a.mw,
+		Title:      appTitle(),
+		MinSize:    Size{Width: homeWindowMinWidth, Height: homeWindowMinHeight},
+		Size:       Size{Width: homeWindowWidth, Height: homeWindowHeight},
+		Icon:       appIcon(),
+		Font:       uikit.BodyFont(),
+		Background: uikit.WindowBackground(),
+		Layout:     VBox{Margins: Margins{Left: uikit.Space20, Top: uikit.Space12, Right: uikit.Space20, Bottom: uikit.Space16}, Spacing: uikit.Space12},
+		Visible:    false,
 		Children: []Widget{
+			uikit.Header("DeskFerry", "Home control panel · version "+buildinfo.Version,
+				uikit.Chip{AssignTo: &a.overallStatus, Text: "Stopped", Alignment: AlignHFarVCenter},
+			),
 			Composite{
-				Layout: VBox{Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 12}, Spacing: 9},
+				Layout: HBox{MarginsZero: true, Spacing: uikit.Space12},
 				Children: []Widget{
-					GroupBox{
-						Title:  "Status",
-						Layout: Grid{Columns: 4, Spacing: 8},
-						Children: []Widget{
-							statusTile("Tunnel", &a.tunnelStatus, "Stopped", statusTileWidth),
-							statusTile("Work Agent", &a.workStatus, "Checking", statusTileWidth),
-							statusTile("Home App", &a.homeStatus, "Connecting", statusTileWidth),
-							statusTile("RDP", &a.rdpStatus, defaultListenAddr, rdpStatusTileWidth),
-							TextLabel{AssignTo: &a.relayStatus, Text: "RDP relay: no connected session", ColumnSpan: 4},
-						},
-					},
+					uikit.StatusTile{Caption: "Tunnel", Chip: &a.tunnelStatus, ChipText: "Stopped", Value: &a.rdpStatus, ValueText: a.cfg.ListenAddr},
+					uikit.StatusTile{Caption: "Work agent", Chip: &a.workStatus, ChipText: "Checking", Value: &a.workTarget, ValueText: a.cfg.SelectedDestination},
+					uikit.StatusTile{Caption: "Home app", Chip: &a.homeStatus, ChipText: "Connecting", ValueText: homeLogInstance()},
+					uikit.StatusTile{Caption: "RDP", Chip: &a.sessionStatus, ChipText: "No active sessions", Value: &a.relayStatus, ValueText: "RDP relay: no connected session"},
+				},
+			},
+			Composite{
+				StretchFactor: 1,
+				Layout:        HBox{MarginsZero: true, Spacing: uikit.Space12},
+				Children: []Widget{
+					// Left: where to connect and with which Windows login.
 					Composite{
-						StretchFactor: 1,
-						Layout:        HBox{MarginsZero: true, Spacing: 9},
+						StretchFactor: 4,
+						MinSize:       Size{Width: 340},
+						Layout:        VBox{MarginsZero: true, Spacing: uikit.Space12},
 						Children: []Widget{
-							GroupBox{
-								Title:         "Connection",
-								MinSize:       Size{Width: 580},
-								StretchFactor: 2,
-								Layout:        Grid{Columns: 2, Spacing: 7},
+							uikit.Card{
+								Title:         "Destination",
+								StretchFactor: 1,
+								Layout:        Grid{Columns: 2, MarginsZero: true, Spacing: uikit.Space8},
 								Children: []Widget{
-									Label{Text: "Destination", MinSize: Size{Width: 120}, MaxSize: Size{Width: 120}},
+									uikit.FieldLabel("Destination"),
+									ComboBox{
+										AssignTo:              &a.destinationList,
+										Model:                 destinationNames(a.cfg.Destinations),
+										OnCurrentIndexChanged: a.destinationSelectionChanged,
+									},
+									uikit.FieldLabel("Profile name"),
+									LineEdit{AssignTo: &a.destinationEdit, CueBanner: "Work destination name"},
+									Label{},
 									Composite{
-										Layout: HBox{MarginsZero: true, Spacing: 4},
+										Layout: HBox{MarginsZero: true, Spacing: uikit.Space8},
 										Children: []Widget{
-											ComboBox{
-												AssignTo:              &a.destinationList,
-												Model:                 destinationNames(a.cfg.Destinations),
-												MaxSize:               Size{Width: 110},
-												OnCurrentIndexChanged: a.destinationSelectionChanged,
-											},
-											LineEdit{AssignTo: &a.destinationEdit, CueBanner: "Work destination name", StretchFactor: 1},
-											PushButton{AssignTo: &a.destinationAdd, Text: "Add", OnClicked: a.addDestination},
-											PushButton{AssignTo: &a.destinationRename, Text: "Rename", OnClicked: a.renameDestination},
-											PushButton{AssignTo: &a.destinationDelete, Text: "Delete", OnClicked: a.deleteDestination},
+											compactButton(&a.destinationAdd, "Add", a.addDestination),
+											compactButton(&a.destinationRename, "Rename", a.renameDestination),
+											compactButton(&a.destinationDelete, "Delete", a.deleteDestination),
+											HSpacer{},
 										},
 									},
-									Label{Text: "Room name", MinSize: Size{Width: 120}, MaxSize: Size{Width: 120}},
+									uikit.FieldLabel("Room name"),
 									LineEdit{AssignTo: &a.roomName, Text: defaultRoomName, CueBanner: defaultRoomName},
-									Label{Text: "Relay service base URLs", MinSize: Size{Width: 120}, MaxSize: Size{Width: 120}},
+									Label{Text: "Relay services", Font: uikit.LabelFont(), TextColor: uikit.ColorTextSecondary, Alignment: AlignHNearVNear, MinSize: Size{Width: uikit.LabelColumnWidth}, MaxSize: Size{Width: uikit.LabelColumnWidth}},
 									Composite{
-										Layout: VBox{MarginsZero: true, Spacing: 4},
+										Layout: HBox{MarginsZero: true, Spacing: uikit.Space8},
 										Children: []Widget{
 											ListBox{
 												AssignTo:              &a.relayList,
 												Model:                 a.cfg.relayAddresses(),
-												MinSize:               Size{Height: 58},
+												MinSize:               Size{Height: 60},
+												StretchFactor:         1,
 												OnCurrentIndexChanged: a.relaySelectionChanged,
 												OnMouseDown:           a.relayListMouseDown,
 												OnMouseMove:           a.relayListMouseMove,
 												OnMouseUp:             a.relayListMouseUp,
+												ToolTipText:           "Drag rows to reorder. Relays are tried from the top.",
 											},
 											Composite{
-												Layout: Grid{Columns: 4, MarginsZero: true, Spacing: 6},
+												Layout: VBox{MarginsZero: true, Spacing: uikit.Space4},
 												Children: []Widget{
-													Label{Text: "Selected URL"},
-													LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultAzureRelayBase, ColumnSpan: 3},
-												},
-											},
-											Composite{
-												Layout: Grid{Columns: 5, MarginsZero: true, Spacing: 6},
-												Children: []Widget{
-													PushButton{AssignTo: &a.relayAdd, Text: "Add", MinSize: Size{Height: 30}, OnClicked: a.addRelayURL},
-													PushButton{AssignTo: &a.relayUpdate, Text: "Update", MinSize: Size{Height: 30}, OnClicked: a.updateRelayURL},
-													PushButton{AssignTo: &a.relayDelete, Text: "Delete", MinSize: Size{Height: 30}, OnClicked: a.deleteRelayURL},
-													PushButton{AssignTo: &a.relayUp, Text: "Up", MinSize: Size{Height: 30}, OnClicked: func() { a.moveRelayURL(-1) }},
-													PushButton{AssignTo: &a.relayDown, Text: "Down", MinSize: Size{Height: 30}, OnClicked: func() { a.moveRelayURL(1) }},
+													compactButton(&a.relayUp, "Up", func() { a.moveRelayURL(-1) }),
+													compactButton(&a.relayDown, "Down", func() { a.moveRelayURL(1) }),
+													VSpacer{},
 												},
 											},
 										},
 									},
-									GroupBox{
-										Title:      "RDP graphics decoding",
-										ColumnSpan: 2,
-										Layout:     Grid{Columns: 3, Spacing: 7},
-										Children: []Widget{
-											ComboBox{AssignTo: &a.rdpDecodingMode, Model: rdpDecodingModeLabels, CurrentIndex: rdpDecodingModeIndex(decodingMode), ColumnSpan: 2},
-											PushButton{AssignTo: &a.applyRDPDecoding, Text: "Apply (admin required)", MinSize: Size{Height: 30}, OnClicked: a.applyRDPDecodingSelection},
-											TextLabel{AssignTo: &a.rdpDecodingAdvice, Text: decodingApplied + ". Recommendation: Checking recent RDP stability...", MinSize: Size{Width: 420}, ColumnSpan: 3},
-										},
-									},
+									uikit.FieldLabel("Selected URL"),
+									LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultAzureRelayBase},
+									Label{},
 									Composite{
-										ColumnSpan: 2,
-										Layout:     VBox{MarginsZero: true, Spacing: 5},
+										Layout: HBox{MarginsZero: true, Spacing: uikit.Space8},
 										Children: []Widget{
-											connectionPair(
-												"Local RDP address", LineEdit{AssignTo: &a.listenAddr, Text: a.cfg.ListenAddr, CueBanner: defaultListenAddr, StretchFactor: 1},
-												"Proxy", LineEdit{AssignTo: &a.proxy, Text: a.cfg.Proxy, CueBanner: "env, direct, or http(s)://host:port", StretchFactor: 1},
-											),
-											connectionPair(
-												"Room password", LineEdit{AssignTo: &a.roomPass, PasswordMode: true, CueBanner: "optional room password", StretchFactor: 1},
-												"Password options", CheckBox{AssignTo: &a.clearRoomPassword, Text: "Clear saved room credential", Alignment: AlignHNearVCenter, StretchFactor: 1},
-											),
-											connectionPair(
-												"Windows username", LineEdit{AssignTo: &a.rdpUser, Text: a.cfg.RDPUser, CueBanner: `DOMAIN\user or user@example.com`, StretchFactor: 1},
-												"Windows password", LineEdit{AssignTo: &a.rdpPass, PasswordMode: true, CueBanner: "blank uses the saved profile login", StretchFactor: 1},
-											),
-											connectionPair(
-												"SMB alias", LineEdit{AssignTo: &a.smbAlias, Text: homenetwork.DefaultAlias, CueBanner: homenetwork.DefaultAlias, StretchFactor: 1, OnTextChanged: a.updateSMBUNCPreview},
-												"UNC example", LineEdit{AssignTo: &a.smbUNCPreview, Text: `\\deskferry-work\sharename`, ReadOnly: true, StretchFactor: 1},
-											),
-										},
-									},
-									Composite{
-										ColumnSpan: 2,
-										Layout:     Grid{Columns: 3, Spacing: 6},
-										Children: []Widget{
-											PushButton{AssignTo: &a.connectButton, Text: "Connect", MinSize: Size{Height: 30}, OnClicked: func() { a.connectFromUI() }},
-											PushButton{AssignTo: &a.openRDPButton, Text: "Open Remote Desktop", MinSize: Size{Height: 30}, OnClicked: a.openRemoteDesktop},
-											PushButton{Text: "Save", MinSize: Size{Height: 30}, OnClicked: func() { a.saveFromUI(true) }},
-											PushButton{Text: "Copy RDP Address", MinSize: Size{Height: 30}, OnClicked: a.copyRDPAddress},
-											PushButton{AssignTo: &a.saveWindowsButton, Text: "Save Windows Login", MinSize: Size{Height: 30}, OnClicked: a.saveWindowsCredentials},
-											PushButton{Text: "Forget Windows Login", MinSize: Size{Height: 30}, OnClicked: a.forgetWindowsCredentials},
-											PushButton{Text: "Relay Dashboard", MinSize: Size{Height: 30}, OnClicked: a.openDashboard},
-											PushButton{Text: "Screen Viewer", MinSize: Size{Height: 30}, OnClicked: a.openScreenViewer},
-											PushButton{Text: "Work Services", MinSize: Size{Height: 30}, OnClicked: a.openWorkServices},
+											compactButton(&a.relayAdd, "Add", a.addRelayURL),
+											compactButton(&a.relayUpdate, "Update", a.updateRelayURL),
+											compactButton(&a.relayDelete, "Delete", a.deleteRelayURL),
+											HSpacer{},
 										},
 									},
 								},
 							},
-							GroupBox{
-								Title:         "WinRM Commands (uses the shared Windows login at left)",
-								MinSize:       Size{Width: 320},
-								StretchFactor: 2,
-								Layout:        VBox{Spacing: 6},
+						},
+					},
+					// Middle: the everyday actions and the connection settings.
+					Composite{
+						StretchFactor: 4,
+						MinSize:       Size{Width: 350},
+						Alignment:     AlignHNearVNear,
+						Layout:        VBox{MarginsZero: true, Spacing: uikit.Space12},
+						Children: []Widget{
+							uikit.Card{
+								Title: "Remote Desktop",
 								Children: []Widget{
+									uikit.PrimaryButton{AssignTo: &a.connectButton, Text: "Connect", Stretch: true, OnClicked: func() { a.connectFromUI() }},
 									Composite{
-										Layout: Grid{Columns: 3, Spacing: 7},
+										Layout: Grid{Columns: 2, MarginsZero: true, Spacing: uikit.Space8},
 										Children: []Widget{
-											Label{Text: "Local WinRM address"},
-											LineEdit{AssignTo: &a.winrmListen, Text: a.cfg.WinRMListenAddr, CueBanner: defaultWinRMListenAddr},
-											PushButton{AssignTo: &a.executeWinRMButton, Text: "Execute", OnClicked: a.executeWinRM},
+											uikit.Button(&a.openRDPButton, "Open Remote Desktop", a.openRemoteDesktop),
+											uikit.Button(nil, "Copy RDP address", a.copyRDPAddress),
+											uikit.Button(nil, "Screen viewer", a.openScreenViewer),
+											uikit.Button(nil, "Relay dashboard", a.openDashboard),
+											uikit.Button(nil, "Work services", a.openWorkServices),
+											uikit.Button(nil, "Save settings", func() { a.saveFromUI(true) }),
 										},
 									},
-									Label{Text: "PowerShell command"},
-									TextEdit{AssignTo: &a.winrmCommand, MinSize: Size{Height: 48}, Text: "Get-ComputerInfo | Select-Object CsName, WindowsProductName, WindowsVersion"},
-									Label{Text: "Output"},
-									TextEdit{AssignTo: &a.winrmOutput, ReadOnly: true, VScroll: true, MinSize: Size{Height: 72}},
 								},
 							},
-							GroupBox{
-								Title:         "Monitoring",
-								MinSize:       Size{Width: 320},
-								StretchFactor: 2,
-								Layout:        VBox{Spacing: 5},
+							uikit.Card{
+								Title:         "Connection",
+								StretchFactor: 1,
+								Layout:        Grid{Columns: 2, MarginsZero: true, Spacing: uikit.Space8},
 								Children: []Widget{
-									Label{Text: "Room Details"},
-									TextEdit{AssignTo: &a.details, ReadOnly: true, VScroll: true, MinSize: Size{Height: 90}, StretchFactor: 1, Text: "Checking relay room..."},
-									Label{Text: "Activity"},
-									TextEdit{AssignTo: &a.logView, ReadOnly: true, VScroll: true, MinSize: Size{Height: 90}, StretchFactor: 1},
+									uikit.FieldLabel("Local RDP address"),
+									LineEdit{AssignTo: &a.listenAddr, Text: a.cfg.ListenAddr, CueBanner: defaultListenAddr},
+									uikit.FieldLabel("Proxy"),
+									LineEdit{AssignTo: &a.proxy, Text: a.cfg.Proxy, CueBanner: "env, direct, or http(s)://host:port"},
+									uikit.FieldLabel("Room password"),
+									Composite{
+										Layout: HBox{MarginsZero: true, Spacing: uikit.Space12},
+										Children: []Widget{
+											LineEdit{AssignTo: &a.roomPass, PasswordMode: true, CueBanner: "optional room password", StretchFactor: 1},
+											CheckBox{AssignTo: &a.clearRoomPassword, Text: "Clear saved"},
+										},
+									},
+									uikit.FieldLabel("SMB alias"),
+									LineEdit{AssignTo: &a.smbAlias, Text: homenetwork.DefaultAlias, CueBanner: homenetwork.DefaultAlias, OnTextChanged: a.updateSMBUNCPreview},
+									uikit.FieldLabel("UNC example"),
+									LineEdit{AssignTo: &a.smbUNCPreview, Text: `\\deskferry-work\sharename`, ReadOnly: true},
 								},
 							},
+							VSpacer{},
+						},
+					},
+					// Right: console and diagnostics share one tabbed card.
+					Composite{
+						StretchFactor: 4,
+						MinSize:       Size{Width: 300},
+						Layout:        VBox{MarginsZero: true, Spacing: uikit.Space12},
+						Children: []Widget{
+							uikit.Card{
+								Title:  "Windows login",
+								Layout: Grid{Columns: 2, MarginsZero: true, Spacing: uikit.Space8},
+								Children: []Widget{
+									uikit.FieldLabel("Username"),
+									LineEdit{AssignTo: &a.rdpUser, Text: a.cfg.RDPUser, CueBanner: `DOMAIN\user or user@example.com`},
+									uikit.FieldLabel("Password"),
+									LineEdit{AssignTo: &a.rdpPass, PasswordMode: true, CueBanner: "blank uses the saved profile login"},
+									Label{},
+									Composite{
+										Layout: HBox{MarginsZero: true, Spacing: uikit.Space8},
+										Children: []Widget{
+											uikit.Button(&a.saveWindowsButton, "Save login", a.saveWindowsCredentials),
+											uikit.Button(nil, "Forget login", a.forgetWindowsCredentials),
+											HSpacer{},
+										},
+									},
+								},
+							},
+							uikit.Card{
+								Title:         "Console and diagnostics",
+								StretchFactor: 1,
+								Children: []Widget{
+									TabWidget{
+										StretchFactor: 1,
+										Pages: []TabPage{
+											{
+												Title:  "WinRM",
+												Layout: VBox{Margins: Margins{Left: uikit.Space8, Top: uikit.Space8, Right: uikit.Space8, Bottom: uikit.Space8}, Spacing: uikit.Space8},
+												Children: []Widget{
+													Composite{
+														Layout: HBox{MarginsZero: true, Spacing: uikit.Space8},
+														Children: []Widget{
+															Label{Text: "Local address", Font: uikit.LabelFont(), TextColor: uikit.ColorTextSecondary},
+															LineEdit{AssignTo: &a.winrmListen, Text: a.cfg.WinRMListenAddr, CueBanner: defaultWinRMListenAddr, StretchFactor: 1},
+															uikit.Button(&a.executeWinRMButton, "Execute", a.executeWinRM),
+														},
+													},
+													withMinHeight(uikit.LogEdit(&a.winrmCommand, false, "Get-ComputerInfo | Select-Object CsName, WindowsProductName, WindowsVersion"), 36, 1),
+													withMinHeight(uikit.LogEdit(&a.winrmOutput, true, ""), 40, 2),
+												},
+											},
+											{
+												Title:  "Room details",
+												Layout: VBox{Margins: Margins{Left: uikit.Space8, Top: uikit.Space8, Right: uikit.Space8, Bottom: uikit.Space8}},
+												Children: []Widget{
+													withMinHeight(uikit.LogEdit(&a.details, true, "Checking relay room..."), 40, 1),
+												},
+											},
+											{
+												Title:  "Activity",
+												Layout: VBox{Margins: Margins{Left: uikit.Space8, Top: uikit.Space8, Right: uikit.Space8, Bottom: uikit.Space8}},
+												Children: []Widget{
+													withMinHeight(uikit.LogEdit(&a.logView, true, ""), 40, 1),
+												},
+											},
+											{
+												Title:  "RDP graphics",
+												Layout: VBox{Margins: Margins{Left: uikit.Space8, Top: uikit.Space8, Right: uikit.Space8, Bottom: uikit.Space8}, Spacing: uikit.Space8},
+												Children: []Widget{
+													uikit.SectionLabel("Graphics decoding used by Remote Desktop on this PC"),
+													Composite{
+														Layout: HBox{MarginsZero: true, Spacing: uikit.Space8},
+														Children: []Widget{
+															ComboBox{AssignTo: &a.rdpDecodingMode, Model: rdpDecodingModeLabels, CurrentIndex: rdpDecodingModeIndex(decodingMode), StretchFactor: 1},
+															uikit.Button(&a.applyRDPDecoding, "Apply (admin)", a.applyRDPDecodingSelection),
+														},
+													},
+													TextEdit{AssignTo: &a.rdpDecodingAdvice, Text: decodingApplied + ". Recommendation: Checking recent RDP stability...", ReadOnly: true, VScroll: true, Font: uikit.CaptionFont(), TextColor: uikit.ColorTextSecondary, Background: SolidColorBrush{Color: uikit.ColorSurfaceSubtle}, MinSize: Size{Height: 40}, StretchFactor: 1},
+												},
+											},
+										},
+									},
+								},
+							},
+							VSpacer{},
 						},
 					},
 				},
@@ -718,6 +792,24 @@ func (a *clientApp) run(smokeTest bool) error {
 		},
 	}
 	if err := window.Create(); err != nil {
+		return err
+	}
+	// walk applies the declarative Size before the first layout pass, which then
+	// shrinks the window to its minimum. The window is created hidden, sized
+	// to the preferred size clamped to the monitor work area, then shown, so
+	// it neither jumps on startup nor opens larger than the screen.
+	uikit.ResizeWindow(a.mw, homeWindowWidth, homeWindowHeight)
+	if !smokeTest {
+		a.mw.Show()
+	}
+	a.tunnelStatus.OnChange(func(string, uikit.Tone) { a.updateOverallStatus() })
+	a.workStatus.OnChange(func(string, uikit.Tone) { a.updateOverallStatus() })
+	a.updateOverallStatus()
+	return nil
+}
+
+func (a *clientApp) run(smokeTest bool) error {
+	if err := a.createMainWindow(smokeTest); err != nil {
 		return err
 	}
 	a.setDestinations(a.cfg.Destinations, a.cfg.SelectedDestination)
@@ -760,46 +852,14 @@ func (a *clientApp) run(smokeTest bool) error {
 	return nil
 }
 
-func connectionPair(leftTitle string, leftField Widget, rightTitle string, rightField Widget) Widget {
-	return Composite{
-		Layout: HBox{MarginsZero: true, Spacing: 7},
-		Children: []Widget{
-			connectionField(leftTitle, leftField),
-			connectionField(rightTitle, rightField),
-		},
-	}
+func compactButton(assignTo **walk.PushButton, text string, onClicked walk.EventHandler) Widget {
+	return PushButton{AssignTo: assignTo, Text: text, OnClicked: onClicked, MinSize: Size{Width: 64, Height: uikit.ButtonHeight}, MaxSize: Size{Width: 64, Height: uikit.ButtonHeight}}
 }
 
-func connectionField(title string, field Widget) Widget {
-	return Composite{
-		MinSize:       Size{Width: 270},
-		StretchFactor: 1,
-		Layout:        Grid{Columns: 2, MarginsZero: true, Spacing: 6},
-		Children: []Widget{
-			Label{Text: title, MinSize: Size{Width: 108}, MaxSize: Size{Width: 108}},
-			field,
-		},
-	}
-}
-
-func statusTile(title string, assignTo **walk.Label, initial string, width int) Widget {
-	return Composite{
-		MinSize:       Size{Width: width, Height: 66},
-		StretchFactor: 1,
-		Layout:        VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 4},
-		Children: []Widget{
-			Label{Text: title, TextColor: walk.RGB(93, 104, 116), Font: Font{Bold: true}, MinSize: Size{Width: width - 16}},
-			Label{
-				AssignTo:      assignTo,
-				Text:          initial,
-				Font:          Font{PointSize: 13, Bold: true},
-				EllipsisMode:  EllipsisEnd,
-				MinSize:       Size{Width: width - 16, Height: 26},
-				TextColor:     walk.RGB(31, 41, 55),
-				TextAlignment: AlignNear,
-			},
-		},
-	}
+func withMinHeight(edit TextEdit, height, stretch int) TextEdit {
+	edit.MinSize = Size{Height: height}
+	edit.StretchFactor = stretch
+	return edit
 }
 
 func (a *clientApp) relayURLListValues() []string {
@@ -1366,11 +1426,7 @@ func trayAction(text string, action func()) *walk.Action {
 }
 
 func appIcon() *walk.Icon {
-	icon, err := walk.NewIconFromResourceId(appIconResourceID)
-	if err == nil {
-		return icon
-	}
-	return walk.IconApplication()
+	return uikit.AppIcon()
 }
 
 func (a *clientApp) showWindow() {
@@ -1707,6 +1763,8 @@ func (a *clientApp) refreshLocalState() {
 
 	a.onUI(func() {
 		_ = a.relayStatus.SetText(routeText)
+		_ = a.relayStatus.SetToolTipText(routeText)
+		_ = a.sessionStatus.SetText(rdpSessionText(running, active))
 		if a.destinationList != nil {
 			a.destinationList.SetEnabled(!running)
 		}
@@ -2047,6 +2105,7 @@ func (a *clientApp) refreshRelayStatusAsync() {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.dashboardCancel = cancel
 	a.mu.Unlock()
+	a.onUI(func() { a.updateWorkTarget(cfg) })
 	go a.followRelayStatus(ctx, cfg)
 }
 

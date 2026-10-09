@@ -28,6 +28,7 @@ import (
 	"deskferry/internal/homenetwork"
 	"deskferry/internal/tunnel"
 	"deskferry/internal/winsecret"
+	"deskferry/windows/uikit"
 )
 
 const (
@@ -85,7 +86,8 @@ type setupApp struct {
 	alias           *walk.LineEdit
 	uncPreview      *walk.Label
 	status          *walk.Label
-	installButton   *walk.PushButton
+	statusChip      *uikit.StatusChip
+	installButton   *uikit.AccentButton
 	uninstallButton *walk.PushButton
 	relayURLs       []string
 	relayDragIndex  int
@@ -136,95 +138,115 @@ func Main() {
 
 func (a *setupApp) run(smokeTest bool) error {
 	window := MainWindow{
-		AssignTo: &a.mw,
-		Title:    productName + " Windows Components",
-		Size:     Size{Width: 840, Height: 620},
-		MinSize:  Size{Width: 760, Height: 560},
-		Layout:   VBox{Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 12}, Spacing: 8},
-		Visible:  !smokeTest,
+		AssignTo:   &a.mw,
+		Title:      productName + " Windows Components",
+		Icon:       uikit.AppIcon(),
+		Font:       uikit.BodyFont(),
+		Background: uikit.WindowBackground(),
+		Size:       Size{Width: setupWindowWidth, Height: setupWindowHeight},
+		MinSize:    Size{Width: 760, Height: 600},
+		Layout:     VBox{Margins: Margins{Left: uikit.Space20, Top: uikit.Space12, Right: uikit.Space20, Bottom: uikit.Space16}, Spacing: uikit.Space12},
+		Visible:    false,
 		Children: []Widget{
-			GroupBox{
+			uikit.Header(productName+" setup", "Install the app and its optional Windows components",
+				uikit.Chip{AssignTo: &a.statusChip, Text: "Checking", Alignment: AlignHFarVCenter},
+			),
+			uikit.Card{
 				Title:  "Application",
-				Layout: Grid{Columns: 3, Spacing: 6},
+				Layout: Grid{Columns: 3, MarginsZero: true, Spacing: uikit.FieldGap},
 				Children: []Widget{
-					Label{Text: "Install location"},
+					uikit.FieldLabel("Install location"),
 					LineEdit{AssignTo: &a.installDir, Text: defaultInstallDir()},
-					PushButton{Text: "Browse...", OnClicked: a.browseInstallDir},
+					uikit.Button(nil, "Browse...", a.browseInstallDir),
 				},
 			},
-			GroupBox{
-				Title:  "Work file access (optional)",
-				Layout: Grid{Columns: 3, Spacing: 6},
+			uikit.Card{
+				Title:       "Work file access (optional)",
+				Description: "The adapter routes only the private DeskFerry work address on TCP port 445; other Internet and LAN traffic is unchanged.",
+				Layout:      Grid{Columns: 2, MarginsZero: true, Spacing: uikit.FieldGap},
 				Children: []Widget{
 					CheckBox{
 						AssignTo:         &a.enableNetwork,
 						Text:             `Enable \\deskferry-work\... file access with the DeskFerry virtual network adapter`,
 						Checked:          true,
-						ColumnSpan:       3,
+						ColumnSpan:       2,
 						OnCheckedChanged: a.updateNetworkControls,
 					},
-					Label{Text: "Room name"},
-					LineEdit{AssignTo: &a.roomName, Text: defaultRoomName, CueBanner: defaultRoomName, ColumnSpan: 2},
-					Label{Text: "Relay service base URLs"},
+					uikit.FieldLabel("Room name"),
+					LineEdit{AssignTo: &a.roomName, Text: defaultRoomName, CueBanner: defaultRoomName},
+					Label{Text: "Relay services", Font: uikit.LabelFont(), TextColor: uikit.ColorTextSecondary, Alignment: AlignHNearVNear, MinSize: Size{Width: uikit.LabelColumnWidth}, MaxSize: Size{Width: uikit.LabelColumnWidth}},
 					Composite{
-						ColumnSpan: 2,
-						Layout:     VBox{Spacing: 5},
+						Layout: HBox{MarginsZero: true, Spacing: uikit.Space8},
 						Children: []Widget{
 							ListBox{
 								AssignTo:              &a.relayList,
 								Model:                 []string{defaultAzureRelayBase, defaultOCIRelayBase},
-								MinSize:               Size{Height: 72},
+								MinSize:               Size{Height: 60},
+								StretchFactor:         1,
+								ToolTipText:           "Drag rows to reorder.",
 								OnCurrentIndexChanged: a.relaySelectionChanged,
 								OnMouseDown:           a.relayListMouseDown,
 								OnMouseMove:           a.relayListMouseMove,
 								OnMouseUp:             a.relayListMouseUp,
 							},
 							Composite{
-								Layout: Grid{Columns: 6, Spacing: 5},
+								Layout: VBox{MarginsZero: true, Spacing: uikit.Space4},
 								Children: []Widget{
-									LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultAzureRelayBase, ColumnSpan: 6},
-									PushButton{AssignTo: &a.relayAdd, Text: "Add", OnClicked: a.addRelayURL},
-									PushButton{AssignTo: &a.relayUpdate, Text: "Update", OnClicked: a.updateRelayURL},
-									PushButton{AssignTo: &a.relayDelete, Text: "Delete", OnClicked: a.deleteRelayURL},
-									PushButton{AssignTo: &a.relayUp, Text: "Up", OnClicked: func() { a.moveRelayURL(-1) }},
-									PushButton{AssignTo: &a.relayDown, Text: "Down", OnClicked: func() { a.moveRelayURL(1) }},
-									Label{Text: "Drag rows to reorder."},
+									compactButton(&a.relayUp, "Up", func() { a.moveRelayURL(-1) }),
+									compactButton(&a.relayDown, "Down", func() { a.moveRelayURL(1) }),
+									VSpacer{},
 								},
 							},
 						},
 					},
-					Label{Text: "Room password"},
-					LineEdit{AssignTo: &a.roomPassword, PasswordMode: true, CueBanner: "same password as the work agent", ColumnSpan: 2},
-					Label{Text: "Proxy"},
-					LineEdit{AssignTo: &a.proxy, CueBanner: "env, direct, or http(s)://host:port", ColumnSpan: 2},
-					Label{Text: "Work computer alias"},
-					LineEdit{AssignTo: &a.alias, Text: homenetwork.DefaultAlias, OnTextChanged: a.updateUNCPreview, ColumnSpan: 2},
-					Label{Text: "UNC path"},
-					Label{AssignTo: &a.uncPreview, Text: `\\deskferry-work\sharename`, ColumnSpan: 2},
+					uikit.FieldLabel("Selected URL"),
+					Composite{
+						Layout: HBox{MarginsZero: true, Spacing: uikit.Space8},
+						Children: []Widget{
+							LineEdit{AssignTo: &a.relayEdit, CueBanner: defaultAzureRelayBase, StretchFactor: 1},
+							compactButton(&a.relayAdd, "Add", a.addRelayURL),
+							compactButton(&a.relayUpdate, "Update", a.updateRelayURL),
+							compactButton(&a.relayDelete, "Delete", a.deleteRelayURL),
+						},
+					},
+					uikit.FieldLabel("Room password"),
+					LineEdit{AssignTo: &a.roomPassword, PasswordMode: true, CueBanner: "same password as the work agent"},
+					uikit.FieldLabel("Proxy"),
+					LineEdit{AssignTo: &a.proxy, CueBanner: "env, direct, or http(s)://host:port"},
+					uikit.FieldLabel("Work PC alias"),
+					LineEdit{AssignTo: &a.alias, Text: homenetwork.DefaultAlias, OnTextChanged: a.updateUNCPreview},
+					uikit.FieldLabel("UNC path"),
+					Label{AssignTo: &a.uncPreview, Text: `\\deskferry-work\sharename`, Font: uikit.MonoFont(), TextColor: uikit.ColorText},
 				},
 			},
-			GroupBox{
-				Title:  "Install",
-				Layout: VBox{Spacing: 7},
+			uikit.Card{
+				Title: "Install",
 				Children: []Widget{
-					Label{AssignTo: &a.status, Text: "Checking installation..."},
+					Label{AssignTo: &a.status, Text: "Checking installation...", TextColor: uikit.ColorTextSecondary, EllipsisMode: EllipsisEnd},
 					Composite{
-						Layout: Flow{Spacing: 8},
+						Layout: HBox{MarginsZero: true, Spacing: uikit.Space8},
 						Children: []Widget{
-							PushButton{AssignTo: &a.installButton, Text: "Install", MinSize: Size{Width: 130, Height: 34}, OnClicked: a.install},
-							PushButton{Text: "Open DeskFerry", MinSize: Size{Width: 155, Height: 34}, OnClicked: a.openHome},
-							PushButton{AssignTo: &a.uninstallButton, Text: "Remove", MinSize: Size{Width: 100, Height: 34}, OnClicked: a.uninstall},
-							PushButton{Text: "Refresh", MinSize: Size{Width: 90, Height: 34}, OnClicked: a.refreshStatus},
-							PushButton{Text: "Close", MinSize: Size{Width: 90, Height: 34}, OnClicked: func() { _ = a.mw.Close() }},
+							uikit.PrimaryButton{AssignTo: &a.installButton, Text: "Install", OnClicked: a.install},
+							uikit.Button(nil, "Open DeskFerry", a.openHome),
+							uikit.Button(&a.uninstallButton, "Remove", a.uninstall),
+							uikit.Button(nil, "Refresh", a.refreshStatus),
+							HSpacer{},
+							uikit.Button(nil, "Close", func() { _ = a.mw.Close() }),
 						},
 					},
 				},
 			},
-			Label{Text: "The adapter routes only the private DeskFerry work address on TCP port 445; other Internet and LAN traffic is unchanged."},
 		},
 	}
 	if err := window.Create(); err != nil {
 		return err
+	}
+	// walk applies the declarative Size before the first layout pass. The
+	// window is created hidden, sized to the preferred size clamped to the
+	// monitor work area, and then shown so it does not jump.
+	uikit.ResizeWindow(a.mw, setupWindowWidth, setupWindowHeight)
+	if !smokeTest {
+		a.mw.Show()
 	}
 	initial := existingSetupOptions(filepath.Dir(mustExecutable()))
 	_ = a.installDir.SetText(initial.InstallDir)
@@ -365,6 +387,13 @@ func (a *setupApp) refreshStatus() {
 	}
 	a.status.SetText(text)
 	installed := homeErr == nil
+	if a.statusChip != nil {
+		chip := "Not installed"
+		if installed {
+			chip = "Installed"
+		}
+		_ = a.statusChip.SetText(chip)
+	}
 	if a.installButton != nil {
 		if installed {
 			a.installButton.SetText("Apply components")
@@ -1954,3 +1983,12 @@ func windowsMessageBox(title, text string, style uint32) {
 
 // Keep net linked in GUI builds and make the intended endpoint explicit to PE
 // analysis tools: this installer never opens a listener itself.
+
+const (
+	setupWindowWidth  = 840
+	setupWindowHeight = 760
+)
+
+func compactButton(assignTo **walk.PushButton, text string, onClicked walk.EventHandler) Widget {
+	return PushButton{AssignTo: assignTo, Text: text, OnClicked: onClicked, MinSize: Size{Width: 64, Height: uikit.ButtonHeight}, MaxSize: Size{Width: 64, Height: uikit.ButtonHeight}}
+}

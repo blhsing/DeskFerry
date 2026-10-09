@@ -308,371 +308,9 @@ static string CleanAgentIdentity(string? value)
     return builder.ToString();
 }
 
-static string IconSvg() => """
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">
-  <defs>
-    <linearGradient id="bg" x1="12" y1="12" x2="96" y2="96" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#13324d"/>
-      <stop offset="1" stop-color="#40b5ae"/>
-    </linearGradient>
-    <clipPath id="clip">
-      <rect x="6" y="6" width="96" height="96" rx="22"/>
-    </clipPath>
-  </defs>
-  <rect x="6" y="6" width="96" height="96" rx="22" fill="url(#bg)"/>
-  <g clip-path="url(#clip)">
-    <path d="M6 34c22-17 61-14 97-24l3 12c-32 12-70 9-99 23z" fill="#fff" opacity=".08"/>
-  </g>
-  <path d="M12 35c19-13 38-6 56-18M43 97c16-13 37-6 60-19" fill="none" stroke="#fff" stroke-width="1.2" stroke-linecap="round" opacity=".22"/>
-  <path d="M70 31c12-8 22-4 33-12" fill="none" stroke="#fff" stroke-width=".7" stroke-linecap="round" opacity=".18"/>
-  <path d="M27 28q0-7 7-7h40q7 0 7 7v28q0 7-7 7H34q-7 0-7-7z" fill="#031727" opacity=".22"/>
-  <path d="M27 25q0-7 7-7h40q7 0 7 7v28q0 7-7 7H34q-7 0-7-7z" fill="#fff"/>
-  <path d="M34 27q0-3 3-3h34q3 0 3 3v20q0 3-3 3H37q-3 0-3-3z" fill="#17324d"/>
-  <path d="M38 27h12l-9 23h-7z" fill="#fff" opacity=".14"/>
-  <path d="M40 29h26" fill="none" stroke="#fff" stroke-width=".65" stroke-linecap="round" opacity=".20"/>
-  <path d="M49 59h10l3 8H46zM39 68q0-3 3-3h24q3 0 3 3v3H39z" fill="#fff"/>
-  <path d="M20 67h68l-8 11q-9 7-42 4q-9-2-18-15z" fill="#031727" opacity=".20"/>
-  <path d="M20 64h68l-8 11q-9 7-42 4q-9-2-18-15z" fill="#e66d4f"/>
-  <path d="M38 77c12 4 28 3 42-2" fill="none" stroke="#71323a" stroke-width=".8" stroke-linecap="round" opacity=".28"/>
-  <path d="M31 66h43q2 0 2 2t-2 2H31q-2 0-2-2t2-2z" fill="#fff" opacity=".76"/>
-  <g clip-path="url(#clip)">
-    <path d="M0 78q13-7 27 0t28 0t28 0q13 7 25-2v32H0z" fill="#69d2c7"/>
-    <path d="M4 86q18-7 36 0t36 0q16-6 28-2v4q-13-2-28 3q-18 7-36 0q-18-7-36 0z" fill="#fff" opacity=".48"/>
-    <path d="M17 92c8-3 15-2 22 0M73 96c7-3 15-2 21-5" fill="none" stroke="#fff" stroke-width=".65" stroke-linecap="round" opacity=".36"/>
-    <path d="M14 97c20-5 31 3 52-2" fill="none" stroke="#fff" stroke-width=".8" stroke-linecap="round" opacity=".32"/>
-  </g>
-</svg>
-""";
+static string IconSvg() => RelayDashboard.Icon;
 
-static string DashboardHtml(string room = "")
-{
-    var roomJson = System.Text.Json.JsonSerializer.Serialize(room);
-    return $$"""
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DeskFerry Relay</title>
-  <link rel="icon" href="/relay/icon.svg" type="image/svg+xml">
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f5f7f8;
-      --panel: #ffffff;
-      --ink: #1f2933;
-      --muted: #65717d;
-      --line: #d7dee3;
-      --accent: #2f6f73;
-      --ok: #287d52;
-      --warn: #9a6a12;
-      --bad: #a94343;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
-      background: var(--bg);
-      color: var(--ink);
-    }
-    header {
-      padding: 28px 24px 18px;
-      border-bottom: 1px solid var(--line);
-      background: var(--panel);
-    }
-    main {
-      width: min(1120px, calc(100% - 32px));
-      margin: 22px auto 40px;
-    }
-    h1 {
-      margin: 0 0 6px;
-      font-size: clamp(26px, 4vw, 38px);
-      letter-spacing: 0;
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }
-    .brand-icon {
-      width: 58px;
-      height: 58px;
-      flex: 0 0 58px;
-      border-radius: 13px;
-    }
-    .brand-text { min-width: 0; }
-    .subtle { color: var(--muted); }
-    .toolbar {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      flex-wrap: wrap;
-      margin-top: 16px;
-    }
-    .toolbar input {
-      flex: 1 1 360px;
-      min-width: 0;
-      height: 40px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 0 12px;
-      color: var(--ink);
-      background: #fbfcfd;
-      font: 13px ui-monospace, SFMono-Regular, Consolas, monospace;
-    }
-    .toolbar button {
-      height: 40px;
-      border: 1px solid var(--accent);
-      border-radius: 8px;
-      padding: 0 14px;
-      color: var(--accent);
-      background: #fff;
-      font-weight: 700;
-      cursor: pointer;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 14px;
-      margin-bottom: 18px;
-    }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 16px;
-      min-height: 128px;
-    }
-    .label {
-      color: var(--muted);
-      font-size: 13px;
-      font-weight: 700;
-      text-transform: uppercase;
-    }
-    .value {
-      margin-top: 10px;
-      font-size: 28px;
-      font-weight: 700;
-      line-height: 1.1;
-    }
-    .ok { color: var(--ok); }
-    .warn { color: var(--warn); }
-    .bad { color: var(--bad); }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow: hidden;
-    }
-    th, td {
-      padding: 12px 14px;
-      text-align: left;
-      border-bottom: 1px solid var(--line);
-      vertical-align: top;
-      font-size: 14px;
-    }
-    th {
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      background: #fbfcfd;
-    }
-    tr:last-child td { border-bottom: 0; }
-    code {
-      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-      font-size: 13px;
-    }
-    .pill {
-      display: inline-block;
-      padding: 3px 8px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      font-size: 12px;
-      font-weight: 700;
-      background: #f9fafb;
-    }
-    .pill.ok { border-color: #bfe4cf; background: #edf8f1; }
-    .pill.bad { border-color: #efc5c5; background: #fff0f0; }
-    @media (max-width: 760px) {
-      .grid { grid-template-columns: 1fr; }
-      th:nth-child(5), td:nth-child(5) { display: none; }
-      .brand-icon {
-        width: 48px;
-        height: 48px;
-        flex-basis: 48px;
-      }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <div class="brand">
-      <img class="brand-icon" src="/relay/icon.svg" alt="">
-      <div class="brand-text">
-        <h1>DeskFerry Relay</h1>
-        <div class="subtle">DeskFerry Relay v{{RelayBuildInfo.Version}} · Azure WebSocket relay at <code>/relay/ws</code>. Status updates stream live over WebSocket.</div>
-      </div>
-    </div>
-    <div class="toolbar">
-      <input id="roomUrl" readonly aria-label="Relay room URL">
-      <button id="copyRoom" type="button">Copy</button>
-    </div>
-  </header>
-  <main>
-    <section class="grid">
-      <div class="card">
-        <div class="label">Work agent</div>
-        <div id="workStatus" class="value warn">Checking</div>
-        <p id="workDetail" class="subtle">Waiting for status.</p>
-      </div>
-      <div class="card">
-        <div class="label">Home side</div>
-        <div id="homeStatus" class="value warn">Checking</div>
-        <p id="homeDetail" class="subtle">Waiting for status.</p>
-      </div>
-      <div class="card">
-        <div class="label">RDP streams</div>
-        <div id="streamStatus" class="value">0</div>
-        <p id="streamDetail" class="subtle">No active pairs.</p>
-      </div>
-    </section>
-    <table>
-      <thead>
-        <tr>
-          <th>Room</th>
-          <th>Work Agent</th>
-          <th>Home Side</th>
-          <th>Active Pairs</th>
-          <th>Last Client</th>
-        </tr>
-      </thead>
-      <tbody id="rooms">
-        <tr><td colspan="5" class="subtle">Loading relay status...</td></tr>
-      </tbody>
-    </table>
-  </main>
-  <script>
-    const roomsBody = document.getElementById("rooms");
-    const workStatus = document.getElementById("workStatus");
-    const workDetail = document.getElementById("workDetail");
-    const homeStatus = document.getElementById("homeStatus");
-    const homeDetail = document.getElementById("homeDetail");
-    const streamStatus = document.getElementById("streamStatus");
-    const streamDetail = document.getElementById("streamDetail");
-    const roomUrl = document.getElementById("roomUrl");
-    const copyRoom = document.getElementById("copyRoom");
-    const pageRoom = {{roomJson}};
-
-    function pill(ok, text) {
-      return `<span class="pill ${ok ? "ok" : "bad"}">${text}</span>`;
-    }
-
-    function esc(value) {
-      return String(value ?? "").replace(/[&<>"']/g, char => ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;"
-      }[char]));
-    }
-
-    function fmt(value) {
-      if (!value) return "";
-      return new Date(value).toLocaleString();
-    }
-
-    function setValue(node, text, cls) {
-      node.className = "value " + cls;
-      node.textContent = text;
-    }
-
-    function relayRoomUrl(room) {
-      if (!room) return `${location.origin}/relay/`;
-      return `${location.origin}/relay/${encodeURIComponent(room)}`;
-    }
-
-    function setRoomUrl(room) {
-      roomUrl.value = relayRoomUrl(room);
-    }
-
-    function render(data) {
-      try {
-        const rooms = data.rooms || [];
-        const waitingAgents = rooms.reduce((sum, r) => sum + (r.waiting_agents || 0), 0);
-        const controls = rooms.reduce((sum, r) => sum + (r.control_connections || 0), 0);
-        const activePairs = rooms.reduce((sum, r) => sum + (r.active_pairs || 0), 0);
-        const homeAgents = rooms.filter(r => r.home_agent_connected).length;
-        const homeActiveRooms = rooms.filter(r => r.home_agent_connected || (r.active_pairs || 0) > 0).length;
-
-        setValue(workStatus, controls + waitingAgents + activePairs > 0 ? "Connected" : "Waiting", controls + waitingAgents + activePairs > 0 ? "ok" : "warn");
-        workDetail.textContent = `${controls} control connections, ${activePairs} active sessions.`;
-        setValue(homeStatus, homeActiveRooms > 0 ? "Active" : "Waiting", homeActiveRooms > 0 ? "ok" : "warn");
-        homeDetail.textContent = `${homeAgents} presence socket${homeAgents === 1 ? "" : "s"}, ${activePairs} active RDP stream${activePairs === 1 ? "" : "s"}.`;
-        streamStatus.textContent = activePairs.toString();
-        streamDetail.textContent = activePairs === 0 ? "No active RDP streams." : `${activePairs} RDP stream${activePairs === 1 ? "" : "s"} bridged.`;
-
-        if (rooms.length === 0) {
-          roomsBody.innerHTML = '<tr><td colspan="5" class="subtle">No token rooms have connected yet.</td></tr>';
-          return;
-        }
-        roomsBody.innerHTML = rooms.map(r => {
-          const workConnected = (r.control_connections || 0) + (r.waiting_agents || 0) + (r.active_pairs || 0) > 0;
-          const homePresence = !!r.home_agent_connected;
-          const streamActive = (r.active_pairs || 0) > 0;
-          const homeState = homePresence ? "presence" : (streamActive ? "active stream" : "waiting");
-          const homeInfo = homePresence
-            ? `${esc(r.home_agent_remote || "")}<br>${esc(fmt(r.home_agent_connected_at))}`
-            : `${r.active_pairs || 0} active<br>${esc(fmt(r.last_client_connected_at))}`;
-          return `<tr>
-            <td><code>${esc(r.id)}</code></td>
-            <td>${pill(workConnected, workConnected ? "connected" : "waiting")}<br><span class="subtle">${r.control_connections || 0} controls<br>${esc(fmt(r.last_agent_connected_at))}</span></td>
-            <td>${pill(homePresence || streamActive, homeState)}<br><span class="subtle">${homeInfo}</span></td>
-            <td>${r.active_pairs || 0}<br><span class="subtle">${r.total_pairs || 0} total</span></td>
-            <td><span class="subtle">${esc(r.last_client_remote || "")}<br>${esc(fmt(r.last_client_connected_at))}</span></td>
-          </tr>`;
-        }).join("");
-      } catch (error) {
-        setValue(workStatus, "Error", "bad");
-        setValue(homeStatus, "Error", "bad");
-        workDetail.textContent = error.message;
-        homeDetail.textContent = error.message;
-        roomsBody.innerHTML = `<tr><td colspan="5" class="bad">${error.message}</td></tr>`;
-      }
-    }
-
-    function connectDashboard() {
-      const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-      const roomPath = pageRoom ? `/relay/${encodeURIComponent(pageRoom)}/ws` : "/relay/ws";
-      const socket = new WebSocket(`${scheme}//${location.host}${roomPath}?role=dashboard`);
-      socket.onopen = () => {
-        workDetail.textContent = "Connected to live relay status.";
-        homeDetail.textContent = "Connected to live relay status.";
-      };
-      socket.onmessage = event => render(JSON.parse(event.data));
-      socket.onclose = () => {
-        setValue(workStatus, "Reconnecting", "warn");
-        setValue(homeStatus, "Reconnecting", "warn");
-        workDetail.textContent = "Dashboard status socket closed. Reconnecting...";
-        homeDetail.textContent = "Dashboard status socket closed. Reconnecting...";
-        setTimeout(connectDashboard, 1500);
-      };
-      socket.onerror = () => socket.close();
-    }
-
-    connectDashboard();
-    setRoomUrl(pageRoom);
-    copyRoom.addEventListener("click", async () => {
-      roomUrl.select();
-      await navigator.clipboard.writeText(roomUrl.value);
-    });
-  </script>
-</body>
-</html>
-""";
-}
+static string DashboardHtml(string room = "") => RelayDashboard.Html(room);
 
 [method: JsonConstructor]
 sealed record ControlMessage(
@@ -2504,9 +2142,42 @@ sealed class ResumeSession
     }
 }
 
+// Serves the dashboard page and icon shared by every DeskFerry relay. The
+// canonical files live in internal/relaydashboard and are embedded by the
+// project file; placeholders are replaced with plain string substitution.
+static class RelayDashboard
+{
+    const string RelayKind = "Azure relay";
+
+    public static readonly string Icon = ReadResource("DeskFerry.Relay.icon.svg");
+
+    static readonly string Template = ReadResource("DeskFerry.Relay.dashboard.html")
+        .Replace("{{VERSION}}", System.Net.WebUtility.HtmlEncode(RelayBuildInfo.Version))
+        .Replace("{{RELAY_KIND}}", System.Net.WebUtility.HtmlEncode(RelayKind));
+
+    // ROOM_JSON is substituted last so a room name cannot inject another
+    // placeholder. The JSON literal is escaped for safe use inside <script>.
+    public static string Html(string room) => Template.Replace("{{ROOM_JSON}}", RoomJson(room));
+
+    static string RoomJson(string room) => JsonSerializer.Serialize(room ?? "")
+        .Replace("<", "\\u003c")
+        .Replace(">", "\\u003e")
+        .Replace("&", "\\u0026")
+        .Replace("\u2028", "\\u2028")
+        .Replace("\u2029", "\\u2029");
+
+    static string ReadResource(string name)
+    {
+        using var stream = typeof(RelayDashboard).Assembly.GetManifestResourceStream(name)
+            ?? throw new InvalidOperationException($"Missing embedded dashboard resource {name}.");
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        return reader.ReadToEnd();
+    }
+}
+
 static class RelayBuildInfo
 {
-    public const string Version = "0.12.18";
+    public const string Version = "0.13.0";
 }
 
 sealed class WaitingAgent

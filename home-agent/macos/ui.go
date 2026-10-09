@@ -21,7 +21,6 @@ import (
 	"sync"
 	"time"
 
-	"deskferry/internal/buildinfo"
 	"deskferry/internal/remotelog"
 	"deskferry/internal/screenview"
 	"deskferry/internal/tunnel"
@@ -137,9 +136,11 @@ func runMacUI(ctx context.Context, initial config, openRDP bool) error {
 func (c *macUIController) handleUI(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/":
-		writeHTML(w, strings.ReplaceAll(macControlPanelHTML, "{{VERSION}}", buildinfo.Version))
+		serveUIPage(w, "index.html")
 	case r.Method == http.MethodGet && r.URL.Path == "/screen":
-		writeHTML(w, strings.ReplaceAll(macScreenViewerHTML, "{{VERSION}}", buildinfo.Version))
+		serveUIPage(w, "screen.html")
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/static/"):
+		serveUIStatic(w, r, strings.TrimPrefix(r.URL.Path, "/static/"))
 	case r.Method == http.MethodGet && r.URL.Path == "/api/settings":
 		c.mu.Lock()
 		value := apiSettingsFrom(c.settings)
@@ -614,12 +615,6 @@ func randomUIToken() (string, error) {
 	return hex.EncodeToString(value[:]), nil
 }
 
-func writeHTML(w http.ResponseWriter, value string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write([]byte(value))
-}
-
 func writeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -629,55 +624,3 @@ func writeJSON(w http.ResponseWriter, value any) {
 func logUI(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
-
-const macControlPanelHTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>DeskFerry Home {{VERSION}}</title><style>
-body{font:14px -apple-system,BlinkMacSystemFont,sans-serif;margin:0;background:#f4f5f7;color:#1f2937}main{max-width:1000px;margin:24px auto;padding:0 18px}.card{background:white;border:1px solid #d9dde5;border-radius:12px;padding:18px;margin:12px 0;box-shadow:0 2px 8px #0000000a}h1{font-size:24px}h2{font-size:17px;margin-top:0}.grid{display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center}input,select,button,textarea{font:inherit;padding:8px;border:1px solid #bcc3cf;border-radius:7px}textarea{width:100%;box-sizing:border-box;min-height:76px}button{background:#fff;cursor:pointer}button.primary{background:#1666d6;color:white;border-color:#1666d6}.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.relay{display:flex;gap:7px;margin:6px 0}.relay input{flex:1}pre{white-space:pre-wrap;background:#f7f8fa;padding:12px;border-radius:8px;min-height:70px}.good{color:#087a45}.bad{color:#b42318}</style></head><body><main><h1>DeskFerry Home for macOS <small>v{{VERSION}}</small></h1>
-<div class="card"><h2>Destination profile</h2><div class="grid"><label>Profile</label><select id="profile"></select><label>Profile name</label><input id="name"><label>Room name</label><input id="room"><label>Relay service bases</label><div><div id="relays"></div><div class="row"><input id="relayEdit" placeholder="https://host/relay" style="flex:1"><button onclick="addRelay()">Add</button></div></div><label>Local RDP address</label><input id="listen"><label>Proxy</label><input id="proxy" placeholder="env, direct, or http(s)://host:port"><label>Room password</label><input id="password" type="password" placeholder="blank keeps saved credential"><label>Room credential</label><label><input id="clear" type="checkbox"> Clear saved room credential</label><label>Windows username</label><input id="windowsUser" placeholder="DOMAIN\\user or local user"><label>Windows password</label><input id="windowsPassword" type="password" placeholder="blank is allowed when saving Windows login"><label>Windows login</label><label><input id="clearWindows" type="checkbox"> Forget saved Windows login</label></div><div class="row"><button onclick="addProfile()">Add profile</button><button onclick="deleteProfile()">Delete profile</button><button class="primary" onclick="save(false)">Save</button><button onclick="save(true)">Save Windows Login</button></div><div id="saveStatus"></div></div>
-<div class="card"><h2>Connection</h2><div class="row"><button class="primary" onclick="post('api/connect')">Connect</button><button onclick="post('api/stop')">Stop</button><button onclick="post('api/open-rdp')">Open Remote Desktop</button><button onclick="window.open('screen','DeskFerryScreen','width=1100,height=760')">Screen Viewer</button></div><p id="tunnel"></p></div>
-<div class="card"><h2>WinRM Commands</h2><textarea id="winrmCommand">Get-ComputerInfo | Select-Object CsName, WindowsProductName, WindowsVersion</textarea><div class="row"><button class="primary" onclick="runWinRM()">Execute</button></div><pre id="winrmOutput">Ready</pre></div>
-<div class="card"><h2>Relay status</h2><pre id="relay">Checking...</pre></div></main><script>
-let s={profiles:[],selected:0};const $=id=>document.getElementById(id);async function load(){s=await (await fetch('api/settings')).json();render();state()}function commit(){if(!s.profiles.length)return;let p=s.profiles[s.selected];p.name=$('name').value;p.room=$('room').value;p.windows_user=$('windowsUser').value}function render(){let q=$('profile');q.innerHTML='';s.profiles.forEach((p,i)=>{let marks=(p.has_password?' room-key':'')+(p.has_windows_login?' Windows-login':'');let o=new Option(p.name+marks,i,i===s.selected,i===s.selected);q.add(o)});let p=s.profiles[s.selected];if(!p)return;$('name').value=p.name;$('room').value=p.room;$('windowsUser').value=p.windows_user||'';$('listen').value=s.listen_addr;$('proxy').value=s.proxy;renderRelays()}$('profile').onchange=()=>{commit();s.selected=+$('profile').value;render()};function renderRelays(){let d=$('relays');d.innerHTML='';s.profiles[s.selected].relay_bases.forEach((v,i)=>{let r=document.createElement('div');r.className='relay';r.innerHTML='<input><button>Update</button><button>Up</button><button>Down</button><button>Delete</button>';r.children[0].value=v;r.children[1].onclick=()=>{s.profiles[s.selected].relay_bases[i]=r.children[0].value};r.children[2].onclick=()=>move(i,-1);r.children[3].onclick=()=>move(i,1);r.children[4].onclick=()=>{s.profiles[s.selected].relay_bases.splice(i,1);renderRelays()};d.appendChild(r)})}function addRelay(){let v=$('relayEdit').value.trim();if(v){s.profiles[s.selected].relay_bases.push(v);$('relayEdit').value='';renderRelays()}}function move(i,n){let a=s.profiles[s.selected].relay_bases,j=i+n;if(j<0||j>=a.length)return;[a[i],a[j]]=[a[j],a[i]];renderRelays()}function addProfile(){commit();s.profiles.push({name:'Work '+(s.profiles.length+1),room:'workdesk',relay_bases:['https://test-officialwebsite.azurewebsites.net/relay','http://217.142.228.117/relay'],has_password:false,windows_user:'',has_windows_login:false});s.selected=s.profiles.length-1;render()}function deleteProfile(){if(s.profiles.length<=1)return alert('At least one profile is required.');s.profiles.splice(s.selected,1);s.selected=Math.max(0,s.selected-1);render()}async function save(saveWindowsLogin){commit();s.listen_addr=$('listen').value;s.proxy=$('proxy').value;let res=await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({settings:s,room_password:$('password').value,clear_password:$('clear').checked,windows_password:$('windowsPassword').value,save_windows_login:saveWindowsLogin,clear_windows_login:$('clearWindows').checked})});let text=await res.text();$('saveStatus').textContent=res.ok?'Saved.':text;if(res.ok){$('password').value='';$('clear').checked=false;$('windowsPassword').value='';$('clearWindows').checked=false;await load()}}async function runWinRM(){let o=$('winrmOutput');o.textContent='Running...';let r=await fetch('api/winrm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:$('winrmCommand').value})});let text=await r.text();if(r.ok){try{text=JSON.parse(text).output}catch(e){}}o.textContent=text||'(no output)'}async function post(path){let r=await fetch(path,{method:'POST'});if(!r.ok)alert(await r.text());state()}async function state(){let x=await (await fetch('api/state')).json();$('tunnel').textContent=x.tunnel_status;$('tunnel').className=x.running?'good':'bad';$('relay').textContent=x.relay_details||'Checking...'}setInterval(state,2000);load();</script></body></html>`
-
-const macScreenViewerHTML = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DeskFerry Screen Viewer</title>
-<style>
-html,body{height:100%;margin:0;overflow:hidden}body{font:14px -apple-system,sans-serif;background:#171a20;color:white;display:flex;flex-direction:column}
-header{display:flex;gap:8px;align-items:center;padding:10px;background:#252a33;flex:none;white-space:nowrap;overflow-x:auto}
-button,select,input{font:inherit;padding:7px 10px;border-radius:7px;border:1px solid #727987;background:#343a46;color:white}input{width:78px}
-#status{overflow:hidden;text-overflow:ellipsis}#view{flex:1;min-height:0;overflow:auto;background:#000;cursor:grab;touch-action:none;user-select:none}
-#view.dragging{cursor:grabbing}#stage{min-width:100%;min-height:100%;display:flex;justify-content:center;align-items:center}
-#image{display:block;pointer-events:none;-webkit-user-drag:none}#stage.fit #image{width:100%;height:100%;object-fit:contain}
-</style></head><body>
-<header>
-<button onclick="start('single')">Capture Once</button><button onclick="start('stream')">Start Stream</button><button onclick="post('api/screen/stop')">Stop</button>
-<label>Interval <select id="interval"><option value="500">0.5 s</option><option value="1000" selected>1 s</option><option value="2000">2 s</option><option value="5000">5 s</option></select></label>
-<label>Zoom <input id="zoom" value="Auto Fit" list="zoom-levels" aria-label="Zoom level"></label>
-<datalist id="zoom-levels"><option>Auto Fit</option><option>25%</option><option>50%</option><option>75%</option><option>100%</option><option>125%</option><option>150%</option><option>200%</option><option>300%</option><option>400%</option></datalist>
-<button onclick="setZoom(0)">Auto Fit</button><button onclick="toggleFullscreen()">Full Screen</button>
-<a id="save" href="api/screen/frame.png" download="DeskFerry-Screenshot.png"><button>Save PNG</button></a><span id="status">Ready</span>
-</header>
-<div id="view"><div id="stage" class="fit"><img id="image" draggable="false" alt="Capture the Work computer screen"></div></div>
-<script>
-const view=document.getElementById('view'),stage=document.getElementById('stage'),image=document.getElementById('image'),zoomInput=document.getElementById('zoom');
-let seq=0,zoom=0,gestureBase=1,drag=null;
-function clamp(value){return Math.max(.1,Math.min(16,value))}
-function effectiveZoom(){if(zoom)return zoom;if(!image.naturalWidth||!image.naturalHeight)return 1;return Math.min(view.clientWidth/image.naturalWidth,view.clientHeight/image.naturalHeight)}
-function formatZoom(value){return value===0?'Auto Fit':(Math.round(value*1000)/10).toString().replace(/\.0$/,'')+'%'}
-function applyZoom(){if(!image.naturalWidth||!image.naturalHeight)return;if(zoom===0){stage.classList.add('fit');stage.style.width='100%';stage.style.height='100%';image.style.width='100%';image.style.height='100%'}else{stage.classList.remove('fit');let w=Math.round(image.naturalWidth*zoom),h=Math.round(image.naturalHeight*zoom);stage.style.width=Math.max(view.clientWidth,w)+'px';stage.style.height=Math.max(view.clientHeight,h)+'px';image.style.width=w+'px';image.style.height=h+'px'}zoomInput.value=formatZoom(zoom)}
-function setZoom(value,anchor){let oldWidth=image.getBoundingClientRect().width||1,oldHeight=image.getBoundingClientRect().height||1,rect=view.getBoundingClientRect(),ax=anchor?anchor.x-rect.left:view.clientWidth/2,ay=anchor?anchor.y-rect.top:view.clientHeight/2,rx=(view.scrollLeft+ax)/oldWidth,ry=(view.scrollTop+ay)/oldHeight;zoom=value===0?0:clamp(value);applyZoom();if(zoom!==0){view.scrollLeft=rx*(image.getBoundingClientRect().width||1)-ax;view.scrollTop=ry*(image.getBoundingClientRect().height||1)-ay}}
-function parseZoom(){let text=zoomInput.value.trim();if(/^(auto( fit)?|fit)$/i.test(text)){setZoom(0);return}let value=Number(text.replace('%','').trim());if(Number.isFinite(value)&&value>=10&&value<=1600)setZoom(value/100);else{zoomInput.value=formatZoom(zoom);document.getElementById('status').textContent='Zoom must be Auto Fit or 10% through 1600%.'}}
-zoomInput.addEventListener('change',parseZoom);zoomInput.addEventListener('keydown',event=>{if(event.key==='Enter'){parseZoom();zoomInput.blur()}});
-view.addEventListener('wheel',event=>{event.preventDefault();let factor=event.ctrlKey?Math.exp(-event.deltaY*.01):(event.deltaY<0?1.1:1/1.1);setZoom(effectiveZoom()*factor,{x:event.clientX,y:event.clientY})},{passive:false});
-view.addEventListener('gesturestart',event=>{event.preventDefault();gestureBase=effectiveZoom()},{passive:false});
-view.addEventListener('gesturechange',event=>{event.preventDefault();setZoom(gestureBase*event.scale,{x:event.clientX,y:event.clientY})},{passive:false});
-view.addEventListener('pointerdown',event=>{if(view.scrollWidth<=view.clientWidth&&view.scrollHeight<=view.clientHeight)return;drag={x:event.clientX,y:event.clientY,left:view.scrollLeft,top:view.scrollTop};view.setPointerCapture(event.pointerId);view.classList.add('dragging')});
-view.addEventListener('pointermove',event=>{if(!drag)return;view.scrollLeft=drag.left-(event.clientX-drag.x);view.scrollTop=drag.top-(event.clientY-drag.y)});
-function endDrag(){drag=null;view.classList.remove('dragging')}view.addEventListener('pointerup',endDrag);view.addEventListener('pointercancel',endDrag);
-image.addEventListener('load',applyZoom);window.addEventListener('resize',applyZoom);
-async function toggleFullscreen(){if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen()}
-async function start(mode){let r=await fetch('api/screen/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,interval_ms:+document.getElementById('interval').value})});if(!r.ok)alert(await r.text())}
-async function post(p){await fetch(p,{method:'POST'})}
-async function poll(){let s=await (await fetch('api/state')).json();document.getElementById('status').textContent=s.screen_status;if(s.screen_seq&&s.screen_seq!==seq){seq=s.screen_seq;image.src='api/screen/frame.png?seq='+seq}}
-setInterval(poll,350);poll();start('single');
-</script></body></html>`

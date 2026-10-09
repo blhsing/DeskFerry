@@ -2,6 +2,10 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
 $source = Join-Path $root 'relay/python'
+$dashboardAssets = @(
+    (Join-Path $root 'internal/relaydashboard/dashboard.html'),
+    (Join-Path $root 'internal/relaydashboard/icon.svg')
+)
 $requirements = Join-Path $source 'requirements.txt'
 $publish = Join-Path $root 'dist/python-relay/publish'
 $zip = Join-Path $root 'dist/python-relay/deskferry-python-relay.zip'
@@ -50,6 +54,9 @@ try {
     Copy-Item -LiteralPath (Join-Path $source 'app.py') -Destination $publish
     Copy-Item -LiteralPath (Join-Path $source 'requirements.txt') -Destination $publish
     Copy-Item -LiteralPath (Join-Path $source 'startup.sh') -Destination $publish
+    # The dashboard page and icon are shared with the Go and .NET relays; app.py
+    # loads them from its own directory when published.
+    Copy-Item -LiteralPath $dashboardAssets -Destination $publish
 
     Get-ChildItem -LiteralPath (Split-Path -Parent $zip) -Filter 'tunneldesktop-python-relay*.zip' -File -ErrorAction SilentlyContinue | ForEach-Object {
         Remove-Item -LiteralPath $_.FullName -Force
@@ -73,6 +80,9 @@ try {
     Copy-Item -LiteralPath (Join-Path $source 'app.py') -Destination $vendoredPublish
     Copy-Item -LiteralPath (Join-Path $source 'requirements.txt') -Destination $vendoredPublish
     Copy-Item -LiteralPath (Join-Path $source 'startup.sh') -Destination $vendoredPublish
+    # The dashboard page and icon are shared with the Go and .NET relays; app.py
+    # loads them from its own directory when published.
+    Copy-Item -LiteralPath $dashboardAssets -Destination $vendoredPublish
     Copy-Item -LiteralPath $vendor -Destination (Join-Path $vendoredPublish 'vendor') -Recurse
 
     New-PortableZip -SourceDirectory $vendoredPublish -DestinationPath $vendoredZip

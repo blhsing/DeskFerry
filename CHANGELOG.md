@@ -1,5 +1,16 @@
 # Release Notes
 
+## 0.13.0 - 2026-10-09
+
+A redesign of every DeskFerry interface around one shared design system (`docs/design-system.md`): a calm neutral background, white cards, status chips that change colour with state, one primary action per area, sentence-case labels, and consistent spacing and typography.
+
+- **Windows app:** the Home window, Work Services, Setup, and Screen Viewer share a new UI kit (`windows/uikit`). Each window has a header with the app icon and an overall status chip, status tiles, card panels, a painted primary button, and monospace diagnostics. Every window shows the app icon, and the app is now per-monitor DPI aware.
+- **macOS Home agent:** the local control panel and screen viewer are now embedded asset files with a two-column layout, a relay list with drag-to-reorder, collapsible WinRM and diagnostics sections, and light and dark themes.
+- **Android Home app:** a new platform-only UI kit with cards, status chips, ripple buttons, and styled fields; a status overview with a prominent Start/Stop button; tidier destination and relay cards; a quick-actions list; and a dark screen viewer. Destination deletion now asks for confirmation.
+- **Relay dashboard:** the Azure, Go, and Python relays now serve one shared page and icon from `internal/relaydashboard`, replacing three drifting copies. The redesigned page has a live connection chip, status tiles, a responsive rooms table that becomes cards on phones, per-service session tags, room detail pages, and light and dark themes.
+- **Release signing:** the Android APK is signed with the original DeskFerry release key again, so it upgrades installations of 0.12.12 and earlier. APKs from 0.12.13 to 0.12.18 were debug-signed and cannot upgrade in place.
+- The Python relay and Azure relay report the current release version.
+
 ## 0.12.18 - 2026-10-09
 
 - Bring the Android Home agent's POST/GET streaming fallback in line with the Go clients. Uploads are now finite batches instead of one never-ending POST, which buffering proxies such as Skyhigh held for about 1.5 seconds each. Up to three uploads and two waiting GETs overlap once the relay confirms pipelining, finished download batches are re-polled at once, records that arrive out of order are delivered in sequence, and upload connections are opened up front. Through a buffering proxy with a 100 ms round trip, Android's idle round trip dropped from about 1.6 s to 103 ms and its sustained median to about 165 ms.

@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>DeskFerry Relay</title>
+<link rel="icon" href="/relay/icon.svg" type="image/svg+xml">
+<style>
+:root{color-scheme:light dark;
+--bg:#F5F7FB;--surface:#FFFFFF;--subtle:#F9FAFC;--border:#E3E8EF;--border-strong:#CDD5DF;
+--text:#101828;--text2:#475467;--muted:#667085;--primary:#2563EB;--primary-hover:#1D4ED8;--primary-soft:#EEF4FF;--on-primary:#FFFFFF;
+--shadow:0 1px 2px rgba(16,24,40,.05);
+--ok-fg:#067647;--ok-bg:#ECFDF3;--ok-dot:#17B26A;
+--warn-fg:#B54708;--warn-bg:#FFFAEB;--warn-dot:#F79009;
+--bad-fg:#B42318;--bad-bg:#FEF3F2;--bad-dot:#F04438;
+--neu-fg:#344054;--neu-bg:#F2F4F7;--neu-dot:#98A2B3;
+--info-fg:#1849A9;--info-bg:#EEF4FF;--info-dot:#2E90FA;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI Variable Text","Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+--mono:"Cascadia Mono","SF Mono",ui-monospace,Menlo,Consolas,monospace}
+@media (prefers-color-scheme:dark){:root{
+--bg:#0B1220;--surface:#111A2E;--subtle:#0F1729;--border:#1F2A44;--border-strong:#2D3B5C;
+--text:#F2F4F7;--text2:#C2C9D6;--muted:#8A94A6;--primary:#4F8BFF;--primary-hover:#6B9DFF;--primary-soft:#16254A;--on-primary:#FFFFFF;
+--shadow:none;
+--ok-fg:#17B26A;--ok-bg:rgba(23,178,106,.14);--warn-fg:#F79009;--warn-bg:rgba(247,144,9,.14);
+--bad-fg:#F04438;--bad-bg:rgba(240,68,56,.14);--neu-fg:#98A2B3;--neu-bg:rgba(152,162,179,.14);
+--info-fg:#2E90FA;--info-bg:rgba(46,144,250,.14)}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:400 14px/1.5 var(--sans)}
+a{color:var(--primary);text-decoration:none}a:hover{color:var(--primary-hover);text-decoration:underline}
+:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+.mono,code{font-family:var(--mono);font-size:12.5px}
+.muted{color:var(--muted)}
+.wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+header.app{background:var(--surface);border-bottom:1px solid var(--border)}
+.bar{display:flex;align-items:center;gap:12px;min-height:72px}
+.mark{width:40px;height:40px;border-radius:10px;flex:none;display:block}
+.brand{min-width:0;flex:1}
+h1{margin:0;font-size:22px;line-height:1.25;font-weight:600;letter-spacing:-.01em}
+.cap{font-size:12px;font-weight:500;color:var(--muted);margin:0}
+main.wrap{padding-top:24px;padding-bottom:24px;display:grid;gap:16px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow);padding:20px}
+h2{margin:0;font-size:16px;line-height:1.35;font-weight:600}
+.head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.head p{margin:2px 0 0}
+.chip{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:999px;font-size:12px;font-weight:500;line-height:1;white-space:nowrap;background:var(--neu-bg);color:var(--neu-fg)}
+.chip .dot{width:8px;height:8px;border-radius:50%;background:var(--neu-dot);flex:none}
+.chip.ok{background:var(--ok-bg);color:var(--ok-fg)}.chip.ok .dot{background:var(--ok-dot)}
+.chip.warn{background:var(--warn-bg);color:var(--warn-fg)}.chip.warn .dot{background:var(--warn-dot)}
+.chip.bad{background:var(--bad-bg);color:var(--bad-fg)}.chip.bad .dot{background:var(--bad-dot)}
+.chip.info{background:var(--info-bg);color:var(--info-fg)}.chip.info .dot{background:var(--info-dot)}
+.chip.live .dot{animation:pulse 2s ease-out infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(23,178,106,.55)}70%,100%{box-shadow:0 0 0 6px rgba(23,178,106,0)}}
+.field label{display:block;font-size:13px;font-weight:500;color:var(--text2);margin-bottom:6px}
+.group{display:flex;gap:8px}
+.group input{flex:1;min-width:0;height:36px;padding:0 12px;border:1px solid var(--border);border-radius:8px;background:var(--subtle);color:var(--text);font:12.5px var(--mono);text-overflow:ellipsis}
+.group input:hover,.group input:focus{border-color:var(--border-strong);outline:none}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;padding:0 14px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--text);font:500 14px var(--sans);cursor:pointer;white-space:nowrap;transition:background .15s,border-color .15s,color .15s}
+.btn:hover{border-color:var(--border-strong);background:var(--subtle)}
+.btn.done{color:var(--ok-fg);border-color:var(--ok-dot);background:var(--ok-bg)}
+.btn svg{width:16px;height:16px;flex:none}
+.help{margin:6px 0 0;font-size:12px;color:var(--muted)}
+.tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}
+.tile{padding:16px 16px 14px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.tile .top{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:24px}
+.tile .cap{font-size:12px}
+.metric{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;font-size:20px;font-weight:600;line-height:1.2}
+.metric small{font-size:13px;font-weight:500;color:var(--text2)}
+.tile .detail{margin:0;font-size:12px;color:var(--muted);min-height:18px}
+.notice{display:none;align-items:center;gap:8px;padding:10px 14px;border-radius:8px;background:var(--warn-bg);color:var(--warn-fg);font-size:13px;font-weight:500}
+.notice.show{display:flex}.notice::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--warn-dot);flex:none}
+body.stale .tiles,body.stale #roomsCard,body.stale #detailCard{opacity:.62;transition:opacity .2s}
+.back{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:500}
+.back svg{width:16px;height:16px}
+.roomtitle{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px}
+.roomtitle h2{font-size:20px;font-family:var(--mono);font-weight:600;word-break:break-all}
+.lock{display:inline-flex;align-items:center;color:var(--muted)}
+.lock svg{width:14px;height:14px}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+#roomsTable th:nth-child(1){width:19%}#roomsTable th:nth-child(2),#roomsTable th:nth-child(3){width:22%}#roomsTable th:nth-child(4){width:17%}
+th{font-size:12px;font-weight:500;color:var(--muted);text-align:left;padding:0 12px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:14px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:var(--subtle)}
+th:first-child,td:first-child{padding-left:4px}th:last-child,td:last-child{padding-right:4px}
+td .sub{display:block;margin-top:4px;font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+td .sub .mono{font-size:12px}
+.roomlink{font:600 13px var(--mono);color:var(--primary);word-break:break-all}
+.roomlink:hover{color:var(--primary)}
+.num{font-size:16px;font-weight:600;font-variant-numeric:tabular-nums}
+.tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.tag{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px;border-radius:999px;background:var(--primary-soft);color:var(--info-fg);font-size:11.5px;font-weight:500}
+.tag b{font-weight:600}
+.tag.warn{background:var(--warn-bg);color:var(--warn-fg)}
+time{white-space:nowrap}
+.none{font-size:13px;color:var(--muted)}
+.empty{padding:32px 16px;text-align:center;color:var(--muted)}
+.empty svg{width:40px;height:40px;color:var(--border-strong);display:block;margin:0 auto 10px}
+.empty strong{display:block;color:var(--text2);font-size:14px;font-weight:600;margin-bottom:2px}
+dl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 24px;margin:0}
+dl div{padding:12px 0;border-top:1px solid var(--border);min-width:0}
+dl div:nth-child(-n+2){border-top:0;padding-top:0}
+dt{font-size:12px;font-weight:500;color:var(--muted);margin-bottom:2px}
+dd{margin:0;overflow-wrap:anywhere}
+.diag{background:var(--subtle);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-top:4px;font:12.5px/1.6 var(--mono)}
+footer.wrap{padding-bottom:32px;font-size:12px;color:var(--muted);text-align:center}
+[hidden]{display:none!important}
+@media (max-width:900px){.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:720px){
+.wrap{padding:0 16px}.bar{min-height:64px}main.wrap{padding-top:16px;gap:12px}
+.card{padding:16px}.tiles{gap:12px}.tile{padding:14px}.tile .top{flex-direction:column;align-items:flex-start;gap:6px}.tile .cap{white-space:nowrap}
+#roomsCard{background:none;border:0;box-shadow:none;padding:0}#roomsCard .head{padding:4px 2px 0;margin-bottom:12px}
+.metric{font-size:18px}
+dl{grid-template-columns:1fr}dl div:nth-child(2){border-top:1px solid var(--border);padding-top:12px}
+#roomsTable thead{display:none}
+#roomsTable,#roomsTable tbody{display:block}
+#roomsTable tr{display:block;border:1px solid var(--border);border-radius:12px;padding:4px 14px;margin-bottom:12px;background:var(--surface)}
+#roomsTable tr:last-child{margin-bottom:0}
+#roomsTable tbody tr:hover td{background:none}
+#roomsTable td{display:grid;grid-template-columns:96px minmax(0,1fr);gap:12px;padding:10px 0;border-bottom:1px solid var(--border)}
+#roomsTable td:last-child{border-bottom:0}
+#roomsTable td::before{content:attr(data-label);font-size:12px;font-weight:500;color:var(--muted);padding-top:3px}
+#roomsTable td.roomcell{display:block;padding:12px 0}
+#roomsTable td.roomcell::before{content:none}
+#roomsTable td.emptycell{display:block}#roomsTable td.emptycell::before{content:none}
+#roomsTable tr.emptyrow{border:0;padding:0}
+}
+@media (max-width:400px){.copylabel{display:none}.cap.kind{display:none}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<header class="app">
+  <div class="wrap bar">
+    <img class="mark" src="/relay/icon.svg" alt="" width="40" height="40">
+    <div class="brand">
+      <h1>DeskFerry Relay</h1>
+      <p class="cap">v{{VERSION}} <span class="kind">· {{RELAY_KIND}}</span></p>
+    </div>
+    <span id="liveChip" class="chip warn" role="status" title="Live updates over WebSocket"><span class="dot" aria-hidden="true"></span>Connecting</span>
+  </div>
+</header>
+<main class="wrap">
+  <div id="notice" class="notice" role="status"></div>
+
+  <section id="roomHead" hidden>
+    <a class="back" href="/relay/"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>All rooms</a>
+    <div class="roomtitle"><h2 id="roomName"></h2><span id="roomLock"></span></div>
+  </section>
+
+  <section class="card field">
+    <label id="roomUrlLabel" for="roomUrl">Relay URL</label>
+    <div class="group">
+      <input id="roomUrl" readonly spellcheck="false" aria-describedby="roomUrlHelp">
+      <button id="copyRoom" class="btn" type="button"></button>
+    </div>
+    <p id="roomUrlHelp" class="help">Add this relay to DeskFerry on your Work and Home PCs. Both sides use the same room name.</p>
+  </section>
+
+  <section class="tiles" aria-label="Status">
+    <div class="card tile"><div class="top"><span class="cap">Work agent</span><span id="workStatus" class="chip warn"><span class="dot"></span>Checking</span></div><div id="workMetric" class="metric">–</div><p id="workDetail" class="detail">Waiting for status.</p></div>
+    <div class="card tile"><div class="top"><span class="cap">Home side</span><span id="homeStatus" class="chip warn"><span class="dot"></span>Checking</span></div><div id="homeMetric" class="metric">–</div><p id="homeDetail" class="detail">Waiting for status.</p></div>
+    <div class="card tile"><div class="top"><span class="cap">Active sessions</span><span id="streamChip" class="chip neutral"><span class="dot"></span>Idle</span></div><div id="streamStatus" class="metric">–</div><p id="streamDetail" class="detail">Waiting for status.</p></div>
+    <div class="card tile"><div class="top"><span id="fourthCap" class="cap">Rooms</span><span id="fourthChip" class="chip info" hidden></span></div><div id="fourthMetric" class="metric">–</div><p id="fourthDetail" class="detail">Waiting for status.</p></div>
+  </section>
+
+  <section id="roomsCard" class="card">
+    <div class="head"><div><h2>Rooms</h2><p class="cap">Every room with a Work agent or Home app connected, updated live.</p></div><span id="updated" class="cap"></span></div>
+    <table id="roomsTable">
+      <thead><tr><th>Room</th><th>Work agent</th><th>Home side</th><th>Sessions</th><th>Last client</th></tr></thead>
+      <tbody id="rooms"><tr class="emptyrow"><td colspan="5" class="emptycell"><div class="empty">Loading relay status…</div></td></tr></tbody>
+    </table>
+  </section>
+
+  <section id="detailCard" class="card" hidden>
+    <div class="head"><div><h2>Room details</h2><p class="cap">Diagnostics for this room, updated live.</p></div><span id="updatedRoom" class="cap"></span></div>
+    <div id="detail"></div>
+  </section>
+</main>
+<footer class="wrap">Status streams live from this relay over a WebSocket. Pages update on their own; there is no need to refresh.</footer>
+<script>
+(function(){
+"use strict";
+var pageRoom={{ROOM_JSON}};
+var $=function(id){return document.getElementById(id)};
+var ICON={
+copy:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.5A1.5 1.5 0 0 0 9 1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5"/></svg>',
+check:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg>',
+lock:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>',
+empty:'<svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="6" width="24" height="16" rx="3"/><path d="M17 22h6l1 4h-8zM5 28h30l-3 4q-12 3-24 0z"/></svg>'};
+var SVC={rdp:"RDP",winrm:"WinRM",smb:"SMB",screen:"Screen"},ORDER=["rdp","winrm","smb","screen"];
+var last=null,skew=0,socket=null,attempts=0,retryTimer=0,copyTimer=0,lastUpdate=0;
+
+function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function n(v){v=Number(v);return isFinite(v)?v:0}
+function plural(c,w,p){return c+" "+(c===1?w:(p||w+"s"))}
+function ts(v){if(!v)return null;var t=Date.parse(v);return isNaN(t)?null:t}
+function rel(v){var t=ts(v);if(t===null)return"";var s=Math.max(0,Math.round((Date.now()-skew-t)/1000));
+  if(s<45)return"just now";var m=Math.round(s/60);if(m<60)return m+" min ago";var h=Math.round(m/60);if(h<24)return plural(h,"hour")+" ago";return plural(Math.round(h/24),"day")+" ago"}
+function when(v,prefix){var t=ts(v);if(t===null)return"";return(prefix?esc(prefix)+" ":"")+'<time datetime="'+esc(v)+'" title="'+esc(new Date(t).toLocaleString())+'">'+esc(rel(v))+"</time>"}
+function chipHTML(k,text){return'<span class="chip '+k+'"><span class="dot" aria-hidden="true"></span>'+esc(text)+"</span>"}
+function setChip(el,k,text){el.className="chip "+k;el.innerHTML='<span class="dot" aria-hidden="true"></span>'+esc(text)}
+function setMetric(el,value,unit){el.innerHTML=esc(value)+(unit?" <small>"+esc(unit)+"</small>":"")}
+function workOnline(r){return n(r.control_connections)+n(r.waiting_agents)+n(r.active_pairs)>0}
+function agentCount(r){return Math.max((r.control_agents||[]).length,n(r.control_connections))}
+function services(map){var out=[];if(!map||typeof map!=="object")return out;
+  var keys=Object.keys(map).sort(function(a,b){var ia=ORDER.indexOf(a),ib=ORDER.indexOf(b);return(ia<0?99:ia)-(ib<0?99:ib)||(a<b?-1:a>b?1:0)});
+  keys.forEach(function(k){if(n(map[k])>0)out.push([SVC[k]||k,n(map[k])])});return out}
+function tags(map,cls){return services(map).map(function(s){return'<span class="tag'+(cls?" "+cls:"")+'">'+esc(s[0])+" <b>"+esc(s[1])+"</b></span>"}).join("")}
+function svcText(map){return services(map).map(function(s){return s[0]+" "+s[1]}).join(" · ")}
+function sumMaps(rooms,key){var m={};rooms.forEach(function(r){var x=r[key]||{};Object.keys(x).forEach(function(k){m[k]=(m[k]||0)+n(x[k])})});return m}
+function sum(rooms,key){return rooms.reduce(function(s,r){return s+n(r[key])},0)}
+function roomUrl(room){return location.origin+"/relay/"+(room?encodeURIComponent(room):"")}
+function lockHTML(r){return r.protected?'<span class="lock" role="img" aria-label="Protected" title="Protected by a room password">'+ICON.lock+'</span>':""}
+
+function workCell(r){var on=workOnline(r),a=agentCount(r),sub;
+  if(on)sub=esc(plural(a,"agent"))+(ts(r.last_agent_connected_at)?" · "+when(r.last_agent_connected_at,"since"):"");
+  else sub=ts(r.last_agent_disconnected_at)?when(r.last_agent_disconnected_at,"Last seen"):"Never connected";
+  return chipHTML(on?"ok":"bad",on?"Online":"Offline")+'<span class="sub">'+sub+"</span>"}
+function homeCell(r){var on=!!r.home_agent_connected,busy=n(r.active_pairs)>0,sub;
+  if(on)sub=(r.home_agent_remote?'<span class="mono">'+esc(r.home_agent_remote)+"</span><br>":"")+when(r.home_agent_connected_at,"since");
+  else if(busy)sub="Connected through an active session";
+  else sub=ts(r.home_agent_disconnected_at)?when(r.home_agent_disconnected_at,"Last seen"):"No Home app connected";
+  return chipHTML(on||busy?"ok":"neutral",on||busy?"Online":"Idle")+'<span class="sub">'+sub+"</span>"}
+function sessionCell(r){var a=n(r.active_pairs),p=n(r.pending_requests);
+  return'<span class="num">'+esc(a)+'</span> <span class="muted">active</span><span class="sub">'+esc(plural(n(r.total_pairs),"session"))+" total</span>"+
+  ((services(r.active_sessions_by_service).length||p)?'<div class="tags">'+tags(r.active_sessions_by_service)+(p?'<span class="tag warn">'+esc(p)+" pending</span>":"")+"</div>":"")}
+function clientCell(r){if(!r.last_client_remote&&!ts(r.last_client_connected_at))return'<span class="none">No clients yet</span>';
+  return'<span class="mono">'+esc(r.last_client_remote||"Unknown address")+'</span><span class="sub">'+when(r.last_client_connected_at,"Connected")+"</span>"}
+
+function renderRooms(rooms){var body=$("rooms");
+  if(!rooms.length){body.innerHTML='<tr class="emptyrow"><td colspan="5" class="emptycell"><div class="empty">'+ICON.empty+"<strong>No rooms yet</strong>Rooms appear here as soon as a DeskFerry Work agent or Home app connects to this relay.</div></td></tr>";return}
+  body.innerHTML=rooms.map(function(r){
+    return'<tr><td class="roomcell"><a class="roomlink" href="/relay/'+esc(encodeURIComponent(r.id))+'">'+esc(r.id)+"</a> "+lockHTML(r)+(r.protected?'<span class="sub">Password protected</span>':"")+"</td>"+
+      '<td data-label="Work agent"><div>'+workCell(r)+'</div></td><td data-label="Home side"><div>'+homeCell(r)+'</div></td><td data-label="Sessions"><div>'+sessionCell(r)+'</div></td><td data-label="Last client"><div>'+clientCell(r)+"</div></td></tr>"}).join("")}
+
+function item(label,html){return"<div><dt>"+esc(label)+"</dt><dd>"+html+"</dd></div>"}
+function renderDetail(r){var el=$("detail");
+  if(!r){el.innerHTML='<div class="empty">'+ICON.empty+"<strong>Nothing has connected yet</strong>Start the DeskFerry Work agent with room <span class=\"mono\">"+esc(pageRoom)+"</span> and it will appear here.</div>";return}
+  var agents=r.control_agents||[],pend=n(r.pending_requests);
+  el.innerHTML="<dl>"+
+    item("Work agents",agents.length?'<div class="diag">'+agents.map(esc).join("<br>")+"</div>":esc(plural(agentCount(r),"control connection")))+
+    item("Protocol",esc(n(r.protocol_version)>=2?"Version "+n(r.protocol_version)+" (control + on-demand sessions)":n(r.protocol_version)?"Version "+n(r.protocol_version):"Legacy agent slots")+(n(r.waiting_agents)?'<span class="sub">'+esc(plural(n(r.waiting_agents),"waiting legacy agent"))+"</span>":""))+
+    item("Last Work connection",r.last_agent_remote||ts(r.last_agent_connected_at)?'<span class="mono">'+esc(r.last_agent_remote||"")+"</span> "+when(r.last_agent_connected_at,"·"):'<span class="muted">Never</span>')+
+    item("Last Work disconnect",ts(r.last_agent_disconnected_at)?when(r.last_agent_disconnected_at):'<span class="muted">None</span>')+
+    item("Home app",r.home_agent_remote?'<span class="mono">'+esc(r.home_agent_remote)+"</span> "+(r.home_agent_connected?when(r.home_agent_connected_at,"· since"):when(r.home_agent_disconnected_at,"· left")):'<span class="muted">Not connected</span>')+
+    item("Last client",r.last_client_remote?'<span class="mono">'+esc(r.last_client_remote)+"</span> "+when(r.last_client_connected_at,"·")+(ts(r.last_client_disconnected_at)?'<span class="sub">'+when(r.last_client_disconnected_at,"Disconnected")+"</span>":""):'<span class="muted">No clients yet</span>')+
+    item("Active sessions by service",services(r.active_sessions_by_service).length?'<div class="tags">'+tags(r.active_sessions_by_service)+"</div>":'<span class="muted">No active sessions</span>')+
+    item("Pending requests",pend?esc(pend)+(services(r.pending_by_service).length?'<div class="tags">'+tags(r.pending_by_service,"warn")+"</div>":""):'<span class="muted">None</span>')+
+    item("Rejected requests",esc(plural(n(r.busy_rejections),"busy rejection"))+" · "+esc(plural(n(r.no_agent_rejections),"no-agent rejection")))+
+    item("Room password",esc(r.protected?"Set. Agents must prove the room password.":"Not set"))+
+    "</dl>"}
+
+function render(data){
+  last=data;var rooms=Array.isArray(data.rooms)?data.rooms:[];
+  var st=ts(data.time);if(st!==null)skew=Date.now()-st;
+  var active=sum(rooms,"active_pairs"),byService=sumMaps(rooms,"active_sessions_by_service"),svc=svcText(byService);
+  setChip($("streamChip"),active>0?"ok":"neutral",active>0?active+" active":"No active sessions");
+  setMetric($("streamStatus"),active,active===1?"session":"sessions");
+  $("streamDetail").textContent=active?(svc||"Bridged through this relay."):"Nothing is bridged right now.";
+  if(pageRoom){
+    var r=rooms[0]||null;
+    $("roomLock").innerHTML=r&&r.protected?chipHTML("info","Password protected"):"";
+    var on=r&&workOnline(r);
+    setChip($("workStatus"),!r?"neutral":on?"ok":"bad",!r?"Unknown":on?"Online":"Offline");
+    setMetric($("workMetric"),r?agentCount(r):0,r&&agentCount(r)===1?"agent":"agents");
+    $("workDetail").innerHTML=!r?"Not seen on this relay yet.":on?(ts(r.last_agent_connected_at)?when(r.last_agent_connected_at,"Connected"):"Connected."):(ts(r.last_agent_disconnected_at)?when(r.last_agent_disconnected_at,"Last seen"):"Not connected.");
+    var home=r&&(r.home_agent_connected||n(r.active_pairs)>0);
+    setChip($("homeStatus"),home?"ok":"neutral",home?"Online":"Idle");
+    var homes=r&&r.home_agent_connected?1:0;
+    setMetric($("homeMetric"),homes,homes===1?"Home app":"Home apps");
+    $("homeDetail").innerHTML=r&&r.home_agent_connected?esc(r.home_agent_remote||"Home app")+" · "+when(r.home_agent_connected_at,"since"):home?"Using an active session.":"Open DeskFerry at home to connect.";
+    var total=r?n(r.total_pairs):0,rej=r?n(r.busy_rejections)+n(r.no_agent_rejections):0;
+    setChip($("fourthChip"),rej?"warn":"info",rej?plural(rej,"rejection"):"All time");$("fourthChip").hidden=false;
+    setMetric($("fourthMetric"),total,total===1?"session":"sessions");
+    $("fourthDetail").textContent=r&&n(r.pending_requests)?plural(n(r.pending_requests),"request")+" waiting for the Work agent.":"Since this relay started.";
+    renderDetail(r);
+  }else{
+    var online=rooms.filter(workOnline).length,controls=sum(rooms,"control_connections"),homes=rooms.filter(function(r){return r.home_agent_connected}).length,prot=rooms.filter(function(r){return r.protected}).length;
+    setChip($("workStatus"),!rooms.length?"neutral":online?"ok":"bad",!rooms.length?"Unknown":online?"Online":"Offline");
+    setMetric($("workMetric"),online,rooms.length?"of "+plural(rooms.length,"room")+" online":"agents online");
+    $("workDetail").textContent=plural(controls,"control connection")+".";
+    setChip($("homeStatus"),homes?"ok":"neutral",homes?"Online":"Idle");
+    setMetric($("homeMetric"),homes,homes===1?"Home app":"Home apps");
+    $("homeDetail").textContent=homes?"Keeping a presence connection open.":"No Home app is connected.";
+    var offline=rooms.length-online;
+    setChip($("fourthChip"),!rooms.length?"neutral":offline?"warn":"ok",!rooms.length?"None yet":offline?offline+" offline":"All online");$("fourthChip").hidden=false;
+    setMetric($("fourthMetric"),rooms.length,rooms.length===1?"room":"rooms");
+    $("fourthDetail").textContent=plural(sum(rooms,"total_pairs"),"session")+" since the relay started"+(prot?" · "+prot+" protected.":".");
+    renderRooms(rooms);
+  }
+  lastUpdate=Date.now();stamp();
+}
+function stamp(){if(!lastUpdate)return;var t="Updated "+new Date(lastUpdate).toLocaleTimeString();$("updated").textContent=t;$("updatedRoom").textContent=t}
+
+function setLive(state){var c=$("liveChip"),n=$("notice");
+  if(state==="ok"){setChip(c,"ok live","Connected");document.body.classList.remove("stale");n.className="notice";n.textContent="";return}
+  if(state==="bad")setChip(c,"bad","Unreachable");else setChip(c,"warn","Connecting");
+  if(last){document.body.classList.add("stale");n.className="notice show";n.textContent=state==="bad"?"The relay is unreachable. Showing the last known status while this page keeps retrying.":"Reconnecting to the relay. Showing the last known status."}}
+function schedule(){clearTimeout(retryTimer);attempts++;setLive(attempts>=3?"bad":"warn");
+  var delay=Math.min(15000,1500*Math.pow(1.6,attempts-1))*(0.85+Math.random()*0.3);retryTimer=setTimeout(connect,delay)}
+function connect(){clearTimeout(retryTimer);
+  if(socket&&(socket.readyState===0||socket.readyState===1))return;
+  var scheme=location.protocol==="https:"?"wss:":"ws:",path=pageRoom?"/relay/"+encodeURIComponent(pageRoom)+"/ws":"/relay/ws",s;
+  try{s=new WebSocket(scheme+"//"+location.host+path+"?role=dashboard")}catch(e){schedule();return}
+  socket=s;
+  s.onopen=function(){attempts=0;setLive("ok")};
+  s.onmessage=function(ev){try{render(JSON.parse(ev.data))}catch(e){if(window.console)console.error("DeskFerry dashboard render failed",e)}};
+  s.onclose=function(){if(socket===s){socket=null;schedule()}};
+  s.onerror=function(){try{s.close()}catch(e){}};
+}
+
+function copyLabel(done){var b=$("copyRoom");b.classList.toggle("done",done);b.innerHTML=(done?ICON.check:ICON.copy)+'<span class="copylabel">'+(done?"Copied":"Copy")+"</span>";b.setAttribute("aria-label",done?"Copied":"Copy URL")}
+function fallbackCopy(input){input.focus();input.select();try{return document.execCommand("copy")}catch(e){return false}}
+$("copyRoom").addEventListener("click",function(){var input=$("roomUrl"),ok=function(){copyLabel(true);clearTimeout(copyTimer);copyTimer=setTimeout(function(){copyLabel(false)},1800)},
+  manual=function(){if(fallbackCopy(input))ok();else{input.focus();input.select();$("copyRoom").querySelector(".copylabel").textContent="Press Ctrl+C"}};
+  if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(input.value).then(ok,manual)}else manual()});
+$("roomUrl").addEventListener("focus",function(){this.select()});
+
+$("roomUrl").value=roomUrl(pageRoom);copyLabel(false);
+if(pageRoom){document.title=pageRoom+" · DeskFerry Relay";$("roomHead").hidden=false;$("roomName").textContent=pageRoom;$("roomsCard").hidden=true;$("detailCard").hidden=false;
+  $("roomUrlLabel").textContent="Room URL";$("roomUrlHelp").textContent="Use this room on both your Work and Home PCs with the same room password.";$("fourthCap").textContent="Total sessions"}
+setInterval(function(){if(last&&!document.hidden)try{render(last)}catch(e){}},30000);
+document.addEventListener("visibilitychange",function(){if(!document.hidden&&!socket){attempts=0;connect()}});
+window.addEventListener("online",function(){if(!socket){attempts=0;connect()}});
+connect();
+})();
+</script>
+</body>
+</html>
