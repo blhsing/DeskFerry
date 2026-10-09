@@ -41,6 +41,8 @@ const (
 	// the first failed sample.
 	initialCaptureAttempts = 12
 	captureRetryDelay      = 250 * time.Millisecond
+	// GetSystemMetrics index that is nonzero inside a Remote Desktop session.
+	smRemoteSession = 0x1000
 )
 
 type desktopCapturer struct {
@@ -282,6 +284,7 @@ func RunCaptureHelper() error {
 		if desktopErr != nil {
 			err = errors.Join(fmt.Errorf("bind capture helper to input desktop: %w", desktopErr), err)
 		}
+		err = explainRemoteSessionCaptureFailure(err)
 		_ = WriteFrame(os.Stdout, Frame{Type: FrameError, Error: err.Error()}, nil)
 		return err
 	}
@@ -302,6 +305,7 @@ func RunCaptureHelper() error {
 		<-ticker.C
 		current, err := captureWithRetry(capturer.Capture, initialCaptureAttempts, captureRetryDelay)
 		if err != nil {
+			err = explainRemoteSessionCaptureFailure(err)
 			_ = WriteFrame(os.Stdout, Frame{Type: FrameError, Seq: sequence, Error: err.Error()}, nil)
 			return err
 		}
@@ -315,6 +319,18 @@ func RunCaptureHelper() error {
 		}
 		previous = current
 	}
+}
+
+// explainRemoteSessionCaptureFailure leads a capture error with its usual
+// cause when the Work PC's session is itself a Remote Desktop session: a
+// minimized Remote Desktop client stops the session from drawing its desktop,
+// so GDI and Desktop Duplication both fail. Viewers truncate long errors, so
+// the actionable part comes first.
+func explainRemoteSessionCaptureFailure(err error) error {
+	if win.GetSystemMetrics(smRemoteSession) == 0 {
+		return err
+	}
+	return fmt.Errorf("the Work PC's Remote Desktop session is not drawing its screen, usually because a Remote Desktop window connected to it is minimized; restore that window, or reconnect it from DeskFerry Home 0.13.1 or later, which keeps it drawing while minimized: %w", err)
 }
 
 func enablePhysicalDesktopCoordinates() {

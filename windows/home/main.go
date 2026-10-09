@@ -817,6 +817,15 @@ func (a *clientApp) run(smokeTest bool) error {
 	if err := a.setupNotifyIcon(); err != nil {
 		return err
 	}
+	if !smokeTest {
+		// Also covers Remote Desktop sessions started outside DeskFerry, so the
+		// screen viewer keeps working while one of them is minimized.
+		if changed, err := ensureRDPDrawsWhenMinimized(); err != nil {
+			a.appendLog("Could not keep Remote Desktop drawing while minimized: %v", err)
+		} else if changed {
+			a.appendLog("Remote Desktop now keeps drawing the Work PC while its window is minimized, so the screen viewer can capture it. Reconnect open Remote Desktop windows to apply this.")
+		}
+	}
 	a.mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		if a.exiting || smokeTest {
 			return
@@ -3101,6 +3110,9 @@ func localListenError(listenAddr string, err error) error {
 func launchMSTSC(cfg config) error {
 	if err := activateWindowsProfileCredential(cfg); err != nil {
 		log.Printf("activate saved Windows login for RDP and SMB: %v", err)
+	}
+	if _, err := ensureRDPDrawsWhenMinimized(); err != nil {
+		log.Printf("keep Remote Desktop drawing while minimized: %v", err)
 	}
 	if profile, err := writeMSTSCRDPFile(cfg); err == nil {
 		return exec.Command("mstsc.exe", profile).Start()

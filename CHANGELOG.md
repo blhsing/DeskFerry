@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.13.1 - 2026-10-09
+
+- Keep the screen viewer working while a Remote Desktop window to the Work PC is minimized. The Windows Remote Desktop client stops the remote session from drawing its desktop while minimized, which made screen capture fail. DeskFerry Home on Windows now sets the current user's `RemoteDesktop_SuppressWhenMinimized` to 2 at startup and before it opens Remote Desktop; Remote Desktop windows that were already open apply it after reconnecting.
+- When screen capture fails inside a Remote Desktop session, the viewer's error now starts with the likely cause and how to fix it.
+
 ## 0.13.0 - 2026-10-09
 
 A redesign of every DeskFerry interface around one shared design system (`docs/design-system.md`): a calm neutral background, white cards, status chips that change colour with state, one primary action per area, sentence-case labels, and consistent spacing and typography.
