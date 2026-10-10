@@ -164,8 +164,12 @@ final class FallbackWebSocket implements WebSocket {
         private static final int BINARY = 2;
         private static final int CLOSE = 8;
         private static final int MAX_BUFFERED = 8 * 1024 * 1024;
-        private static final int UPLOAD_PIPELINE = 3;
-        private static final int DOWNLOAD_PIPELINE = 2;
+        // Matches the Go clients: behind a buffering proxy each request holds
+        // its slot for about a round trip plus travel time, so interactive
+        // traffic needs about five uploads and four waiting GETs to stay at
+        // one round trip.
+        private static final int UPLOAD_PIPELINE = 5;
+        private static final int DOWNLOAD_PIPELINE = 4;
         private static final int PIPELINE_BATCH_BYTES = 256 * 1024;
         private static final int REORDER_LIMIT = 4096;
         private static final long KEEPALIVE_MILLIS = 10_000;

@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.13.2 - 2026-10-10
+
+- Widen the POST/GET streaming fallback's pipelines from three uploads and two waiting GETs to five uploads and four waiting GETs, on Windows, macOS, and Android. Behind a buffering proxy each request holds its slot for about a round trip plus its travel time, so data waited whenever every slot was busy. Through a buffering proxy with a 100 ms round trip, a message every 30 ms now returns in one round trip (p50 102 ms, p99 about 105 ms, down from p50 about 154 ms and p99 about 200 ms), with smaller gains under heavier traffic and no regression.
+- Keep enough idle connections for the wider pipelines so they are reused rather than re-authenticated with the proxy.
+
 ## 0.13.1 - 2026-10-09
 
 - Keep the screen viewer working while a Remote Desktop window to the Work PC is minimized. The Windows Remote Desktop client stops the remote session from drawing its desktop while minimized, which made screen capture fail. DeskFerry Home on Windows now sets the current user's `RemoteDesktop_SuppressWhenMinimized` to 2 at startup and before it opens Remote Desktop; Remote Desktop windows that were already open apply it after reconnecting.

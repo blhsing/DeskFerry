@@ -55,14 +55,18 @@ const (
 	httpStreamAckCoalesce          = 20 * time.Millisecond
 	httpStreamReadLimit            = 1 << 20
 	// Upload batches in flight at once, and the payload size at which a
-	// pipelined batch is split so large bursts spread across them.
-	httpStreamUploadPipeline     = 3
+	// pipelined batch is split so large bursts spread across them. Behind a
+	// buffering proxy each request holds its slot for about a round trip plus
+	// its travel time, so data waits whenever every slot is busy. With a
+	// 100 ms round trip, five uploads and four waiting GETs kept a message
+	// every 30 ms at one round trip, where three and two added about 50 ms.
+	httpStreamUploadPipeline     = 5
 	httpStreamPipelineBatchBytes = 256 << 10
 	// Out-of-order records a receiver holds while an earlier batch is late.
 	httpStreamReorderLimit = 4096
 	httpStreamResendAfter  = 3 * time.Second
 	// Downstream GETs kept waiting at a relay that supports pipelining.
-	httpStreamDownloadPipeline = 2
+	httpStreamDownloadPipeline = 4
 )
 
 type httpStreamFrame struct {
@@ -244,7 +248,7 @@ func httpStreamHTTPClientWithAuth(relayAddr, proxySpec string, authFactory integ
 		// Pipelined uploads plus the downstream GET use several connections
 		// at once. Keep them all reusable so an authenticating proxy does not
 		// renegotiate on fresh connections.
-		MaxIdleConnsPerHost: httpStreamUploadPipeline + 2,
+		MaxIdleConnsPerHost: httpStreamUploadPipeline + httpStreamDownloadPipeline + 1,
 	}
 	// HTTPS requests still need CONNECT before their ordinary POST/GET traffic
 	// can reach the relay. Use the same integrated-authentication tunnel dialer

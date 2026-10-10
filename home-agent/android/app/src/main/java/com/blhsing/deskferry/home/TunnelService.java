@@ -215,7 +215,7 @@ public class TunnelService extends Service {
                 roomProof = requestedRoomProof == null ? "" : requestedRoomProof.trim();
                 logRetentionDays = HomePrefs.sanitizeLogRetentionDays(requestedLogRetentionDays);
                 // Every relay socket shares this client. Over the HTTP-stream
-                // fallback each socket keeps up to two GETs waiting and three
+                // fallback each socket keeps up to four GETs waiting and five
                 // uploads in flight, so OkHttp's default of five concurrent
                 // requests per host would queue new calls behind long polls.
                 Dispatcher dispatcher = new Dispatcher();
@@ -223,7 +223,7 @@ public class TunnelService extends Service {
                 dispatcher.setMaxRequestsPerHost(128);
                 OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
                         .dispatcher(dispatcher)
-                        .connectionPool(new ConnectionPool(32, 5, TimeUnit.MINUTES))
+                        .connectionPool(new ConnectionPool(64, 5, TimeUnit.MINUTES))
                         .readTimeout(30, TimeUnit.SECONDS)
                         .retryOnConnectionFailure(true);
                 ProxySettings.apply(clientBuilder, requestedProxy);
