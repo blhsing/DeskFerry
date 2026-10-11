@@ -466,6 +466,49 @@ func TestResumablePairCoordinatesBothSidesAfterDrop(t *testing.T) {
 	}
 }
 
+func TestResumeAttachmentInterruptsSilentlyAbandonedTransport(t *testing.T) {
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	capability := http.Header{"X-DeskFerry-Resumable": []string{"1"}}
+	abandoned := dialRoleHeaders(t, ctx, server.URL, "/relay/unit-abandon/ws", "agent", capability)
+	defer abandoned.CloseNow()
+	waitForWaitingAgents(t, server.URL, "unit-abandon", 1)
+	home := dialRoleHeaders(t, ctx, server.URL, "/relay/unit-abandon/ws", "client", capability)
+	agentStart := expectTextPrefix(t, ctx, abandoned, startMessage+" ")
+	expectTextPrefix(t, ctx, home, startMessage+" ")
+	sessionID := strings.TrimPrefix(agentStart, startMessage+" ")
+
+	// The agent gives up on a stalled transport without closing it, as an
+	// HTTP-stream transport does, and attaches a resume socket. The relay must
+	// not wait for the abandoned transport to expire before resuming the home side.
+	agent := dialRoleHeaders(t, ctx, server.URL, "/relay/unit-abandon/ws", resumeRole, http.Header{
+		"X-DeskFerry-Session":      []string{sessionID},
+		"X-DeskFerry-Session-Side": []string{"agent"},
+	})
+	defer agent.Close(websocket.StatusNormalClosure, "session closed")
+	readCtx, readCancel := context.WithTimeout(ctx, 3*time.Second)
+	_, _, err := home.Read(readCtx)
+	timedOut := readCtx.Err() != nil
+	readCancel()
+	if err == nil || timedOut {
+		t.Fatalf("home transport was not interrupted promptly: %v", err)
+	}
+	home = dialRoleHeaders(t, ctx, server.URL, "/relay/unit-abandon/ws", resumeRole, http.Header{
+		"X-DeskFerry-Session":      []string{sessionID},
+		"X-DeskFerry-Session-Side": []string{"client"},
+	})
+	defer home.Close(websocket.StatusNormalClosure, "session closed")
+	expectText(t, ctx, agent, resumeMessage+" "+sessionID)
+	expectText(t, ctx, home, resumeMessage+" "+sessionID)
+	if err := agent.Write(ctx, websocket.MessageBinary, []byte("after-resume")); err != nil {
+		t.Fatal(err)
+	}
+	expectBinary(t, ctx, home, "after-resume")
+}
+
 func TestResumablePairReconstructsAfterRelayRestart(t *testing.T) {
 	server := httptest.NewServer(newServer())
 	defer server.Close()

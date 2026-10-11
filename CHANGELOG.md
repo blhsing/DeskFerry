@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.13.4 - 2026-10-11
+
+- Resume Remote Desktop sessions within seconds after one side abandons a stalled POST/GET streaming transport. That transport is abandoned without a close message, so the relay kept treating it as alive until it expired about five minutes later, never told the other side to resume, and the Remote Desktop client gave up after about 20 seconds. The Azure, Go, and Python relays now treat a resume connection from either side as proof that its previous transport failed, and immediately coordinate both sides to resume.
+
 ## 0.13.3 - 2026-10-11
 
 - Stop dropping Remote Desktop sessions that use the POST/GET streaming fallback through a proxy. On that path heartbeats routinely take about 4.7 seconds and data acknowledgements stall briefly for up to about 6 seconds before recovering on their own, but the 5-second Remote Desktop recovery deadline closed the transport first, and the session was often lost while it resumed. Remote Desktop over the streaming fallback now waits 8 seconds, on Windows, macOS, and Android; WebSocket transports keep the 5-second deadline.

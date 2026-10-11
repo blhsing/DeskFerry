@@ -1897,30 +1897,49 @@ sealed class ResumeSession
         {
             while (true)
             {
-                var completed = await Task.WhenAny(pumps.Values);
-                var result = await completed;
-                pumps.Remove(result.Direction);
-                if (IsSessionClose(result))
+                // A side only sends a resume socket after abandoning its
+                // transport. An HTTP-stream transport abandoned without a close
+                // frame stays apparently alive here until it expires minutes
+                // later, long after the RDP client gives up, so the arrival
+                // itself is treated as that side's failure. WaitToReadAsync
+                // leaves the attachment queued for the coordinated resume.
+                using var arrivalWait = CancellationTokenSource.CreateLinkedTokenSource(_finished.Token);
+                var agentArrival = _agent.Reader.WaitToReadAsync(arrivalWait.Token).AsTask();
+                var clientArrival = _client.Reader.WaitToReadAsync(arrivalWait.Token).AsTask();
+                var completed = await Task.WhenAny(pumps.Values.Cast<Task>().Append(agentArrival).Append(clientArrival));
+                arrivalWait.Cancel();
+                if (completed == agentArrival || completed == clientArrival)
                 {
-                    await Task.WhenAll(
-                        RelayRoom.CloseQuietlyAsync(agentEndpoint.Snapshot().Socket, WebSocketCloseStatus.NormalClosure, "session closed"),
-                        RelayRoom.CloseQuietlyAsync(clientEndpoint.Snapshot().Socket, WebSocketCloseStatus.NormalClosure, "session closed"));
-                    agentAttachment?.Done.TrySetResult();
-                    clientAttachment?.Done.TrySetResult();
-                    return;
+                    if (completed.IsCanceled || completed.IsFaulted) return;
+                    var arrivedSide = completed == agentArrival ? "agent" : "client";
+                    _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} failed_side={FailedSide} reason=resume attachment arrived", Room.Id, pairId, Id, arrivedSide);
                 }
-                if (result.FailedSide is not ("agent" or "client"))
+                else
                 {
-                    _log.LogWarning("resumable bridge pump stopped without endpoint failure room={Room} pair={PairId} session={Session} direction={Direction} error={Error}", Room.Id, pairId, Id, result.Direction, result.Error);
-                    return;
+                    var result = await (Task<ResumePumpResult>)completed;
+                    pumps.Remove(result.Direction);
+                    if (IsSessionClose(result))
+                    {
+                        await Task.WhenAll(
+                            RelayRoom.CloseQuietlyAsync(agentEndpoint.Snapshot().Socket, WebSocketCloseStatus.NormalClosure, "session closed"),
+                            RelayRoom.CloseQuietlyAsync(clientEndpoint.Snapshot().Socket, WebSocketCloseStatus.NormalClosure, "session closed"));
+                        agentAttachment?.Done.TrySetResult();
+                        clientAttachment?.Done.TrySetResult();
+                        return;
+                    }
+                    if (result.FailedSide is not ("agent" or "client"))
+                    {
+                        _log.LogWarning("resumable bridge pump stopped without endpoint failure room={Room} pair={PairId} session={Session} direction={Direction} error={Error}", Room.Id, pairId, Id, result.Direction, result.Error);
+                        return;
+                    }
+                    var failedEndpoint = result.FailedSide == "agent" ? agentEndpoint : clientEndpoint;
+                    if (failedEndpoint.Generation != result.FailedGeneration)
+                    {
+                        StartPump(result.Direction);
+                        continue;
+                    }
+                    _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} failed_side={FailedSide} direction={Direction} end={End} close_status={CloseStatus} close_reason={CloseReason} error={Error}", Room.Id, pairId, Id, result.FailedSide, result.Direction, result.End, result.CloseStatus, result.CloseReason, result.Error);
                 }
-                var failedEndpoint = result.FailedSide == "agent" ? agentEndpoint : clientEndpoint;
-                if (failedEndpoint.Generation != result.FailedGeneration)
-                {
-                    StartPump(result.Direction);
-                    continue;
-                }
-                _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} failed_side={FailedSide} direction={Direction} end={End} close_status={CloseStatus} close_reason={CloseReason} error={Error}", Room.Id, pairId, Id, result.FailedSide, result.Direction, result.End, result.CloseStatus, result.CloseReason, result.Error);
                 // Treat either transport failure as a generation barrier. A
                 // proxy can leave the opposite socket apparently alive after
                 // it has stopped carrying traffic. Releasing one replacement
@@ -2177,7 +2196,7 @@ static class RelayDashboard
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.13.3";
+    public const string Version = "0.13.4";
 }
 
 sealed class WaitingAgent

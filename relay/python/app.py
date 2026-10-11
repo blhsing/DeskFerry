@@ -21,7 +21,7 @@ from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.13.3"
+RELAY_VERSION = "0.13.4"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -1041,6 +1041,7 @@ class ResumeSession:
         self._agent: asyncio.Queue[ResumeAttachment] = asyncio.Queue(maxsize=2)
         self._client: asyncio.Queue[ResumeAttachment] = asyncio.Queue(maxsize=2)
         self._done = asyncio.Event()
+        self._arrival = asyncio.Event()
         self._on_finish = on_finish
 
     async def attach(self, side: str, websocket: WebSocket, remote: str) -> bool:
@@ -1048,6 +1049,7 @@ class ResumeSession:
         queue = self._agent if side == "agent" else self._client
         try:
             await queue.put(attachment)
+            self._arrival.set()
             done_task = asyncio.create_task(self._done.wait())
             await asyncio.wait({attachment.done, done_task}, return_when=asyncio.FIRST_COMPLETED)
             done_task.cancel()
@@ -1130,32 +1132,51 @@ class ResumeSession:
         start_pump("client_to_agent")
         try:
             while True:
-                done, _ = await asyncio.wait(set(pumps.values()), return_when=asyncio.FIRST_COMPLETED)
-                completed = next(iter(done))
-                result = await completed
-                pumps.pop(result.direction, None)
-                if is_session_close(result):
-                    await close_quietly(agent, 1000, "session closed")
-                    await close_quietly(client, 1000, "session closed")
-                    if agent_attachment is not None:
-                        try_set_result(agent_attachment.done, None)
-                    if client_attachment is not None:
-                        try_set_result(client_attachment.done, None)
-                    return
-                if result.failed_side not in {"agent", "client"}:
-                    logger.warning(
-                        "resumable bridge pump stopped without endpoint failure room=%s pair=%s session=%s direction=%s error=%r",
-                        self.room.id, pair_id, self.id, result.direction, result.error,
+                # A side only sends a resume socket after abandoning its
+                # transport. An HTTP-stream transport abandoned without a close
+                # frame stays apparently alive here until it expires minutes
+                # later, long after the RDP client gives up, so the arrival
+                # itself is treated as that side's failure. The attachment
+                # stays queued for the coordinated resume.
+                self._arrival.clear()
+                arrived_side = "agent" if not self._agent.empty() else "client" if not self._client.empty() else None
+                if arrived_side is None:
+                    arrival = asyncio.create_task(self._arrival.wait())
+                    done, _ = await asyncio.wait({*pumps.values(), arrival}, return_when=asyncio.FIRST_COMPLETED)
+                    arrival.cancel()
+                    pump_done = [task for task in done if task is not arrival]
+                    if not pump_done:
+                        arrived_side = "agent" if not self._agent.empty() else "client"
+                if arrived_side is not None:
+                    logger.info(
+                        "resumable bridge interrupted room=%s pair=%s session=%s failed_side=%s reason=resume attachment arrived",
+                        self.room.id, pair_id, self.id, arrived_side,
                     )
-                    return
-                failed_endpoint = agent_endpoint if result.failed_side == "agent" else client_endpoint
-                if failed_endpoint.generation != result.failed_generation:
-                    start_pump(result.direction)
-                    continue
-                logger.info(
-                    "resumable bridge interrupted room=%s pair=%s session=%s failed_side=%s direction=%s end=%s close_code=%s close_reason=%r error=%r",
-                    self.room.id, pair_id, self.id, result.failed_side, result.direction, result.end, result.close_code, result.close_reason, result.error,
-                )
+                else:
+                    result = await pump_done[0]
+                    pumps.pop(result.direction, None)
+                    if is_session_close(result):
+                        await close_quietly(agent, 1000, "session closed")
+                        await close_quietly(client, 1000, "session closed")
+                        if agent_attachment is not None:
+                            try_set_result(agent_attachment.done, None)
+                        if client_attachment is not None:
+                            try_set_result(client_attachment.done, None)
+                        return
+                    if result.failed_side not in {"agent", "client"}:
+                        logger.warning(
+                            "resumable bridge pump stopped without endpoint failure room=%s pair=%s session=%s direction=%s error=%r",
+                            self.room.id, pair_id, self.id, result.direction, result.error,
+                        )
+                        return
+                    failed_endpoint = agent_endpoint if result.failed_side == "agent" else client_endpoint
+                    if failed_endpoint.generation != result.failed_generation:
+                        start_pump(result.direction)
+                        continue
+                    logger.info(
+                        "resumable bridge interrupted room=%s pair=%s session=%s failed_side=%s direction=%s end=%s close_code=%s close_reason=%r error=%r",
+                        self.room.id, pair_id, self.id, result.failed_side, result.direction, result.end, result.close_code, result.close_reason, result.error,
+                    )
                 # Treat either transport failure as a generation barrier. A
                 # proxy can leave the opposite socket apparently alive after
                 # it has stopped carrying traffic. Releasing one replacement

@@ -1735,7 +1735,7 @@ func (s *ResumeSession) Run(agent, client tunnel.MessageConn, clientDone chan st
 func (s *ResumeSession) RunRecovered(stateChanged func()) {
 	defer s.Finish()
 	for {
-		agentAttachment, clientAttachment, ok := s.waitForAttachments()
+		agentAttachment, clientAttachment, ok := s.waitForAttachments(nil, nil)
 		if !ok {
 			return
 		}
@@ -1796,34 +1796,45 @@ func (s *ResumeSession) run(agent, client tunnel.MessageConn, clientDone chan st
 	}()
 
 	for {
-		result := <-pumpDone
-		running[result.Direction] = false
-		if isSessionClose(result.Err) {
-			closeQuietly(agent, websocket.StatusNormalClosure, "session closed")
-			closeQuietly(client, websocket.StatusNormalClosure, "session closed")
-			if agentAttachment != nil {
-				closeOnce(agentAttachment.Done)
+		var earlyAgent, earlyClient *ResumeAttachment
+		select {
+		case result := <-pumpDone:
+			running[result.Direction] = false
+			if isSessionClose(result.Err) {
+				closeQuietly(agent, websocket.StatusNormalClosure, "session closed")
+				closeQuietly(client, websocket.StatusNormalClosure, "session closed")
+				if agentAttachment != nil {
+					closeOnce(agentAttachment.Done)
+				}
+				if clientAttachment != nil {
+					closeOnce(clientAttachment.Done)
+				}
+				return
 			}
-			if clientAttachment != nil {
-				closeOnce(clientAttachment.Done)
+			if result.FailedSide == "" {
+				log.Printf("resumable bridge pump stopped without endpoint failure room=%s pair=%d session=%s direction=%s error=%v", s.Room.ID, pairID, s.ID, result.Direction, result.Err)
+				return
 			}
-			return
+			failedEndpoint := clientEndpoint
+			if result.FailedSide == "agent" {
+				failedEndpoint = agentEndpoint
+			}
+			if failedEndpoint.Generation() != result.FailedGeneration {
+				// A pump attached to an obsolete socket reported its expected
+				// shutdown after the replacement was already installed.
+				startPump(result.Direction)
+				continue
+			}
+			log.Printf("resumable bridge interrupted room=%s pair=%d session=%s failed_side=%s direction=%s error=%v", s.Room.ID, pairID, s.ID, result.FailedSide, result.Direction, result.Err)
+		case earlyAgent = <-s.agent:
+			log.Printf("resumable bridge interrupted room=%s pair=%d session=%s failed_side=agent reason=resume attachment arrived", s.Room.ID, pairID, s.ID)
+		case earlyClient = <-s.client:
+			log.Printf("resumable bridge interrupted room=%s pair=%d session=%s failed_side=client reason=resume attachment arrived", s.Room.ID, pairID, s.ID)
 		}
-		if result.FailedSide == "" {
-			log.Printf("resumable bridge pump stopped without endpoint failure room=%s pair=%d session=%s direction=%s error=%v", s.Room.ID, pairID, s.ID, result.Direction, result.Err)
-			return
-		}
-		failedEndpoint := clientEndpoint
-		if result.FailedSide == "agent" {
-			failedEndpoint = agentEndpoint
-		}
-		if failedEndpoint.Generation() != result.FailedGeneration {
-			// A pump attached to an obsolete socket reported its expected
-			// shutdown after the replacement was already installed.
-			startPump(result.Direction)
-			continue
-		}
-		log.Printf("resumable bridge interrupted room=%s pair=%d session=%s failed_side=%s direction=%s error=%v", s.Room.ID, pairID, s.ID, result.FailedSide, result.Direction, result.Err)
+		// A side only sends a resume socket after abandoning its transport. An
+		// HTTP-stream transport abandoned without a close frame stays apparently
+		// alive here until it expires minutes later, long after the RDP client
+		// gives up, so the arrival itself is treated as that side's failure.
 
 		// Treat either transport failure as a generation barrier. A proxy can
 		// leave the opposite socket apparently alive after it has stopped
@@ -1843,7 +1854,8 @@ func (s *ResumeSession) run(agent, client tunnel.MessageConn, clientDone chan st
 
 		for {
 			var ok bool
-			agentAttachment, clientAttachment, ok = s.waitForAttachments()
+			agentAttachment, clientAttachment, ok = s.waitForAttachments(earlyAgent, earlyClient)
+			earlyAgent, earlyClient = nil, nil
 			if !ok {
 				return
 			}
@@ -1880,10 +1892,9 @@ func isSessionClose(err error) bool {
 	return errors.As(err, &closeErr) && closeErr.Code == websocket.StatusNormalClosure && closeErr.Reason == "session closed"
 }
 
-func (s *ResumeSession) waitForAttachments() (*ResumeAttachment, *ResumeAttachment, bool) {
+func (s *ResumeSession) waitForAttachments(agent, client *ResumeAttachment) (*ResumeAttachment, *ResumeAttachment, bool) {
 	timer := time.NewTimer(5 * time.Minute)
 	defer timer.Stop()
-	var agent, client *ResumeAttachment
 	for agent == nil || client == nil {
 		select {
 		case next := <-s.agent:

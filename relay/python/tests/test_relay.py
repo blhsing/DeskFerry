@@ -402,6 +402,44 @@ def test_resumable_pair_coordinates_both_sides_after_drop():
     asyncio.run(scenario())
 
 
+def test_resume_attachment_interrupts_silently_abandoned_transport():
+    from app import RelayRoom, ResumeSession
+
+    async def scenario():
+        room = RelayRoom("unit-abandon")
+        session = ResumeSession("e" * 32, room, "work", "home", lambda _: None)
+        agent = FakeWebSocket()
+        home = FakeWebSocket()
+        session_task = asyncio.create_task(session.run(agent, home, asyncio.Future(), lambda: None))
+
+        # The agent gives up on a stalled transport without closing it, as an
+        # HTTP-stream transport does, and attaches a resume socket. The relay
+        # must not wait for the abandoned transport to expire.
+        resumed_agent = FakeWebSocket()
+        agent_attach = asyncio.create_task(session.attach("agent", resumed_agent, "work-2"))
+        for _ in range(50):
+            if home.closed:
+                break
+            await asyncio.sleep(0.01)
+        assert home.closed is True
+
+        resumed_home = FakeWebSocket()
+        home_attach = asyncio.create_task(session.attach("client", resumed_home, "home-2"))
+        for _ in range(50):
+            if resumed_agent.text_messages and resumed_home.text_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert resumed_agent.text_messages == ["resume " + session.id]
+        assert resumed_home.text_messages == ["resume " + session.id]
+
+        session_task.cancel()
+        for task in (agent_attach, home_attach):
+            task.cancel()
+        await asyncio.gather(session_task, agent_attach, home_attach, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_resumable_pair_coalesces_overlapping_side_replacements():
     from app import RelayRoom, ResumeSession
 
