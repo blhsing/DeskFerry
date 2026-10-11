@@ -16,18 +16,22 @@ import (
 )
 
 const (
-	resumableFrameData        = byte(1)
-	resumableFrameAck         = byte(2)
-	resumableFramePing        = byte(3)
-	resumableFramePong        = byte(4)
-	resumableHeaderLen        = 9
-	resumableChunkSize        = 64 * 1024
-	resumableMaxBuffer        = 8 * 1024 * 1024
-	resumableWindow           = 5 * time.Minute
-	defaultHeartbeatInterval  = 5 * time.Second
-	defaultHeartbeatTimeout   = 15 * time.Second
-	ackStallThreshold         = 3 * time.Second
-	rdpAckRecoveryThreshold   = 5 * time.Second
+	resumableFrameData       = byte(1)
+	resumableFrameAck        = byte(2)
+	resumableFramePing       = byte(3)
+	resumableFramePong       = byte(4)
+	resumableHeaderLen       = 9
+	resumableChunkSize       = 64 * 1024
+	resumableMaxBuffer       = 8 * 1024 * 1024
+	resumableWindow          = 5 * time.Minute
+	defaultHeartbeatInterval = 5 * time.Second
+	defaultHeartbeatTimeout  = 15 * time.Second
+	ackStallThreshold        = 3 * time.Second
+	rdpAckRecoveryThreshold  = 5 * time.Second
+	// HTTP-stream fallback through corporate proxies routinely shows ~4.7s
+	// heartbeat round trips and self-healing ack stalls of up to ~6s, so the
+	// WebSocket RDP deadline would drop transports that were about to recover.
+	rdpHTTPStreamAckRecovery  = 8 * time.Second
 	defaultAckRecovery        = 10 * time.Second
 	resumableDialAttemptLimit = 8 * time.Second
 )
@@ -611,6 +615,9 @@ func (c *resumableWebSocketConn) checkAckProgress(now time.Time) {
 	recoveryThreshold := defaultAckRecovery
 	if c.opts.Service == ServiceRDP {
 		recoveryThreshold = rdpAckRecoveryThreshold
+		if protocol == "http-stream" {
+			recoveryThreshold = rdpHTTPStreamAckRecovery
+		}
 	}
 	shouldRecover := elapsed >= recoveryThreshold
 	c.mu.Unlock()

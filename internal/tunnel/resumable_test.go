@@ -104,6 +104,22 @@ func TestNonRDPAckStallKeepsConservativeRecoveryDeadline(t *testing.T) {
 	}
 }
 
+func TestRDPHTTPStreamAckStallToleratesProxyLatency(t *testing.T) {
+	ws := &HTTPStreamConn{}
+	c := &resumableWebSocketConn{
+		opts: ResumableWebSocketOptions{SessionID: "test-session", Side: "agent", Service: ServiceRDP},
+		ws:   ws, generation: 1, lost: make(chan struct{}, 1),
+		sendBuffer: []byte("hello"), sendEnd: 5,
+	}
+	c.cond = sync.NewCond(&c.mu)
+	now := time.Now()
+	c.lastAckProgress = now.Add(-rdpHTTPStreamAckRecovery + time.Millisecond)
+	c.checkAckProgress(now)
+	if c.ws == nil {
+		t.Fatal("HTTP-stream RDP transport was dropped before its recovery deadline")
+	}
+}
+
 type recordingMessageConn struct {
 	closed atomic.Bool
 }
