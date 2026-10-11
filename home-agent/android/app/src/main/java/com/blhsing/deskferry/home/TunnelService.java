@@ -84,6 +84,8 @@ public class TunnelService extends Service {
     private static final long HEARTBEAT_INTERVAL_MS = 5L * 1000L;
     private static final long DIAGNOSTIC_STALL_MS = 3L * 1000L;
     private static final long RDP_ACK_RECOVERY_MS = 5L * 1000L;
+    // Proxy-routed HTTP-stream fallback has ~4.7s round trips and self-healing ack stalls of up to ~6s.
+    private static final long RDP_HTTP_STREAM_ACK_RECOVERY_MS = 8L * 1000L;
     private static final long DEFAULT_ACK_RECOVERY_MS = 10L * 1000L;
     private static final long HEARTBEAT_TIMEOUT_MS = 15L * 1000L;
     private static final long RESUME_ATTEMPT_TIMEOUT_MS = 8L * 1000L;
@@ -1145,7 +1147,10 @@ public class TunnelService extends Service {
 						append(serviceLabel + " relay acknowledgements stalled session=" + sessionId + " relay=" + selectedRelay
 								+ " generation=" + generation + " pending_bytes=" + pending + " no_progress_ms=" + noProgress + ".");
 					}
-					long recoveryDeadline = "rdp".equals(service) ? RDP_ACK_RECOVERY_MS : DEFAULT_ACK_RECOVERY_MS;
+					long recoveryDeadline = DEFAULT_ACK_RECOVERY_MS;
+					if ("rdp".equals(service)) {
+						recoveryDeadline = "http-stream".equals(relayProtocol(stalledSocket)) ? RDP_HTTP_STREAM_ACK_RECOVERY_MS : RDP_ACK_RECOVERY_MS;
+					}
 					if (noProgress >= recoveryDeadline) {
 						markTransportLost(stalledSocket, "data acknowledgements made no progress for " + noProgress + "ms");
 					}

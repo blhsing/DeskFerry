@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.13.3 - 2026-10-11
+
+- Stop dropping Remote Desktop sessions that use the POST/GET streaming fallback through a proxy. On that path heartbeats routinely take about 4.7 seconds and data acknowledgements stall briefly for up to about 6 seconds before recovering on their own, but the 5-second Remote Desktop recovery deadline closed the transport first, and the session was often lost while it resumed. Remote Desktop over the streaming fallback now waits 8 seconds, on Windows, macOS, and Android; WebSocket transports keep the 5-second deadline.
+
 ## 0.13.2 - 2026-10-10
 
 - Widen the POST/GET streaming fallback's pipelines from three uploads and two waiting GETs to five uploads and four waiting GETs, on Windows, macOS, and Android. Behind a buffering proxy each request holds its slot for about a round trip plus its travel time, so data waited whenever every slot was busy. Through a buffering proxy with a 100 ms round trip, a message every 30 ms now returns in one round trip (p50 102 ms, p99 about 105 ms, down from p50 about 154 ms and p99 about 200 ms), with smaller gains under heavier traffic and no regression.
