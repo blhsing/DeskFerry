@@ -88,6 +88,8 @@ public class TunnelService extends Service {
     private static final long RDP_HTTP_STREAM_ACK_RECOVERY_MS = 8L * 1000L;
     private static final long DEFAULT_ACK_RECOVERY_MS = 10L * 1000L;
     private static final long HEARTBEAT_TIMEOUT_MS = 15L * 1000L;
+    // Remote Desktop clients reset about 16s after data stops; notice a frozen path in time to resume.
+    private static final long RDP_HEARTBEAT_TIMEOUT_MS = 8L * 1000L;
     private static final long RESUME_ATTEMPT_TIMEOUT_MS = 8L * 1000L;
     private static final int MAX_CONCURRENT_BRIDGES_PER_SERVICE = 2;
     private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss", Locale.ROOT);
@@ -1530,7 +1532,7 @@ public class TunnelService extends Service {
 						return;
 					}
 					long pingAt = SystemClock.elapsedRealtime();
-					long deadline = SystemClock.elapsedRealtime() + HEARTBEAT_TIMEOUT_MS;
+					long deadline = SystemClock.elapsedRealtime() + ("rdp".equals(service) ? RDP_HEARTBEAT_TIMEOUT_MS : HEARTBEAT_TIMEOUT_MS);
 					synchronized (resumeLock) {
 						while (!closed.get() && webSocket == socket && transportGeneration == generation
 								&& heartbeatAcknowledged < nonce) {

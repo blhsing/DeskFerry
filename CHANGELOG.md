@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.13.5 - 2026-10-12
+
+- Notice a frozen relay path within 8 seconds instead of 15 during Remote Desktop sessions, on Windows, macOS, and Android. The OCI relay's network briefly stops passing traffic for about 11 seconds, roughly once an hour. A side with no data awaiting acknowledgement only noticed through its 15-second heartbeat timeout, after the Remote Desktop client had already reset the connection (about 16 seconds after data stopped). It now notices at 8 seconds and keeps retrying the resume, so the session reattaches as soon as the path recovers. Other services keep the 15-second timeout.
+
 ## 0.13.4 - 2026-10-11
 
 - Resume Remote Desktop sessions within seconds after one side abandons a stalled POST/GET streaming transport. That transport is abandoned without a close message, so the relay kept treating it as alive until it expired about five minutes later, never told the other side to resume, and the Remote Desktop client gave up after about 20 seconds. The Azure, Go, and Python relays now treat a resume connection from either side as proof that its previous transport failed, and immediately coordinate both sides to resume.

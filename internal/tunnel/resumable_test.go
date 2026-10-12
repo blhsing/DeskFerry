@@ -483,3 +483,16 @@ func TestParseFrameRejectsOversizedDataAndAckPayload(t *testing.T) {
 		t.Fatal("heartbeat payload was accepted")
 	}
 }
+
+func TestRDPHeartbeatTimeoutFitsRemoteDesktopReconnectWindow(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rdp := NewResumableWebSocketConn(ctx, nil, ResumableWebSocketOptions{SessionID: "rdp", Service: ServiceRDP}).(*resumableWebSocketConn)
+	smb := NewResumableWebSocketConn(ctx, nil, ResumableWebSocketOptions{SessionID: "smb", Service: ServiceSMB}).(*resumableWebSocketConn)
+	if rdp.opts.heartbeatTimeout != rdpHeartbeatTimeout {
+		t.Fatalf("RDP heartbeat timeout = %s", rdp.opts.heartbeatTimeout)
+	}
+	if smb.opts.heartbeatTimeout != defaultHeartbeatTimeout {
+		t.Fatalf("SMB heartbeat timeout = %s", smb.opts.heartbeatTimeout)
+	}
+}

@@ -26,7 +26,12 @@ const (
 	resumableWindow          = 5 * time.Minute
 	defaultHeartbeatInterval = 5 * time.Second
 	defaultHeartbeatTimeout  = 15 * time.Second
-	ackStallThreshold        = 3 * time.Second
+	// Remote Desktop clients reset the connection about 16s after data stops.
+	// A side with nothing awaiting acknowledgement learns of a frozen path only
+	// from heartbeats, so RDP must notice within the acknowledgement recovery
+	// deadline and keep retrying its resume while the path is still frozen.
+	rdpHeartbeatTimeout = 8 * time.Second
+	ackStallThreshold       = 3 * time.Second
 	rdpAckRecoveryThreshold  = 5 * time.Second
 	// HTTP-stream fallback through corporate proxies routinely shows ~4.7s
 	// heartbeat round trips and self-healing ack stalls of up to ~6s, so the
@@ -71,6 +76,9 @@ func NewResumableWebSocketConn(ctx context.Context, initial MessageConn, opts Re
 	}
 	if c.opts.heartbeatTimeout <= 0 {
 		c.opts.heartbeatTimeout = defaultHeartbeatTimeout
+		if c.opts.Service == ServiceRDP {
+			c.opts.heartbeatTimeout = rdpHeartbeatTimeout
+		}
 	}
 	c.cond = sync.NewCond(&c.mu)
 	go c.connectionLoop(initial)
