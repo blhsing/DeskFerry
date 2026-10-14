@@ -40,4 +40,20 @@ public class TunnelServiceTest {
         assertFalse(TunnelService.isTerminalResumeClose(1012));
         assertFalse(TunnelService.isTerminalResumeClose(1013));
     }
+
+    @Test
+    public void idleProtocolV2WorkAgentIsOnline() {
+        assertTrue(TunnelService.workAgentOnline(1, 0, 0));
+        assertTrue(TunnelService.workAgentOnline(0, 1, 0));
+        assertTrue(TunnelService.workAgentOnline(0, 0, 1));
+        assertFalse(TunnelService.workAgentOnline(0, 0, 0));
+    }
+
+    @Test
+    public void roomAuthenticationFailureIsRecognized() {
+        assertTrue(TunnelService.isRoomAuthenticationFailure(1008, "room authentication failed"));
+        assertFalse(TunnelService.isRoomAuthenticationFailure(1008, "unsupported role"));
+        assertFalse(TunnelService.isRoomAuthenticationFailure(1000, "room authentication failed"));
+        assertFalse(TunnelService.isRoomAuthenticationFailure(1008, null));
+    }
 }

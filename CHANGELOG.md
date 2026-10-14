@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.13.6 - 2026-10-14
+
+- Show the Android Home app's Work agent as Online while it is idle. The app counted only legacy waiting Work sockets and active streams, but protocol v2 Work agents hold control connections and open data sockets on demand, so an idle Work agent always appeared Offline.
+- Report a wrong room password in the Android Home app. The relay accepts the connection before checking the room password and then closes it, so the app looked connected but the Work agent appeared Offline and Remote Desktop could not connect. The app now shows "Wrong password" and asks you to re-enter the room password.
+
 ## 0.13.5 - 2026-10-12
 
 - Notice a frozen relay path within 8 seconds instead of 15 during Remote Desktop sessions, on Windows, macOS, and Android. The OCI relay's network briefly stops passing traffic for about 11 seconds, roughly once an hour. A side with no data awaiting acknowledgement only noticed through its 15-second heartbeat timeout, after the Remote Desktop client had already reset the connection (about 16 seconds after data stopped). It now notices at 8 seconds and keeps retrying the resume, so the session reattaches as soon as the path recovers. Other services keep the 15-second timeout.

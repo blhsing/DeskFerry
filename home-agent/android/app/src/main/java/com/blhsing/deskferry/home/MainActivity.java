@@ -969,6 +969,10 @@ public class MainActivity extends Activity {
                 ui.setChip(workStatus, Ui.Tone.DANGER, "Unreachable");
                 workDetail.setText("Relay status unavailable");
                 break;
+            case "Rejected":
+                ui.setChip(workStatus, Ui.Tone.DANGER, "Wrong password");
+                workDetail.setText("Re-enter the room password");
+                break;
             case "Unknown":
                 ui.setChip(workStatus, Ui.Tone.NEUTRAL, "Unknown");
                 workDetail.setText(state.running ? "Waiting for relay status" : "Start the tunnel to check");
@@ -996,6 +1000,10 @@ public class MainActivity extends Activity {
             case "Offline":
                 ui.setChip(homeStatus, state.running ? Ui.Tone.DANGER : Ui.Tone.NEUTRAL, "Offline");
                 homeDetail.setText("Not announced");
+                break;
+            case "Rejected":
+                ui.setChip(homeStatus, Ui.Tone.DANGER, "Rejected");
+                homeDetail.setText("Room password rejected");
                 break;
             default:
                 ui.setChip(homeStatus, Ui.Tone.WARNING, home);
@@ -1025,6 +1033,9 @@ public class MainActivity extends Activity {
             statusSentence.setText(active == 1
                     ? "Connected. 1 active session through the relay."
                     : "Connected. " + active + " active sessions through the relay.");
+        } else if ("Rejected".equals(work)) {
+            ui.setChip(overallChip, Ui.Tone.DANGER, "Wrong password");
+            statusSentence.setText("The relay rejected the room password. Re-enter it in Settings, then restart the tunnel.");
         } else if ("Connected".equals(work)) {
             ui.setChip(overallChip, Ui.Tone.SUCCESS, "Connected");
             statusSentence.setText("Ready. Point your Remote Desktop app at " + state.rdpAddress + ".");

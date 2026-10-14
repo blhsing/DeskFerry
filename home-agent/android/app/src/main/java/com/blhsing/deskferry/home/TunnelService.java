@@ -78,6 +78,7 @@ public class TunnelService extends Service {
     private static final int NOTIFICATION_ID = 7310;
     private static final String LOG_TAG = "DeskFerryHome";
     private static final long MAX_DIAGNOSTIC_LOG_BYTES = 8L * 1024L * 1024L;
+    private static final long PRESENCE_CONFIRM_MILLIS = 2L * 1000L;
     private static final int RESUMABLE_MAX_BUFFER = 8 * 1024 * 1024;
     private static final int RESUMABLE_CHUNK_SIZE = 64 * 1024;
     private static final long RESUMABLE_WINDOW_MS = 5L * 60L * 1000L;
@@ -134,6 +135,9 @@ public class TunnelService extends Service {
     private volatile int localPort = HomePrefs.DEFAULT_LOCAL_PORT;
 	private volatile int localSMBPort = HomePrefs.DEFAULT_LOCAL_SMB_PORT;
     private volatile String roomProof = "";
+    // Set when the relay closes the presence socket for a wrong room password.
+    private volatile boolean roomAuthRejected;
+    private volatile String lastRelayWorkStatus = "Checking";
     private volatile int logRetentionDays = HomePrefs.DEFAULT_LOG_RETENTION_DAYS;
     private volatile String lastPrunedLogDate = "";
     private volatile int activeConnections;
@@ -217,6 +221,7 @@ public class TunnelService extends Service {
 					throw new IllegalArgumentException("local SMB and RDP ports must be different");
 				}
                 roomProof = requestedRoomProof == null ? "" : requestedRoomProof.trim();
+                roomAuthRejected = false;
                 logRetentionDays = HomePrefs.sanitizeLogRetentionDays(requestedLogRetentionDays);
                 // Every relay socket shares this client. Over the HTTP-stream
                 // fallback each socket keeps up to four GETs waiting and five
@@ -502,7 +507,6 @@ public class TunnelService extends Service {
                             public void onOpen(WebSocket webSocket, Response response) {
                                 presenceSocket = webSocket;
                                 openedCandidate.set(true);
-                                updateState(null, "Online", null, null);
                                 append("Home status connected to " + candidate + ".");
                             }
 
@@ -510,6 +514,9 @@ public class TunnelService extends Service {
                             public void onClosed(WebSocket webSocket, int code, String reason) {
                                 if (openedCandidate.get()) {
                                     append("Home status disconnected relay=" + candidate + " duration_ms=" + elapsedMillis(attemptStarted) + " close_code=" + code + " close_reason=" + quoted(reason) + ".");
+                                }
+                                if (running && isRoomAuthenticationFailure(code, reason)) {
+                                    markRoomAuthRejected(candidate);
                                 }
                                 closed.countDown();
                             }
@@ -525,6 +532,14 @@ public class TunnelService extends Service {
                             }
                         });
                         presenceSocket = socket;
+                        // The relay accepts the upgrade before it checks the
+                        // room password, so a rejected socket opens and then
+                        // closes at once. Report Online only once it stays up.
+                        if (!closed.await(PRESENCE_CONFIRM_MILLIS, TimeUnit.MILLISECONDS) && openedCandidate.get()) {
+                            boolean wasRejected = roomAuthRejected;
+                            roomAuthRejected = false;
+                            updateState(null, "Online", wasRejected ? lastRelayWorkStatus : null, null);
+                        }
                         closed.await();
                     } catch (Exception ex) {
                         failure.set(ex.getMessage());
@@ -566,7 +581,7 @@ public class TunnelService extends Service {
                             public void onOpen(WebSocket webSocket, Response response) {
                                 statusSocket = webSocket;
                                 openedCandidate.set(true);
-                                updateState(null, null, "Checking", "Relay status stream connected to " + candidate + ".");
+                                updateState(null, null, roomAuthRejected ? null : "Checking", "Relay status stream connected to " + candidate + ".");
                             }
 
                             @Override
@@ -618,21 +633,50 @@ public class TunnelService extends Service {
         try {
             JSONObject root = new JSONObject(payload);
             JSONArray rooms = root.optJSONArray("rooms");
+            int controls = 0;
             int waiting = 0;
             int active = 0;
             if (rooms != null) {
                 for (int i = 0; i < rooms.length(); i++) {
                     JSONObject room = rooms.getJSONObject(i);
+                    controls += room.optInt("control_connections", 0);
                     waiting += room.optInt("waiting_agents", 0);
                     active += room.optInt("active_pairs", 0);
                 }
             }
-            boolean online = waiting + active > 0;
-            String detail = waiting + " waiting work sockets, " + active + " active streams.";
-            updateState(null, null, online ? "Connected" : "Waiting", detail);
+            String work = workAgentOnline(controls, waiting, active) ? "Connected" : "Waiting";
+            lastRelayWorkStatus = work;
+            if (roomAuthRejected) {
+                // The dashboard stream is unauthenticated, so it reports the
+                // Work agent even when this phone's room password is wrong.
+                return;
+            }
+            String detail = controls + " work control connections, " + waiting + " legacy work sockets, " + active + " active streams.";
+            updateState(null, null, work, detail);
         } catch (Exception ex) {
             updateState(null, null, "Check relay", "Relay status stream: " + ex.getMessage());
         }
+    }
+
+    /**
+     * Protocol v2 Work agents hold agent-control sockets and open data sockets
+     * on demand, so they appear only as control connections while idle.
+     * Legacy agents park waiting sockets instead.
+     */
+    static boolean workAgentOnline(int controlConnections, int waitingAgents, int activePairs) {
+        return controlConnections + waitingAgents + activePairs > 0;
+    }
+
+    static boolean isRoomAuthenticationFailure(int code, String reason) {
+        return code == 1008 && reason != null && reason.contains("authentication failed");
+    }
+
+    private void markRoomAuthRejected(String relay) {
+        if (!roomAuthRejected) {
+            append("Relay rejected the room password relay=" + relay + ". Re-enter the room password in Settings.");
+        }
+        roomAuthRejected = true;
+        updateState(null, "Rejected", "Rejected", "The relay rejected this room password.");
     }
 
     private Request webSocketRequest(String relayUrl, String role) throws URISyntaxException {
