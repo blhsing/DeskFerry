@@ -443,11 +443,17 @@ func TestLogicalSessionCloseRequiresExplicitReason(t *testing.T) {
 }
 
 func TestResumableDialAttemptLeavesTimeForRetry(t *testing.T) {
-	if got := resumableDialAttemptTimeout(resumableWindow); got != 8*time.Second {
+	if got := resumableDialAttemptTimeout(resumableWindow, ServiceSMB, 0); got != 8*time.Second {
 		t.Fatalf("dial attempt timeout = %s, want 8s", got)
 	}
-	if got := resumableDialAttemptTimeout(3 * time.Second); got != 3*time.Second {
+	if got := resumableDialAttemptTimeout(3*time.Second, ServiceSMB, 0); got != 3*time.Second {
 		t.Fatalf("short remaining timeout = %s, want 3s", got)
+	}
+	if got := resumableDialAttemptTimeout(resumableWindow, ServiceRDP, 0); got != rdpResumeDialAttemptLimit {
+		t.Fatalf("RDP dial attempt timeout = %s, want %s", got, rdpResumeDialAttemptLimit)
+	}
+	if got := resumableDialAttemptTimeout(resumableWindow, ServiceRDP, rdpResumeDialShortTimeoutRuns); got != resumableDialAttemptLimit {
+		t.Fatalf("RDP dial timeout after repeated timeouts = %s, want %s", got, resumableDialAttemptLimit)
 	}
 }
 

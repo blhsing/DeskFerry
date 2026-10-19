@@ -1680,6 +1680,7 @@ public class TunnelService extends Service {
                 long backoff = 250;
                 try {
                     while (!closed.get() && SystemClock.elapsedRealtime() < deadline) {
+                        boolean attemptTimedOut = false;
                         CountDownLatch ready = new CountDownLatch(1);
                         AtomicBoolean started = new AtomicBoolean(false);
                         AtomicReference<Throwable> failure = new AtomicReference<>();
@@ -1713,6 +1714,7 @@ public class TunnelService extends Service {
                                 return;
                             }
 							if (!closed.get()) {
+								attemptTimedOut = !signaled;
 								String result = !signaled ? "attempt_timeout" : "transport_failure";
 								append(serviceLabel + " relay resume attempt failed relay=" + selectedRelay
 										+ " result=" + result + " elapsed_ms=" + elapsedMillis(attemptStarted)
@@ -1736,7 +1738,10 @@ public class TunnelService extends Service {
 							}
                         }
                         sleepQuietly(backoff);
-                        backoff = Math.min(5000, backoff * 2);
+                        // An attempt that ran out its whole wait has already waited.
+                        if (!attemptTimedOut) {
+                            backoff = Math.min(5000, backoff * 2);
+                        }
                     }
                     if (!closed.get()) {
                         recordTermination("resume_window_expired");

@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.13.7 - 2026-10-19
+
+- Reconnect Remote Desktop sessions sooner after the relay path recovers from a freeze. A resume attempt started while the path was frozen kept waiting for its full 8-second limit after the path came back, and failed attempts also doubled the delay before the next one, so a session could resume a fraction of a second after the Remote Desktop client had already given up. On Windows and macOS, Remote Desktop resume attempts now give up after 4 seconds, returning to 8 seconds after three consecutive timeouts in case a slow proxy needs longer. On every client, an attempt that timed out no longer increases the delay before the next one.
+
 ## 0.13.6 - 2026-10-14
 
 - Show the Android Home app's Work agent as Online while it is idle. The app counted only legacy waiting Work sockets and active streams, but protocol v2 Work agents hold control connections and open data sockets on demand, so an idle Work agent always appeared Offline.

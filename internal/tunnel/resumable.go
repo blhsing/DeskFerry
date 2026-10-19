@@ -30,15 +30,21 @@ const (
 	// A side with nothing awaiting acknowledgement learns of a frozen path only
 	// from heartbeats, so RDP must notice within the acknowledgement recovery
 	// deadline and keep retrying its resume while the path is still frozen.
-	rdpHeartbeatTimeout = 8 * time.Second
+	rdpHeartbeatTimeout     = 8 * time.Second
 	ackStallThreshold       = 3 * time.Second
-	rdpAckRecoveryThreshold  = 5 * time.Second
+	rdpAckRecoveryThreshold = 5 * time.Second
 	// HTTP-stream fallback through corporate proxies routinely shows ~4.7s
 	// heartbeat round trips and self-healing ack stalls of up to ~6s, so the
 	// WebSocket RDP deadline would drop transports that were about to recover.
 	rdpHTTPStreamAckRecovery  = 8 * time.Second
 	defaultAckRecovery        = 10 * time.Second
 	resumableDialAttemptLimit = 8 * time.Second
+	// A resume dial sent into a frozen path waits on connection retries long
+	// after the path recovers. RDP retries on a shorter cycle so a fresh dial
+	// starts soon after recovery, inside the client's reconnect window, and
+	// falls back to the full limit if a slow proxy keeps needing longer.
+	rdpResumeDialAttemptLimit     = 4 * time.Second
+	rdpResumeDialShortTimeoutRuns = 3
 )
 
 type ResumableWebSocketOptions struct {
@@ -250,6 +256,7 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 	}()
 	ws := initial
 	backoff := 250 * time.Millisecond
+	dialTimeouts := 0
 	for {
 		if ws != nil {
 			c.drainLostSignal()
@@ -281,10 +288,16 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 		}
 
 		remaining := resumableWindow - time.Since(lostAt)
-		dialTimeout := resumableDialAttemptTimeout(remaining)
+		dialTimeout := resumableDialAttemptTimeout(remaining, c.opts.Service, dialTimeouts)
 		dialCtx, cancelDial := context.WithTimeout(c.ctx, dialTimeout)
 		candidate, err := c.dialResume(dialCtx)
+		timedOut := err != nil && dialCtx.Err() == context.DeadlineExceeded && c.ctx.Err() == nil
 		cancelDial()
+		if timedOut {
+			dialTimeouts++
+		} else if err == nil {
+			dialTimeouts = 0
+		}
 		if err == nil {
 			// Reaching the relay proves the path is healthy again. If this
 			// provisional attachment closes before its peer arrives, retry
@@ -317,7 +330,9 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 			return
 		case <-timer.C:
 		}
-		if backoff < 5*time.Second {
+		// A dial that ran out its whole attempt has already waited; only fast
+		// failures, such as a refused connection, back off further.
+		if !timedOut && backoff < 5*time.Second {
 			backoff *= 2
 			if backoff > 5*time.Second {
 				backoff = 5 * time.Second
@@ -326,11 +341,15 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 	}
 }
 
-func resumableDialAttemptTimeout(remaining time.Duration) time.Duration {
-	if remaining < resumableDialAttemptLimit {
+func resumableDialAttemptTimeout(remaining time.Duration, service string, consecutiveTimeouts int) time.Duration {
+	limit := resumableDialAttemptLimit
+	if service == ServiceRDP && consecutiveTimeouts < rdpResumeDialShortTimeoutRuns {
+		limit = rdpResumeDialAttemptLimit
+	}
+	if remaining < limit {
 		return remaining
 	}
-	return resumableDialAttemptLimit
+	return limit
 }
 
 func (c *resumableWebSocketConn) drainLostSignal() {
