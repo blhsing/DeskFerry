@@ -466,14 +466,15 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 				log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t heartbeat=%t via=%s elapsed=%s", relayAddr, service, ready.ProtocolV2, ready.Heartbeat, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
 				if ready.SessionID != "" && service != tunnel.ServiceScreen {
 					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{
-						RelayAddr: relayAddr,
-						Proxy:     cfg.Proxy,
-						SessionID: ready.SessionID,
-						Side:      "client",
-						RoomProof: roomProof(cfg, relayAddr),
-						Service:   service,
-						Heartbeat: ready.Heartbeat,
-						Logf:      log.Printf,
+						RelayAddr:           relayAddr,
+						AlternateRelayAddrs: cfg.relayAddresses(),
+						Proxy:               cfg.Proxy,
+						SessionID:           ready.SessionID,
+						Side:                "client",
+						RoomProof:           roomProof(cfg, relayAddr),
+						Service:             service,
+						Heartbeat:           ready.Heartbeat,
+						Logf:                log.Printf,
 					}), relayAddr, nil
 				}
 				return tunnel.MessageNetConn(ctx, ws), relayAddr, nil

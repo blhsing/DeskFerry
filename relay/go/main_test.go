@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -805,4 +807,92 @@ func assertStreamTransfer(t *testing.T, ctx context.Context, source, destination
 	if string(got) != string(payload) {
 		t.Fatalf("stream received %q, want %q", got, payload)
 	}
+}
+
+type trackingListener struct {
+	net.Listener
+	mu    sync.Mutex
+	conns []net.Conn
+}
+
+func (l *trackingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.mu.Lock()
+		l.conns = append(l.conns, c)
+		l.mu.Unlock()
+	}
+	return c, err
+}
+
+func (l *trackingListener) killAll() {
+	_ = l.Listener.Close()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, c := range l.conns {
+		_ = c.Close()
+	}
+}
+
+func TestResumableSessionFailsOverToAlternateRelay(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenerA := &trackingListener{Listener: inner}
+	relayA := httptest.NewUnstartedServer(newServer())
+	relayA.Listener = listenerA
+	relayA.Start()
+	defer relayA.Close()
+	relayB := httptest.NewServer(newServer())
+	defer relayB.Close()
+	addrA := relayA.URL + "/relay/unit-failover"
+	addrB := relayB.URL + "/relay/unit-failover"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	capability := http.Header{"X-DeskFerry-Resumable": []string{"1"}}
+	agentWS, err := tunnel.DialWebSocketWithHeaders(ctx, addrA, "direct", "agent", "", capability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForWaitingAgents(t, relayA.URL, "unit-failover", 1)
+	clientWS, err := tunnel.DialWebSocketWithHeaders(ctx, addrA, "direct", "client", "", capability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID, err := tunnel.AwaitWebSocketStartSession(ctx, agentWS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, err := tunnel.AwaitWebSocketStartSession(ctx, clientWS); err != nil || id != sessionID {
+		t.Fatalf("client start id=%q error=%v", id, err)
+	}
+	options := func(side string) tunnel.ResumableWebSocketOptions {
+		return tunnel.ResumableWebSocketOptions{RelayAddr: addrA, AlternateRelayAddrs: []string{addrB}, Proxy: "direct", SessionID: sessionID, Side: side, Service: tunnel.ServiceRDP, Logf: t.Logf}
+	}
+	agent := tunnel.NewResumableWebSocketConn(ctx, agentWS, options("agent"))
+	defer agent.Close()
+	client := tunnel.NewResumableWebSocketConn(ctx, clientWS, options("client"))
+	defer client.Close()
+
+	exchange := func(from, to net.Conn, payload string) {
+		t.Helper()
+		if _, err := from.Write([]byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(payload))
+		if _, err := io.ReadFull(to, got); err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != payload {
+			t.Fatalf("got %q, want %q", got, payload)
+		}
+	}
+	exchange(client, agent, "before-failover")
+
+	// Relay A disappears entirely. Both sides must find each other on B.
+	listenerA.killAll()
+	exchange(agent, client, "after-failover")
+	exchange(client, agent, "reverse-after-failover")
 }

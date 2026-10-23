@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.13.8 - 2026-10-23
+
+- Move an interrupted Remote Desktop, WinRM, or SMB session to another relay of the same room when its relay cannot be reached. A resume previously retried only the relay the session started on, so when one side's path to that relay stayed down longer than the Remote Desktop client's ~16-second reconnect window, the session was lost even though the room's other relay was reachable. The Windows Home app, the Work service, and the macOS Home agent now try the room's relays in the configured order, waiting a bounded and growing time at each for the other side, and every relay rebuilds the session from the two resume attachments. The Android Home app still resumes only through the session's original relay.
+
 ## 0.13.7 - 2026-10-19
 
 - Reconnect Remote Desktop sessions sooner after the relay path recovers from a freeze. A resume attempt started while the path was frozen kept waiting for its full 8-second limit after the path came back, and failed attempts also doubled the delay before the next one, so a session could resume a fraction of a second after the Remote Desktop client had already given up. On Windows and macOS, Remote Desktop resume attempts now give up after 4 seconds, returning to 8 seconds after three consecutive timeouts in case a slow proxy needs longer. On every client, an attempt that timed out no longer increases the delay before the next one.

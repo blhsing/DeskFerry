@@ -49,19 +49,22 @@ const (
 var relayLogs = remotelog.New("work-agent")
 
 type config struct {
-	RelayAddr        string   `json:"relay_addr"`
-	RelayAddrs       []string `json:"relay_addrs,omitempty"`
-	Proxy            string   `json:"proxy"`
-	RDPAddr          string   `json:"rdp_addr"`
-	WinRMAddr        string   `json:"winrm_addr,omitempty"`
-	SMBAddr          string   `json:"smb_addr,omitempty"`
-	RoomPasswordFile string   `json:"room_password_file,omitempty"`
-	RoomPassword     string   `json:"-"`
-	MinBackoff       string   `json:"min_backoff"`
-	MaxBackoff       string   `json:"max_backoff"`
-	ConcurrencyLimit int      `json:"concurrency_limit,omitempty"`
-	LegacyMode       bool     `json:"legacy_mode,omitempty"`
-	ScreenView       bool     `json:"screen_view,omitempty"`
+	RelayAddr  string   `json:"relay_addr"`
+	RelayAddrs []string `json:"relay_addrs,omitempty"`
+	// FailoverRelayAddrs keeps every configured relay after a per-relay copy
+	// narrows RelayAddrs, so resumable sessions can move between relays.
+	FailoverRelayAddrs []string `json:"-"`
+	Proxy              string   `json:"proxy"`
+	RDPAddr            string   `json:"rdp_addr"`
+	WinRMAddr          string   `json:"winrm_addr,omitempty"`
+	SMBAddr            string   `json:"smb_addr,omitempty"`
+	RoomPasswordFile   string   `json:"room_password_file,omitempty"`
+	RoomPassword       string   `json:"-"`
+	MinBackoff         string   `json:"min_backoff"`
+	MaxBackoff         string   `json:"max_backoff"`
+	ConcurrencyLimit   int      `json:"concurrency_limit,omitempty"`
+	LegacyMode         bool     `json:"legacy_mode,omitempty"`
+	ScreenView         bool     `json:"screen_view,omitempty"`
 }
 
 type relayURLFlag []string
@@ -489,6 +492,7 @@ func (c config) withRelayAddress(relayAddr string) config {
 	next := c
 	next.RelayAddr = strings.TrimSpace(relayAddr)
 	next.RelayAddrs = []string{next.RelayAddr}
+	next.FailoverRelayAddrs = c.relayAddresses()
 	return next
 }
 
@@ -970,7 +974,7 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 	cancel()
 	stream := net.Conn(tunnel.MessageNetConn(parent, ws))
 	if offer.Resumable {
-		stream = tunnel.NewResumableWebSocketConn(parent, ws, tunnel.ResumableWebSocketOptions{RelayAddr: cfg.RelayAddr, Proxy: cfg.Proxy, SessionID: offer.SessionID, Side: "agent", RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword), Service: target.Service, Heartbeat: ready.Heartbeat, Logf: log.Printf})
+		stream = tunnel.NewResumableWebSocketConn(parent, ws, tunnel.ResumableWebSocketOptions{RelayAddr: cfg.RelayAddr, AlternateRelayAddrs: cfg.FailoverRelayAddrs, Proxy: cfg.Proxy, SessionID: offer.SessionID, Side: "agent", RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword), Service: target.Service, Heartbeat: ready.Heartbeat, Logf: log.Printf})
 	}
 	log.Printf("session ready relay=%s session=%s service=%s target=%s heartbeat=%t setup_duration=%s", cfg.RelayAddr, offer.SessionID, target.Service, target.Address, ready.Heartbeat, time.Since(started).Round(time.Millisecond))
 	pipeStream := stream

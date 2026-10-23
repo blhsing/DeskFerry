@@ -45,17 +45,27 @@ const (
 	// falls back to the full limit if a slow proxy keeps needing longer.
 	rdpResumeDialAttemptLimit     = 4 * time.Second
 	rdpResumeDialShortTimeoutRuns = 3
+	// With alternate relays, a side waits at a reachable relay only so long for
+	// its peer before trying the next one. The wait grows each round so two
+	// sides that keep missing each other eventually overlap at one relay.
+	resumePeerWaitStep = 3 * time.Second
+	resumePeerWaitMax  = 15 * time.Second
 )
 
 type ResumableWebSocketOptions struct {
 	RelayAddr string
-	Proxy     string
-	Token     string
-	SessionID string
-	Side      string
-	RoomProof string
-	Service   string
-	Heartbeat bool
+	// AlternateRelayAddrs are other relays serving the same room, in the
+	// configured order. When the session's relay cannot be reached, both sides
+	// try them in the same order; relays rebuild a resumable session from the
+	// resume attachments of both sides.
+	AlternateRelayAddrs []string
+	Proxy               string
+	Token               string
+	SessionID           string
+	Side                string
+	RoomProof           string
+	Service             string
+	Heartbeat           bool
 	// Logf receives abnormal transport and data-progress diagnostics only.
 	Logf func(string, ...any)
 
@@ -86,6 +96,7 @@ func NewResumableWebSocketConn(ctx context.Context, initial MessageConn, opts Re
 			c.opts.heartbeatTimeout = rdpHeartbeatTimeout
 		}
 	}
+	c.relays = resumeRelayOrder(opts.RelayAddr, opts.AlternateRelayAddrs)
 	c.cond = sync.NewCond(&c.mu)
 	go c.connectionLoop(initial)
 	go c.watchAckProgress()
@@ -113,6 +124,9 @@ type resumableWebSocketConn struct {
 	lastAckProgress time.Time
 	ackStallLogged  bool
 	ackStallAt      time.Time
+
+	relays     []string
+	relayIndex int
 
 	writeMu        sync.Mutex
 	lost           chan struct{}
@@ -257,11 +271,13 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 	ws := initial
 	backoff := 250 * time.Millisecond
 	dialTimeouts := 0
+	peerWaitRound := 0
 	for {
 		if ws != nil {
 			c.drainLostSignal()
 			if err := c.attachTransport(ws); err == nil {
 				backoff = 250 * time.Millisecond
+				peerWaitRound = 0
 				select {
 				case <-c.ctx.Done():
 					return
@@ -289,8 +305,9 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 
 		remaining := resumableWindow - time.Since(lostAt)
 		dialTimeout := resumableDialAttemptTimeout(remaining, c.opts.Service, dialTimeouts)
+		relay := c.relays[c.relayIndex]
 		dialCtx, cancelDial := context.WithTimeout(c.ctx, dialTimeout)
-		candidate, err := c.dialResume(dialCtx)
+		candidate, err := c.dialResume(dialCtx, relay)
 		timedOut := err != nil && dialCtx.Err() == context.DeadlineExceeded && c.ctx.Err() == nil
 		cancelDial()
 		if timedOut {
@@ -307,21 +324,38 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 			// Once the proxy has accepted the WebSocket, keep this attachment at
 			// the relay until its peer arrives. Re-dialing on a short timer would
 			// otherwise leave stale resume sockets queued at the relay.
-			resumeCtx, cancelResume := context.WithTimeout(c.ctx, remaining)
+			// With alternate relays the peer may be waiting elsewhere, so the
+			// wait is bounded and grows each round.
+			peerWait := remaining
+			if len(c.relays) > 1 {
+				peerWait = resumePeerWait(peerWaitRound, remaining)
+			}
+			resumeCtx, cancelResume := context.WithTimeout(c.ctx, peerWait)
 			err = AwaitWebSocketResume(resumeCtx, candidate, c.opts.SessionID)
+			peerTimedOut := err != nil && resumeCtx.Err() == context.DeadlineExceeded && c.ctx.Err() == nil
 			cancelResume()
 			if err != nil {
 				CloseMessageConn(candidate)
 			}
+			if peerTimedOut {
+				peerWaitRound++
+				timedOut = true
+			}
 		}
 		if err == nil {
+			if relay != c.opts.RelayAddr || c.relayIndex != 0 {
+				c.diagnostic("transport resumed through relay=%s", relay)
+			}
 			ws = candidate
 			continue
 		}
-		c.diagnostic("resume attempt failed after=%s error=%v", time.Since(lostAt).Round(time.Millisecond), err)
+		c.diagnostic("resume attempt failed relay=%s after=%s error=%v", relay, time.Since(lostAt).Round(time.Millisecond), err)
 		if IsTerminalSessionError(err) {
 			c.setTerminal(fmt.Errorf("relay session %s is closed: %w", c.opts.SessionID, err))
 			return
+		}
+		if len(c.relays) > 1 {
+			c.relayIndex = (c.relayIndex + 1) % len(c.relays)
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -362,7 +396,36 @@ func (c *resumableWebSocketConn) drainLostSignal() {
 	}
 }
 
-func (c *resumableWebSocketConn) dialResume(ctx context.Context) (MessageConn, error) {
+func resumeRelayOrder(primary string, alternates []string) []string {
+	relays := []string{strings.TrimSpace(primary)}
+	for _, relay := range alternates {
+		relay = strings.TrimSpace(relay)
+		duplicate := relay == ""
+		for _, existing := range relays {
+			if strings.EqualFold(existing, relay) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			relays = append(relays, relay)
+		}
+	}
+	return relays
+}
+
+func resumePeerWait(round int, remaining time.Duration) time.Duration {
+	wait := resumePeerWaitStep * time.Duration(round+1)
+	if wait > resumePeerWaitMax {
+		wait = resumePeerWaitMax
+	}
+	if remaining < wait {
+		return remaining
+	}
+	return wait
+}
+
+func (c *resumableWebSocketConn) dialResume(ctx context.Context, relay string) (MessageConn, error) {
 	headers := http.Header{}
 	headers.Set(HeaderSessionID, c.opts.SessionID)
 	headers.Set(HeaderSessionSide, c.opts.Side)
@@ -370,7 +433,7 @@ func (c *resumableWebSocketConn) dialResume(ctx context.Context) (MessageConn, e
 		headers.Set(HeaderRoomProof, c.opts.RoomProof)
 	}
 	AddServiceHeader(headers, c.opts.Service)
-	ws, err := DialResumeMessageConnWithHeaders(ctx, c.opts.RelayAddr, c.opts.Proxy, c.opts.Token, headers)
+	ws, err := DialResumeMessageConnWithHeaders(ctx, relay, c.opts.Proxy, c.opts.Token, headers)
 	if err != nil {
 		return nil, err
 	}
