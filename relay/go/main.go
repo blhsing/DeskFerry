@@ -1067,7 +1067,7 @@ func (h *RelayHub) ServeResume(ctx context.Context, token string, c tunnel.Messa
 		return
 	}
 	log.Printf("resume attachment waiting room=%s session=%s side=%s remote=%s", roomID, sessionID, side, remote)
-	attached := session.Attach(ctx, side, c, remote)
+	attached := session.Attach(ctx, side, newReadAheadConn(c), remote)
 	log.Printf("resume attachment released room=%s session=%s side=%s remote=%s attached=%t", roomID, sessionID, side, remote, attached)
 	if !attached {
 		closeQuietly(c, websocket.StatusTryAgainLater, "resumable session unavailable")
@@ -1677,6 +1677,100 @@ type ResumeAttachment struct {
 	Done   chan struct{}
 }
 
+// Dead reports when the attachment's connection has closed. A side that gives
+// up waiting at one relay closes its resume socket and tries another, so a
+// waiting attachment must be dropped rather than paired once it is dead.
+func (a *ResumeAttachment) Dead() <-chan struct{} {
+	if conn, ok := a.Conn.(*readAheadConn); ok {
+		return conn.done
+	}
+	return nil
+}
+
+func (a *ResumeAttachment) isDead() bool {
+	dead := a.Dead()
+	if dead == nil {
+		return false
+	}
+	select {
+	case <-dead:
+		return true
+	default:
+		return false
+	}
+}
+
+type readAheadMessage struct {
+	typ  websocket.MessageType
+	data []byte
+}
+
+// readAheadConn reads a connection continuously so the relay notices when a
+// waiting resume attachment closes. Messages are handed to the bridge in order.
+type readAheadConn struct {
+	tunnel.MessageConn
+	messages chan readAheadMessage
+	done     chan struct{}
+	stop     chan struct{}
+	stopOnce sync.Once
+	err      error
+}
+
+func newReadAheadConn(conn tunnel.MessageConn) *readAheadConn {
+	r := &readAheadConn{
+		MessageConn: conn,
+		messages:    make(chan readAheadMessage, 64),
+		done:        make(chan struct{}),
+		stop:        make(chan struct{}),
+	}
+	go r.readLoop()
+	return r
+}
+
+func (r *readAheadConn) readLoop() {
+	for {
+		typ, data, err := r.MessageConn.Read(context.Background())
+		if err != nil {
+			r.err = err
+			close(r.done)
+			return
+		}
+		select {
+		case r.messages <- readAheadMessage{typ: typ, data: data}:
+		case <-r.stop:
+			r.err = net.ErrClosed
+			close(r.done)
+			return
+		}
+	}
+}
+
+func (r *readAheadConn) Read(ctx context.Context) (websocket.MessageType, []byte, error) {
+	select {
+	case m := <-r.messages:
+		return m.typ, m.data, nil
+	case <-r.done:
+		select {
+		case m := <-r.messages:
+			return m.typ, m.data, nil
+		default:
+			return 0, nil, r.err
+		}
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
+}
+
+func (r *readAheadConn) Close(code websocket.StatusCode, reason string) error {
+	r.stopOnce.Do(func() { close(r.stop) })
+	return r.MessageConn.Close(code, reason)
+}
+
+func (r *readAheadConn) CloseNow() error {
+	r.stopOnce.Do(func() { close(r.stop) })
+	return r.MessageConn.CloseNow()
+}
+
 type ResumeSession struct {
 	ID           string
 	Room         *RelayRoom
@@ -1827,8 +1921,16 @@ func (s *ResumeSession) run(agent, client tunnel.MessageConn, clientDone chan st
 			}
 			log.Printf("resumable bridge interrupted room=%s pair=%d session=%s failed_side=%s direction=%s error=%v", s.Room.ID, pairID, s.ID, result.FailedSide, result.Direction, result.Err)
 		case earlyAgent = <-s.agent:
+			if earlyAgent.isDead() {
+				closeOnce(earlyAgent.Done)
+				continue
+			}
 			log.Printf("resumable bridge interrupted room=%s pair=%d session=%s failed_side=agent reason=resume attachment arrived", s.Room.ID, pairID, s.ID)
 		case earlyClient = <-s.client:
+			if earlyClient.isDead() {
+				closeOnce(earlyClient.Done)
+				continue
+			}
 			log.Printf("resumable bridge interrupted room=%s pair=%d session=%s failed_side=client reason=resume attachment arrived", s.Room.ID, pairID, s.ID)
 		}
 		// A side only sends a resume socket after abandoning its transport. An
@@ -1861,6 +1963,11 @@ func (s *ResumeSession) run(agent, client tunnel.MessageConn, clientDone chan st
 			}
 			agentAttachment = s.latestAttachment(s.agent, agentAttachment)
 			clientAttachment = s.latestAttachment(s.client, clientAttachment)
+			if agentAttachment.isDead() || clientAttachment.isDead() {
+				earlyAgent, earlyClient = s.keepLive(agentAttachment), s.keepLive(clientAttachment)
+				agentAttachment, clientAttachment = nil, nil
+				continue
+			}
 			agent = agentAttachment.Conn
 			client = clientAttachment.Conn
 			s.AgentRemote = agentAttachment.Remote
@@ -1896,7 +2003,22 @@ func (s *ResumeSession) waitForAttachments(agent, client *ResumeAttachment) (*Re
 	timer := time.NewTimer(5 * time.Minute)
 	defer timer.Stop()
 	for agent == nil || client == nil {
+		var agentDead, clientDead <-chan struct{}
+		if agent != nil {
+			agentDead = agent.Dead()
+		}
+		if client != nil {
+			clientDead = client.Dead()
+		}
 		select {
+		case <-agentDead:
+			log.Printf("resume attachment closed before its peer arrived room=%s session=%s side=agent remote=%s", s.Room.ID, s.ID, agent.Remote)
+			closeOnce(agent.Done)
+			agent = nil
+		case <-clientDead:
+			log.Printf("resume attachment closed before its peer arrived room=%s session=%s side=client remote=%s", s.Room.ID, s.ID, client.Remote)
+			closeOnce(client.Done)
+			client = nil
 		case next := <-s.agent:
 			if agent != nil {
 				closeQuietly(agent.Conn, websocket.StatusNormalClosure, "replaced resume socket")
@@ -1924,6 +2046,19 @@ func (s *ResumeSession) waitForAttachments(agent, client *ResumeAttachment) (*Re
 		}
 	}
 	return agent, client, true
+}
+
+// keepLive returns a live attachment so pairing can keep waiting with it, and
+// releases a dead one.
+func (s *ResumeSession) keepLive(a *ResumeAttachment) *ResumeAttachment {
+	if a == nil {
+		return nil
+	}
+	if a.isDead() {
+		closeOnce(a.Done)
+		return nil
+	}
+	return a
 }
 
 func (s *ResumeSession) latestAttachment(queue <-chan *ResumeAttachment, latest *ResumeAttachment) *ResumeAttachment {

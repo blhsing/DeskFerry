@@ -56,4 +56,20 @@ public class TunnelServiceTest {
         assertFalse(TunnelService.isRoomAuthenticationFailure(1000, "room authentication failed"));
         assertFalse(TunnelService.isRoomAuthenticationFailure(1008, null));
     }
+
+    @Test
+    public void failoverTriesSessionRelayFirstThenConfiguredOrder() {
+        assertEquals(
+                java.util.Arrays.asList("http://oci/relay/b", "https://azure/relay/b"),
+                TunnelService.resumeRelayOrder("http://oci/relay/b",
+                        java.util.Arrays.asList("https://azure/relay/b", "http://OCI/relay/b")));
+    }
+
+    @Test
+    public void failoverWaitGrowsEachRoundUpToTheLimit() {
+        assertEquals(4_000L, TunnelService.failoverAttemptWaitMillis(0, 300_000L));
+        assertEquals(7_000L, TunnelService.failoverAttemptWaitMillis(1, 300_000L));
+        assertEquals(15_000L, TunnelService.failoverAttemptWaitMillis(9, 300_000L));
+        assertEquals(2_000L, TunnelService.failoverAttemptWaitMillis(3, 2_000L));
+    }
 }

@@ -440,6 +440,41 @@ def test_resume_attachment_interrupts_silently_abandoned_transport():
     asyncio.run(scenario())
 
 
+def test_resume_ignores_attachment_closed_before_its_peer_arrived():
+    from app import ReadAheadWebSocket, RelayRoom, ResumeSession
+
+    async def scenario():
+        room = RelayRoom("unit-abandoned")
+        session = ResumeSession("f" * 32, room, "work", "home", lambda _: None)
+        recovered = asyncio.create_task(session.run_recovered(lambda: None))
+
+        # The agent attaches, then abandons this socket to try another relay.
+        abandoned = FakeWebSocket()
+        abandoned_attach = asyncio.create_task(session.attach("agent", ReadAheadWebSocket(abandoned), "work-1"))
+        await abandoned._received.put({"type": "websocket.disconnect", "code": 1000, "reason": ""})
+        await asyncio.sleep(0.02)
+
+        home = FakeWebSocket()
+        home_attach = asyncio.create_task(session.attach("client", ReadAheadWebSocket(home), "home-1"))
+        await asyncio.sleep(0.02)
+        agent = FakeWebSocket()
+        agent_attach = asyncio.create_task(session.attach("agent", ReadAheadWebSocket(agent), "work-2"))
+        for _ in range(50):
+            if agent.text_messages and home.text_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert abandoned.text_messages == []
+        assert agent.text_messages == ["resume " + session.id]
+        assert home.text_messages == ["resume " + session.id]
+
+        recovered.cancel()
+        for task in (abandoned_attach, home_attach, agent_attach):
+            task.cancel()
+        await asyncio.gather(recovered, abandoned_attach, home_attach, agent_attach, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_resumable_pair_coalesces_overlapping_side_replacements():
     from app import RelayRoom, ResumeSession
 

@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.13.9 - 2026-10-23
+
+- Move interrupted Android Home sessions to the room's other relays too. When the session's relay cannot be reached, the Android Home app now tries the room's relays in the configured order, as the Windows and macOS apps and the Work service do since 0.13.8. With more than one relay, each attempt allows 4 seconds plus 3 more per round (up to 15) for connecting and for the Work agent to arrive.
+- Stop pairing a resume connection that a side has already abandoned. A side that gives up waiting at one relay closes that resume connection and tries the next, but the relay did not notice until it tried to pair it, which cost another full resume round. The Azure, Go, and Python relays now read waiting resume connections continuously, drop one as soon as it closes, and no longer interrupt a working session because of one.
+
 ## 0.13.8 - 2026-10-23
 
 - Move an interrupted Remote Desktop, WinRM, or SMB session to another relay of the same room when its relay cannot be reached. A resume previously retried only the relay the session started on, so when one side's path to that relay stayed down longer than the Remote Desktop client's ~16-second reconnect window, the session was lost even though the room's other relay was reachable. The Windows Home app, the Work service, and the macOS Home agent now try the room's relays in the configured order, waiting a bounded and growing time at each for the other side, and every relay rebuilds the session from the two resume attachments. The Android Home app still resumes only through the session's original relay.

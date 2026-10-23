@@ -931,11 +931,12 @@ sealed class RelayHub
             return;
         }
         _log.LogInformation("resume attachment waiting room={Room} session={Session} side={Side} remote={Remote}", roomId, sessionId, side, remote);
-        var attached = await session.AttachAsync(side, socket, remote, abort);
+        var attachedSocket = new ReadAheadWebSocket(socket);
+        var attached = await session.AttachAsync(side, attachedSocket, remote, abort);
         _log.LogInformation("resume attachment released room={Room} session={Session} side={Side} remote={Remote} attached={Attached}", roomId, sessionId, side, remote, attached);
         if (!attached)
         {
-            await CloseQuietlyAsync(socket, WebSocketCloseStatus.EndpointUnavailable, "resumable session unavailable");
+            await CloseQuietlyAsync(attachedSocket, WebSocketCloseStatus.EndpointUnavailable, "resumable session unavailable");
         }
     }
 
@@ -1764,7 +1765,12 @@ sealed record SocketEnd(string End, WebSocketCloseStatus? CloseStatus, string? C
 
 sealed record PumpResult(string Direction, long Bytes, long Messages, string End, WebSocketCloseStatus? CloseStatus, string? CloseReason, string? Error);
 
-sealed record ResumeAttachment(WebSocket Socket, string Remote, TaskCompletionSource Done);
+sealed record ResumeAttachment(WebSocket Socket, string Remote, TaskCompletionSource Done)
+{
+    // A side that gives up waiting at one relay closes its resume socket and
+    // tries another, so a dead waiting attachment must be replaced, not paired.
+    public bool IsDead => Socket is ReadAheadWebSocket readAhead && readAhead.IsDead;
+}
 
 sealed record ResumePumpResult(string Direction, string FailedSide, long FailedGeneration, long Bytes, long Messages, string End, WebSocketCloseStatus? CloseStatus, string? CloseReason, string? Error);
 
@@ -1832,6 +1838,7 @@ sealed class ResumeSession
 				{
 					agentAttachment = await _agent.Reader.ReadAsync(timeout.Token);
 					clientAttachment = await _client.Reader.ReadAsync(timeout.Token);
+					(agentAttachment, clientAttachment) = await ReplaceDeadAttachmentsAsync(agentAttachment, clientAttachment, timeout.Token);
 				}
 				catch (OperationCanceledException)
 				{
@@ -1911,6 +1918,13 @@ sealed class ResumeSession
                 if (completed == agentArrival || completed == clientArrival)
                 {
                     if (completed.IsCanceled || completed.IsFaulted) return;
+                    var arrivedReader = completed == agentArrival ? _agent.Reader : _client.Reader;
+                    if (arrivedReader.TryPeek(out var arrived) && arrived.IsDead)
+                    {
+                        arrivedReader.TryRead(out _);
+                        arrived.Done.TrySetResult();
+                        continue;
+                    }
                     var arrivedSide = completed == agentArrival ? "agent" : "client";
                     _log.LogInformation("resumable bridge interrupted room={Room} pair={PairId} session={Session} failed_side={FailedSide} reason=resume attachment arrived", Room.Id, pairId, Id, arrivedSide);
                 }
@@ -1963,6 +1977,7 @@ sealed class ResumeSession
                             ReadLatestAttachmentAsync(_client.Reader, timeout.Token));
                         agentAttachment = TakeLatestAttachment(_agent.Reader, attachments[0]);
                         clientAttachment = TakeLatestAttachment(_client.Reader, attachments[1]);
+                        (agentAttachment, clientAttachment) = await ReplaceDeadAttachmentsAsync(agentAttachment, clientAttachment, timeout.Token);
                     }
                     catch (OperationCanceledException)
                     {
@@ -2011,6 +2026,26 @@ sealed class ResumeSession
             stateChanged();
             _log.LogInformation("resumable bridge closed room={Room} pair={PairId} session={Session} agent={AgentRemote} client={ClientRemote} duration_ms={DurationMs}", Room.Id, pairId, Id, AgentRemote, ClientRemote, stopwatch.ElapsedMilliseconds);
         }
+    }
+
+    private async Task<(ResumeAttachment Agent, ResumeAttachment Client)> ReplaceDeadAttachmentsAsync(ResumeAttachment agent, ResumeAttachment client, CancellationToken cancellationToken)
+    {
+        while (agent.IsDead || client.IsDead)
+        {
+            if (agent.IsDead)
+            {
+                _log.LogInformation("resume attachment closed before its peer arrived room={Room} session={Session} side=agent remote={Remote}", Room.Id, Id, agent.Remote);
+                agent.Done.TrySetResult();
+                agent = await ReadLatestAttachmentAsync(_agent.Reader, cancellationToken);
+            }
+            if (client.IsDead)
+            {
+                _log.LogInformation("resume attachment closed before its peer arrived room={Room} session={Session} side=client remote={Remote}", Room.Id, Id, client.Remote);
+                client.Done.TrySetResult();
+                client = await ReadLatestAttachmentAsync(_client.Reader, cancellationToken);
+            }
+        }
+        return (agent, client);
     }
 
     private static async Task<ResumeAttachment> ReadLatestAttachmentAsync(ChannelReader<ResumeAttachment> reader, CancellationToken cancellationToken)
@@ -2196,7 +2231,7 @@ static class RelayDashboard
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.13.8";
+    public const string Version = "0.13.9";
 }
 
 sealed class WaitingAgent

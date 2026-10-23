@@ -21,7 +21,7 @@ from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.13.8"
+RELAY_VERSION = "0.13.9"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -1014,11 +1014,59 @@ class RelayRoom:
         self._agents = deque(agent for agent in self._agents if agent.is_open)
 
 
+class ReadAheadWebSocket:
+    """Receives a resume attachment continuously so the relay notices when a
+    side abandons a waiting resume socket to try another relay. Messages are
+    handed to the bridge in order; everything else is delegated."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self._messages: asyncio.Queue[Any] = asyncio.Queue(maxsize=64)
+        self.dead = asyncio.Event()
+        self._reader = asyncio.create_task(self._read_loop())
+
+    async def _read_loop(self) -> None:
+        while True:
+            try:
+                message = await self._inner.receive()
+            except asyncio.CancelledError:
+                self.dead.set()
+                raise
+            except Exception as exc:
+                self.dead.set()
+                await self._messages.put(exc)
+                return
+            if message.get("type") == "websocket.disconnect":
+                self.dead.set()
+                await self._messages.put(message)
+                return
+            await self._messages.put(message)
+
+    async def receive(self) -> Any:
+        item = await self._messages.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    async def close(self, *args: Any, **kwargs: Any) -> None:
+        self._reader.cancel()
+        await self._inner.close(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 @dataclass
 class ResumeAttachment:
     websocket: WebSocket
     remote: str
     done: asyncio.Future[None]
+
+    @property
+    def is_dead(self) -> bool:
+        # A side that gives up waiting at one relay closes its resume socket and
+        # tries another, so a dead waiting attachment must not be paired.
+        return isinstance(self.websocket, ReadAheadWebSocket) and self.websocket.dead.is_set()
 
 
 class ResumeSession:
@@ -1072,6 +1120,9 @@ class ResumeSession:
                 try:
                     agent_attachment, client_attachment = await asyncio.wait_for(
                         asyncio.gather(self._agent.get(), self._client.get()), timeout=300
+                    )
+                    agent_attachment, client_attachment = await asyncio.wait_for(
+                        self._replace_dead(agent_attachment, client_attachment), timeout=300
                     )
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     return
@@ -1139,6 +1190,8 @@ class ResumeSession:
                 # itself is treated as that side's failure. The attachment
                 # stays queued for the coordinated resume.
                 self._arrival.clear()
+                self._drop_dead(self._agent)
+                self._drop_dead(self._client)
                 arrived_side = "agent" if not self._agent.empty() else "client" if not self._client.empty() else None
                 if arrived_side is None:
                     arrival = asyncio.create_task(self._arrival.wait())
@@ -1146,6 +1199,10 @@ class ResumeSession:
                     arrival.cancel()
                     pump_done = [task for task in done if task is not arrival]
                     if not pump_done:
+                        self._drop_dead(self._agent)
+                        self._drop_dead(self._client)
+                        if self._agent.empty() and self._client.empty():
+                            continue
                         arrived_side = "agent" if not self._agent.empty() else "client"
                 if arrived_side is not None:
                     logger.info(
@@ -1212,6 +1269,12 @@ class ResumeSession:
                     client_attachment = await self._latest_from(
                         self._client, client_attachment
                     )
+                    try:
+                        agent_attachment, client_attachment = await asyncio.wait_for(
+                            self._replace_dead(agent_attachment, client_attachment), timeout=300
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        return
                     agent = agent_attachment.websocket
                     client = client_attachment.websocket
                     self.agent_remote = agent_attachment.remote
@@ -1263,6 +1326,34 @@ class ResumeSession:
     ) -> ResumeAttachment:
         latest = await queue.get()
         return await ResumeSession._latest_from(queue, latest)
+
+    def _drop_dead(self, queue: asyncio.Queue[ResumeAttachment]) -> None:
+        live = []
+        while True:
+            try:
+                attachment = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if attachment.is_dead:
+                try_set_result(attachment.done, None)
+            else:
+                live.append(attachment)
+        for attachment in live:
+            queue.put_nowait(attachment)
+
+    async def _replace_dead(
+        self, agent: ResumeAttachment, client: ResumeAttachment
+    ) -> tuple[ResumeAttachment, ResumeAttachment]:
+        while agent.is_dead or client.is_dead:
+            if agent.is_dead:
+                logger.info("resume attachment closed before its peer arrived room=%s session=%s side=agent remote=%s", self.room.id, self.id, agent.remote)
+                try_set_result(agent.done, None)
+                agent = await self._latest_attachment(self._agent)
+            if client.is_dead:
+                logger.info("resume attachment closed before its peer arrived room=%s session=%s side=client remote=%s", self.room.id, self.id, client.remote)
+                try_set_result(client.done, None)
+                client = await self._latest_attachment(self._client)
+        return agent, client
 
     @staticmethod
     async def _latest_from(
@@ -1715,7 +1806,7 @@ class RelayHub:
             await close_quietly(websocket, 1008, "unknown resumable session")
             return
         logger.info("resume attachment waiting room=%s session=%s side=%s remote=%s", room_key, session_id, side, remote)
-        attached = await session.attach(side, websocket, remote)
+        attached = await session.attach(side, ReadAheadWebSocket(websocket), remote)
         logger.info("resume attachment released room=%s session=%s side=%s remote=%s attached=%s", room_key, session_id, side, remote, attached)
         if not attached:
             await close_quietly(websocket, 1013, "resumable session unavailable")

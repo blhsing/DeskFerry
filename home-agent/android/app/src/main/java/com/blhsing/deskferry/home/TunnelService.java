@@ -92,6 +92,9 @@ public class TunnelService extends Service {
     // Remote Desktop clients reset about 16s after data stops; notice a frozen path in time to resume.
     private static final long RDP_HEARTBEAT_TIMEOUT_MS = 8L * 1000L;
     private static final long RESUME_ATTEMPT_TIMEOUT_MS = 8L * 1000L;
+    private static final long FAILOVER_ATTEMPT_BASE_MS = 4L * 1000L;
+    private static final long FAILOVER_ATTEMPT_STEP_MS = 3L * 1000L;
+    private static final long FAILOVER_ATTEMPT_MAX_MS = 15L * 1000L;
     private static final int MAX_CONCURRENT_BRIDGES_PER_SERVICE = 2;
     private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss", Locale.ROOT);
     private static final SimpleDateFormat DIAGNOSTIC_TIME_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.ROOT);
@@ -1678,15 +1681,22 @@ public class TunnelService extends Service {
             new Thread(() -> {
                 long deadline = SystemClock.elapsedRealtime() + RESUMABLE_WINDOW_MS;
                 long backoff = 250;
+                // Try the session's relay first, then the room's other relays in
+                // the configured order, as the Work agent does; relays rebuild the
+                // session from both sides' resume attachments.
+                List<String> resumeRelays = resumeRelayOrder(selectedRelay, relayUrlsSnapshot());
+                int relayIndex = 0;
+                int waitRound = 0;
                 try {
                     while (!closed.get() && SystemClock.elapsedRealtime() < deadline) {
                         boolean attemptTimedOut = false;
+                        String relay = resumeRelays.get(relayIndex);
                         CountDownLatch ready = new CountDownLatch(1);
                         AtomicBoolean started = new AtomicBoolean(false);
                         AtomicReference<Throwable> failure = new AtomicReference<>();
 						long attemptStarted = SystemClock.elapsedRealtime();
                         try {
-                            Request request = webSocketRequest(selectedRelay, "resume").newBuilder()
+                            Request request = webSocketRequest(relay, "resume").newBuilder()
 									.header("X-DeskFerry-Service", service)
                                     .header("X-DeskFerry-Session", sessionId)
                                     .header("X-DeskFerry-Session-Side", "client")
@@ -1697,11 +1707,14 @@ public class TunnelService extends Service {
 								pendingResumeReady = ready;
 							}
                             long remaining = Math.max(1, deadline - SystemClock.elapsedRealtime());
-							long attemptWait = resumeAttemptWaitMillis(remaining);
+							long attemptWait = resumeRelays.size() > 1
+									? failoverAttemptWaitMillis(waitRound, remaining)
+									: resumeAttemptWaitMillis(remaining);
 							boolean signaled = ready.await(attemptWait, TimeUnit.MILLISECONDS);
 							if (signaled && started.get() && failure.get() == null) {
 								clearPendingResume(candidate, ready);
-								append(serviceLabel + " relay stream resumed through " + selectedRelay + ".");
+								selectedRelay = relay;
+								append(serviceLabel + " relay stream resumed through " + relay + ".");
                                 return;
                             }
 							clearPendingResume(candidate, ready);
@@ -1716,7 +1729,7 @@ public class TunnelService extends Service {
 							if (!closed.get()) {
 								attemptTimedOut = !signaled;
 								String result = !signaled ? "attempt_timeout" : "transport_failure";
-								append(serviceLabel + " relay resume attempt failed relay=" + selectedRelay
+								append(serviceLabel + " relay resume attempt failed relay=" + relay
 										+ " result=" + result + " elapsed_ms=" + elapsedMillis(attemptStarted)
 										+ (resumeFailure == null ? "" : " error=" + throwableText(resumeFailure)) + ".");
 							}
@@ -1732,11 +1745,15 @@ public class TunnelService extends Service {
 								pendingReady.countDown();
 							}
 							if (!closed.get()) {
-								append(serviceLabel + " relay resume attempt failed relay=" + selectedRelay
+								append(serviceLabel + " relay resume attempt failed relay=" + relay
 										+ " result=exception elapsed_ms=" + elapsedMillis(attemptStarted)
 										+ " error=" + throwableText(ex) + ".");
 							}
                         }
+                        if (attemptTimedOut) {
+                            waitRound++;
+                        }
+                        relayIndex = (relayIndex + 1) % resumeRelays.size();
                         sleepQuietly(backoff);
                         // An attempt that ran out its whole wait has already waited.
                         if (!attemptTimedOut) {
@@ -2029,6 +2046,37 @@ public class TunnelService extends Service {
 
 	static long resumeAttemptWaitMillis(long remainingMillis) {
 		return Math.max(1L, Math.min(RESUME_ATTEMPT_TIMEOUT_MS, remainingMillis));
+	}
+
+	// With alternate relays, an attempt covers connecting plus a bounded wait for
+	// the Work agent, growing each round so the two sides eventually meet.
+	static long failoverAttemptWaitMillis(int round, long remainingMillis) {
+		long wait = Math.min(FAILOVER_ATTEMPT_MAX_MS, FAILOVER_ATTEMPT_BASE_MS + FAILOVER_ATTEMPT_STEP_MS * round);
+		return Math.max(1L, Math.min(wait, remainingMillis));
+	}
+
+	static List<String> resumeRelayOrder(String current, List<String> configured) {
+		List<String> order = new ArrayList<>();
+		if (current != null && !current.trim().isEmpty() && !"none".equals(current)) {
+			order.add(current.trim());
+		}
+		for (String relay : configured) {
+			String trimmed = relay == null ? "" : relay.trim();
+			boolean duplicate = trimmed.isEmpty();
+			for (String existing : order) {
+				if (existing.equalsIgnoreCase(trimmed)) {
+					duplicate = true;
+					break;
+				}
+			}
+			if (!duplicate) {
+				order.add(trimmed);
+			}
+		}
+		if (order.isEmpty()) {
+			order.add(RelayUrls.DEFAULT_RELAY_URL);
+		}
+		return order;
 	}
 
 	static boolean isLogicalSessionClose(int code, String reason) {

@@ -896,3 +896,48 @@ func TestResumableSessionFailsOverToAlternateRelay(t *testing.T) {
 	exchange(agent, client, "after-failover")
 	exchange(client, agent, "reverse-after-failover")
 }
+
+func TestResumeIgnoresAttachmentClosedBeforeItsPeerArrived(t *testing.T) {
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+	testAbandonedResumeAttachment(t, server.URL)
+}
+
+// testAbandonedResumeAttachment pairs a session at baseURL, drops it, and has
+// the agent attach a resume socket and abandon it, as it does when it tries
+// another relay. Fresh attachments from both sides must still resume.
+func testAbandonedResumeAttachment(t *testing.T, baseURL string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	room := fmt.Sprintf("unit-abandoned-%d", time.Now().UnixNano())
+	path := "/relay/" + room + "/ws"
+	capability := http.Header{"X-DeskFerry-Resumable": []string{"1"}}
+	agent := dialRoleHeaders(t, ctx, baseURL, path, "agent", capability)
+	waitForWaitingAgents(t, baseURL, room, 1)
+	home := dialRoleHeaders(t, ctx, baseURL, path, "client", capability)
+	sessionID := strings.TrimPrefix(expectTextPrefix(t, ctx, agent, startMessage+" "), startMessage+" ")
+	expectTextPrefix(t, ctx, home, startMessage+" ")
+	_ = home.Close(websocket.StatusNormalClosure, "")
+	if _, _, err := agent.Read(ctx); err == nil {
+		t.Fatal("agent transport remained open after client-side failure")
+	}
+	sideHeaders := func(side string) http.Header {
+		return http.Header{"X-DeskFerry-Session": []string{sessionID}, "X-DeskFerry-Session-Side": []string{side}}
+	}
+	abandoned := dialRoleHeaders(t, ctx, baseURL, path, resumeRole, sideHeaders("agent"))
+	time.Sleep(200 * time.Millisecond)
+	_ = abandoned.Close(websocket.StatusNormalClosure, "")
+	time.Sleep(300 * time.Millisecond)
+
+	home = dialRoleHeaders(t, ctx, baseURL, path, resumeRole, sideHeaders("client"))
+	defer home.Close(websocket.StatusNormalClosure, "session closed")
+	time.Sleep(300 * time.Millisecond)
+	agent = dialRoleHeaders(t, ctx, baseURL, path, resumeRole, sideHeaders("agent"))
+	defer agent.Close(websocket.StatusNormalClosure, "session closed")
+	expectText(t, ctx, home, resumeMessage+" "+sessionID)
+	expectText(t, ctx, agent, resumeMessage+" "+sessionID)
+	if err := agent.Write(ctx, websocket.MessageBinary, []byte("after-abandoned")); err != nil {
+		t.Fatal(err)
+	}
+	expectBinary(t, ctx, home, "after-abandoned")
+}
