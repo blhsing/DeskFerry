@@ -550,6 +550,18 @@ func (c *HTTPStreamConn) Close(code websocket.StatusCode, reason string) error {
 }
 
 func (c *HTTPStreamConn) CloseNow() error {
+	// A relay aborting a stream queues a close record that the client's next
+	// download receives, so the client drops this transport at once instead of
+	// polling an empty stream until its heartbeat times out.
+	c.mu.Lock()
+	if c.endpoint == "" && !c.closed && !c.closing {
+		c.closing = true
+		payload := encodeHTTPStreamClose(websocket.StatusServiceRestart, "relay aborted transport")
+		c.sendFrames = append(c.sendFrames, httpStreamFrame{kind: httpStreamRecordClose, seq: c.nextSend, payload: payload})
+		c.nextSend++
+		c.sendBytes += len(payload)
+	}
+	c.mu.Unlock()
 	c.closeTerminal(netClosedError())
 	return nil
 }
@@ -1203,7 +1215,19 @@ func (c *HTTPStreamConn) serveDownload(w http.ResponseWriter, r *http.Request) {
 	for {
 		c.mu.Lock()
 		current := c.downGen == generation && !c.closed
+		closedCurrent := c.downGen == generation && c.closed
 		c.mu.Unlock()
+		if closedCurrent {
+			// Deliver what remains, including the close record, then end.
+			frames, _ := c.snapshotAfter(lastSeq)
+			for _, frame := range frames {
+				if err := writeHTTPStreamRecord(w, frame); err != nil {
+					return
+				}
+			}
+			flusher.Flush()
+			return
+		}
 		if !current {
 			return
 		}
@@ -1288,7 +1312,14 @@ func (c *HTTPStreamConn) serveDownloadBatch(w http.ResponseWriter, r *http.Reque
 	for {
 		c.mu.Lock()
 		// A newer GET supersedes a legacy one; pipelined GETs wait together.
-		if (!pipelined && c.downGen != generation) || c.closed {
+		if c.closed {
+			c.mu.Unlock()
+			// Deliver what remains, including the close record, then end.
+			frames, ack := c.snapshotAfter(0)
+			c.writeDownloadBatch(w, ack, frames)
+			return
+		}
+		if !pipelined && c.downGen != generation {
 			c.mu.Unlock()
 			return
 		}

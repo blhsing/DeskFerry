@@ -723,3 +723,76 @@ func TestHTTPStreamPipelinedDownloadRecoversLostResponse(t *testing.T) {
 		t.Fatal("test proxy never dropped a response")
 	}
 }
+
+// A relay aborts a stream with CloseNow when it coordinates a resume. The
+// client must learn of it from its next download instead of polling an empty
+// stream until its heartbeat times out.
+func TestHTTPStreamClientLearnsOfRelayAbortPromptly(t *testing.T) {
+	for _, buffering := range []bool{false, true} {
+		t.Run(fmt.Sprintf("buffering=%t", buffering), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			streams := NewHTTPStreamServer(func(ctx context.Context, conn MessageConn, _ *http.Request, _ string) {
+				for {
+					typ, payload, err := conn.Read(ctx)
+					if err != nil {
+						return
+					}
+					if string(payload) == "abort" {
+						_ = conn.CloseNow()
+						return
+					}
+					if err := conn.Write(ctx, typ, payload); err != nil {
+						return
+					}
+				}
+			})
+			defer streams.Close()
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+				if len(parts) != 5 || parts[0] != "relay" || parts[2] != "stream" {
+					http.NotFound(w, r)
+					return
+				}
+				if !buffering || parts[4] == "up" {
+					streams.Serve(w, r, parts[1], parts[3], parts[4])
+					return
+				}
+				recorder := httptest.NewRecorder()
+				streams.Serve(recorder, r, parts[1], parts[3], parts[4])
+				for name, values := range recorder.Header() {
+					w.Header()[name] = values
+				}
+				w.WriteHeader(recorder.Code)
+				_, _ = w.Write(recorder.Body.Bytes())
+			}))
+			defer origin.Close()
+
+			conn, err := DialHTTPStreamWithHeaders(ctx, origin.URL+"/relay/unit", "direct", RoleProbe, "", nil)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer CloseMessageConn(conn)
+			if err := conn.Write(ctx, websocket.MessageBinary, []byte("ping")); err != nil {
+				t.Fatal(err)
+			}
+			if _, payload, err := conn.Read(ctx); err != nil || string(payload) != "ping" {
+				t.Fatalf("echo = %q, %v", payload, err)
+			}
+			if err := conn.Write(ctx, websocket.MessageBinary, []byte("abort")); err != nil {
+				t.Fatal(err)
+			}
+			started := time.Now()
+			readCtx, readCancel := context.WithTimeout(ctx, 3*time.Second)
+			defer readCancel()
+			if _, _, err := conn.Read(readCtx); err == nil {
+				t.Fatal("read succeeded after the relay aborted the stream")
+			} else if readCtx.Err() != nil {
+				t.Fatalf("client did not notice the relay abort within 3s: %v", err)
+			}
+			if elapsed := time.Since(started); elapsed > 2*time.Second {
+				t.Fatalf("client noticed the relay abort after %s", elapsed)
+			}
+		})
+	}
+}

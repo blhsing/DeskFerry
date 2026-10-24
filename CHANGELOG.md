@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.13.10 - 2026-10-24
+
+- Tell a POST/GET streaming client at once when the relay ends its transport. When one side of a session reconnected, the Azure and Go relays aborted the other side's transport to resume both together, but a streaming client only received empty responses until its own heartbeat timed out several seconds later. By then the other side had moved on to the next relay, and the two kept missing each other until the Remote Desktop client gave up. The relays now send a close record on the client's next download, so it resumes within a fraction of a second. The Python relay already did this.
+- Wait longer at the room's other relays when the session's relay cannot be reached. A side that cannot reach that relay cannot return to it, so it now waits at least 8 seconds at the other relays (12 seconds per attempt on Android), giving the other side time to give up on the session's relay and follow. Resume diagnostics now name both relays when a session moves.
+
 ## 0.13.9 - 2026-10-23
 
 - Move interrupted Android Home sessions to the room's other relays too. When the session's relay cannot be reached, the Android Home app now tries the room's relays in the configured order, as the Windows and macOS apps and the Work service do since 0.13.8. With more than one relay, each attempt allows 4 seconds plus 3 more per round (up to 15) for connecting and for the Work agent to arrive.

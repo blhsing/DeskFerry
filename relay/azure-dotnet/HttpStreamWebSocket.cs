@@ -137,6 +137,18 @@ sealed class HttpStreamWebSocket : WebSocket
             {
                 return;
             }
+            // A relay aborting a stream queues a close record that the client's
+            // next download receives, so the client drops this transport at once
+            // instead of polling an empty stream until its heartbeat times out.
+            if (_state is WebSocketState.Open or WebSocketState.CloseReceived)
+            {
+                var reason = System.Text.Encoding.UTF8.GetBytes("relay aborted transport");
+                var payload = new byte[2 + reason.Length];
+                BinaryPrimitives.WriteUInt16BigEndian(payload, (ushort)WebSocketCloseStatus.EndpointUnavailable);
+                reason.CopyTo(payload.AsSpan(2));
+                _outbound.Add(new Frame(CloseRecord, _nextSend++, payload));
+                _buffered += payload.Length;
+            }
             _state = WebSocketState.Aborted;
         }
         _lifetime.Cancel();
@@ -425,6 +437,10 @@ sealed class HttpStreamWebSocket : WebSocket
                     lastSequence = frame.Sequence;
                 }
                 await context.Response.Body.FlushAsync(context.RequestAborted);
+                if (_lifetime.IsCancellationRequested)
+                {
+                    break;
+                }
 
                 using var timeout = new CancellationTokenSource(Keepalive);
                 using var linked = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, _lifetime.Token, timeout.Token);
@@ -439,6 +455,36 @@ sealed class HttpStreamWebSocket : WebSocket
             }
         }
         catch (Exception exception) when (exception is IOException or OperationCanceledException) { }
+        if (_lifetime.IsCancellationRequested && !context.RequestAborted.IsCancellationRequested)
+        {
+            // Deliver what remains, including the close record, then end.
+            try
+            {
+                List<Frame> rest;
+                lock (_gate)
+                {
+                    rest = _outbound.Where(frame => frame.Sequence > lastSequence).ToList();
+                }
+                foreach (var frame in rest)
+                {
+                    await WriteRecordAsync(context.Response.Body, frame, context.RequestAborted);
+                }
+                await context.Response.Body.FlushAsync(context.RequestAborted);
+            }
+            catch (Exception exception) when (exception is IOException or OperationCanceledException) { }
+        }
+    }
+
+    private async Task WriteRemainingBatchAsync(HttpContext context)
+    {
+        List<Frame> rest;
+        ulong ack;
+        lock (_gate)
+        {
+            rest = _outbound.ToList();
+            ack = _nextReceive - 1;
+        }
+        await WriteDownloadBatchAsync(context, ack, rest);
     }
 
     private async Task ServeDownloadBatchAsync(HttpContext context, long generation, bool prime, bool pipelined)
@@ -450,6 +496,12 @@ sealed class HttpStreamWebSocket : WebSocket
         var keepaliveDeadline = DateTimeOffset.UtcNow + Keepalive;
         DateTimeOffset? coalesceDeadline = null;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, _lifetime.Token);
+        if (_lifetime.IsCancellationRequested)
+        {
+            // Deliver what remains, including the close record, then end.
+            await WriteRemainingBatchAsync(context);
+            return;
+        }
         // A newer GET supersedes a legacy one; pipelined GETs wait together.
         while (!context.RequestAborted.IsCancellationRequested && !_lifetime.IsCancellationRequested && (pipelined || generation == Volatile.Read(ref _downGeneration)))
         {
@@ -485,9 +537,17 @@ sealed class HttpStreamWebSocket : WebSocket
                 deadline = resend;
             }
             var wait = deadline - DateTimeOffset.UtcNow;
-            if (wait > TimeSpan.Zero && await _changed.WaitAsync(wait, linked.Token))
+            try
             {
-                continue;
+                if (wait > TimeSpan.Zero && await _changed.WaitAsync(wait, linked.Token))
+                {
+                    continue;
+                }
+            }
+            catch (OperationCanceledException) when (_lifetime.IsCancellationRequested && !context.RequestAborted.IsCancellationRequested)
+            {
+                await WriteRemainingBatchAsync(context);
+                return;
             }
             var now = DateTimeOffset.UtcNow;
             var keepaliveDue = now >= keepaliveDeadline;
@@ -506,6 +566,10 @@ sealed class HttpStreamWebSocket : WebSocket
                 // Another waiting GET already carried the acknowledgement.
                 coalesceDeadline = null;
             }
+        }
+        if (_lifetime.IsCancellationRequested && !context.RequestAborted.IsCancellationRequested)
+        {
+            await WriteRemainingBatchAsync(context);
         }
     }
 

@@ -941,3 +941,48 @@ func testAbandonedResumeAttachment(t *testing.T, baseURL string) {
 	}
 	expectBinary(t, ctx, home, "after-abandoned")
 }
+
+func TestHTTPStreamAgentLearnsOfCoordinatedResumePromptly(t *testing.T) {
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+	testHTTPStreamAgentLearnsOfAbort(t, server.URL)
+}
+
+// testHTTPStreamAgentLearnsOfAbort pairs an HTTP-stream agent with a WebSocket
+// client. When the client's transport fails, the relay aborts the agent's
+// transport for a coordinated resume; the agent must notice promptly instead
+// of waiting for its own heartbeat to time out.
+func testHTTPStreamAgentLearnsOfAbort(t *testing.T, baseURL string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	room := fmt.Sprintf("unit-stream-abort-%d", time.Now().UnixNano())
+	capability := http.Header{"X-DeskFerry-Resumable": []string{"1"}}
+	agent, err := tunnel.DialHTTPStreamWithHeaders(ctx, baseURL+"/relay/"+room, "direct", "agent", "", capability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseMessageConn(agent)
+	waitForWaitingAgents(t, baseURL, room, 1)
+	home := dialRoleHeaders(t, ctx, baseURL, "/relay/"+room+"/ws", "client", capability)
+	if _, err := tunnel.AwaitWebSocketStartSession(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	expectTextPrefix(t, ctx, home, startMessage+" ")
+	_ = home.Close(websocket.StatusNormalClosure, "")
+	started := time.Now()
+	readCtx, readCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer readCancel()
+	for {
+		_, _, err := agent.Read(readCtx)
+		if err == nil {
+			continue
+		}
+		if readCtx.Err() != nil {
+			t.Fatalf("HTTP-stream agent did not notice the coordinated resume within 5s: %v", err)
+		}
+		break
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("HTTP-stream agent noticed the coordinated resume after %s", elapsed)
+	}
+}

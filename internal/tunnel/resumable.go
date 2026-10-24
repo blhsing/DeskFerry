@@ -50,6 +50,10 @@ const (
 	// sides that keep missing each other eventually overlap at one relay.
 	resumePeerWaitStep = 3 * time.Second
 	resumePeerWaitMax  = 15 * time.Second
+	// A side that cannot reach the session's relay cannot return there, so it
+	// waits longer at the others while the peer, which can reach it, gives up
+	// there and follows.
+	resumeUnreachablePeerWait = 8 * time.Second
 )
 
 type ResumableWebSocketOptions struct {
@@ -272,12 +276,17 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 	backoff := 250 * time.Millisecond
 	dialTimeouts := 0
 	peerWaitRound := 0
+	// The relay the transport was lost on, and whether it proved unreachable
+	// during this resume.
+	lostRelay := -1
+	lostRelayUnreachable := false
 	for {
 		if ws != nil {
 			c.drainLostSignal()
 			if err := c.attachTransport(ws); err == nil {
 				backoff = 250 * time.Millisecond
 				peerWaitRound = 0
+				lostRelay, lostRelayUnreachable = -1, false
 				select {
 				case <-c.ctx.Done():
 					return
@@ -303,6 +312,9 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 			return
 		}
 
+		if lostRelay < 0 {
+			lostRelay = c.relayIndex
+		}
 		remaining := resumableWindow - time.Since(lostAt)
 		dialTimeout := resumableDialAttemptTimeout(remaining, c.opts.Service, dialTimeouts)
 		relay := c.relays[c.relayIndex]
@@ -314,6 +326,9 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 			dialTimeouts++
 		} else if err == nil {
 			dialTimeouts = 0
+		}
+		if err != nil && c.relayIndex == lostRelay && c.ctx.Err() == nil {
+			lostRelayUnreachable = true
 		}
 		if err == nil {
 			// Reaching the relay proves the path is healthy again. If this
@@ -329,6 +344,9 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 			peerWait := remaining
 			if len(c.relays) > 1 {
 				peerWait = resumePeerWait(peerWaitRound, remaining)
+				if lostRelayUnreachable && c.relayIndex != lostRelay && peerWait < resumeUnreachablePeerWait {
+					peerWait = min(resumeUnreachablePeerWait, remaining)
+				}
 			}
 			resumeCtx, cancelResume := context.WithTimeout(c.ctx, peerWait)
 			err = AwaitWebSocketResume(resumeCtx, candidate, c.opts.SessionID)
@@ -343,8 +361,8 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 			}
 		}
 		if err == nil {
-			if relay != c.opts.RelayAddr || c.relayIndex != 0 {
-				c.diagnostic("transport resumed through relay=%s", relay)
+			if c.relayIndex != lostRelay {
+				c.diagnostic("transport moved from relay=%s to relay=%s", c.relays[lostRelay], relay)
 			}
 			ws = candidate
 			continue

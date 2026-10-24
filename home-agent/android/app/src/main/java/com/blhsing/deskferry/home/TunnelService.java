@@ -95,6 +95,7 @@ public class TunnelService extends Service {
     private static final long FAILOVER_ATTEMPT_BASE_MS = 4L * 1000L;
     private static final long FAILOVER_ATTEMPT_STEP_MS = 3L * 1000L;
     private static final long FAILOVER_ATTEMPT_MAX_MS = 15L * 1000L;
+    private static final long FAILOVER_UNREACHABLE_ATTEMPT_MS = 12L * 1000L;
     private static final int MAX_CONCURRENT_BRIDGES_PER_SERVICE = 2;
     private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss", Locale.ROOT);
     private static final SimpleDateFormat DIAGNOSTIC_TIME_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.ROOT);
@@ -1687,6 +1688,9 @@ public class TunnelService extends Service {
                 List<String> resumeRelays = resumeRelayOrder(selectedRelay, relayUrlsSnapshot());
                 int relayIndex = 0;
                 int waitRound = 0;
+                // A phone that cannot reach the session's relay cannot return
+                // there, so it waits longer at the others for the Work agent.
+                boolean sessionRelayUnreachable = false;
                 try {
                     while (!closed.get() && SystemClock.elapsedRealtime() < deadline) {
                         boolean attemptTimedOut = false;
@@ -1710,6 +1714,9 @@ public class TunnelService extends Service {
 							long attemptWait = resumeRelays.size() > 1
 									? failoverAttemptWaitMillis(waitRound, remaining)
 									: resumeAttemptWaitMillis(remaining);
+							if (sessionRelayUnreachable && relayIndex != 0) {
+								attemptWait = Math.max(attemptWait, Math.min(FAILOVER_UNREACHABLE_ATTEMPT_MS, remaining));
+							}
 							boolean signaled = ready.await(attemptWait, TimeUnit.MILLISECONDS);
 							if (signaled && started.get() && failure.get() == null) {
 								clearPendingResume(candidate, ready);
@@ -1728,6 +1735,9 @@ public class TunnelService extends Service {
                             }
 							if (!closed.get()) {
 								attemptTimedOut = !signaled;
+								if (relayIndex == 0 && signaled) {
+									sessionRelayUnreachable = true;
+								}
 								String result = !signaled ? "attempt_timeout" : "transport_failure";
 								append(serviceLabel + " relay resume attempt failed relay=" + relay
 										+ " result=" + result + " elapsed_ms=" + elapsedMillis(attemptStarted)
@@ -1743,6 +1753,9 @@ public class TunnelService extends Service {
                             }
 							if (pendingReady != null) {
 								pendingReady.countDown();
+							}
+							if (relayIndex == 0) {
+								sessionRelayUnreachable = true;
 							}
 							if (!closed.get()) {
 								append(serviceLabel + " relay resume attempt failed relay=" + relay
