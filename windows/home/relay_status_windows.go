@@ -16,13 +16,19 @@ import (
 var errWorkAgentOffline = errors.New("Work agent offline")
 
 func checkWorkAgentOnline(ctx context.Context, cfg config) error {
+	return checkWorkAgentOnlineFor(ctx, cfg, "Remote Desktop was not opened.")
+}
+
+// checkWorkAgentOnlineFor reports why the selected room's Work agent cannot
+// be reached, ending the message with what the caller did not do.
+func checkWorkAgentOnlineFor(ctx context.Context, cfg config, outcome string) error {
 	summary, err := queryRelaySummary(ctx, cfg)
 	room := tunnel.RelayRoomToken(cfg.primaryRelayAddress(), "")
 	if err != nil {
-		return fmt.Errorf("Could not check the Work agent in room %q. Check your proxy and relay connection, then try again. Remote Desktop was not opened.\n\n%w", room, err)
+		return fmt.Errorf("Could not check the Work agent in room %q. Check your proxy and relay connection, then try again. %s\n\n%w", room, outcome, err)
 	}
 	if !summary.WorkOnline {
-		return fmt.Errorf("The Work agent in room %q is not connected to any reachable relay. Check that DeskFerry Work services are running on that computer and can connect through its proxy. Remote Desktop was not opened.\n\n%w", room, errWorkAgentOffline)
+		return fmt.Errorf("The Work agent in room %q is not connected to any reachable relay. Check that DeskFerry Work services are running on that computer and can connect through its proxy. %s\n\n%w", room, outcome, errWorkAgentOffline)
 	}
 	return nil
 }

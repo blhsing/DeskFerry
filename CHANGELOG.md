@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.13.12 - 2026-11-04
+
+- Keep the Windows app responsive when Save login cannot reach the Work computer. Saving a login that needs the Work computer (qualifying a local username or changing Remote Desktop security) now checks the Work agent first and gives up within seconds when it is offline, instead of retrying the relay for 90 seconds. Saving a username saves it as entered; a security change reports that the Work computer was not changed. Stopping the tunnel, saving settings, or switching destination while such a command runs now cancels it at once, where the window used to stop responding until the command timed out.
+
 ## 0.13.11 - 2026-11-04
 
 - Make mouse clicks work on the Windows app's filled primary buttons, such as Connect / Stop Tunnel in the Home window and the primary actions in the Setup and Work Services windows. The button took mouse capture on press, and the window framework then took it again for the same button, which the button read as a lost press, so it ignored the release. Only Space and Enter activated these buttons. A capture notice for the button itself no longer cancels the press.

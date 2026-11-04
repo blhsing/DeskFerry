@@ -42,7 +42,11 @@ type winRMResponse struct {
 }
 
 type winRMSessionManager struct {
-	mu          sync.Mutex
+	mu sync.Mutex
+	// activeMu guards active separately from mu, which Execute holds for a
+	// whole command, so Close can abort commands without waiting for them.
+	activeMu    sync.Mutex
+	active      map[*context.CancelFunc]struct{}
 	idleTimeout time.Duration
 	lastUsed    time.Time
 	idleTimer   *time.Timer
@@ -65,6 +69,20 @@ func winRMSessionKey(destination, user, port, password string) string {
 }
 
 func (m *winRMSessionManager) Execute(ctx context.Context, destination, user, password, command, port string) (winRMResponse, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	m.activeMu.Lock()
+	if m.active == nil {
+		m.active = make(map[*context.CancelFunc]struct{})
+	}
+	m.active[&cancel] = struct{}{}
+	m.activeMu.Unlock()
+	defer func() {
+		m.activeMu.Lock()
+		delete(m.active, &cancel)
+		m.activeMu.Unlock()
+	}()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -102,6 +120,11 @@ func (m *winRMSessionManager) Execute(ctx context.Context, destination, user, pa
 	var read readResult
 	select {
 	case <-ctx.Done():
+		// The worker is busy with this command and cannot read a graceful
+		// close request, so end it at once.
+		if m.cmd != nil && m.cmd.Process != nil {
+			_ = m.cmd.Process.Kill()
+		}
 		m.stopWorkerLocked()
 		return winRMResponse{}, ctx.Err()
 	case read = <-result:
@@ -147,7 +170,14 @@ func decodeWinRMResponseText(response *winRMResponse) error {
 	return nil
 }
 
+// Close stops the worker. Commands in progress are canceled first, so the
+// caller (often the UI thread) never waits for its relay dial to time out.
 func (m *winRMSessionManager) Close() {
+	m.activeMu.Lock()
+	for cancel := range m.active {
+		(*cancel)()
+	}
+	m.activeMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.idleTimer != nil {

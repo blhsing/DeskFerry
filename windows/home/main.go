@@ -1953,8 +1953,12 @@ func (a *clientApp) prepareWindowsCredentialSave(cfg config, user, pass, port st
 		manager = newWinRMSessionManager(defaultWinRMSessionIdleTimeout)
 		a.winRMSession = manager
 	}
-	var err error
-	if needsQualification {
+	// A WinRM dial to an offline Work agent retries for the whole relay
+	// window, so check presence first and fail within seconds instead.
+	checkCtx, checkCancel := context.WithTimeout(ctx, 7*time.Second)
+	err := checkWorkAgentOnlineFor(checkCtx, cfg, "The Work computer was not changed.")
+	checkCancel()
+	if err == nil && needsQualification {
 		var response winRMResponse
 		response, err = manager.Execute(ctx, cfg.SelectedDestination, user, pass, "[Environment]::MachineName", port)
 		if err == nil {
