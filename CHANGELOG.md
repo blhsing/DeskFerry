@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.13.13 - 2026-11-04
+
+- Allow the Work service to read Home settings without blocking atomic replacement, and retry brief Windows sharing locks when saving settings or Windows logins. Persistent errors still leave the previous settings intact.
+- Create the DeskFerry Start menu shortcut for Work-only installations as well as Home installations.
+
 ## 0.13.12 - 2026-11-04
 
 - Keep the Windows app responsive when Save login cannot reach the Work computer. Saving a login that needs the Work computer (qualifying a local username or changing Remote Desktop security) now checks the Work agent first and gives up within seconds when it is offline, instead of retrying the relay for 90 seconds. Saving a username saves it as entered; a security change reports that the Work computer was not changed. Stopping the tunnel, saving settings, or switching destination while such a command runs now cancels it at once, where the window used to stop responding until the command timed out.

@@ -28,6 +28,7 @@ import (
 	"deskferry/internal/homenetwork"
 	"deskferry/internal/tunnel"
 	"deskferry/internal/winsecret"
+	"deskferry/windows/shortcut"
 	"deskferry/windows/uikit"
 )
 
@@ -1802,24 +1803,10 @@ func restrictConfigACL(path string) error {
 }
 
 func createShortcuts(installDir string) error {
-	dir := shortcutDir()
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := shortcut.Create("DeskFerry.lnk", installDir, "", "DeskFerry"); err != nil {
 		return err
 	}
-	if err := createShortcut(filepath.Join(dir, "DeskFerry.lnk"), filepath.Join(installDir, "DeskFerry.exe"), "", installDir, "DeskFerry"); err != nil {
-		return err
-	}
-	return createShortcut(filepath.Join(dir, "Remove DeskFerry.lnk"), filepath.Join(installDir, "DeskFerry.exe"), "-windows-setup -elevated-uninstall", installDir, "Remove DeskFerry")
-}
-
-func createShortcut(shortcut, target, args, workDir, description string) error {
-	quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "''") + "'" }
-	script := "$w=New-Object -ComObject WScript.Shell;$s=$w.CreateShortcut(" + quote(shortcut) + ");$s.TargetPath=" + quote(target) + ";$s.Arguments=" + quote(args) + ";$s.WorkingDirectory=" + quote(workDir) + ";$s.Description=" + quote(description) + ";$s.IconLocation=" + quote(target+",0") + ";$s.Save()"
-	out, err := hiddenCommand("powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("create Start menu shortcut: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	return shortcut.Create("Remove DeskFerry.lnk", installDir, "-windows-setup -elevated-uninstall", "Remove DeskFerry")
 }
 
 func configPath() string {
@@ -1851,11 +1838,7 @@ func hostsPath() string {
 }
 
 func shortcutDir() string {
-	base := strings.TrimSpace(os.Getenv("ProgramData"))
-	if base == "" {
-		base = `C:\ProgramData`
-	}
-	return filepath.Join(base, "Microsoft", "Windows", "Start Menu", "Programs", productName)
+	return shortcut.Directory()
 }
 
 func defaultInstallDir() string {

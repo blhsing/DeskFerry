@@ -31,6 +31,7 @@ import (
 	"deskferry/internal/uiproxy"
 	"deskferry/internal/winsecret"
 	"deskferry/internal/winservice"
+	"deskferry/windows/shortcut"
 	"deskferry/windows/uikit"
 )
 
@@ -945,6 +946,9 @@ func installOrUpdate(opts actionOptions) (string, error) {
 	_ = s.SetRecoveryActionsOnNonCrashFailures(true)
 
 	if err := startMgrService(s); err != nil {
+		return "", err
+	}
+	if err := shortcut.Create("DeskFerry.lnk", installDir, "", "DeskFerry"); err != nil {
 		return "", err
 	}
 	cleanupLegacyWorkInstall(existingExecutable, existingPasswordFile, agentDest, passwordDest)
