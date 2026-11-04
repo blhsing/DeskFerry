@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.13.11 - 2026-11-04
+
+- Make mouse clicks work on the Windows app's filled primary buttons, such as Connect / Stop Tunnel in the Home window and the primary actions in the Setup and Work Services windows. The button took mouse capture on press, and the window framework then took it again for the same button, which the button read as a lost press, so it ignored the release. Only Space and Enter activated these buttons. A capture notice for the button itself no longer cancels the press.
+
 ## 0.13.10 - 2026-10-24
 
 - Tell a POST/GET streaming client at once when the relay ends its transport. When one side of a session reconnected, the Azure and Go relays aborted the other side's transport to resume both together, but a streaming client only received empty responses until its own heartbeat timed out several seconds later. By then the other side had moved on to the next relay, and the two kept missing each other until the Remote Desktop client gave up. The relays now send a close record on the client's next download, so it resumes within a fraction of a second. The Python relay already did this.

@@ -135,7 +135,10 @@ func (b *AccentButton) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr
 			}
 		}
 	case win.WM_CAPTURECHANGED:
-		if b.pressed {
+		// walk's base WndProc calls SetCapture again on mouse-down, which
+		// notifies this same window; only a capture lost to another window
+		// cancels the press.
+		if b.pressed && win.HWND(lParam) != hwnd {
 			b.pressed = false
 			_ = b.Invalidate()
 		}

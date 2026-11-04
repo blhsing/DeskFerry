@@ -21,7 +21,7 @@ from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.13.10"
+RELAY_VERSION = "0.13.11"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
