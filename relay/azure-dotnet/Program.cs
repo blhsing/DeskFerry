@@ -45,7 +45,7 @@ app.UseWebSockets(new WebSocketOptions
     KeepAliveInterval = TimeSpan.FromSeconds(20)
 });
 
-app.MapGet("/", () => Results.Redirect("/relay/"));
+app.MapGet("/", () => Results.Text("<!doctype html><html><head><meta charset=\"utf-8\"><title></title></head><body></body></html>", "text/html; charset=utf-8"));
 app.MapGet("/relay", () => Results.Text(DashboardHtml(), "text/html; charset=utf-8"));
 app.MapGet("/relay/health", () => Results.Json(new
 {
