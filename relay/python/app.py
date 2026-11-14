@@ -21,7 +21,7 @@ from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.13.13"
+RELAY_VERSION = "0.14.0"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -503,7 +503,7 @@ def read_agent_services(websocket: WebSocket) -> set[str]:
     return {
         value.strip().lower()
         for value in websocket.headers.get("x-deskferry-agent-services", "").split(",")
-        if value.strip().lower() in {"rdp", "winrm", "smb", "screen"}
+        if is_known_service(value.strip().lower())
     }
 
 
@@ -521,7 +521,20 @@ def read_room_proof(websocket: WebSocket) -> str:
 
 def read_service(websocket: WebSocket) -> str:
     service = websocket.headers.get("x-deskferry-service", "").strip().lower()
-    return service if service in {"winrm", "smb", "screen"} else "rdp"
+    return service if is_known_service(service) else "rdp"
+
+
+def is_known_service(service: str) -> bool:
+    """Built-in services plus Work agent TCP forwards named tcp-<forward port>.
+
+    The relay only pairs a TCP forward; the Work agent owns its target.
+    """
+    if service in {"rdp", "winrm", "smb", "screen"}:
+        return True
+    digits = service[4:] if service.startswith("tcp-") else ""
+    if not (1 <= len(digits) <= 5) or digits[0] == "0" or not all("0" <= ch <= "9" for ch in digits):
+        return False
+    return 1 <= int(digits) <= 65535
 
 
 def clean_session_value(value: str | None) -> str:

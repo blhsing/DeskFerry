@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -210,5 +211,29 @@ func TestReconnectDelayResetsAfterConnection(t *testing.T) {
 	delay, next := reconnectDelay(maxBackoff, minBackoff, maxBackoff, true)
 	if delay != time.Second || next != time.Second {
 		t.Fatalf("connected delay, next = %s, %s; want 1s, 1s", delay, next)
+	}
+}
+
+func TestTCPForwardsRequirePasswordAndAdvertiseServices(t *testing.T) {
+	relayURL := "https://test-officialwebsite.azurewebsites.net/relay/workdesk"
+	if _, err := loadConfig(relayURL, "", "", false, "", "", "", "15432=db01:5432"); err == nil || !strings.Contains(err.Error(), "room password") {
+		t.Fatalf("forward without a room password: %v", err)
+	}
+	if _, err := loadConfig(relayURL, "", "", false, "", "", "", "15432=db01"); err == nil {
+		t.Fatal("forward without a target port was accepted")
+	}
+	cfg := config{RelayAddr: relayURL, RoomPassword: "secret", TCPForwards: []tunnel.TCPForward{{ForwardPort: 15432, Target: "db01:5432"}}}
+	cfg.applyDefaults()
+	if err := cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAgentOptionsArgsIncludeTCPForwards(t *testing.T) {
+	args := serviceArgs(agentOptions{RelayURL: "https://relay/workdesk", RoomPasswordFile: `C:\pw.dpapi`, TCPForwards: "15432=db01:5432;2222=jump:22", ScreenView: true})
+	got := strings.Join(args, " ")
+	want := `-service -relay-url https://relay/workdesk -room-password-file C:\pw.dpapi -tcp-forward 15432=db01:5432;2222=jump:22 -screen-view`
+	if got != want {
+		t.Fatalf("service args = %q, want %q", got, want)
 	}
 }

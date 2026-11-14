@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.14.0 - 2026-11-14
+
+- Add TCP forwards: reach a host and port on the Work network, such as a database or an SSH server, from a loopback port on the Home PC. The Work PC owner lists the targets Home apps may reach, each under a forward port number, in the new **TCP forwards** card of the Work Services window or with `-tcp-forward forwardPort=host:port` (for example `-tcp-forward 5432=db01:5432`). On the Home PC, the selected destination's new **TCP forwards** card maps a local port on `127.0.0.1` to a Work forward port (for example `15432=5432`); the listeners start with **Connect**. `DeskFerry.exe -console -tcp-forward 15432=5432` does the same for one run. Each forward travels as its own relay service, `tcp-<forward port>`, through the existing relay room, so the relays open no new ports and only the Work PC knows the target. Like WinRM and SMB, TCP forwards require a room password.
+- Accept TCP forward services in the Azure, Go, and Python relays. A Home app requires the relay to confirm the requested forward service, so an older relay that would map it to Remote Desktop is skipped instead.
+
 ## 0.13.13 - 2026-11-04
 
 - Allow the Work service to read Home settings without blocking atomic replacement, and retry brief Windows sharing locks when saving settings or Windows logins. Persistent errors still leave the previous settings intact.

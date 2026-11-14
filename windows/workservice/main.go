@@ -65,6 +65,58 @@ type config struct {
 	ConcurrencyLimit   int      `json:"concurrency_limit,omitempty"`
 	LegacyMode         bool     `json:"legacy_mode,omitempty"`
 	ScreenView         bool     `json:"screen_view,omitempty"`
+	// TCPForwards are the targets Home apps may reach through this agent,
+	// each advertised as the relay service "tcp-<forward port>".
+	TCPForwards []tunnel.TCPForward `json:"-"`
+}
+
+// agentOptions carries the command-line settings shared by install,
+// elevation, Scheduled Task fallback, and service startup.
+type agentOptions struct {
+	RelayURL         string
+	Proxy            string
+	RDP              string
+	WinRM            string
+	SMB              string
+	RoomPasswordFile string
+	TCPForwards      string
+	ScreenView       bool
+}
+
+// args returns the flags reproducing the options, without the mode flag.
+func (o agentOptions) args() []string {
+	var args []string
+	add := func(name, value string) {
+		if value != "" {
+			args = append(args, name, value)
+		}
+	}
+	add("-relay-url", o.RelayURL)
+	add("-proxy", o.Proxy)
+	add("-rdp", o.RDP)
+	add("-winrm", o.WinRM)
+	add("-smb", o.SMB)
+	add("-room-password-file", o.RoomPasswordFile)
+	add("-tcp-forward", o.TCPForwards)
+	if o.ScreenView {
+		args = append(args, "-screen-view")
+	}
+	return args
+}
+
+// tcpForwardFlag collects repeatable -tcp-forward values.
+type tcpForwardFlag []string
+
+func (f *tcpForwardFlag) Set(value string) error {
+	if _, err := tunnel.ParseTCPForwards(value); err != nil {
+		return err
+	}
+	*f = append(*f, value)
+	return nil
+}
+
+func (f *tcpForwardFlag) String() string {
+	return strings.Join(*f, ";")
 }
 
 type relayURLFlag []string
@@ -89,6 +141,7 @@ func Main() {
 	var smbFlag string
 	var roomPasswordFile string
 	var screenView bool
+	var tcpForwards tcpForwardFlag
 	var screenCaptureHelper bool
 	var logRetentionDays int
 	var consoleMode bool
@@ -107,6 +160,7 @@ func Main() {
 	flag.StringVar(&smbFlag, "smb", "", "local SMB target; blank disables SMB")
 	flag.StringVar(&roomPasswordFile, "room-password-file", "", "DPAPI-protected room password file")
 	flag.BoolVar(&screenView, "screen-view", false, "allow authenticated screen capture and streaming")
+	flag.Var(&tcpForwards, "tcp-forward", "TCP forward forwardPort=host:port that Home apps may reach; repeat or separate with semicolons")
 	flag.BoolVar(&screenCaptureHelper, "screen-capture-helper", false, "internal interactive desktop capture helper")
 	flag.IntVar(&logRetentionDays, "log-retention-days", diaglog.DefaultRetentionDays, "number of calendar days of diagnostic logs to retain")
 	flag.BoolVar(&consoleMode, "console", false, "run in the foreground for debugging")
@@ -149,6 +203,7 @@ func Main() {
 	if relayURL == "" {
 		relayURL = defaultRelayURL
 	}
+	opts := agentOptions{RelayURL: relayURL, Proxy: proxyFlag, RDP: rdpFlag, WinRM: winrmFlag, SMB: smbFlag, RoomPasswordFile: roomPasswordFile, TCPForwards: tcpForwards.String(), ScreenView: screenView}
 	// Maintenance actions must take precedence over service-context detection.
 	// A remote administrator may intentionally launch the updater through a
 	// one-shot LocalSystem service so replacement does not depend on the agent's
@@ -169,7 +224,7 @@ func Main() {
 		}
 	}
 	if runningAsService {
-		if err := runService(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile, screenView); err != nil {
+		if err := runService(opts); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -187,7 +242,7 @@ func Main() {
 		return
 	}
 	if selfTestMode {
-		cfg, err := loadConfig(relayURL, proxyFlag, rdpFlag, screenView, winrmFlag, smbFlag, roomPasswordFile)
+		cfg, err := loadAgentConfig(opts)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -198,13 +253,13 @@ func Main() {
 		return
 	}
 	if installMode || !consoleMode {
-		if err := installService(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile, screenView); err != nil {
+		if err := installService(opts); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
 
-	cfg, err := loadConfig(relayURL, proxyFlag, rdpFlag, screenView, winrmFlag, smbFlag, roomPasswordFile)
+	cfg, err := loadAgentConfig(opts)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -339,8 +394,12 @@ func waitForServiceState(s *mgr.Service, want svc.State, timeout time.Duration) 
 	}
 }
 
+func loadAgentConfig(opts agentOptions) (config, error) {
+	return loadConfig(opts.RelayURL, opts.Proxy, opts.RDP, opts.ScreenView, opts.WinRM, opts.SMB, opts.RoomPasswordFile, opts.TCPForwards)
+}
+
 func loadConfig(relayURL, proxyOverride, rdpOverride string, screenView bool, extras ...string) (config, error) {
-	winrmOverride, smbOverride, passwordFile := "", "", ""
+	winrmOverride, smbOverride, passwordFile, tcpForwards := "", "", "", ""
 	if len(extras) > 0 {
 		winrmOverride = extras[0]
 	}
@@ -350,6 +409,13 @@ func loadConfig(relayURL, proxyOverride, rdpOverride string, screenView bool, ex
 	if len(extras) > 2 {
 		passwordFile = extras[2]
 	}
+	if len(extras) > 3 {
+		tcpForwards = extras[3]
+	}
+	forwards, err := tunnel.ParseTCPForwards(tcpForwards)
+	if err != nil {
+		return config{}, err
+	}
 	cfg := config{
 		RelayAddrs:       splitRelayURLs(relayURL),
 		Proxy:            strings.TrimSpace(proxyOverride),
@@ -358,6 +424,7 @@ func loadConfig(relayURL, proxyOverride, rdpOverride string, screenView bool, ex
 		SMBAddr:          strings.TrimSpace(smbOverride),
 		RoomPasswordFile: strings.TrimSpace(passwordFile),
 		ScreenView:       screenView,
+		TCPForwards:      forwards,
 	}
 	if cfg.RoomPasswordFile != "" {
 		data, err := os.ReadFile(cfg.RoomPasswordFile)
@@ -408,6 +475,9 @@ func (c config) validate() error {
 	}
 	if c.ScreenView && c.RoomPassword == "" {
 		return fmt.Errorf("screen viewing requires a non-empty room password")
+	}
+	if len(c.TCPForwards) > 0 && c.RoomPassword == "" {
+		return fmt.Errorf("TCP forwards require a non-empty room password")
 	}
 	if c.SMBAddr != "" {
 		if _, _, err := net.SplitHostPort(c.SMBAddr); err != nil {
@@ -531,12 +601,12 @@ func joinRelayURLs(values []string) string {
 	return strings.Join(uniqueRelayURLs(values), ";")
 }
 
-func installService(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile string, screenView bool) error {
-	if strings.TrimSpace(relayURL) == "" {
-		relayURL = defaultRelayURL
+func installService(opts agentOptions) error {
+	if strings.TrimSpace(opts.RelayURL) == "" {
+		opts.RelayURL = defaultRelayURL
 	}
 	if !isElevated() {
-		return relaunchElevated(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile, screenView)
+		return relaunchElevated(opts)
 	}
 	exePath, err := os.Executable()
 	if err != nil {
@@ -548,7 +618,7 @@ func installService(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswo
 	}
 	defer m.Disconnect()
 
-	args := serviceArgs(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile, screenView)
+	args := serviceArgs(opts)
 	serviceConfig := serviceInstallConfig(exePath, args)
 	s, err := m.CreateService(serviceName, exePath, serviceConfig, args...)
 	if err != nil {
@@ -562,7 +632,7 @@ func installService(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswo
 				return fmt.Errorf("update existing service: %w", err)
 			}
 		} else if isAccessDenied(err) {
-			return installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile, screenView)
+			return installScheduledTask(opts)
 		} else {
 			return fmt.Errorf("create service: %w", err)
 		}
@@ -576,30 +646,8 @@ func installService(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswo
 	return nil
 }
 
-func serviceArgs(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile string, screenView bool) []string {
-	args := []string{"-service"}
-	if relayURL != "" {
-		args = append(args, "-relay-url", relayURL)
-	}
-	if proxyFlag != "" {
-		args = append(args, "-proxy", proxyFlag)
-	}
-	if rdpFlag != "" {
-		args = append(args, "-rdp", rdpFlag)
-	}
-	if winrmFlag != "" {
-		args = append(args, "-winrm", winrmFlag)
-	}
-	if smbFlag != "" {
-		args = append(args, "-smb", smbFlag)
-	}
-	if roomPasswordFile != "" {
-		args = append(args, "-room-password-file", roomPasswordFile)
-	}
-	if screenView {
-		args = append(args, "-screen-view")
-	}
-	return args
+func serviceArgs(opts agentOptions) []string {
+	return append([]string{"-service"}, opts.args()...)
 }
 
 func serviceInstallConfig(exePath string, args []string) mgr.Config {
@@ -609,7 +657,7 @@ func serviceInstallConfig(exePath string, args []string) mgr.Config {
 		ErrorControl:   mgr.ErrorNormal,
 		BinaryPathName: serviceBinaryPath(exePath, args),
 		DisplayName:    "DeskFerry Agent",
-		Description:    "Work-side RDP, WinRM, SMB, and optional screen-view backend for DeskFerry.",
+		Description:    "Work-side RDP, WinRM, SMB, TCP forward, and optional screen-view backend for DeskFerry.",
 	}
 }
 
@@ -661,24 +709,18 @@ func printStatus() error {
 	return nil
 }
 
-func runService(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile string, screenView bool) error {
-	return svc.Run(serviceName, &agentService{relayURL: relayURL, proxyFlag: proxyFlag, rdpFlag: rdpFlag, winrmFlag: winrmFlag, smbFlag: smbFlag, roomPasswordFile: roomPasswordFile, screenView: screenView})
+func runService(opts agentOptions) error {
+	return svc.Run(serviceName, &agentService{opts: opts})
 }
 
 type agentService struct {
-	relayURL         string
-	proxyFlag        string
-	rdpFlag          string
-	winrmFlag        string
-	smbFlag          string
-	roomPasswordFile string
-	screenView       bool
+	opts agentOptions
 }
 
 func (s *agentService) Execute(_ []string, requests <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
 	const accepts = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange
 	changes <- svc.Status{State: svc.StartPending}
-	cfg, err := loadConfig(s.relayURL, s.proxyFlag, s.rdpFlag, s.screenView, s.winrmFlag, s.smbFlag, s.roomPasswordFile)
+	cfg, err := loadAgentConfig(s.opts)
 	if err != nil {
 		logEvent(eventlog.Error, "load config failed: %v", err)
 		return false, 1
@@ -736,6 +778,9 @@ func runWebSocketPoolsWithSessions(ctx, sessionCtx context.Context, cfg config, 
 	}
 	if cfg.ScreenView {
 		targets = append(targets, serviceTarget{Service: tunnel.ServiceScreen, Address: "interactive desktop", Interactive: true})
+	}
+	for _, forward := range cfg.TCPForwards {
+		targets = append(targets, serviceTarget{Service: forward.Service(), Address: forward.Target, Forward: true})
 	}
 	var wg sync.WaitGroup
 	relayAddrs := cfg.relayAddresses()
@@ -801,7 +846,8 @@ func runLegacyPools(ctx context.Context, cfg config, agentID string, targets []s
 	const slots = 4
 	var wg sync.WaitGroup
 	for _, target := range targets {
-		if target.Interactive {
+		// Legacy relays predate screen viewing and TCP forwards.
+		if target.Interactive || target.Forward {
 			continue
 		}
 		for i := 0; i < slots; i++ {
@@ -990,6 +1036,8 @@ type serviceTarget struct {
 	Service     string
 	Address     string
 	Interactive bool
+	// Forward marks a TCP forward target configured with -tcp-forward.
+	Forward bool
 }
 
 func runWebSocketSlot(ctx context.Context, cfg config, slot int, agentID string, target serviceTarget) {
@@ -1239,32 +1287,18 @@ func handleStream(ctx context.Context, stream net.Conn, target serviceTarget, re
 	log.Printf("%s stream slot=%d relay=%s target=%s ended duration=%s end_initiator=%s relay_to_local_bytes=%d relay_to_local_error=%v local_to_relay_bytes=%d local_to_relay_error=%v", strings.ToUpper(target.Service), slot, relayAddr, target.Address, result.Duration.Round(time.Millisecond), result.EndInitiator("relay", "local_"+target.Service), result.AToB.Bytes, result.AToB.CopyErr, result.BToA.Bytes, result.BToA.CopyErr)
 }
 
-func installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile string, screenView bool) error {
+func installScheduledTask(opts agentOptions) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
 	}
 	args := []string{strconv.Quote(exePath), "-console"}
-	if relayURL != "" {
-		args = append(args, "-relay-url", strconv.Quote(relayURL))
-	}
-	if proxyFlag != "" {
-		args = append(args, "-proxy", strconv.Quote(proxyFlag))
-	}
-	if rdpFlag != "" {
-		args = append(args, "-rdp", strconv.Quote(rdpFlag))
-	}
-	if winrmFlag != "" {
-		args = append(args, "-winrm", strconv.Quote(winrmFlag))
-	}
-	if smbFlag != "" {
-		args = append(args, "-smb", strconv.Quote(smbFlag))
-	}
-	if roomPasswordFile != "" {
-		args = append(args, "-room-password-file", strconv.Quote(roomPasswordFile))
-	}
-	if screenView {
-		args = append(args, "-screen-view")
+	for _, arg := range opts.args() {
+		if strings.HasPrefix(arg, "-") {
+			args = append(args, arg)
+		} else {
+			args = append(args, strconv.Quote(arg))
+		}
 	}
 	out, err := exec.Command("schtasks", "/Create", "/TN", "DeskFerry Agent", "/SC", "ONLOGON", "/TR", strings.Join(args, " "), "/F").CombinedOutput()
 	if err != nil {
@@ -1274,39 +1308,18 @@ func installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, room
 	return nil
 }
 
-func relaunchElevated(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile string, screenView bool) error {
+func relaunchElevated(opts agentOptions) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	args := []string{"-install"}
-	if relayURL != "" {
-		args = append(args, "-relay-url", relayURL)
-	}
-	if proxyFlag != "" {
-		args = append(args, "-proxy", proxyFlag)
-	}
-	if rdpFlag != "" {
-		args = append(args, "-rdp", rdpFlag)
-	}
-	if winrmFlag != "" {
-		args = append(args, "-winrm", winrmFlag)
-	}
-	if smbFlag != "" {
-		args = append(args, "-smb", smbFlag)
-	}
-	if roomPasswordFile != "" {
-		args = append(args, "-room-password-file", roomPasswordFile)
-	}
-	if screenView {
-		args = append(args, "-screen-view")
-	}
+	args := append([]string{"-install"}, opts.args()...)
 	verb, _ := windows.UTF16PtrFromString("runas")
 	exe, _ := windows.UTF16PtrFromString(exePath)
 	params, _ := windows.UTF16PtrFromString(joinWindowsArgs(args))
 	if err := windows.ShellExecute(0, verb, exe, params, nil, windows.SW_NORMAL); err != nil {
 		if isAccessDenied(err) {
-			return installScheduledTask(relayURL, proxyFlag, rdpFlag, winrmFlag, smbFlag, roomPasswordFile, screenView)
+			return installScheduledTask(opts)
 		}
 		return err
 	}

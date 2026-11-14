@@ -44,7 +44,7 @@ const (
 	defaultRoomName       = "workdesk"
 	defaultSMBAlias       = "deskferry-work"
 	workWindowWidth       = 760
-	workWindowHeight      = 800
+	workWindowHeight      = 940
 )
 
 type app struct {
@@ -61,6 +61,13 @@ type app struct {
 	winrmAddr       *walk.LineEdit
 	smbAddr         *walk.LineEdit
 	smbAlias        *walk.LineEdit
+	forwardList     *walk.ListBox
+	forwardPort     *walk.LineEdit
+	forwardTarget   *walk.LineEdit
+	forwardAdd      *walk.PushButton
+	forwardUpdate   *walk.PushButton
+	forwardDelete   *walk.PushButton
+	forwards        []tunnel.TCPForward
 	status          *walk.Label
 	serviceChip     *uikit.StatusChip
 	log             *walk.TextEdit
@@ -85,6 +92,9 @@ type actionOptions struct {
 	SMBAddr           string
 	SMBAlias          string
 	ScreenView        bool
+	// TCPForwards lists "forwardPort=host:port" targets separated by
+	// semicolons that Home apps may reach through this PC.
+	TCPForwards string
 }
 
 type serviceInfo struct {
@@ -131,6 +141,7 @@ func (a *app) run(smokeTest bool) error {
 		relayBases = []string{defaultAzureRelayBase, defaultOCIRelayBase}
 	}
 	a.relayURLs = uniqueRelayURLs(relayBases)
+	a.forwards, _ = tunnel.ParseTCPForwards(installedOpts.TCPForwards)
 
 	window := MainWindow{
 		AssignTo:   &a.mw,
@@ -157,7 +168,7 @@ func (a *app) run(smokeTest bool) error {
 					uikit.FieldLabel("Room password"),
 					LineEdit{AssignTo: &a.roomPassword, PasswordMode: true, CueBanner: "blank keeps the current password"},
 					Label{},
-					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM, SMB, and screen viewing)"},
+					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM, SMB, TCP forwards, and screen viewing)"},
 					uikit.FieldLabel("Screen viewing"),
 					CheckBox{AssignTo: &a.screenView, Text: "Allow authenticated screenshots and delta streaming", Checked: installedOpts.ScreenView},
 					CheckBox{AssignTo: &a.winrmEnabled, Text: "WinRM", Checked: installedOpts.WinRMAddr != "", OnCheckedChanged: a.updateCapabilityControls, MinSize: Size{Width: uikit.LabelColumnWidth}},
@@ -166,6 +177,29 @@ func (a *app) run(smokeTest bool) error {
 					LineEdit{AssignTo: &a.smbAddr, Text: firstNonEmpty(installedOpts.SMBAddr, "127.0.0.1:445"), CueBanner: "local Windows SMB listener"},
 					uikit.FieldLabel("SMB server alias"),
 					LineEdit{AssignTo: &a.smbAlias, Text: firstNonEmpty(installedOpts.SMBAlias, defaultSMBAlias), CueBanner: defaultSMBAlias},
+				},
+			},
+			uikit.Card{
+				Title:       "TCP forwards",
+				Description: "Hosts a Home app may reach through this PC. Each Home app listens on its own loopback port and names the forward port. Requires a room password.",
+				Layout:      Grid{Columns: 2, MarginsZero: true, Spacing: uikit.FieldGap},
+				Children: []Widget{
+					Label{Text: "Forwards", Font: uikit.LabelFont(), TextColor: uikit.ColorTextSecondary, Alignment: AlignHNearVNear, MinSize: Size{Width: uikit.LabelColumnWidth}, MaxSize: Size{Width: uikit.LabelColumnWidth}},
+					ListBox{AssignTo: &a.forwardList, Model: tcpForwardRows(a.forwards), MinSize: Size{Height: 60}, OnCurrentIndexChanged: a.forwardSelectionChanged},
+					uikit.FieldLabel("Forward port"),
+					LineEdit{AssignTo: &a.forwardPort, CueBanner: "number Home apps request, such as 5432", OnTextChanged: a.updateForwardButtons},
+					uikit.FieldLabel("Target"),
+					LineEdit{AssignTo: &a.forwardTarget, CueBanner: "host:port reachable from this PC, such as db01:5432", OnTextChanged: a.updateForwardButtons},
+					Label{},
+					Composite{
+						Layout: HBox{MarginsZero: true, Spacing: uikit.Space8},
+						Children: []Widget{
+							uikit.Button(&a.forwardAdd, "Add", a.addForward),
+							uikit.Button(&a.forwardUpdate, "Update", a.updateForward),
+							uikit.Button(&a.forwardDelete, "Delete", a.deleteForward),
+							HSpacer{},
+						},
+					},
 				},
 			},
 			uikit.Card{
@@ -212,6 +246,7 @@ func (a *app) run(smokeTest bool) error {
 		a.stopWorkActivityFollower()
 	})
 	a.updateCapabilityControls()
+	a.updateForwardButtons()
 	if smokeTest {
 		time.AfterFunc(250*time.Millisecond, func() {
 			a.mw.Synchronize(func() {
@@ -265,6 +300,8 @@ func installedServiceOptions() (actionOptions, bool) {
 		SMBAddr:    serviceCommandLineOption(commandLine, "-smb"),
 		ScreenView: serviceCommandLineHasFlag(commandLine, "-screen-view"),
 		SMBAlias:   defaultSMBAlias,
+		// The service stores all forwards in one -tcp-forward value.
+		TCPForwards: serviceCommandLineOption(commandLine, "-tcp-forward"),
 	}
 	if args := serviceCommandLineArgs(commandLine); len(args) > 0 {
 		if dir := filepath.Dir(args[0]); dir != "." {
@@ -387,6 +424,9 @@ func (a *app) runSelfTest() {
 		}
 		if opts.ScreenView {
 			args = append(args, "-screen-view")
+		}
+		if opts.TCPForwards != "" {
+			args = append(args, "-tcp-forward", opts.TCPForwards)
 		}
 		cmd := exec.Command(exePath, args...)
 		var output bytes.Buffer
@@ -552,7 +592,100 @@ func (a *app) options() actionOptions {
 		SMBAddr:           smbAddr,
 		SMBAlias:          strings.TrimSpace(a.smbAlias.Text()),
 		ScreenView:        a.screenView.Checked(),
+		TCPForwards:       tunnel.FormatTCPForwards(a.forwards),
 	}
+}
+
+func tcpForwardRows(forwards []tunnel.TCPForward) []string {
+	rows := make([]string, 0, len(forwards))
+	for _, forward := range forwards {
+		rows = append(rows, fmt.Sprintf("%d  →  %s", forward.ForwardPort, forward.Target))
+	}
+	return rows
+}
+
+func (a *app) setForwards(forwards []tunnel.TCPForward, selectIndex int) {
+	a.forwards = forwards
+	if a.forwardList != nil {
+		_ = a.forwardList.SetModel(tcpForwardRows(forwards))
+		_ = a.forwardList.SetCurrentIndex(selectIndex)
+	}
+	a.updateForwardButtons()
+}
+
+func (a *app) forwardSelectionChanged() {
+	index := a.forwardList.CurrentIndex()
+	if index >= 0 && index < len(a.forwards) {
+		a.forwardPort.SetText(fmt.Sprint(a.forwards[index].ForwardPort))
+		a.forwardTarget.SetText(a.forwards[index].Target)
+	}
+	a.updateForwardButtons()
+}
+
+func (a *app) updateForwardButtons() {
+	if a.forwardAdd == nil || a.forwardList == nil || a.forwardPort == nil || a.forwardTarget == nil {
+		return
+	}
+	filled := strings.TrimSpace(a.forwardPort.Text()) != "" && strings.TrimSpace(a.forwardTarget.Text()) != ""
+	selected := a.forwardList.CurrentIndex() >= 0 && a.forwardList.CurrentIndex() < len(a.forwards)
+	a.forwardAdd.SetEnabled(filled)
+	if a.forwardUpdate != nil {
+		a.forwardUpdate.SetEnabled(filled && selected)
+	}
+	if a.forwardDelete != nil {
+		a.forwardDelete.SetEnabled(selected)
+	}
+}
+
+// forwardFromEditor validates the editor fields; ignored is the row being
+// replaced, or -1.
+func (a *app) forwardFromEditor(ignored int) (tunnel.TCPForward, error) {
+	forward, err := tunnel.ParseTCPForward(strings.TrimSpace(a.forwardPort.Text()) + "=" + strings.TrimSpace(a.forwardTarget.Text()))
+	if err != nil {
+		return forward, err
+	}
+	for i, existing := range a.forwards {
+		if i != ignored && existing.ForwardPort == forward.ForwardPort {
+			return forward, fmt.Errorf("forward port %d is already listed", forward.ForwardPort)
+		}
+	}
+	return forward, nil
+}
+
+func (a *app) addForward() {
+	forward, err := a.forwardFromEditor(-1)
+	if err != nil {
+		a.showError(err)
+		return
+	}
+	next := append(append([]tunnel.TCPForward(nil), a.forwards...), forward)
+	a.setForwards(next, len(next)-1)
+}
+
+func (a *app) updateForward() {
+	index := a.forwardList.CurrentIndex()
+	if index < 0 || index >= len(a.forwards) {
+		return
+	}
+	forward, err := a.forwardFromEditor(index)
+	if err != nil {
+		a.showError(err)
+		return
+	}
+	next := append([]tunnel.TCPForward(nil), a.forwards...)
+	next[index] = forward
+	a.setForwards(next, index)
+}
+
+func (a *app) deleteForward() {
+	index := a.forwardList.CurrentIndex()
+	if index < 0 || index >= len(a.forwards) {
+		return
+	}
+	next := append(append([]tunnel.TCPForward(nil), a.forwards[:index]...), a.forwards[index+1:]...)
+	a.setForwards(next, min(index, len(next)-1))
+	a.forwardPort.SetText("")
+	a.forwardTarget.SetText("")
 }
 
 func composeRelayRoomURLs(bases []string, room string) []string {
@@ -609,6 +742,7 @@ func runElevatedAction(args []string) {
 	smbAddr := fs.String("smb", "", "SMB target")
 	smbAlias := fs.String("smb-alias", defaultSMBAlias, "SMB server alias")
 	screenView := fs.Bool("screen-view", false, "allow authenticated screen viewing")
+	tcpForwards := fs.String("tcp-forward", "", "TCP forwards")
 	noDialog := fs.Bool("no-dialog", false, "write the result to the console instead of displaying a dialog")
 	if err := fs.Parse(args); err != nil {
 		reportElevatedResult(*noDialog, "", err)
@@ -625,6 +759,7 @@ func runElevatedAction(args []string) {
 		SMBAddr:           *smbAddr,
 		SMBAlias:          *smbAlias,
 		ScreenView:        *screenView,
+		TCPForwards:       *tcpForwards,
 	})
 	if err != nil {
 		reportElevatedResult(*noDialog, "", err)
@@ -664,8 +799,24 @@ func (values *relayURLFlags) Set(value string) error {
 	return nil
 }
 
+// tcpForwardFlags collects repeatable -tcp-forward values.
+type tcpForwardFlags []string
+
+func (values *tcpForwardFlags) String() string {
+	return strings.Join(*values, ";")
+}
+
+func (values *tcpForwardFlags) Set(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return errors.New("TCP forward cannot be empty")
+	}
+	*values = append(*values, value)
+	return nil
+}
+
 func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error) {
 	var opts actionOptions
+	var tcpForwards tcpForwardFlags
 	var relayURLs relayURLFlags
 	var relayBases relayURLFlags
 	fs := flag.NewFlagSet("DeskFerry Work Services", flag.ContinueOnError)
@@ -684,9 +835,11 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error)
 	fs.StringVar(&opts.SMBAddr, "smb", "", "SMB target in host:port form")
 	fs.StringVar(&opts.SMBAlias, "smb-alias", defaultSMBAlias, "SMB server alias")
 	fs.BoolVar(&opts.ScreenView, "screen-view", false, "allow authenticated screen viewing")
+	fs.Var(&tcpForwards, "tcp-forward", "TCP forward forwardPort=host:port; repeat for more forwards")
 	if err := fs.Parse(args); err != nil {
 		return "", opts, err
 	}
+	opts.TCPForwards = tcpForwards.String()
 	if fs.NArg() != 0 {
 		return "", opts, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
 	}
@@ -702,7 +855,7 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error)
 		installOnly := map[string]bool{
 			"agent": true, "relay-url": true, "relay-base-url": true, "room": true, "proxy": true, "room-password-stdin": true,
 			"room-password-blob": true, "clear-room-password": true,
-			"winrm": true, "smb": true, "smb-alias": true, "screen-view": true,
+			"winrm": true, "smb": true, "smb-alias": true, "screen-view": true, "tcp-forward": true,
 		}
 		if *action != "uninstall" {
 			installOnly["install-dir"] = true
@@ -818,6 +971,7 @@ func printCLIUsage(output io.Writer) {
 	fmt.Fprintln(output, "  -smb HOST:PORT             SMB target")
 	fmt.Fprintln(output, "  -smb-alias NAME            SMB server alias (default deskferry-work)")
 	fmt.Fprintln(output, "  -screen-view               Allow authenticated screenshots and delta streaming")
+	fmt.Fprintln(output, "  -tcp-forward PORT=HOST:PORT  Let Home apps reach HOST:PORT as forward PORT; repeat for more")
 	fmt.Fprintln(output, "Omitting all password flags preserves the installed credential.")
 }
 
@@ -896,8 +1050,8 @@ func installOrUpdate(opts actionOptions) (string, error) {
 			return "", fmt.Errorf("migrate installed room password: %w", err)
 		}
 	}
-	if (opts.WinRMAddr != "" || opts.SMBAddr != "" || opts.ScreenView) && !fileExists(passwordDest) {
-		return "", errors.New("WinRM, SMB, and screen viewing require a room password")
+	if (opts.WinRMAddr != "" || opts.SMBAddr != "" || opts.ScreenView || opts.TCPForwards != "") && !fileExists(passwordDest) {
+		return "", errors.New("WinRM, SMB, TCP forwards, and screen viewing require a room password")
 	}
 	args := []string{"-service", "-relay-url", opts.RelayURL}
 	if opts.Proxy != "" {
@@ -914,6 +1068,9 @@ func installOrUpdate(opts actionOptions) (string, error) {
 	}
 	if opts.ScreenView {
 		args = append(args, "-screen-view")
+	}
+	if opts.TCPForwards != "" {
+		args = append(args, "-tcp-forward", opts.TCPForwards)
 	}
 	if err := configureSMBAlias(installDir, opts.SMBAlias, opts.SMBAddr != ""); err != nil {
 		return "", err
@@ -1098,6 +1255,9 @@ func validateInstallInputs(opts actionOptions) error {
 			return errors.New("SMB server alias must be a single DNS label containing only letters, numbers, and hyphens")
 		}
 	}
+	if _, err := tunnel.ParseTCPForwards(opts.TCPForwards); err != nil {
+		return err
+	}
 	if _, err := os.Stat(opts.AgentPath); err != nil {
 		return fmt.Errorf("agent executable is not readable: %w", err)
 	}
@@ -1234,6 +1394,9 @@ func relaunchElevatedAction(action string, opts actionOptions, noDialog bool) er
 	}
 	if opts.ScreenView {
 		args = append(args, "-screen-view")
+	}
+	if opts.TCPForwards != "" {
+		args = append(args, "-tcp-forward", opts.TCPForwards)
 	}
 	temporaryPasswordBlob := ""
 	if opts.ClearRoomPassword {

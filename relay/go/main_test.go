@@ -986,3 +986,78 @@ func testHTTPStreamAgentLearnsOfAbort(t *testing.T, baseURL string) {
 		t.Fatalf("HTTP-stream agent noticed the coordinated resume after %s", elapsed)
 	}
 }
+
+func TestV2TCPForwardServicePairs(t *testing.T) {
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	relayAddr := server.URL + "/relay/unit-tcp"
+	const service = "tcp-15432"
+	controlHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(controlHeaders)
+	controlHeaders.Set(tunnel.HeaderAgentInstance, "unit-agent")
+	controlHeaders.Set(tunnel.HeaderAgentServices, "rdp,"+service+",tcp-0")
+	control, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleAgentControl, "", controlHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(control)
+	if _, err := tunnel.AwaitControlReadyInfo(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+
+	clientHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(clientHeaders)
+	tunnel.AddServiceHeader(clientHeaders, service)
+	client, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleClient, "", clientHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(client)
+	offer, err := tunnel.ReadControlMessage(ctx, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tunnel.ValidateSessionOffer(offer, "unit-tcp", "unit-agent", time.Now().UTC()); err != nil || offer.Service != service {
+		t.Fatalf("offer=%+v error=%v", offer, err)
+	}
+	if err := tunnel.WriteControlMessage(ctx, control, tunnel.ControlMessage{Type: tunnel.MessageAccept, SessionID: offer.SessionID}); err != nil {
+		t.Fatal(err)
+	}
+	agentHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(agentHeaders)
+	agentHeaders.Set(tunnel.HeaderAgentInstance, "unit-agent")
+	agentHeaders.Set(tunnel.HeaderSessionID, offer.SessionID)
+	tunnel.AddServiceHeader(agentHeaders, service)
+	agent, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleAgentSession, "", agentHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(agent)
+	if _, err := tunnel.AwaitSessionReadyInfoResult(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tunnel.AwaitSessionReadyCompatibleServiceInfo(ctx, client, service); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Write(ctx, websocket.MessageBinary, []byte("to-forward")); err != nil {
+		t.Fatal(err)
+	}
+	expectBinary(t, ctx, agent, "to-forward")
+
+	// A forward the agent does not advertise has no control to pair with.
+	otherHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(otherHeaders)
+	tunnel.AddServiceHeader(otherHeaders, "tcp-15433")
+	other, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleClient, "", otherHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(other)
+	var rejected *tunnel.SessionResultError
+	if _, err := tunnel.AwaitSessionReadyCompatibleServiceInfo(ctx, other, "tcp-15433"); !errors.As(err, &rejected) || rejected.Result != tunnel.MessageNoAgent {
+		t.Fatalf("unadvertised forward result = %v", err)
+	}
+}

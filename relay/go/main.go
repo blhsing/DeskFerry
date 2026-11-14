@@ -403,7 +403,7 @@ func readAgentServices(r *http.Request) map[string]bool {
 	services := make(map[string]bool)
 	for _, value := range strings.Split(r.Header.Get(tunnel.HeaderAgentServices), ",") {
 		value = strings.ToLower(strings.TrimSpace(value))
-		if value == serviceRDP || value == serviceWinRM || value == serviceSMB || value == serviceScreen {
+		if tunnel.IsKnownService(value) {
 			services[value] = true
 		}
 	}
@@ -436,7 +436,7 @@ func readService(r *http.Request) string {
 	if value == "" {
 		return serviceRDP
 	}
-	if value == serviceRDP || value == serviceWinRM || value == serviceSMB || value == serviceScreen {
+	if tunnel.IsKnownService(value) {
 		return value
 	}
 	return ""

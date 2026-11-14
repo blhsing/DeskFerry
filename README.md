@@ -208,6 +208,8 @@ To enable Windows file sharing on the Work PC, enable **SMB**, normally use targ
 
 For screenshots and delta streaming, select **Allow authenticated screenshots and delta streaming**. This requires a room password and remains disabled until explicitly selected.
 
+To let Home PCs reach another TCP service on the Work network, such as a database or an SSH server, add it to **TCP forwards** in Work Services: a forward port number and a `host:port` target that this Work PC can reach, for example forward `5432` to `db01:5432`. Each forward is advertised to the relay as the service `tcp-<forward port>`; the target never leaves the Work PC, so a Home app can reach only the targets listed here. On the Home PC, add a listener to the selected destination's **TCP forwards** card, for example local port `15432` to Work forward `5432`, and point the client program at `127.0.0.1:15432`. Listeners bind only to `127.0.0.1` and start with **Connect**. The relays open no extra ports. TCP forwards require a room password.
+
 The merged executable retains CLI modes for administration:
 
 ```powershell
@@ -221,7 +223,12 @@ Read-Host "Room password" -MaskInput | .\DeskFerry.exe -work-configurator `
   -room-password-stdin `
   -winrm 127.0.0.1:5985 `
   -smb 127.0.0.1:445 `
-  -smb-alias deskferry-work
+  -smb-alias deskferry-work `
+  -tcp-forward 5432=db01:5432 `
+  -tcp-forward 22=jump01:22
+
+# Home TCP forwards for one console run (localPort=forwardPort)
+.\DeskFerry.exe -console -destination Work -tcp-forward 15432=5432 -tcp-forward 2222=22
 
 .\DeskFerry.exe -work-configurator -cli-action status
 .\DeskFerry.exe -status
@@ -442,6 +449,7 @@ Good free Android RDP client options include Microsoft's Remote Desktop/Windows 
 - A room proof is a bearer credential. Use a strong, unique room password and prefer `https://` relays. The plain-HTTP OCI fallback cannot protect a captured proof from interception and replay.
 - The relay never dials the work PC or home PC.
 - The work agent only dials its configured RDP, WinRM, or SMB loopback target after a relay has paired an authenticated, same-room, same-service home connection. Screen capture is separate, password-required, opt-in, and visibly launches in the active user session.
+- TCP forwards are disabled unless Work Services has both a room password and at least one forward. The Work agent dials only the `host:port` targets its owner configured, identified by forward port number; a Home app chooses a forward number, never a target. Home forward listeners bind only to `127.0.0.1`, and no relay opens a listening port for them.
 - WinRM is disabled unless Work Services has both a room password and a WinRM target. Windows login credentials are supplied by the home user for each command and are not handled by the relay.
 - SMB is disabled unless Work Services has both a room password and an SMB target. The Home SOCKS bridge rejects every destination except the configured synthetic work address on TCP port 445; it is not a general-purpose VPN or proxy.
 - SMB authentication and authorization remain Windows responsibilities. The Home app registers the selected destination's shared Windows login for the installed SMB alias in Windows Credential Manager; DeskFerry never places it in JSON or sends it through the relay, and it does not bypass share or NTFS permissions.
@@ -736,6 +744,7 @@ The repository contains three compatible relay implementations, the single merge
 - Multiple App Service instances are not supported unless sticky routing or shared broker state is added.
 - The Go work and home agents support direct, environment, HTTP proxy, and HTTPS proxy modes. Proxy URLs may contain Basic credentials. Windows uses its current identity when a proxy requests NTLM for either authenticated `CONNECT` or the plain-HTTP non-CONNECT fallback; LocalSystem services acquire the credential from a logged-on interactive Windows session.
 - The Windows home app is an RDP launcher and tunnel endpoint, not a full RDP client.
+- TCP forwards are configured on the Windows Home app; the macOS and Android Home apps do not offer them yet. Forwards carry TCP only, not UDP.
 - Windows UNC access currently transports SMB only. It does not carry arbitrary IP traffic, SMB discovery, or printer discovery; users open a known `\\alias\share` path.
 - The macOS home agent is a tunnel endpoint and `.rdp` launcher, not a full RDP client; use Microsoft Remote Desktop/Windows App or another macOS RDP client against `127.0.0.1:3389`.
 - The Android home app is also a tunnel endpoint, not a full RDP client; use a separate Android RDP client against `127.0.0.1:3389`.

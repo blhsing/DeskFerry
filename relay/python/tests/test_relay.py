@@ -17,6 +17,7 @@ from app import (
     RELAY_VERSION,
     RelayHub,
     app,
+    is_known_service,
     room_id,
 )
 
@@ -888,6 +889,55 @@ def test_legacy_client_is_translated_to_v2_control_offer():
                 break
             await asyncio.sleep(0.01)
         assert agent.byte_messages == [b"legacy-smb"]
+        for task in (home_task, agent_task, control_task):
+            task.cancel()
+        await asyncio.gather(home_task, agent_task, control_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_tcp_forward_service_names():
+    for service in ("rdp", "screen", "tcp-1", "tcp-15432", "tcp-65535"):
+        assert is_known_service(service)
+    for service in ("tcp-", "tcp-0", "tcp-01", "tcp-65536", "tcp-1a", "udp-1", "ftp"):
+        assert not is_known_service(service)
+
+
+def test_v2_tcp_forward_pairing():
+    async def scenario():
+        hub = RelayHub()
+        control = FakeWebSocket()
+        home = FakeWebSocket()
+        agent = FakeWebSocket()
+        control_task = asyncio.create_task(
+            hub.serve_agent_control("unit-tcp", control, "work", "unit-agent", {"rdp", "tcp-15432"}, 2)
+        )
+        for _ in range(50):
+            if control.json_messages:
+                break
+            await asyncio.sleep(0.01)
+        home_task = asyncio.create_task(hub.serve_v2_client("unit-tcp", home, "home", False, "", "tcp-15432"))
+        for _ in range(50):
+            if len(control.json_messages) > 1:
+                break
+            await asyncio.sleep(0.01)
+        offer = control.json_messages[1]
+        assert offer["service"] == "tcp-15432"
+        await control._received.put({"type": "accept", "session_id": offer["session_id"]})
+        agent_task = asyncio.create_task(
+            hub.serve_agent_session("unit-tcp", agent, "work-data", "unit-agent", offer["session_id"], False, "", "tcp-15432")
+        )
+        for _ in range(50):
+            if home.json_messages and agent.json_messages:
+                break
+            await asyncio.sleep(0.01)
+        assert home.json_messages[-1]["type"] == "session-ready"
+        assert home.json_messages[-1]["service"] == "tcp-15432"
+
+        other = FakeWebSocket()
+        await hub.serve_v2_client("unit-tcp", other, "home-2", False, "", "tcp-15433")
+        assert other.json_messages[-1]["type"] == "no-agent"
+
         for task in (home_task, agent_task, control_task):
             task.cancel()
         await asyncio.gather(home_task, agent_task, control_task, return_exceptions=True)

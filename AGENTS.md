@@ -25,6 +25,7 @@ DeskFerry is a Go + .NET + Python + Android project for outbound-only RDP, WinRM
 - The merged Windows app should remain control-panel/tray-first. Console mode is debug-only. `DeskFerry.exe` is the only DeskFerry Windows executable and dispatches to the interactive UI, Work service, optional Home SMB network service, setup/component-management actions, and screen-capture helper by mode.
 - The Windows home app should listen on loopback by default, normally `127.0.0.1:3390`.
 - SMB is a separate relay service and must use the same room password as RDP and WinRM.
+- TCP forwards are relay services named `tcp-<forward port>`. The Work service owns each forward's `host:port` target (`-tcp-forward forwardPort=host:port`, or the Work Services TCP forwards card) and requires a room password; Home apps listen only on `127.0.0.1` and request a forward port, never a target. Relays only pair these services and must not open listening ports for them. Home clients must require the relay to echo a TCP forward service so older relays cannot map it to RDP.
 - The optional Windows Home network component uses the synthetic `198.18.0.0/30` network and permits only TCP port 445 to the configured work-host alias. It must not become a general-purpose VPN.
 - The merged Windows UI should offer the virtual network adapter as an optional component selected by default, detect existing services before presenting actions, and offer Install only when a service is absent.
 - `windows/workservice` must remain Windows-service-first. Console mode is debug-only.

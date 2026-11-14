@@ -217,7 +217,7 @@ static HashSet<string> ReadAgentServices(HttpRequest request)
     return (request.Headers["X-DeskFerry-Agent-Services"].FirstOrDefault() ?? "")
         .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
         .Select(value => value.ToLowerInvariant())
-        .Where(value => value is "rdp" or "winrm" or "smb" or "screen")
+        .Where(IsKnownService)
         .ToHashSet(StringComparer.Ordinal);
 }
 
@@ -242,7 +242,24 @@ static string ReadRoomProof(HttpRequest request) =>
 static string ReadService(HttpRequest request)
 {
     var service = (request.Headers["X-DeskFerry-Service"].FirstOrDefault() ?? "").Trim().ToLowerInvariant();
-    return service is "winrm" or "smb" or "screen" ? service : "rdp";
+    return IsKnownService(service) ? service : "rdp";
+}
+
+// Built-in services plus Work agent TCP forwards, named "tcp-<forward port>".
+// The relay only pairs a TCP forward; the Work agent owns its target.
+static bool IsKnownService(string service)
+{
+    if (service is "rdp" or "winrm" or "smb" or "screen")
+    {
+        return true;
+    }
+    if (!service.StartsWith("tcp-", StringComparison.Ordinal))
+    {
+        return false;
+    }
+    var digits = service[4..];
+    return digits.Length is >= 1 and <= 5 && digits[0] != '0' && digits.All(char.IsAsciiDigit)
+        && int.TryParse(digits, out var port) && port is >= 1 and <= 65535;
 }
 
 static string? ReadToken(HttpRequest request)
@@ -2231,7 +2248,7 @@ static class RelayDashboard
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.13.13";
+    public const string Version = "0.14.0";
 }
 
 sealed class WaitingAgent

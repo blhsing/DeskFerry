@@ -52,7 +52,7 @@ const (
 	defaultListenAddr      = "127.0.0.1:3390"
 	defaultWinRMListenAddr = "127.0.0.1:3391"
 	homeWindowWidth        = 1360
-	homeWindowHeight       = 800
+	homeWindowHeight       = 880
 	homeWindowMinWidth     = 1180
 	homeWindowMinHeight    = 640
 	singleInstanceName     = `Global\DeskFerryHomeAgent`
@@ -74,6 +74,9 @@ type config struct {
 	RoomProof           string               `json:"room_proof,omitempty"`
 	Destinations        []destinationProfile `json:"destinations,omitempty"`
 	SelectedDestination string               `json:"selected_destination,omitempty"`
+	// TCPForwards overrides the selected destination's forward listeners for
+	// one run, from -tcp-forward. It is never saved.
+	TCPForwards string `json:"-"`
 }
 
 type destinationProfile struct {
@@ -86,6 +89,9 @@ type destinationProfile struct {
 	WindowsUser     string   `json:"windows_user,omitempty"`
 	PasswordlessRDP bool     `json:"passwordless_rdp,omitempty"`
 	SMBAlias        string   `json:"smb_alias,omitempty"`
+	// TCPForwards lists loopback listeners as "localPort=forwardPort" entries
+	// separated by semicolons; each reaches the Work agent's forward port.
+	TCPForwards string `json:"tcp_forwards,omitempty"`
 }
 
 type relayURLFlag []string
@@ -132,6 +138,12 @@ type clientApp struct {
 	winrmOutput        *walk.TextEdit
 	executeWinRMButton *walk.PushButton
 	saveWindowsButton  *walk.PushButton
+	forwardList        *walk.ListBox
+	forwardLocal       *walk.LineEdit
+	forwardRemote      *walk.LineEdit
+	forwardAdd         *walk.PushButton
+	forwardUpdate      *walk.PushButton
+	forwardDelete      *walk.PushButton
 
 	overallStatus *uikit.StatusChip
 	tunnelStatus  *uikit.StatusChip
@@ -164,6 +176,7 @@ type clientApp struct {
 	cancel              context.CancelFunc
 	listener            net.Listener
 	winrmListener       net.Listener
+	tcpForwards         []openTCPForward
 	activeLocal         int
 	rdpRoutes           map[string]string
 	activeWinRM         int
@@ -230,6 +243,7 @@ func Main() {
 	var screenInterval time.Duration
 	var screenCount int
 	var setRDPDecodingModeFlag string
+	var tcpForwards tcpForwardFlag
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.StringVar(&listenAddr, "listen", "", "local RDP listen address")
 	flag.StringVar(&proxyFlag, "proxy", "", "proxy: env, direct, or http(s)://host:port")
@@ -246,6 +260,7 @@ func Main() {
 	flag.DurationVar(&screenInterval, "screen-interval", time.Second, "screenshot stream interval")
 	flag.IntVar(&screenCount, "screen-count", 0, "number of streamed screenshots to save; 0 runs until interrupted")
 	flag.StringVar(&setRDPDecodingModeFlag, "set-rdp-decoding-mode", "", "set the machine RDP decoding policy (automatic, hardware, or software)")
+	flag.Var(&tcpForwards, "tcp-forward", "loopback TCP forward localPort=forwardPort (or forwardPort) for this run; repeat or separate with semicolons")
 	flag.Parse()
 	winRMCommandMode := winRMCommand != "" || winRMCommandFile != ""
 	screenOptions := screenview.CLIOptions{Screenshot: screenshot, StreamDirectory: screenshotStream, Interval: screenInterval, Count: screenCount}
@@ -309,6 +324,7 @@ func Main() {
 	if err := selectDestinationConfig(&cfg, destinationFlag); err != nil {
 		log.Fatal(err)
 	}
+	cfg.TCPForwards = tcpForwards.String()
 	relayLogs.SetInstance(homeLogInstance())
 	setHomeLogTargets(cfg)
 	if screenCommandMode {
@@ -651,6 +667,29 @@ func (a *clientApp) createMainWindow(smokeTest bool) error {
 									},
 								},
 							},
+							uikit.Card{
+								Title:       "TCP forwards",
+								Description: "Loopback ports on this PC that reach a forward the Work PC allows. They start with Connect and need a room password.",
+								Layout:      Grid{Columns: 2, MarginsZero: true, Spacing: uikit.Space8},
+								Children: []Widget{
+									Label{Text: "Listeners", Font: uikit.LabelFont(), TextColor: uikit.ColorTextSecondary, Alignment: AlignHNearVNear, MinSize: Size{Width: uikit.LabelColumnWidth}, MaxSize: Size{Width: uikit.LabelColumnWidth}},
+									ListBox{AssignTo: &a.forwardList, MinSize: Size{Height: 48}, OnCurrentIndexChanged: a.forwardSelectionChanged},
+									uikit.FieldLabel("Local port"),
+									LineEdit{AssignTo: &a.forwardLocal, CueBanner: "port on 127.0.0.1, such as 15432", OnTextChanged: a.updateForwardButtons},
+									uikit.FieldLabel("Work forward"),
+									LineEdit{AssignTo: &a.forwardRemote, CueBanner: "forward port set on the Work PC, such as 5432", OnTextChanged: a.updateForwardButtons},
+									Label{},
+									Composite{
+										Layout: HBox{MarginsZero: true, Spacing: uikit.Space8},
+										Children: []Widget{
+											compactButton(&a.forwardAdd, "Add", a.addForward),
+											compactButton(&a.forwardUpdate, "Update", a.updateForward),
+											compactButton(&a.forwardDelete, "Delete", a.deleteForward),
+											HSpacer{},
+										},
+									},
+								},
+							},
 						},
 					},
 					// Middle: the everyday actions and the connection settings.
@@ -886,7 +925,7 @@ func destinationNames(values []destinationProfile) []string {
 func cloneDestinations(values []destinationProfile) []destinationProfile {
 	out := make([]destinationProfile, len(values))
 	for i, value := range values {
-		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RelayBases: append([]string(nil), value.RelayBases...), Room: value.Room, Proxy: value.Proxy, RoomProof: value.RoomProof, WindowsUser: value.WindowsUser, PasswordlessRDP: value.PasswordlessRDP, SMBAlias: value.SMBAlias}
+		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RelayBases: append([]string(nil), value.RelayBases...), Room: value.Room, Proxy: value.Proxy, RoomProof: value.RoomProof, WindowsUser: value.WindowsUser, PasswordlessRDP: value.PasswordlessRDP, SMBAlias: value.SMBAlias, TCPForwards: value.TCPForwards}
 	}
 	return out
 }
@@ -979,6 +1018,7 @@ func (a *clientApp) updateDestinationEditor() {
 		if a.smbAlias != nil {
 			_ = a.smbAlias.SetText(a.destinations[a.selectedDestination].SMBAlias)
 		}
+		a.refreshForwardList(-1)
 	}
 }
 
@@ -1613,6 +1653,8 @@ func (a *clientApp) startTunnel(openRDP bool) error {
 		}
 	}
 
+	forwards := openTCPForwards(cfg, a.appendLog)
+
 	a.mu.Lock()
 	if a.listener != nil {
 		a.mu.Unlock()
@@ -1620,6 +1662,9 @@ func (a *clientApp) startTunnel(openRDP bool) error {
 		_ = listener.Close()
 		if winrmListener != nil {
 			_ = winrmListener.Close()
+		}
+		for _, forward := range forwards {
+			_ = forward.listener.Close()
 		}
 		if openRDP {
 			if err := launchMSTSC(cfg); err != nil {
@@ -1631,6 +1676,7 @@ func (a *clientApp) startTunnel(openRDP bool) error {
 	a.cancel = cancel
 	a.listener = listener
 	a.winrmListener = winrmListener
+	a.tcpForwards = forwards
 	a.activeLocal = 0
 	a.rdpRoutes = make(map[string]string)
 	a.activeWinRM = 0
@@ -1664,6 +1710,7 @@ func (a *clientApp) startTunnel(openRDP bool) error {
 			}
 		}()
 	}
+	serveTCPForwards(ctx, cfg, forwards, a.appendLog)
 
 	if openRDP {
 		if err := launchMSTSC(cfg); err != nil {
@@ -1679,9 +1726,11 @@ func (a *clientApp) stopTunnel() {
 	cancel := a.cancel
 	listener := a.listener
 	winrmListener := a.winrmListener
+	forwards := a.tcpForwards
 	a.cancel = nil
 	a.listener = nil
 	a.winrmListener = nil
+	a.tcpForwards = nil
 	a.activeLocal = 0
 	a.rdpRoutes = nil
 	a.activeWinRM = 0
@@ -1697,6 +1746,7 @@ func (a *clientApp) stopTunnel() {
 		_ = winrmListener.Close()
 		a.appendLog("Local WinRM listener stopped.")
 	}
+	closeTCPForwards(forwards, a.appendLog)
 	a.refreshLocalState()
 }
 
@@ -2466,7 +2516,11 @@ func (c *config) ensureDestinations() error {
 		if err := homenetwork.ValidateAlias(alias); err != nil {
 			return fmt.Errorf("destination %q: %w", name, err)
 		}
-		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RelayBases: destination.RelayBases, Room: destination.Room, Proxy: destination.Proxy, RoomProof: destination.RoomProof, WindowsUser: destination.WindowsUser, PasswordlessRDP: destination.PasswordlessRDP, SMBAlias: alias})
+		forwards, err := tunnel.ParseTCPForwardListeners(destination.TCPForwards)
+		if err != nil {
+			return fmt.Errorf("destination %q: %w", name, err)
+		}
+		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RelayBases: destination.RelayBases, Room: destination.Room, Proxy: destination.Proxy, RoomProof: destination.RoomProof, WindowsUser: destination.WindowsUser, PasswordlessRDP: destination.PasswordlessRDP, SMBAlias: alias, TCPForwards: tunnel.FormatTCPForwardListeners(forwards)})
 	}
 	selected := 0
 	for i, destination := range normalized {
@@ -2546,6 +2600,10 @@ func run(ctx context.Context, cfg config, openMSTSC bool) error {
 	}
 	defer listener.Close()
 	log.Printf("client listening on %s; mstsc should target this address", listener.Addr())
+	logf := func(format string, args ...any) { log.Printf(format, args...) }
+	forwards := openTCPForwards(cfg, logf)
+	defer closeTCPForwards(forwards, logf)
+	serveTCPForwards(ctx, cfg, forwards, logf)
 	if openMSTSC {
 		if err := launchMSTSC(cfg); err != nil {
 			log.Printf("open Remote Desktop: %v", err)
@@ -2662,7 +2720,7 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 			ws, err := tunnel.DialMessageConnWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
 			ready := tunnel.SessionReadyInfo{}
 			if err == nil {
-				if service == tunnel.ServiceScreen {
+				if requiresServiceEcho(service) {
 					ready, err = tunnel.AwaitSessionReadyCompatibleServiceInfo(attemptCtx, ws, service)
 				} else {
 					ready, err = tunnel.AwaitSessionReadyCompatibleInfo(attemptCtx, ws)

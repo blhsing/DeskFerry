@@ -234,7 +234,7 @@ func ValidateSessionOffer(message ControlMessage, room, agentID string, now time
 	if message.AgentID != "" && message.AgentID != agentID {
 		return errors.New("session offer agent identity does not match")
 	}
-	if message.Service != ServiceRDP && message.Service != ServiceWinRM && message.Service != ServiceSMB && message.Service != ServiceScreen {
+	if !IsKnownService(message.Service) {
 		return fmt.Errorf("session offer has unsupported service %q", message.Service)
 	}
 	if message.ExpiresAt.IsZero() || !now.Before(message.ExpiresAt) {
