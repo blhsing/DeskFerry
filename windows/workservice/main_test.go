@@ -237,3 +237,11 @@ func TestAgentOptionsArgsIncludeTCPForwards(t *testing.T) {
 		t.Fatalf("service args = %q, want %q", got, want)
 	}
 }
+
+func TestScheduledTaskCommandRunsWorkConsole(t *testing.T) {
+	got := scheduledTaskCommand(`C:\Program Files\DeskFerry\DeskFerry.exe`, agentOptions{RelayURL: "https://relay/workdesk", RoomPasswordFile: `C:\Program Files\DeskFerry\room-password.dpapi`, TCPForwards: "5432=db01:5432"})
+	want := `"C:\Program Files\DeskFerry\DeskFerry.exe" -work-console -relay-url https://relay/workdesk -room-password-file "C:\Program Files\DeskFerry\room-password.dpapi" -tcp-forward 5432=db01:5432`
+	if got != want {
+		t.Fatalf("task command = %s, want %s", got, want)
+	}
+}

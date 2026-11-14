@@ -1292,20 +1292,23 @@ func installScheduledTask(opts agentOptions) error {
 	if err != nil {
 		return err
 	}
-	args := []string{strconv.Quote(exePath), "-console"}
-	for _, arg := range opts.args() {
-		if strings.HasPrefix(arg, "-") {
-			args = append(args, arg)
-		} else {
-			args = append(args, strconv.Quote(arg))
-		}
-	}
-	out, err := exec.Command("schtasks", "/Create", "/TN", "DeskFerry Agent", "/SC", "ONLOGON", "/TR", strings.Join(args, " "), "/F").CombinedOutput()
+	out, err := exec.Command("schtasks", "/Create", "/TN", "DeskFerry Agent", "/SC", "ONLOGON", "/TR", scheduledTaskCommand(exePath, opts), "/F").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("service install requires admin and Scheduled Task fallback failed: %v: %s", err, out)
 	}
 	fmt.Println("Installed Scheduled Task fallback for current-user logon")
 	return nil
+}
+
+// scheduledTaskCommand is the logon task's command line. The merged
+// executable routes plain -console to the Home app, so the task selects the
+// Work agent's foreground mode with -work-console.
+func scheduledTaskCommand(exePath string, opts agentOptions) string {
+	args := []string{syscall.EscapeArg(exePath), "-work-console"}
+	for _, arg := range opts.args() {
+		args = append(args, syscall.EscapeArg(arg))
+	}
+	return strings.Join(args, " ")
 }
 
 func relaunchElevated(opts agentOptions) error {

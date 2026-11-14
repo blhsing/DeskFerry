@@ -20,6 +20,10 @@ const (
 	modeWorkConfigurator = "-work-configurator"
 	modeWindowsSetup     = "-windows-setup"
 	modeHomeNetwork      = "-home-network-service"
+	// modeWorkConsole runs the Work agent in the foreground. Plain -console
+	// belongs to the Home app, so the Work agent's Scheduled Task fallback
+	// (used when the Windows service cannot be created) launches this mode.
+	modeWorkConsole = "-work-console"
 )
 
 func main() {
@@ -30,6 +34,9 @@ func main() {
 		windowssetup.Main()
 	case consumeMode(modeHomeNetwork):
 		homenetworkservice.Main()
+	case consumeMode(modeWorkConsole):
+		os.Args = append(os.Args, "-console")
+		workservice.Main()
 	case workServiceInvocation(os.Args[1:]):
 		workservice.Main()
 	default:
