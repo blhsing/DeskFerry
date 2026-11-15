@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.14.1 - 2026-11-15
+
+- Start the Work agent from its Scheduled Task fallback. When the Work service cannot be installed as a Windows service, DeskFerry registers a logon task instead, but the task ran `DeskFerry.exe -console`, which opens the Home app, so the Work agent never started. The task now runs the new `-work-console` mode, which starts the Work agent in the foreground. The task's command line also doubled every backslash in its paths; it now quotes them the Windows way.
+
 ## 0.14.0 - 2026-11-14
 
 - Add TCP forwards: reach a host and port on the Work network, such as a database or an SSH server, from a loopback port on the Home PC. The Work PC owner lists the targets Home apps may reach, each under a forward port number, in the new **TCP forwards** card of the Work Services window or with `-tcp-forward forwardPort=host:port` (for example `-tcp-forward 5432=db01:5432`). On the Home PC, the selected destination's new **TCP forwards** card maps a local port on `127.0.0.1` to a Work forward port (for example `15432=5432`); the listeners start with **Connect**. `DeskFerry.exe -console -tcp-forward 15432=5432` does the same for one run. Each forward travels as its own relay service, `tcp-<forward port>`, through the existing relay room, so the relays open no new ports and only the Work PC knows the target. Like WinRM and SMB, TCP forwards require a room password.
