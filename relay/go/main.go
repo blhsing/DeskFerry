@@ -1829,8 +1829,15 @@ func (s *ResumeSession) Attach(ctx context.Context, side string, conn tunnel.Mes
 	case <-attachment.Done:
 		return true
 	case <-s.done:
-		return true
 	}
+	select {
+	case <-attachment.Done:
+	default:
+		// The session ended while this socket was still queued, so no bridge
+		// owns it. Close it as a terminal rejection so the peer stops resuming.
+		closeQuietly(conn, websocket.StatusPolicyViolation, "unknown resumable session")
+	}
+	return true
 }
 
 func (s *ResumeSession) Run(agent, client tunnel.MessageConn, clientDone chan struct{}, stateChanged func()) {

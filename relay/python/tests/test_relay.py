@@ -836,6 +836,23 @@ def test_v2_control_heartbeat():
     asyncio.run(scenario())
 
 
+def test_resume_socket_queued_when_session_finishes_is_closed_terminally():
+    from app import RelayRoom, ResumeSession
+
+    async def scenario():
+        room = RelayRoom("unit-finish-queued")
+        session = ResumeSession("d" * 32, room, "work", "home", lambda _: None)
+        home = FakeWebSocket()
+        attach = asyncio.create_task(session.attach("client", home, "home-2"))
+        await asyncio.sleep(0.05)
+        session.finish()
+        assert await asyncio.wait_for(attach, 2) is True
+        assert home.close_code == 1008
+        assert home.close_reason == "unknown resumable session"
+
+    asyncio.run(scenario())
+
+
 def test_v2_control_idle_timeout_after_heartbeat(monkeypatch):
     import app as relay_app
 

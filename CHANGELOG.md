@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.14.3 - 2026-11-16
+
+- End a Remote Desktop, WinRM, or other session within seconds when the Work agent accepts it but cannot finish connecting its side to the relay. Through a slow Work-side proxy, the relay could complete the agent's connection while the agent timed out waiting for the answer; the agent then gave up silently, and the relay and Home app kept the session open for the whole five-minute resume window, so each reconnect attempt seemed to hang. The Work agent now reports `session-closed` to the relay when its side fails after accepting, so the Home app sees the failure at once and a new attempt can start.
+- Close a resume connection that is still waiting when its session ends with a terminal "unknown resumable session" rejection, in the Azure, Go, and Python relays. The Go relay previously left such a connection open, so the Home app waited on it until its resume window ran out.
+
 ## 0.14.2 - 2026-11-16
 
 - Mark a Work agent offline when its host disappears without closing the connection, for example on power loss or a network drop. The Work agent sends a heartbeat every 3 seconds, but the relays never timed out a silent control connection, and the Azure front end kept the half-open socket alive, so the dashboard kept showing the Work agent online and Home apps kept trying to connect to it. The Azure, Go, and Python relays now drop a control connection after 30 seconds without a message, once that agent has sent at least one heartbeat. Agents too old to send heartbeats are unaffected.

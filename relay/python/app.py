@@ -21,7 +21,7 @@ from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.14.2"
+RELAY_VERSION = "0.14.3"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -1114,6 +1114,10 @@ class ResumeSession:
             done_task = asyncio.create_task(self._done.wait())
             await asyncio.wait({attachment.done, done_task}, return_when=asyncio.FIRST_COMPLETED)
             done_task.cancel()
+            if not attachment.done.done():
+                # The session ended while this socket was still queued, so no bridge
+                # owns it. Close it as a terminal rejection so the peer stops resuming.
+                await close_quietly(websocket, 1008, "unknown resumable session")
             return True
         except asyncio.CancelledError:
             return False

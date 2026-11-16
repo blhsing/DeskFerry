@@ -1004,9 +1004,18 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 	}
 	tunnel.AddRoomPasswordHeader(headers, cfg.RelayAddr, "", cfg.RoomPassword)
 	tunnel.AddServiceHeader(headers, target.Service)
+	// Once accepted, the relay may already have paired the session even when
+	// this side never saw the handshake complete (a slow proxy can deliver the
+	// upgrade to the relay but not the response back in time). Tell the relay
+	// the session is over so it fails the Home client now, instead of holding
+	// the paired session open for the whole resume window.
+	abandon := func() {
+		_ = writer.send(parent, tunnel.ControlMessage{Type: tunnel.MessageSessionClosed, SessionID: offer.SessionID, Service: target.Service, Reason: "agent-connect-failed"})
+	}
 	ws, err := tunnel.DialMessageConnWithHeaders(sessionCtx, cfg.RelayAddr, cfg.Proxy, tunnel.RoleAgentSession, "", headers)
 	if err != nil {
 		_ = localConn.Close()
+		abandon()
 		log.Printf("agent session dial failed relay=%s session=%s service=%s duration=%s error=%v", cfg.RelayAddr, offer.SessionID, target.Service, time.Since(started).Round(time.Millisecond), err)
 		return
 	}
@@ -1014,6 +1023,7 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 	if err != nil {
 		_ = localConn.Close()
 		tunnel.CloseMessageConn(ws)
+		abandon()
 		log.Printf("agent session rejected relay=%s session=%s service=%s error=%v", cfg.RelayAddr, offer.SessionID, target.Service, err)
 		return
 	}

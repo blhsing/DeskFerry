@@ -1109,3 +1109,98 @@ func TestV2ControlIdleTimeoutAfterHeartbeat(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// A Work agent whose data socket dies right after pairing (its proxy delivered
+// the upgrade but not the response) reports session-closed on its control
+// channel; the Home client's resume must then end promptly, not after the
+// five-minute resume window.
+func TestV2AgentSessionClosedEndsPairedSessionPromptly(t *testing.T) {
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	relayAddr := server.URL + "/relay/unit-abandon"
+	controlHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(controlHeaders)
+	controlHeaders.Set(tunnel.HeaderAgentInstance, "unit-agent")
+	controlHeaders.Set(tunnel.HeaderAgentServices, tunnel.ServiceRDP)
+	controlHeaders.Set(tunnel.HeaderConcurrency, "2")
+	control, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleAgentControl, "", controlHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(control)
+	if _, err := tunnel.AwaitControlReadyInfo(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+
+	clientHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(clientHeaders)
+	clientHeaders.Set(tunnel.HeaderResumable, "1")
+	tunnel.AddServiceHeader(clientHeaders, tunnel.ServiceRDP)
+	client, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleClient, "", clientHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(client)
+	offer, err := tunnel.ReadControlMessage(ctx, control)
+	if err != nil || offer.Type != tunnel.MessageSessionOffer {
+		t.Fatalf("offer=%#v error=%v", offer, err)
+	}
+	if err := tunnel.WriteControlMessage(ctx, control, tunnel.ControlMessage{Type: tunnel.MessageAccept, SessionID: offer.SessionID}); err != nil {
+		t.Fatal(err)
+	}
+	agentHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(agentHeaders)
+	agentHeaders.Set(tunnel.HeaderAgentInstance, "unit-agent")
+	agentHeaders.Set(tunnel.HeaderSessionID, offer.SessionID)
+	agentHeaders.Set(tunnel.HeaderResumable, "1")
+	tunnel.AddServiceHeader(agentHeaders, tunnel.ServiceRDP)
+	agent, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleAgentSession, "", agentHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tunnel.AwaitSessionReadyCompatibleServiceInfo(ctx, client, tunnel.ServiceRDP); err != nil {
+		t.Fatal(err)
+	}
+	// The agent never saw its socket become ready and drops it.
+	_ = agent.CloseNow()
+	tunnel.CloseWebSocket(client)
+
+	resumeHeaders := http.Header{}
+	resumeHeaders.Set(tunnel.HeaderSessionID, offer.SessionID)
+	resumeHeaders.Set(tunnel.HeaderSessionSide, "client")
+	tunnel.AddServiceHeader(resumeHeaders, tunnel.ServiceRDP)
+	resume, err := tunnel.DialResumeMessageConnWithHeaders(ctx, relayAddr, "direct", "", resumeHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseMessageConn(resume)
+	resumeDone := make(chan error, 1)
+	go func() { resumeDone <- tunnel.AwaitWebSocketResume(ctx, resume, offer.SessionID) }()
+
+	started := time.Now()
+	if err := tunnel.WriteControlMessage(ctx, control, tunnel.ControlMessage{Type: tunnel.MessageSessionClosed, SessionID: offer.SessionID, Service: tunnel.ServiceRDP, Reason: "agent-connect-failed"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-resumeDone:
+		if err == nil {
+			t.Fatal("client resumed an abandoned session")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("client resume still waiting after the agent closed the session")
+	}
+	retry, err := tunnel.DialResumeMessageConnWithHeaders(ctx, relayAddr, "direct", "", resumeHeaders)
+	if err == nil {
+		err = tunnel.AwaitWebSocketResume(ctx, retry, offer.SessionID)
+		tunnel.CloseMessageConn(retry)
+	}
+	if !tunnel.IsTerminalSessionError(err) {
+		t.Fatalf("resume after session-closed = %v, want terminal error", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("abandoned session took %s to end", elapsed)
+	}
+}

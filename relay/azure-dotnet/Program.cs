@@ -1857,6 +1857,12 @@ sealed class ResumeSession
             return false;
         }
         await Task.WhenAny(attachment.Done.Task, Task.Delay(Timeout.InfiniteTimeSpan, _finished.Token));
+        if (!attachment.Done.Task.IsCompleted)
+        {
+            // The session ended while this socket was still queued, so no bridge
+            // owns it. Close it as a terminal rejection so the peer stops resuming.
+            await RelayRoom.CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "unknown resumable session");
+        }
         return true;
     }
 
@@ -2272,7 +2278,7 @@ static class RelayDashboard
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.14.2";
+    public const string Version = "0.14.3";
 }
 
 sealed class WaitingAgent
