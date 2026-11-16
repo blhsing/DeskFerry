@@ -115,6 +115,22 @@ Always delete old builds and copies as part of every build, installation, and up
 
 `DeskFerry.exe` is a GUI-subsystem executable, so PowerShell's `&` call operator returns immediately without waiting for it or capturing its output, even for console-style modes such as `-update-service` and `-windows-setup -cli-action install`. In any script that runs one of these modes and then acts on the result (restarting `DeskFerryHomeNetwork`, relaunching the desktop app, deleting `DeskFerry.exe.previous`, checking hashes), launch it with `Start-Process -FilePath <exe> -ArgumentList ... -Wait -PassThru -RedirectStandardOutput <file>` and check `ExitCode` first. Otherwise the follow-up steps race the file swap: a service restarted too early comes back on the old binary and keeps the renamed copy locked.
 
+To upgrade a remote Work PC that is reachable only through DeskFerry, such as room `p`'s `blhsing-px13`:
+
+1. Run PowerShell on it through the local Home app's saved destination and Windows login: select the destination in the Home app, then run `"C:\Program Files\DeskFerry\DeskFerry.exe" -winrm-command-file <script.ps1> -winrm-timeout 10m`. Use a script file rather than `-winrm-command` to avoid quoting problems; the WinRM session is elevated.
+2. Have the remote PC download `deskferry-windows-amd64-debug.exe` and `SHA256SUMS.txt` from the GitHub Release into `C:\ProgramData\DeskFerry\update-<version>` and stop unless the hash matches.
+3. Recheck the room's relay pairs and the PC's established loopback connections (ports 3389, 445, 3390, 3391, and TCP forward ports) within 10 seconds of starting, and report what will be cut.
+4. Because the WinRM session runs through the Work agent being replaced, do the swap in a one-shot scheduled task running as `SYSTEM` that logs to `C:\ProgramData\DeskFerry\update-<version>.log`. In order, the task:
+   - runs `-update-service "C:\Program Files\DeskFerry\DeskFerry.exe"` with `Start-Process -Wait`;
+   - restarts `DeskFerryHomeNetwork` only after that returns;
+   - stops the desktop app in the user's session and relaunches it through a second one-shot task whose principal is that user with `-LogonType Interactive`, then unregisters that task;
+   - deletes `DeskFerry.exe.previous`.
+5. Wait for the room's `last_agent_connected_at` on the relay status to advance. Then reconnect over WinRM and verify:
+   - the `Work Agent version` line in `work-agent-*.log`;
+   - the installed hash;
+   - that each `DeskFerry.exe` process started after the swap, and that the network log shows a fresh `virtual network ready` line with the DeskFerry adapter at metric 9999.
+6. Remove the scheduled tasks, the update folder and log, and any old executable copies. If a copy is still in use, schedule it with `MoveFileEx(path, [NullString]::Value, 4)`; PowerShell turns `$null` into an empty string, which fails with error 3. Delete local helper scripts too.
+
 After code changes, build the relevant artifacts. The user prefers deployment after code changes, but deployment and installation decisions must be made independently for every component: the merged Windows app and its Work/network service modes, macOS Home agent, Android Home agent, Azure relay, OCI relay, and Python relay. Inspect the substantive diff for each component. Upgrade a component when it contains an actual functional, reliability, security, protocol, compatibility, or packaging fix that applies to that installation. Do not upgrade or restart any component merely to synchronize or display a new version number. It is acceptable for deployed components to report different versions when their code did not otherwise change.
 
 Immediately before stopping or upgrading any component, recheck its active RDP, WinRM, SMB, and screen connections or relay pairs. The check must occur within 10 seconds of the stop; an earlier idle result is stale. Disconnecting or transparently resuming existing connections is acceptable when the target component contains an actual applicable fix and the upgrade requires a restart. When the target component changed only by version metadata, interrupting existing connections is unacceptable and the component must not be upgraded. Record or communicate the expected connection impact before a necessary disruptive upgrade, and prefer a non-disruptive or resumable path when available.
