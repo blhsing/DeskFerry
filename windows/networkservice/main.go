@@ -223,8 +223,32 @@ func configureAdapter(ctx context.Context, cfg homenetwork.Config) error {
 	if out, err := hiddenCommand(ctx, "netsh", "interface", "ipv4", "set", "address", "name="+cfg.InterfaceName, "source=static", "address="+ip.String(), "mask="+mask, "gateway=none").CombinedOutput(); err != nil {
 		return fmt.Errorf("configure virtual adapter address: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	// Windows derives an automatic metric from the adapter's reported link
+	// speed, which makes the virtual adapter the preferred interface (metric 5
+	// against typical Wi-Fi 35). Broadcasts and multicast sent without an
+	// explicit interface, such as LAN printer or casting discovery, would then
+	// leave through DeskFerry and be dropped. The work address is reachable
+	// only through this adapter's on-link route, so the worst metric costs SMB
+	// nothing.
+	for _, family := range []string{"ipv4", "ipv6"} {
+		if out, err := hiddenCommand(ctx, "netsh", adapterMetricArgs(family, cfg.InterfaceName)...).CombinedOutput(); err != nil {
+			log.Printf("could not lower virtual adapter %s priority: %v: %s", family, err, strings.TrimSpace(string(out)))
+		}
+	}
 	return nil
 }
+
+func adapterMetricArgs(family, interfaceName string) []string {
+	return []string{"interface", family, "set", "interface", "interface=" + interfaceName, "metric=" + adapterInterfaceMetric}
+}
+
+// adapterInterfaceMetric is the largest interface metric Windows accepts.
+const adapterInterfaceMetric = "9999"
+
+// errSOCKSUDPAssociate marks UDP flows that tun2socks forwards for Windows'
+// own broadcast and multicast chatter on the adapter. The bridge carries only
+// TCP 445, so they are refused without logging each one.
+var errSOCKSUDPAssociate = errors.New("SOCKS UDP ASSOCIATE is not supported")
 
 func hiddenCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -239,7 +263,7 @@ func serveSOCKS(ctx context.Context, listener net.Listener, cfg homenetwork.Conf
 			return err
 		}
 		go func() {
-			if err := handleSOCKS(ctx, conn, cfg); err != nil && ctx.Err() == nil {
+			if err := handleSOCKS(ctx, conn, cfg); err != nil && ctx.Err() == nil && !errors.Is(err, errSOCKSUDPAssociate) {
 				log.Printf("SMB connection rejected or ended: %v", err)
 			}
 		}()
@@ -275,9 +299,13 @@ func handleSOCKS(ctx context.Context, conn net.Conn, cfg homenetwork.Config) err
 	if _, err := io.ReadFull(reader, request); err != nil {
 		return err
 	}
+	if request[0] == 5 && request[1] == 3 {
+		writeSOCKSReply(conn, 7)
+		return errSOCKSUDPAssociate
+	}
 	if request[0] != 5 || request[1] != 1 {
 		writeSOCKSReply(conn, 7)
-		return errors.New("only SOCKS CONNECT is supported")
+		return fmt.Errorf("only SOCKS CONNECT is supported (version %d command %d)", request[0], request[1])
 	}
 	destination, err := readSOCKSAddress(reader, request[3])
 	if err != nil {

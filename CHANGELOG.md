@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.14.4 - 2026-11-16
+
+- Stop the optional DeskFerry virtual network adapter from becoming the preferred network interface. Windows gave it an automatic interface metric of 5, ahead of Wi-Fi or Ethernet, so broadcasts and multicast sent without a chosen interface, such as printer, casting, and other LAN discovery, left through the DeskFerry adapter and were dropped. The Home network service now sets the adapter's IPv4 and IPv6 metric to 9999; Work file access is unaffected because the work address is reachable only through the adapter.
+- Stop logging an "only SOCKS CONNECT is supported" line for each UDP broadcast or multicast packet Windows sends on the adapter. These UDP flows are still refused, because the bridge carries only TCP port 445.
+
 ## 0.14.3 - 2026-11-16
 
 - End a Remote Desktop, WinRM, or other session within seconds when the Work agent accepts it but cannot finish connecting its side to the relay. Through a slow Work-side proxy, the relay could complete the agent's connection while the agent timed out waiting for the answer; the agent then gave up silently, and the relay and Home app kept the session open for the whole five-minute resume window, so each reconnect attempt seemed to hang. The Work agent now reports `session-closed` to the relay when its side fails after accepting, so the Home app sees the failure at once and a new attempt can start.
