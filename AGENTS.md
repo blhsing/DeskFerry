@@ -86,7 +86,7 @@ When `windows/`, `home-agent/macos`, `relay/go`, `internal/tunnel`, or shared re
 This repo has been built with:
 
 - Go 1.26.x installed under `D:\Scoop`
-- .NET SDK 9.x, publishing the relay as `net8.0`
+- .NET SDK 9.x, publishing the relay as `net8.0`. On this host, the `dotnet` on `PATH` (`C:\Program Files\dotnet`) has only SDK 5.0, which fails the relay build with `NETSDK1045`. The usable SDK (8.0.425) is the per-user install under `%USERPROFILE%\.dotnet`, so put it first for the build, for example from Git Bash: `PATH="$HOME/.dotnet:$PATH" DOTNET_ROOT="$HOME/.dotnet" powershell -NoProfile -File build/build-azure-relay.ps1`, or in PowerShell set `$env:DOTNET_ROOT` and prepend it to `$env:PATH`
 - Python 3.14.x
 - Android SDK under `D:\Android\Sdk`
 - Gradle 9.6.x with `JAVA_HOME` set per command to `C:\Program Files\Java\jdk-25` when the global value is stale
