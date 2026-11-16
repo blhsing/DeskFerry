@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.14.2 - 2026-11-16
+
+- Mark a Work agent offline when its host disappears without closing the connection, for example on power loss or a network drop. The Work agent sends a heartbeat every 3 seconds, but the relays never timed out a silent control connection, and the Azure front end kept the half-open socket alive, so the dashboard kept showing the Work agent online and Home apps kept trying to connect to it. The Azure, Go, and Python relays now drop a control connection after 30 seconds without a message, once that agent has sent at least one heartbeat. Agents too old to send heartbeats are unaffected.
+
 ## 0.14.1 - 2026-11-15
 
 - Start the Work agent from its Scheduled Task fallback. When the Work service cannot be installed as a Windows service, DeskFerry registers a logon task instead, but the task ran `DeskFerry.exe -console`, which opens the Home app, so the Work agent never started. The task now runs the new `-work-console` mode, which starts the Work agent in the foreground. The task's command line also doubled every backslash in its paths; it now quotes them the Windows way.

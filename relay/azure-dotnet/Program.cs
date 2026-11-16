@@ -475,6 +475,9 @@ sealed class RelayHub
     private const string ClientUnavailable = "client-unavailable";
     private const int ProtocolVersion = 2;
     private static readonly TimeSpan SessionOfferTtl = TimeSpan.FromSeconds(8);
+    // Work agents that heartbeat send control-ping every few seconds. Once one has been seen, a silent
+    // control socket means the Work host vanished (power loss, network drop) behind a half-open TCP path.
+    internal static readonly TimeSpan ControlIdleTimeout = TimeSpan.FromSeconds(30);
 
     private readonly ConcurrentDictionary<string, RelayRoom> _rooms = new();
     private readonly ConcurrentDictionary<Guid, DashboardClient> _dashboards = new();
@@ -523,11 +526,32 @@ sealed class RelayHub
                 return;
             }
             _log.LogInformation("agent control connected room={Room} agent={Agent} services={Services} concurrency={Concurrency} remote={Remote} removed_legacy_slots={RemovedLegacy}", room.Id, agentId, string.Join(',', services.OrderBy(value => value)), concurrency, remote, removedLegacy);
+            var heartbeatSeen = false;
             while (!abort.IsCancellationRequested && socket.State == WebSocketState.Open)
             {
-                var message = await ReceiveV2Async(socket, abort);
+                ControlMessage message;
+                if (heartbeatSeen)
+                {
+                    using var idle = CancellationTokenSource.CreateLinkedTokenSource(abort);
+                    idle.CancelAfter(ControlIdleTimeout);
+                    try
+                    {
+                        message = await ReceiveV2Async(socket, idle.Token);
+                    }
+                    catch (OperationCanceledException) when (!abort.IsCancellationRequested)
+                    {
+                        _log.LogInformation("agent control heartbeat timed out room={Room} agent={Agent} remote={Remote} idle_ms={IdleMs}", room.Id, agentId, remote, (long)ControlIdleTimeout.TotalMilliseconds);
+                        socket.Abort();
+                        return;
+                    }
+                }
+                else
+                {
+                    message = await ReceiveV2Async(socket, abort);
+                }
                 if (message.Type == "control-ping")
                 {
+                    heartbeatSeen = true;
                     if (!await control.SendAsync(new ControlMessage("control-pong"), abort))
                     {
                         return;
@@ -2248,7 +2272,7 @@ static class RelayDashboard
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.14.1";
+    public const string Version = "0.14.2";
 }
 
 sealed class WaitingAgent

@@ -637,12 +637,23 @@ func (h *RelayHub) ServeAgentControl(ctx context.Context, token string, c tunnel
 	}
 	log.Printf("agent control connected room=%s agent=%s services=%v concurrency=%d remote=%s removed_legacy_slots=%d", room.ID, agentID, sortedServices(services), concurrency, remote, removedLegacy)
 	h.NotifyDashboards()
+	heartbeatSeen := false
 	for {
-		message, err := tunnel.ReadControlMessage(ctx, c)
+		readCtx, cancelRead := ctx, context.CancelFunc(func() {})
+		if heartbeatSeen {
+			readCtx, cancelRead = context.WithTimeout(ctx, controlIdleTimeout)
+		}
+		message, err := tunnel.ReadControlMessage(readCtx, c)
+		timedOut := heartbeatSeen && readCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
+		cancelRead()
 		if err != nil {
+			if timedOut {
+				log.Printf("agent control heartbeat timed out room=%s agent=%s remote=%s idle=%s", room.ID, agentID, remote, controlIdleTimeout)
+			}
 			return
 		}
 		if message.Type == tunnel.MessageControlPing {
+			heartbeatSeen = true
 			if !control.Send(tunnel.ControlMessage{Type: tunnel.MessageControlPong}) {
 				return
 			}
@@ -2295,6 +2306,10 @@ func randomID() string {
 
 // relayKind labels this relay implementation on the shared dashboard.
 const relayKind = "Go relay"
+
+// Once a Work agent has sent a control-ping, a control socket silent this long belongs to a
+// vanished host (power loss, network drop) behind a half-open TCP path. A variable for tests.
+var controlIdleTimeout = 30 * time.Second
 
 func iconSVG() string {
 	return relaydashboard.IconSVG()

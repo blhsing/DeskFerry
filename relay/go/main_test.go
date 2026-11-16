@@ -1061,3 +1061,51 @@ func TestV2TCPForwardServicePairs(t *testing.T) {
 		t.Fatalf("unadvertised forward result = %v", err)
 	}
 }
+
+func TestV2ControlIdleTimeoutAfterHeartbeat(t *testing.T) {
+	previous := controlIdleTimeout
+	controlIdleTimeout = 300 * time.Millisecond
+	defer func() { controlIdleTimeout = previous }()
+	server := httptest.NewServer(newServer())
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	relayAddr := server.URL + "/relay/unit-idle"
+	controlHeaders := http.Header{}
+	tunnel.AddProtocolV2Header(controlHeaders)
+	controlHeaders.Set(tunnel.HeaderAgentInstance, "unit-agent")
+	controlHeaders.Set(tunnel.HeaderAgentServices, tunnel.ServiceRDP)
+	controlHeaders.Set(tunnel.HeaderConcurrency, "1")
+	control, err := tunnel.DialWebSocketWithHeaders(ctx, relayAddr, "direct", tunnel.RoleAgentControl, "", controlHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.CloseWebSocket(control)
+	if _, err := tunnel.AwaitControlReadyInfo(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+	// Without a heartbeat the relay keeps the control socket (older agents never ping).
+	time.Sleep(600 * time.Millisecond)
+	if status := getStatus(t, server.URL, "unit-idle"); len(status.Rooms) != 1 || status.Rooms[0].ControlConnections != 1 {
+		t.Fatalf("control dropped before any heartbeat: %+v", status.Rooms)
+	}
+	if err := tunnel.WriteControlMessage(ctx, control, tunnel.ControlMessage{Type: tunnel.MessageControlPing}); err != nil {
+		t.Fatal(err)
+	}
+	if pong, err := tunnel.ReadControlMessage(ctx, control); err != nil || pong.Type != tunnel.MessageControlPong {
+		t.Fatalf("control heartbeat response=%#v error=%v", pong, err)
+	}
+	// The agent falls silent, as a powered-off Work host would.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		status := getStatus(t, server.URL, "unit-idle")
+		if len(status.Rooms) == 1 && status.Rooms[0].ControlConnections == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("silent control connection was not dropped: %+v", status.Rooms)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}

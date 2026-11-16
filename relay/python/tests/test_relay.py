@@ -836,6 +836,26 @@ def test_v2_control_heartbeat():
     asyncio.run(scenario())
 
 
+def test_v2_control_idle_timeout_after_heartbeat(monkeypatch):
+    import app as relay_app
+
+    monkeypatch.setattr(relay_app, "CONTROL_IDLE_TIMEOUT_SECONDS", 0.2)
+
+    async def scenario():
+        hub = RelayHub()
+        control = FakeWebSocket()
+        control_task = asyncio.create_task(
+            hub.serve_agent_control("unit-idle", control, "work", "unit-agent", {"rdp"}, 1)
+        )
+        await asyncio.sleep(0.4)
+        assert not control_task.done(), "control dropped before any heartbeat"
+        await control._received.put({"type": "control-ping"})
+        await asyncio.wait_for(control_task, 2)
+        assert "unit-idle/unit-agent" not in hub._controls
+
+    asyncio.run(scenario())
+
+
 def test_v2_no_agent_is_typed_and_immediate():
     async def scenario():
         hub = RelayHub()

@@ -21,7 +21,7 @@ from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 SERVICE_NAME = "DeskFerry.Relay"
-RELAY_VERSION = "0.14.1"
+RELAY_VERSION = "0.14.2"
 DASHBOARD_ROLE = "dashboard"
 RESUME_ROLE = "resume"
 STARTED = "started"
@@ -1455,6 +1455,11 @@ class PendingSession:
     agent: asyncio.Future[AgentDataSocket] = field(default_factory=asyncio.Future)
 
 
+# Work agents that heartbeat send control-ping every few seconds. Once one has been seen, a silent
+# control socket means the Work host vanished (power loss, network drop) behind a half-open TCP path.
+CONTROL_IDLE_TIMEOUT_SECONDS = 30.0
+
+
 class RelayHub:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -1492,12 +1497,21 @@ class RelayHub:
             if not await control.send({"type": "control-ready", "agent_id": agent_id, "protocol_version": 2, "heartbeat": True}):
                 return
             logger.info("agent control connected room=%s agent=%s services=%s concurrency=%s remote=%s removed_legacy_slots=%s", room.id, agent_id, sorted(services), concurrency, remote, removed_legacy)
+            heartbeat_seen = False
             while websocket_is_connected(websocket):
-                message = await websocket.receive_json()
+                if heartbeat_seen:
+                    try:
+                        message = await asyncio.wait_for(websocket.receive_json(), CONTROL_IDLE_TIMEOUT_SECONDS)
+                    except asyncio.TimeoutError:
+                        logger.info("agent control heartbeat timed out room=%s agent=%s remote=%s idle_s=%s", room.id, agent_id, remote, CONTROL_IDLE_TIMEOUT_SECONDS)
+                        return
+                else:
+                    message = await websocket.receive_json()
                 if not isinstance(message, dict):
                     continue
                 message_type = str(message.get("type", "")).strip().lower()
                 if message_type == "control-ping":
+                    heartbeat_seen = True
                     if not await control.send({"type": "control-pong"}):
                         return
                     continue
