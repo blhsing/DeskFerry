@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.14.5 - 2026-11-21
+
+- Stop the two sides of an interrupted session from missing each other at the relays. The side that noticed the loss first waited only 3 seconds at the session's relay before moving to the next one, but the other side may notice only when its heartbeat times out (8 seconds for Remote Desktop). The first wait at the session's relay now lasts at least the heartbeat timeout, on Windows and macOS. The Android Home app is unchanged.
+- Close the local connection at once when a session cannot resume. A failed stream only half-closed the local connection, and a Remote Desktop server that had not yet received any data kept it open for hours, also holding one of the Work service's session slots.
+
 ## 0.14.4 - 2026-11-16
 
 - Stop the optional DeskFerry virtual network adapter from becoming the preferred network interface. Windows gave it an automatic interface metric of 5, ahead of Wi-Fi or Ethernet, so broadcasts and multicast sent without a chosen interface, such as printer, casting, and other LAN discovery, left through the DeskFerry adapter and were dropped. The Home network service now sets the adapter's IPv4 and IPv6 metric to 9999; Work file access is unaffected because the work address is reachable only through the adapter.

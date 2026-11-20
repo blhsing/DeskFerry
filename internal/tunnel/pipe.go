@@ -83,6 +83,15 @@ func copyHalf(wg *sync.WaitGroup, dst, src net.Conn, result *CopyResult, complet
 	defer wg.Done()
 	result.Bytes, result.CopyErr = io.Copy(dst, src)
 	completed <- source
+	if result.CopyErr != nil {
+		// A failed copy means the stream is broken, for example a resumable
+		// session that could not resume. Half-closing would leave the other
+		// direction waiting until its peer closes, which a Remote Desktop server
+		// that never received a byte may not do for hours.
+		result.CloseWriteErr = dst.Close()
+		result.CloseReadErr = src.Close()
+		return
+	}
 	if cw, ok := dst.(closeWriter); ok {
 		result.CloseWriteErr = cw.CloseWrite()
 	} else {

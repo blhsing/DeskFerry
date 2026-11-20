@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -93,5 +94,47 @@ func assertTransferred(t *testing.T, source, destination net.Conn, payload []byt
 	}
 	if string(received) != string(payload) {
 		t.Fatalf("received %q, want %q", received, payload)
+	}
+}
+
+type failingReadConn struct {
+	net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *failingReadConn) Read([]byte) (int, error) {
+	return 0, errors.New("relay session could not resume")
+}
+func (c *failingReadConn) Write(p []byte) (int, error) {
+	<-c.closed
+	return 0, net.ErrClosed
+}
+func (c *failingReadConn) Close() error { c.once.Do(func() { close(c.closed) }); return nil }
+
+// A broken stream must not leave the local TCP connection half-open until its
+// peer, here one that never sends or closes, finally hangs up.
+func TestPipeClosesLocalConnectionWhenStreamFails(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	peer, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	local, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &failingReadConn{closed: make(chan struct{})}
+	done := make(chan PipeResult, 1)
+	go func() { done <- PipeWithResult(stream, local) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pipe kept the local connection open after the stream failed")
 	}
 }

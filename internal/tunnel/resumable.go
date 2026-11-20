@@ -347,6 +347,12 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 				if lostRelayUnreachable && c.relayIndex != lostRelay && peerWait < resumeUnreachablePeerWait {
 					peerWait = min(resumeUnreachablePeerWait, remaining)
 				}
+				// The peer may notice the loss only when its heartbeat times
+				// out, well after this side did, so the first wait at the
+				// session's relay must cover that delay.
+				if peerWaitRound == 0 && c.relayIndex == lostRelay && peerWait < c.opts.heartbeatTimeout {
+					peerWait = min(c.opts.heartbeatTimeout, remaining)
+				}
 			}
 			resumeCtx, cancelResume := context.WithTimeout(c.ctx, peerWait)
 			err = AwaitWebSocketResume(resumeCtx, candidate, c.opts.SessionID)
