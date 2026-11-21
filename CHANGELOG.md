@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.14.6 - 2026-11-22
+
+- Reconnect Remote Desktop to the original desktop after an interrupted session gives up. When the Remote Desktop client abandoned an interrupted session and reconnected, the Work service still held the old session's connection to the Remote Desktop server for up to five minutes while it waited to resume. Windows could not hand the reconnecting client its original desktop and started a new logon session instead. The Work service now ends any interrupted Remote Desktop session as soon as a new one arrives, before connecting it to the server; a new connection would displace the old one anyway.
+
 ## 0.14.5 - 2026-11-21
 
 - Stop the two sides of an interrupted session from missing each other at the relays. The side that noticed the loss first waited only 3 seconds at the session's relay before moving to the next one, but the other side may notice only when its heartbeat times out (8 seconds for Remote Desktop). The first wait at the session's relay now lasts at least the heartbeat timeout, on Windows and macOS. The Android Home app is unchanged.

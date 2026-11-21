@@ -829,6 +829,27 @@ func (c *resumableWebSocketConn) setTerminal(err error) {
 	}
 }
 
+// ResumableSession is implemented by the connection NewResumableWebSocketConn
+// returns.
+type ResumableSession interface {
+	// Interrupted reports whether the session has lost its transport and is
+	// waiting to resume.
+	Interrupted() bool
+	// Abort ends the session at once, as if it had failed to resume.
+	Abort(reason error)
+}
+
+func (c *resumableWebSocketConn) Interrupted() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.closed && c.ws == nil
+}
+
+func (c *resumableWebSocketConn) Abort(reason error) {
+	c.diagnostic("session aborted: %v", reason)
+	c.setTerminal(reason)
+}
+
 func (c *resumableWebSocketConn) Close() error {
 	c.mu.Lock()
 	if c.closed {
