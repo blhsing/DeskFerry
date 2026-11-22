@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.14.7 - 2026-11-22
+
+- Revert the 0.14.6 change that ended interrupted Remote Desktop sessions when a new one arrived. Closing the old connection to the Remote Desktop server just before the reconnecting client signed in raced with Windows handing the desktop to the new connection, and Windows then disconnected the reconnecting client as if another computer had taken over. The Work service again leaves the old connection open, and the reconnecting client takes over the desktop from it as before.
+
 ## 0.14.6 - 2026-11-22
 
 - Reconnect Remote Desktop to the original desktop after an interrupted session gives up. When the Remote Desktop client abandoned an interrupted session and reconnected, the Work service still held the old session's connection to the Remote Desktop server for up to five minutes while it waited to resume. Windows could not hand the reconnecting client its original desktop and started a new logon session instead. The Work service now ends any interrupted Remote Desktop session as soon as a new one arrives, before connecting it to the server; a new connection would displace the old one anyway.

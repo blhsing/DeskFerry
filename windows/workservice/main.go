@@ -978,9 +978,6 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 	sessionCtx, cancel := context.WithDeadline(parent, offer.ExpiresAt)
 	defer cancel()
 	started := time.Now()
-	if target.Service == tunnel.ServiceRDP {
-		abortInterruptedRDPSessions(offer.SessionID)
-	}
 	var localConn net.Conn
 	var err error
 	if target.Interactive {
@@ -1036,10 +1033,6 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 		stream = tunnel.NewResumableWebSocketConn(parent, ws, tunnel.ResumableWebSocketOptions{RelayAddr: cfg.RelayAddr, AlternateRelayAddrs: cfg.FailoverRelayAddrs, Proxy: cfg.Proxy, SessionID: offer.SessionID, Side: "agent", RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword), Service: target.Service, Heartbeat: ready.Heartbeat, Logf: log.Printf})
 	}
 	log.Printf("session ready relay=%s session=%s service=%s target=%s heartbeat=%t setup_duration=%s", cfg.RelayAddr, offer.SessionID, target.Service, target.Address, ready.Heartbeat, time.Since(started).Round(time.Millisecond))
-	if resumable, ok := stream.(tunnel.ResumableSession); ok && target.Service == tunnel.ServiceRDP {
-		done := trackRDPSession(offer.SessionID, resumable)
-		defer close(done)
-	}
 	pipeStream := stream
 	if target.Interactive {
 		pipeStream = drainScreenResponse(stream)
@@ -1047,60 +1040,6 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 	result := tunnel.PipeWithResult(pipeStream, localConn)
 	_ = writer.send(parent, tunnel.ControlMessage{Type: tunnel.MessageSessionClosed, SessionID: offer.SessionID, Service: target.Service, Reason: result.EndInitiator("relay", "local_"+target.Service)})
 	log.Printf("session closed relay=%s session=%s service=%s duration=%s end_initiator=%s relay_to_local_bytes=%d local_to_relay_bytes=%d", cfg.RelayAddr, offer.SessionID, target.Service, result.Duration.Round(time.Millisecond), result.EndInitiator("relay", "local_"+target.Service), result.AToB.Bytes, result.BToA.Bytes)
-}
-
-// rdpSessions tracks live resumable RDP sessions across every relay. A Remote
-// Desktop client that gave up on an interrupted session reconnects with its
-// auto-reconnect cookie, but Windows cannot hand it the original desktop while
-// the interrupted session still holds its connection to port 3389, and puts the
-// client into a new logon session instead. A new RDP session would displace
-// the old connection anyway, so interrupted ones are ended first.
-var rdpSessions = struct {
-	sync.Mutex
-	byID map[string]trackedRDPSession
-}{byID: map[string]trackedRDPSession{}}
-
-type trackedRDPSession struct {
-	session tunnel.ResumableSession
-	done    chan struct{}
-}
-
-func trackRDPSession(id string, session tunnel.ResumableSession) chan struct{} {
-	done := make(chan struct{})
-	rdpSessions.Lock()
-	rdpSessions.byID[id] = trackedRDPSession{session: session, done: done}
-	rdpSessions.Unlock()
-	go func() {
-		<-done
-		rdpSessions.Lock()
-		delete(rdpSessions.byID, id)
-		rdpSessions.Unlock()
-	}()
-	return done
-}
-
-func abortInterruptedRDPSessions(newSessionID string) {
-	rdpSessions.Lock()
-	var waits []chan struct{}
-	for id, tracked := range rdpSessions.byID {
-		if id == newSessionID || !tracked.session.Interrupted() {
-			continue
-		}
-		log.Printf("ending interrupted RDP session=%s before new RDP session=%s connects", id, newSessionID)
-		tracked.session.Abort(fmt.Errorf("replaced by new RDP session %s", newSessionID))
-		waits = append(waits, tracked.done)
-	}
-	rdpSessions.Unlock()
-	// Let the old connection to the RDP server close before the new one
-	// authenticates, so the server marks the original desktop disconnected.
-	deadline := time.After(3 * time.Second)
-	for _, done := range waits {
-		select {
-		case <-done:
-		case <-deadline:
-			return
-		}
-	}
 }
 
 type serviceTarget struct {
