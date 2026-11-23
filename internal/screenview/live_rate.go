@@ -8,6 +8,8 @@ import (
 
 // compressionLevel is one step of extra compression for a busy screen.
 type compressionLevel struct {
+	// Lossless sends every tile losslessly (PNG-style).
+	Lossless    bool
 	Quality     int
 	MotionLossy bool
 	MotionScale int
@@ -20,6 +22,7 @@ type compressionLevel struct {
 // the viewer while changes are waiting, and keeps a step only if it raises
 // the frame rate.
 var compressionLevels = []compressionLevel{
+	{Lossless: true, MotionScale: 1},
 	{Quality: 80, MotionScale: 1},
 	{Quality: 60, MotionLossy: true, MotionScale: 1},
 	{Quality: 45, MotionLossy: true, MotionScale: 1},
@@ -335,6 +338,10 @@ func (c *fpsController) describe(level int) string {
 		return "lossless only"
 	case level == 0:
 		return "full quality"
+	case value.Lossless:
+		return "lossless"
+	case !value.MotionLossy && value.MotionScale <= 1:
+		return fmt.Sprintf("JPEG %d for photographic areas", value.Quality)
 	case value.Video:
 		return "H.264 video for the moving area"
 	case value.MotionScale > 1:

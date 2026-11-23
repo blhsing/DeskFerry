@@ -2278,7 +2278,7 @@ static class RelayDashboard
 
 static class RelayBuildInfo
 {
-    public const string Version = "0.15.5";
+    public const string Version = "0.15.6";
 }
 
 sealed class WaitingAgent

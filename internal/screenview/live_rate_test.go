@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -156,12 +157,12 @@ func TestMinFPSZeroSendsOnlyLossless(t *testing.T) {
 		_ = ServeLive(context.Background(), struct {
 			io.Reader
 			io.Writer
-		}{reader, serverSide}, request, LiveServerOptions{ScreenKey: key, Source: &movingSource{frames: frames}, Host: &fakeHost{}, Logf: t.Logf})
+		}{reader, &throttledWriter{w: serverSide, rate: 150 << 10}}, request, LiveServerOptions{ScreenKey: key, Source: &movingSource{frames: frames}, Host: &fakeHost{}, Logf: t.Logf})
 	}()
 	var mu sync.Mutex
 	lossy, total := 0, 0
 	zero := 0
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	client, err := StartLive(ctx, clientSide, LiveClientOptions{ScreenKey: key, MinFPS: &zero, OnEncoded: func(event EncodedEvent) {
 		mu.Lock()
@@ -187,11 +188,13 @@ func TestMinFPSZeroSendsOnlyLossless(t *testing.T) {
 		t.Fatalf("with min fps 0: %d rects, %d lossy", total, lossy)
 	}
 	mu.Unlock()
-	time.Sleep(time.Second)
+	// The link is too slow for 30 lossless frames a second, so compression
+	// must start.
+	time.Sleep(4 * time.Second)
 	mu.Lock()
 	defer mu.Unlock()
 	if lossy == 0 {
-		t.Fatal("photo tiles stayed lossless after raising min fps to 30")
+		t.Fatal("photo tiles stayed lossless after raising min fps to 30 on a slow link")
 	}
 }
 
@@ -376,5 +379,108 @@ func TestControllerGoesStraightToVideoForFullScreenMotion(t *testing.T) {
 	c.decide(time.Now(), 2, true, true, 2, 100)
 	if c.level != 1 {
 		t.Fatalf("level = %d for a small moving area, want the next step (1)", c.level)
+	}
+}
+
+// tickerSource changes a photographic area until stopped and keeps changing
+// a small corner, like a clock, all the time.
+type tickerSource struct {
+	photos  []*image.RGBA
+	stopped atomic.Bool
+	index   int
+}
+
+func (s *tickerSource) Next(timeout time.Duration) (*image.RGBA, bool, error) {
+	time.Sleep(20 * time.Millisecond)
+	s.index++
+	photo := s.photos[0]
+	if !s.stopped.Load() {
+		photo = s.photos[s.index%len(s.photos)]
+	}
+	frame := image.NewRGBA(photo.Bounds())
+	copy(frame.Pix, photo.Pix)
+	for y := 0; y < 16; y++ {
+		for x := 0; x < 16; x++ {
+			offset := frame.PixOffset(x, y)
+			frame.Pix[offset], frame.Pix[offset+1], frame.Pix[offset+2] = uint8(s.index*40), uint8(s.index*90), 0
+		}
+	}
+	return frame, true, nil
+}
+func (s *tickerSource) Cursor() CursorState { return CursorState{} }
+func (s *tickerSource) Method() string      { return "ticker" }
+func (s *tickerSource) Close()              {}
+
+// TestStillAreasAreRefinedWhileAClockTicks checks that lossy areas are re-sent
+// losslessly once they stop changing, even though another part of the screen
+// never stops.
+func TestStillAreasAreRefinedWhileAClockTicks(t *testing.T) {
+	source := &tickerSource{}
+	for seed := int64(1); seed <= 3; seed++ {
+		source.photos = append(source.photos, photoFrame(640, 384, seed))
+	}
+	key := DeriveScreenKey("room", "secret")
+	serverSide, clientSide := net.Pipe()
+	go func() {
+		defer serverSide.Close()
+		reader := bufio.NewReader(serverSide)
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		request, err := ReadRequest(bytes.NewReader(line))
+		if err != nil {
+			return
+		}
+		_ = ServeLive(context.Background(), struct {
+			io.Reader
+			io.Writer
+		}{reader, &throttledWriter{w: serverSide, rate: 300 << 10}}, request, LiveServerOptions{ScreenKey: key, Source: source, Host: &fakeHost{}, Logf: t.Logf})
+	}()
+	var mu sync.Mutex
+	lossy := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, err := StartLive(ctx, clientSide, LiveClientOptions{ScreenKey: key, OnEncoded: func(event EncodedEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, rect := range event.Rects {
+			if rect.Enc == EncJPEG || rect.Enc == EncJPEGScaled {
+				lossy++
+			}
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	time.Sleep(5 * time.Second)
+	mu.Lock()
+	sentLossy := lossy
+	mu.Unlock()
+	if sentLossy == 0 {
+		t.Fatal("the moving photo was never compressed on a slow link")
+	}
+	source.stopped.Store(true)
+	want := source.photos[0]
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		snapshot, _, _ := client.Snapshot()
+		differ := 0
+		if snapshot != nil {
+			for y := 64; y < want.Rect.Dy(); y++ {
+				start, end := want.PixOffset(0, y), want.PixOffset(want.Rect.Dx(), y)
+				if !bytes.Equal(snapshot.Pix[start:end], want.Pix[start:end]) {
+					differ++
+				}
+			}
+		}
+		if differ == 0 && snapshot != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d rows of the still photo were not refined losslessly while the corner kept changing", differ)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

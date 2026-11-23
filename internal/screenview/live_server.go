@@ -550,6 +550,7 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 	lastStatusAt := time.Time{}
 	lastPing := time.Now()
 	lastIteration := time.Now()
+	refineTurn := false
 
 	for {
 		if ctx.Err() != nil {
@@ -666,9 +667,19 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 			return err
 		}
 		canSend := inflight < limit && frames < maxFramesInFlight && now.Sub(lastSend) >= minInterval && s.queued.Load() < maxQueuedFrames
-		if canSend && (grid.anyDirty() || keyframe) {
+		// Lossy tiles are refined as soon as they have been still for
+		// refineDelay, even while other parts of the screen (a clock, a
+		// spinner) keep changing; refinement and changes take turns.
+		var stale []int
+		if canSend {
+			stale = s.staleLossyTiles(grid, now)
+		}
+		changes := grid.anyDirty() || keyframe
+		refineNow := len(stale) > 0 && (!changes || refineTurn)
+		if canSend && changes && !refineNow {
+			refineTurn = true
 			level := s.rate.current()
-			mode := encodeMode{Quality: level.Quality, MotionLossy: level.MotionLossy, MotionScale: level.MotionScale, Now: now, Lossless: s.rate.lossless()}
+			mode := encodeMode{Quality: level.Quality, MotionLossy: level.MotionLossy, MotionScale: level.MotionScale, Now: now, Lossless: s.rate.lossless() || level.Lossless}
 			if s.fixedQuality > 0 {
 				mode.Quality = s.fixedQuality
 			}
@@ -698,14 +709,12 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 			}
 			keyframe = false
 			lastSend = now
-		} else if canSend && grid.anyLossy() && now.Sub(lastChange) >= refineDelay {
+		} else if canSend && refineNow {
+			refineTurn = false
 			budget := max(64<<10, limit/refineBudgetFraction)
 			selected := make(map[int]bool)
 			estimated := 0
-			for index, lossy := range grid.lossy {
-				if !lossy {
-					continue
-				}
+			for _, index := range stale {
 				selected[index] = true
 				estimated += 12 << 10
 				if estimated >= budget {
@@ -1037,4 +1046,35 @@ func mergeRects(rects []image.Rectangle) [][4]int {
 
 func adjacent(a, b image.Rectangle) bool {
 	return a.Inset(-1).Overlaps(b)
+}
+
+// staleLossyTiles lists lossy tiles that have not changed for refineDelay and
+// are not covered by a running video stream (whose next picture would draw
+// over a refinement).
+func (s *liveServer) staleLossyTiles(grid *tileGrid, now time.Time) []int {
+	if s.video != nil {
+		// A stream whose area has gone still is over; its tiles can then be
+		// refined.
+		still := true
+		for index := range grid.lossy {
+			if grid.tileRect(index).Overlaps(s.video.rect) && (grid.dirty[index] || now.Sub(grid.lastChange[index]) < refineDelay) {
+				still = false
+				break
+			}
+		}
+		if still {
+			s.stopVideo()
+		}
+	}
+	var stale []int
+	for index, lossy := range grid.lossy {
+		if !lossy || grid.dirty[index] || now.Sub(grid.lastChange[index]) < refineDelay {
+			continue
+		}
+		if s.video != nil && grid.tileRect(index).Overlaps(s.video.rect) {
+			continue
+		}
+		stale = append(stale, index)
+	}
+	return stale
 }

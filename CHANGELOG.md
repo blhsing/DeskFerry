@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.15.6 - 2026-11-23
+
+- Keep the picture lossless while the frame rate is above Min fps. At full quality the Work PC used to send photographic-looking areas as JPEG whenever they changed, even with plenty of frame rate and bandwidth to spare; full quality is now lossless (PNG-style), and JPEG, then video, are used only when fewer frames than Min fps get through.
+- Re-send lossy areas losslessly as soon as each one stops changing. Refinement used to wait until the whole screen had been still for a quarter of a second, so a ticking clock, a spinner or a screen watermark anywhere on screen could keep the rest of the picture lossy indefinitely. Refinement and new changes now take turns, and a video stream whose area has gone still ends so its area can be refined.
+
 ## 0.15.5 - 2026-11-23
 
 - Stream large moving areas, such as video or a screen saver, as H.264 video when that keeps the frame rate up. When fewer frames than the viewer's Min fps get through and lower JPEG quality is not enough, the Work PC sends the region that keeps changing as a hardware-encoded H.264 stream (Intel Quick Sync, AMD or NVIDIA through Windows Media Foundation, or Microsoft's software encoder), at a bitrate below the throughput the viewer actually acknowledges, and keeps it only if the frame rate rises; once the area stops changing it is re-sent losslessly as before, and Min fps 0 never uses video. The Windows viewer decodes it with Windows Media Foundation, the macOS viewer with the browser's WebCodecs, and the Android viewer with MediaCodec; older viewers keep receiving tiles. On a simulated 1.5 MB/s link with a 1280x720 area in constant motion, the frame rate rose from about 25 frames a second with JPEG to about 40 with video.
