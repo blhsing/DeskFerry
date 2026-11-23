@@ -2,6 +2,7 @@ package workservice
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -16,7 +17,14 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"deskferry/internal/screenview"
+	"deskferry/windows/sharebanner"
 )
+
+func runShareBanner(ctx context.Context, states <-chan screenview.SessionState, stopControl, stopSharing func()) {
+	sharebanner.Run(ctx, states, sharebanner.Actions{StopControl: stopControl, StopSharing: stopSharing})
+}
 
 type helperConn struct {
 	reader  *os.File
@@ -46,13 +54,26 @@ func drainScreenResponse(conn net.Conn) net.Conn {
 	return &screenRelayConn{Conn: conn}
 }
 
-func launchScreenCaptureHelper() (net.Conn, error) {
-	token, sessionID, err := activeInteractiveUserToken()
+// launchScreenCaptureHelper starts the capture helper in the active user's
+// session and writes the preamble to it. The helper runs as LocalSystem when
+// possible, so it can capture and control the lock screen, sign-in and UAC
+// prompts; otherwise it runs as the signed-in user.
+func launchScreenCaptureHelper(preamble screenview.HelperPreamble) (net.Conn, error) {
+	userToken, sessionID, err := activeInteractiveUserToken()
 	if err != nil {
 		return nil, err
 	}
-	defer token.Close()
-	log.Printf("launching screen capture helper in interactive session=%d", sessionID)
+	defer userToken.Close()
+	token := userToken
+	identity := "user"
+	if systemToken, systemErr := systemTokenForSession(sessionID); systemErr == nil {
+		defer systemToken.Close()
+		token = systemToken
+		identity = "LocalSystem"
+	} else {
+		log.Printf("screen capture helper will run as the signed-in user: %v", systemErr)
+	}
+	log.Printf("launching screen capture helper in interactive session=%d identity=%s control_allowed=%t", sessionID, identity, preamble.ControlAllowed)
 
 	sa := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), InheritHandle: 1}
 	var childInput, parentInput windows.Handle
@@ -121,13 +142,13 @@ func launchScreenCaptureHelper() (net.Conn, error) {
 		StdErr:    stderrHandle,
 	}
 	var environment *uint16
-	if err := windows.CreateEnvironmentBlock(&environment, token, false); err != nil {
+	if err := windows.CreateEnvironmentBlock(&environment, userToken, false); err != nil {
 		return nil, err
 	}
 	defer windows.DestroyEnvironmentBlock(environment)
 	var process windows.ProcessInformation
 	if err := windows.CreateProcessAsUser(token, application, commandLine, nil, nil, true,
-		windows.CREATE_UNICODE_ENVIRONMENT|windows.CREATE_NEW_CONSOLE, environment, nil, &startup, &process); err != nil {
+		windows.CREATE_UNICODE_ENVIRONMENT|windows.CREATE_NO_WINDOW, environment, nil, &startup, &process); err != nil {
 		return nil, err
 	}
 	windows.CloseHandle(process.Thread)
@@ -139,7 +160,43 @@ func launchScreenCaptureHelper() (net.Conn, error) {
 	writer := os.NewFile(uintptr(parentInput), "DeskFerry screen helper input")
 	parentOutput = 0
 	parentInput = 0
-	return &helperConn{reader: reader, writer: writer, process: process.Process}, nil
+	conn := &helperConn{reader: reader, writer: writer, process: process.Process}
+	line, err := json.Marshal(preamble)
+	if err == nil {
+		_, err = conn.Write(append(line, '\n'))
+	}
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("send screen helper settings: %w", err)
+	}
+	return conn, nil
+}
+
+// systemTokenForSession returns a primary LocalSystem token moved into the
+// given session. It fails unless this process runs as LocalSystem.
+func systemTokenForSession(sessionID uint32) (windows.Token, error) {
+	var current windows.Token
+	access := uint32(windows.TOKEN_DUPLICATE | windows.TOKEN_QUERY | windows.TOKEN_ASSIGN_PRIMARY | windows.TOKEN_ADJUST_DEFAULT | windows.TOKEN_ADJUST_SESSIONID)
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), access, &current); err != nil {
+		return 0, fmt.Errorf("open service token: %w", err)
+	}
+	defer current.Close()
+	user, err := current.GetTokenUser()
+	if err != nil {
+		return 0, fmt.Errorf("query service token: %w", err)
+	}
+	if !user.User.Sid.IsWellKnown(windows.WinLocalSystemSid) {
+		return 0, errors.New("the Work agent is not running as LocalSystem")
+	}
+	var duplicate windows.Token
+	if err := windows.DuplicateTokenEx(current, windows.MAXIMUM_ALLOWED, nil, windows.SecurityIdentification, windows.TokenPrimary, &duplicate); err != nil {
+		return 0, fmt.Errorf("duplicate service token: %w", err)
+	}
+	if err := windows.SetTokenInformation(duplicate, windows.TokenSessionId, (*byte)(unsafe.Pointer(&sessionID)), uint32(unsafe.Sizeof(sessionID))); err != nil {
+		duplicate.Close()
+		return 0, fmt.Errorf("move service token to session %d: %w", sessionID, err)
+	}
+	return duplicate, nil
 }
 
 func activeInteractiveUserToken() (windows.Token, uint32, error) {

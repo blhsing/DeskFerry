@@ -10,8 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"image"
-	"image/png"
 	"net"
 	"net/http"
 	"os"
@@ -31,6 +29,7 @@ type macProfile struct {
 	RelayBases  []string `json:"relay_bases"`
 	Room        string   `json:"room"`
 	RoomProof   string   `json:"-"`
+	ScreenKey   string   `json:"-"`
 	WindowsUser string   `json:"windows_user,omitempty"`
 }
 
@@ -78,10 +77,7 @@ type macUIController struct {
 	tunnelStatus string
 	relayDetails string
 
-	screenCancel context.CancelFunc
-	screenStatus string
-	screenPNG    []byte
-	screenSeq    uint64
+	screenClient *screenview.LiveClient
 }
 
 func runMacUI(ctx context.Context, initial config, openRDP bool) error {
@@ -94,7 +90,7 @@ func runMacUI(ctx context.Context, initial config, openRDP bool) error {
 	if err != nil {
 		return err
 	}
-	controller := &macUIController{root: ctx, settings: settings, cfg: cfg, tunnelStatus: "Stopped", screenStatus: "Ready"}
+	controller := &macUIController{root: ctx, settings: settings, cfg: cfg, tunnelStatus: "Stopped"}
 	controller.startTunnel()
 	if openRDP {
 		_ = launchRDP(cfg)
@@ -127,7 +123,6 @@ func runMacUI(ctx context.Context, initial config, openRDP bool) error {
 	logUI("macOS Home control panel: %s", url)
 	<-ctx.Done()
 	controller.stopTunnel()
-	controller.stopScreen()
 	shutdown, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	return server.Shutdown(shutdown)
@@ -206,38 +201,13 @@ func (c *macUIController) handleUI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"output": output.String()})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/state":
 		c.mu.Lock()
-		state := map[string]any{"running": c.running, "tunnel_status": c.tunnelStatus, "relay_details": c.relayDetails, "screen_status": c.screenStatus, "screen_seq": c.screenSeq}
+		state := map[string]any{"running": c.running, "tunnel_status": c.tunnelStatus, "relay_details": c.relayDetails}
 		c.mu.Unlock()
 		writeJSON(w, state)
-	case r.Method == http.MethodPost && r.URL.Path == "/api/screen/start":
-		var request struct {
-			Mode       string `json:"mode"`
-			IntervalMS int    `json:"interval_ms"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if err := c.startScreen(request.Mode, request.IntervalMS); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-	case r.Method == http.MethodPost && r.URL.Path == "/api/screen/stop":
-		c.stopScreen()
-		writeJSON(w, map[string]bool{"ok": true})
+	case r.Method == http.MethodGet && r.URL.Path == "/api/screen/ws":
+		c.serveScreenSocket(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/screen/frame.png":
-		c.mu.Lock()
-		data := append([]byte(nil), c.screenPNG...)
-		c.mu.Unlock()
-		if len(data) == 0 {
-			http.Error(w, "no screenshot is available", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "image/png")
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Disposition", "inline; filename=DeskFerry-Screenshot.png")
-		_, _ = w.Write(data)
+		c.serveScreenPNG(w)
 	default:
 		http.NotFound(w, r)
 	}
@@ -251,13 +221,14 @@ func (c *macUIController) applySettings(request settingsRequest) error {
 	c.mu.Lock()
 	old := c.settings
 	c.mu.Unlock()
-	proofs := make(map[string]string, len(old.Profiles))
+	proofs := make(map[string][2]string, len(old.Profiles))
 	for _, profile := range old.Profiles {
-		proofs[profile.Name+"\x00"+profile.Room] = profile.RoomProof
+		proofs[profile.Name+"\x00"+profile.Room] = [2]string{profile.RoomProof, profile.ScreenKey}
 	}
 	for index := range settings.Profiles {
 		profile := &settings.Profiles[index]
-		profile.RoomProof = proofs[profile.Name+"\x00"+profile.Room]
+		saved := proofs[profile.Name+"\x00"+profile.Room]
+		profile.RoomProof, profile.ScreenKey = saved[0], saved[1]
 	}
 	// A profile rename keeps its credential when its room and profile count
 	// are unchanged. Add/delete operations intentionally require an exact
@@ -266,18 +237,19 @@ func (c *macUIController) applySettings(request settingsRequest) error {
 		selected := &settings.Profiles[settings.Selected]
 		previous := old.Profiles[old.Selected]
 		if selected.RoomProof == "" && selected.Room == previous.Room {
-			selected.RoomProof = previous.RoomProof
+			selected.RoomProof, selected.ScreenKey = previous.RoomProof, previous.ScreenKey
 		}
 	}
 	selected := &settings.Profiles[settings.Selected]
 	if request.ClearPassword {
-		selected.RoomProof = ""
+		selected.RoomProof, selected.ScreenKey = "", ""
 	} else if request.RoomPassword != "" {
 		relay, composeErr := tunnel.RelayRoomURL(selected.RelayBases[0], selected.Room)
 		if composeErr != nil {
 			return composeErr
 		}
 		selected.RoomProof = tunnel.RoomPasswordProof(relay, "", request.RoomPassword)
+		selected.ScreenKey = screenview.DeriveScreenKeyForRelay(relay, request.RoomPassword)
 	}
 	cfg, err := settingsConfig(settings)
 	if err != nil {
@@ -394,74 +366,6 @@ func (c *macUIController) statusLoop() {
 	}
 }
 
-func (c *macUIController) startScreen(mode string, interval int) error {
-	request := screenview.Request{Mode: mode, IntervalMS: interval, TileSize: screenview.DefaultTileSize}
-	if err := request.Normalize(); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	if roomProof(c.cfg, c.cfg.primaryRelayAddress()) == "" {
-		c.mu.Unlock()
-		return errors.New("save a room password for this profile before viewing its screen")
-	}
-	if c.screenCancel != nil {
-		c.screenCancel()
-	}
-	ctx, cancel := context.WithCancel(c.root)
-	c.screenCancel = cancel
-	c.screenStatus = "Connecting to the Work screen service"
-	cfg := c.cfg
-	c.mu.Unlock()
-	go c.receiveScreen(ctx, cfg, request)
-	return nil
-}
-
-func (c *macUIController) receiveScreen(ctx context.Context, cfg config, request screenview.Request) {
-	conn, relayAddr, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
-	if err != nil {
-		c.setScreenStatus("Screen connection failed: " + err.Error())
-		return
-	}
-	defer conn.Close()
-	c.setScreenStatus("Connected through " + relayAddr)
-	err = screenview.Receive(conn, request, func(frame screenview.Frame, canvas *image.RGBA) error {
-		var output bytes.Buffer
-		if err := png.Encode(&output, canvas); err != nil {
-			return err
-		}
-		c.mu.Lock()
-		c.screenPNG = output.Bytes()
-		c.screenSeq++
-		if request.Mode == screenview.ModeStream {
-			c.screenStatus = fmt.Sprintf("Streaming frame %d (%d changed tiles)", frame.Seq, len(frame.Rects))
-		} else {
-			c.screenStatus = "Screenshot captured"
-		}
-		c.mu.Unlock()
-		return nil
-	})
-	if err != nil && ctx.Err() == nil {
-		c.setScreenStatus("Screen stream ended: " + err.Error())
-	}
-}
-
-func (c *macUIController) stopScreen() {
-	c.mu.Lock()
-	cancel := c.screenCancel
-	c.screenCancel = nil
-	c.screenStatus = "Screen stream stopped"
-	c.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-}
-
-func (c *macUIController) setScreenStatus(value string) {
-	c.mu.Lock()
-	c.screenStatus = value
-	c.mu.Unlock()
-}
-
 func settingsFromConfig(cfg config) macSettings {
 	bases, room, _ := tunnel.SplitRelayRoomURLs(cfg.relayAddresses())
 	if room == "" {
@@ -490,7 +394,7 @@ func settingsConfig(settings macSettings) (config, error) {
 		}
 		relays = append(relays, relay)
 	}
-	cfg := config{RelayAddrs: relays, ListenAddr: settings.ListenAddr, Proxy: settings.Proxy, RoomProof: profile.RoomProof}
+	cfg := config{RelayAddrs: relays, ListenAddr: settings.ListenAddr, Proxy: settings.Proxy, RoomProof: profile.RoomProof, ScreenKey: profile.ScreenKey}
 	cfg.applyDefaults()
 	cfg.setRelayAddresses(relays)
 	return cfg, cfg.validate()
@@ -544,6 +448,7 @@ type persistedProfile struct {
 	RelayBases  []string `json:"relay_bases"`
 	Room        string   `json:"room"`
 	RoomProof   string   `json:"room_proof,omitempty"`
+	ScreenKey   string   `json:"screen_key,omitempty"`
 	WindowsUser string   `json:"windows_user,omitempty"`
 }
 
@@ -572,7 +477,7 @@ func loadMacSettings(initial config) (macSettings, error) {
 	}
 	settings := macSettings{ListenAddr: stored.ListenAddr, Proxy: stored.Proxy, Selected: stored.Selected}
 	for _, profile := range stored.Profiles {
-		settings.Profiles = append(settings.Profiles, macProfile{Name: profile.Name, RelayBases: profile.RelayBases, Room: profile.Room, RoomProof: profile.RoomProof, WindowsUser: profile.WindowsUser})
+		settings.Profiles = append(settings.Profiles, macProfile{Name: profile.Name, RelayBases: profile.RelayBases, Room: profile.Room, RoomProof: profile.RoomProof, ScreenKey: profile.ScreenKey, WindowsUser: profile.WindowsUser})
 	}
 	if _, err := settingsConfig(settings); err != nil {
 		return macSettings{}, err
@@ -590,7 +495,7 @@ func saveMacSettings(settings macSettings) error {
 	}
 	stored := persistedSettings{ListenAddr: settings.ListenAddr, Proxy: settings.Proxy, Selected: settings.Selected}
 	for _, profile := range settings.Profiles {
-		stored.Profiles = append(stored.Profiles, persistedProfile{Name: profile.Name, RelayBases: profile.RelayBases, Room: profile.Room, RoomProof: profile.RoomProof, WindowsUser: profile.WindowsUser})
+		stored.Profiles = append(stored.Profiles, persistedProfile{Name: profile.Name, RelayBases: profile.RelayBases, Room: profile.Room, RoomProof: profile.RoomProof, ScreenKey: profile.ScreenKey, WindowsUser: profile.WindowsUser})
 	}
 	data, err := json.MarshalIndent(stored, "", "  ")
 	if err != nil {

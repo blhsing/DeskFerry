@@ -3,69 +3,124 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light dark">
 <title>DeskFerry Screen Viewer</title>
 <link rel="icon" href="static/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="static/screen.css">
 </head>
 <body>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <symbol id="i-camera" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M2 5.5A1.5 1.5 0 0 1 3.5 4h1.6l1-1.5h3.8l1 1.5h1.6A1.5 1.5 0 0 1 14 5.5v6a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/><circle cx="8" cy="8.5" r="2.3"/></g></symbol>
   <symbol id="i-play" viewBox="0 0 16 16"><path d="M5 3.5v9l7.5-4.5z" fill="currentColor"/></symbol>
   <symbol id="i-stop" viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor"/></symbol>
+  <symbol id="i-pointer" viewBox="0 0 16 16"><path d="M3 2.5l9.5 4.1-3.9 1.5L7.1 12zM9.3 9.3l3.2 3.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-keyboard" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="4" width="13" height="8" rx="1.5"/><path d="M4.4 7h.01M6.8 7h.01M9.2 7h.01M11.6 7h.01M5.2 9.5h5.6"/></g></symbol>
+  <symbol id="i-chev" viewBox="0 0 16 16"><path d="M4.5 6.5L8 10l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-clip-send" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5H4.5A1.5 1.5 0 0 0 3 5v7a1.5 1.5 0 0 0 1.5 1.5h7A1.5 1.5 0 0 0 13 12V5a1.5 1.5 0 0 0-1.5-1.5H10"/><rect x="6" y="2.2" width="4" height="2.6" rx=".8"/><path d="M8 11.3V7.2M6.2 8.9L8 7.1l1.8 1.8"/></g></symbol>
+  <symbol id="i-clip-get" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5H4.5A1.5 1.5 0 0 0 3 5v7a1.5 1.5 0 0 0 1.5 1.5h7A1.5 1.5 0 0 0 13 12V5a1.5 1.5 0 0 0-1.5-1.5H10"/><rect x="6" y="2.2" width="4" height="2.6" rx=".8"/><path d="M8 7.1v4.1M6.2 9.5L8 11.3l1.8-1.8"/></g></symbol>
   <symbol id="i-minus" viewBox="0 0 16 16"><path d="M4 8h8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
   <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 4v8M4 8h8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
   <symbol id="i-fit" viewBox="0 0 16 16"><path d="M2.5 6V3.5a1 1 0 0 1 1-1H6M10 2.5h2.5a1 1 0 0 1 1 1V6M13.5 10v2.5a1 1 0 0 1-1 1H10M6 13.5H3.5a1 1 0 0 1-1-1V10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.6-3.7M13 2.8v2.7h-2.7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="i-full" viewBox="0 0 16 16"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="i-save" viewBox="0 0 16 16"><path d="M8 2.5v7.5M4.8 7l3.2 3.2L11.2 7M3 13h10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/><path d="M5.5 7V5.2a2.5 2.5 0 0 1 5 0V7"/></g></symbol>
+  <symbol id="i-info" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="6"/><path d="M8 7.4v3.4M8 5.2h.01"/></g></symbol>
 </svg>
 
 <header class="bar">
-  <div class="toolbar" role="toolbar" aria-label="Screen viewer controls">
-    <div class="brand"><img src="static/icon.svg" alt=""><span>Work screen</span></div>
+  <div class="toolbar" id="toolbar" role="toolbar" aria-label="Screen viewer controls">
+    <div class="brand"><img src="static/icon.svg" alt=""><span class="lbl opt">Work screen</span></div>
 
-    <div class="seg" role="group" aria-label="Capture">
-      <button type="button" id="captureBtn" title="Capture one screenshot"><svg class="ico"><use href="#i-camera"/></svg><span class="lbl">Capture once</span></button>
-      <button type="button" id="streamBtn" title="Start a live stream"><svg class="ico"><use href="#i-play"/></svg><span class="lbl">Start stream</span></button>
-      <button type="button" id="stopBtn" title="Stop the stream"><svg class="ico"><use href="#i-stop"/></svg><span class="lbl">Stop</span></button>
+    <button type="button" class="tbtn live" id="liveBtn" aria-pressed="false" aria-label="Live view" title="Start live viewing">
+      <svg class="ico" aria-hidden="true"><use id="liveIcon" href="#i-play"/></svg><span class="lbl">Live</span>
+    </button>
+
+    <div class="group" role="group" aria-label="Control">
+      <button type="button" class="tbtn control" id="controlBtn" aria-pressed="false" aria-disabled="true" aria-keyshortcuts="Control+Alt+Shift+C" title="Control the Work PC mouse and keyboard">
+        <span class="control-dot" aria-hidden="true"></span>
+        <svg class="ico" aria-hidden="true"><use href="#i-pointer"/></svg><span class="lbl">Control</span>
+        <kbd id="controlKbd" aria-hidden="true">&#x2303;&#x2325;&#x21E7;C</kbd>
+      </button>
+      <details class="menu" id="kbdMenu">
+        <summary class="tbtn icon-only" aria-label="Keyboard options and shortcuts" title="Keyboard options and shortcuts"><svg class="ico" aria-hidden="true"><use href="#i-keyboard"/></svg><svg class="ico chev" aria-hidden="true"><use href="#i-chev"/></svg></summary>
+        <div class="pop" role="group" aria-label="Keyboard options">
+          <h2>Keyboard</h2>
+          <label class="check"><input type="checkbox" id="metaAsCtrl" checked> <span>&#x2318; acts as Ctrl</span></label>
+          <p class="help">&#x2318;C, &#x2318;V and other &#x2318; shortcuts reach the Work PC as Ctrl shortcuts. Turn this off to send &#x2318; as the Windows key.</p>
+          <h2>Shortcuts</h2>
+          <dl class="keys">
+            <dt><kbd id="menuKbd">&#x2303;&#x2325;&#x21E7;C</kbd></dt><dd>Take or release control</dd>
+            <dt><kbd>+</kbd> <kbd>&minus;</kbd> <kbd>0</kbd></dt><dd>Zoom in, zoom out, Auto Fit</dd>
+            <dt><kbd>F</kbd></dt><dd>Full screen</dd>
+          </dl>
+          <p class="help">While you control the Work PC, every key except the control shortcut is sent to it. macOS and the browser keep a few shortcuts for themselves, such as &#x2318;Q, &#x2318;W and &#x2318;Tab.</p>
+        </div>
+      </details>
     </div>
 
-    <label class="select" title="Stream refresh interval">
-      <span class="sr-only">Stream interval</span>
-      <select id="interval" aria-label="Stream interval">
-        <option value="500">Every 0.5 s</option>
-        <option value="1000" selected>Every 1 s</option>
-        <option value="2000">Every 2 s</option>
-        <option value="5000">Every 5 s</option>
-      </select>
-    </label>
+    <div class="seg" id="controlTools" role="group" aria-label="Control tools" hidden>
+      <button type="button" id="sasBtn" title="Send Ctrl+Alt+Del to the Work PC">Ctrl+Alt+Del</button>
+      <button type="button" id="clipSendBtn" title="Send this Mac's clipboard text to the Work PC" aria-label="Send clipboard"><svg class="ico" aria-hidden="true"><use href="#i-clip-send"/></svg><span class="lbl opt">Send clipboard</span></button>
+      <button type="button" id="clipGetBtn" title="Copy the Work PC's clipboard text to this Mac" aria-label="Get clipboard"><svg class="ico" aria-hidden="true"><use href="#i-clip-get"/></svg><span class="lbl opt">Get clipboard</span></button>
+    </div>
+
+    <span class="spacer"></span>
 
     <div class="seg zoom" role="group" aria-label="Zoom">
-      <button type="button" id="zoomOut" title="Zoom out" aria-label="Zoom out"><svg class="ico"><use href="#i-minus"/></svg></button>
-      <input id="zoom" value="Auto Fit" list="zoom-levels" aria-label="Zoom level" spellcheck="false">
-      <button type="button" id="zoomIn" title="Zoom in" aria-label="Zoom in"><svg class="ico"><use href="#i-plus"/></svg></button>
-      <button type="button" id="fitBtn" title="Auto fit to window"><svg class="ico"><use href="#i-fit"/></svg><span class="lbl">Fit</span></button>
+      <button type="button" id="zoomOut" title="Zoom out" aria-label="Zoom out"><svg class="ico" aria-hidden="true"><use href="#i-minus"/></svg></button>
+      <input id="zoom" value="Auto Fit" list="zoom-levels" aria-label="Zoom level" spellcheck="false" autocomplete="off">
+      <button type="button" id="zoomIn" title="Zoom in" aria-label="Zoom in"><svg class="ico" aria-hidden="true"><use href="#i-plus"/></svg></button>
+      <button type="button" id="fitBtn" title="Auto fit to window" aria-label="Auto fit"><svg class="ico" aria-hidden="true"><use href="#i-fit"/></svg><span class="lbl opt">Fit</span></button>
     </div>
     <datalist id="zoom-levels"><option>Auto Fit</option><option>25%</option><option>50%</option><option>75%</option><option>100%</option><option>125%</option><option>150%</option><option>200%</option><option>300%</option><option>400%</option></datalist>
 
     <div class="seg" role="group" aria-label="View">
-      <button type="button" id="fullBtn" title="Full screen" aria-label="Full screen"><svg class="ico"><use href="#i-full"/></svg></button>
-      <a id="save" class="btn" href="api/screen/frame.png" download="DeskFerry-Screenshot.png" title="Save the current frame as PNG"><svg class="ico"><use href="#i-save"/></svg><span class="lbl">Save PNG</span></a>
+      <button type="button" id="refreshBtn" title="Redraw the whole screen" aria-label="Refresh screen"><svg class="ico" aria-hidden="true"><use href="#i-refresh"/></svg></button>
+      <button type="button" id="fullBtn" title="Full screen" aria-label="Full screen" aria-pressed="false"><svg class="ico" aria-hidden="true"><use href="#i-full"/></svg></button>
+      <a id="save" class="btn" href="api/screen/frame.png" download="DeskFerry-Screenshot.png" title="Save the current frame as PNG" aria-label="Save PNG"><svg class="ico" aria-hidden="true"><use href="#i-save"/></svg><span class="lbl opt">Save PNG</span></a>
     </div>
 
-    <span class="spacer"></span>
-    <span class="chip" id="statusChip" role="status"><span id="statusWord">Ready</span></span>
+    <span class="chip warning" id="statusChip" role="status"><span id="statusWord">Connecting</span></span>
   </div>
 </header>
 
-<div id="view">
-  <div id="stage" class="fit"><img id="image" draggable="false" alt="Work computer screen"></div>
+<div class="strip warning" id="lockStrip" role="status" hidden>
+  <svg class="ico" aria-hidden="true"><use href="#i-lock"/></svg>
+  <strong id="lockTitle">Work PC is locked</strong><span id="lockDetail">Showing the secure desktop.</span>
+</div>
+<div class="strip info" id="legacyStrip" role="status" hidden>
+  <svg class="ico" aria-hidden="true"><use href="#i-info"/></svg>
+  <strong>Read-only: the Work PC runs an older DeskFerry</strong><span>Update DeskFerry on the Work PC to control its mouse and keyboard.</span>
+</div>
+
+<main class="viewport" id="viewport">
+  <div id="view" tabindex="0" role="application" aria-label="Work computer screen" aria-describedby="viewHelp">
+    <div id="stage">
+      <div id="screen" hidden>
+        <canvas id="canvas" width="1" height="1">Live image of the Work computer screen.</canvas>
+        <img id="cursor" alt="" draggable="false" hidden>
+      </div>
+    </div>
+  </div>
+  <div class="frame" aria-hidden="true"></div>
   <div class="empty" id="empty">
     <div class="spinner" aria-hidden="true"></div>
-    <p id="emptyText">Capturing the Work computer screen…</p>
+    <p id="emptyText">Connecting to the Work computer screen…</p>
   </div>
-</div>
-<p class="status-line" id="status" aria-live="polite">Ready</p>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+</main>
+<p class="sr-only" id="viewHelp">Shows the Work computer screen live. Press Control+Alt+Shift+C to take or release control of its mouse and keyboard. While you are in control, every other key is sent to the Work computer.</p>
+
+<footer class="statusbar">
+  <span class="status-text" id="status" aria-live="polite">Connecting to DeskFerry Home…</span>
+  <span class="status-title" id="foreground" hidden></span>
+  <span class="spacer"></span>
+  <span class="hint" id="hint" hidden></span>
+  <span class="stat" id="statSize" title="Work PC screen size">—</span>
+  <span class="stat" id="statFps" title="Frames shown per second">— fps</span>
+  <span class="stat" id="statRate" title="Screen data rate">— kbps</span>
+  <span class="stat" id="statQuality" title="Image quality">—</span>
+</footer>
 
 <script src="static/screen.js"></script>
 </body>

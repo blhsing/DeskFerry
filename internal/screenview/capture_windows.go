@@ -1,9 +1,14 @@
 package screenview
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
+	"io"
+	"log"
 	"os"
 	"runtime"
 	"time"
@@ -261,22 +266,105 @@ func bindThreadToInputDesktop() (func(), error) {
 	}, nil
 }
 
+// HelperPreamble is the first line the Work service writes to the capture
+// helper's standard input, before the Home client's request.
+type HelperPreamble struct {
+	DeskFerryHelper int    `json:"deskferry_helper"`
+	ScreenKey       string `json:"screen_key,omitempty"`
+	ControlAllowed  bool   `json:"control_allowed,omitempty"`
+}
+
+// HelperOptions configures the capture helper process.
+type HelperOptions struct {
+	// RunBanner shows the Work PC's sharing banner until ctx is done. It is
+	// called on its own goroutine.
+	RunBanner func(ctx context.Context, states <-chan SessionState, stopControl, stopSharing func())
+}
+
+type stdioConn struct {
+	io.Reader
+	io.Writer
+}
+
 // RunCaptureHelper is the interactive-session side of the Work agent screen
-// service. Its stdout is reserved for the binary frame stream.
-func RunCaptureHelper() error {
+// service. Its stdout is reserved for the screen stream.
+func RunCaptureHelper(opts HelperOptions) error {
 	enablePhysicalDesktopCoordinates()
-	request, err := ReadRequest(os.Stdin)
+	first, err := readLine(os.Stdin, maxMetadataSize)
+	if err != nil {
+		return fmt.Errorf("read screen helper input: %w", err)
+	}
+	var preamble HelperPreamble
+	requestLine := first
+	if json.Unmarshal(first, &preamble) == nil && preamble.DeskFerryHelper == 1 {
+		if requestLine, err = readLine(os.Stdin, maxMetadataSize); err != nil {
+			return fmt.Errorf("read screen request: %w", err)
+		}
+	}
+	request, err := ReadRequest(bytes.NewReader(requestLine))
 	if err != nil {
 		return err
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	states := make(chan SessionState, 32)
+	publish := func(state SessionState) {
+		select {
+		case states <- state:
+		default:
+		}
+	}
+	control := make(chan bool, 1)
+	bannerDone := make(chan struct{})
+	if opts.RunBanner != nil {
+		go func() {
+			defer close(bannerDone)
+			opts.RunBanner(ctx, states,
+				func() {
+					select {
+					case control <- false:
+					default:
+					}
+				},
+				func() {
+					log.Printf("screen sharing stopped from the Work PC banner")
+					cancel()
+				})
+		}()
+	} else {
+		close(bannerDone)
+	}
+	defer func() {
+		publish(SessionState{Ended: true})
+		cancel()
+		select {
+		case <-bannerDone:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+	if request.Protocol == ProtocolLive && request.ClientHello != "" && preamble.ScreenKey != "" {
+		source := NewLiveSource()
+		defer source.Close()
+		host := NewLiveHost()
+		return ServeLive(ctx, stdioConn{Reader: os.Stdin, Writer: os.Stdout}, request, LiveServerOptions{
+			ScreenKey:      preamble.ScreenKey,
+			ControlAllowed: preamble.ControlAllowed,
+			Version:        buildinfo.Version,
+			Source:         source,
+			Host:           host,
+			OnState:        publish,
+			Control:        control,
+		})
+	}
+	publish(SessionState{ClientName: request.Name, ClientKind: request.Client})
+	return runLegacyCaptureHelper(ctx, request)
+}
+
+func runLegacyCaptureHelper(ctx context.Context, request Request) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	restoreDesktop, desktopErr := bindThreadToInputDesktop()
 	defer restoreDesktop()
-	if console, openErr := os.OpenFile("CONOUT$", os.O_WRONLY, 0); openErr == nil {
-		defer console.Close()
-		_, _ = fmt.Fprintf(console, "DeskFerry %s authenticated screen viewing is active. Close this window to stop sharing the screen.\n", buildinfo.Version)
-	}
 	capturer := &desktopCapturer{}
 	defer capturer.Close()
 	first, err := captureWithRetry(capturer.Capture, initialCaptureAttempts, captureRetryDelay)
@@ -302,7 +390,11 @@ func RunCaptureHelper() error {
 	ticker := time.NewTicker(time.Duration(request.IntervalMS) * time.Millisecond)
 	defer ticker.Stop()
 	for sequence := uint64(2); ; sequence++ {
-		<-ticker.C
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
 		current, err := captureWithRetry(capturer.Capture, initialCaptureAttempts, captureRetryDelay)
 		if err != nil {
 			err = explainRemoteSessionCaptureFailure(err)

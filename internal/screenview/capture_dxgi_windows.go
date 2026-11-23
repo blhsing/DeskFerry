@@ -43,6 +43,12 @@ type dxgiDevice struct {
 }
 
 func newDXGICapturer() (*dxgiCapturer, error) {
+	return newDXGICapturerWithPointer(true)
+}
+
+// newDXGICapturerWithPointer creates a primary-display capturer. Live sessions
+// send the pointer separately, so they capture without drawing it.
+func newDXGICapturerWithPointer(drawPointer bool) (*dxgiCapturer, error) {
 	var factory *dxgi.IDXGIFactory1
 	if err := dxgi.CreateDXGIFactory1(&factory); err != nil {
 		return nil, fmt.Errorf("create DirectX adapter factory: %w", err)
@@ -92,8 +98,8 @@ func newDXGICapturer() (*dxgiCapturer, error) {
 				duplicator.Release()
 				continue
 			}
-			duplicator.UpdatePointerInfo = true
-			duplicator.DrawPointer = true
+			duplicator.UpdatePointerInfo = drawPointer
+			duplicator.DrawPointer = drawPointer
 			capturer.outputs = append(capturer.outputs, dxgiOutput{duplicator: duplicator, bounds: bounds})
 			capturer.bounds = bounds
 			deviceUsed = true
@@ -208,4 +214,13 @@ func (c *dxgiCapturer) Capture() (*image.RGBA, error) {
 		draw.Draw(canvas, destination, frame, frame.Bounds().Min, draw.Src)
 	}
 	return canvas, nil
+}
+
+// captureInto copies the primary output into dst when the desktop changed. It
+// returns outputduplication.ErrNoImageYet when nothing changed within timeout.
+func (c *dxgiCapturer) captureInto(dst *image.RGBA, timeoutMS uint) error {
+	if len(c.outputs) == 0 {
+		return errors.New("DirectX capturer has no output")
+	}
+	return c.outputs[0].duplicator.GetImage(dst, timeoutMS)
 }

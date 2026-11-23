@@ -65,6 +65,9 @@ type config struct {
 	ConcurrencyLimit   int      `json:"concurrency_limit,omitempty"`
 	LegacyMode         bool     `json:"legacy_mode,omitempty"`
 	ScreenView         bool     `json:"screen_view,omitempty"`
+	// ScreenControl lets authenticated live screen sessions inject mouse and
+	// keyboard input. It requires ScreenView.
+	ScreenControl bool `json:"screen_control,omitempty"`
 	// TCPForwards are the targets Home apps may reach through this agent,
 	// each advertised as the relay service "tcp-<forward port>".
 	TCPForwards []tunnel.TCPForward `json:"-"`
@@ -81,6 +84,7 @@ type agentOptions struct {
 	RoomPasswordFile string
 	TCPForwards      string
 	ScreenView       bool
+	ScreenControl    bool
 }
 
 // args returns the flags reproducing the options, without the mode flag.
@@ -100,6 +104,9 @@ func (o agentOptions) args() []string {
 	add("-tcp-forward", o.TCPForwards)
 	if o.ScreenView {
 		args = append(args, "-screen-view")
+	}
+	if o.ScreenControl {
+		args = append(args, "-screen-control")
 	}
 	return args
 }
@@ -141,6 +148,7 @@ func Main() {
 	var smbFlag string
 	var roomPasswordFile string
 	var screenView bool
+	var screenControl bool
 	var tcpForwards tcpForwardFlag
 	var screenCaptureHelper bool
 	var logRetentionDays int
@@ -160,6 +168,7 @@ func Main() {
 	flag.StringVar(&smbFlag, "smb", "", "local SMB target; blank disables SMB")
 	flag.StringVar(&roomPasswordFile, "room-password-file", "", "DPAPI-protected room password file")
 	flag.BoolVar(&screenView, "screen-view", false, "allow authenticated screen capture and streaming")
+	flag.BoolVar(&screenControl, "screen-control", false, "allow authenticated live screen sessions to use the mouse and keyboard (requires -screen-view)")
 	flag.Var(&tcpForwards, "tcp-forward", "TCP forward forwardPort=host:port that Home apps may reach; repeat or separate with semicolons")
 	flag.BoolVar(&screenCaptureHelper, "screen-capture-helper", false, "internal interactive desktop capture helper")
 	flag.IntVar(&logRetentionDays, "log-retention-days", diaglog.DefaultRetentionDays, "number of calendar days of diagnostic logs to retain")
@@ -172,7 +181,7 @@ func Main() {
 	flag.StringVar(&updateServiceTarget, "update-service", "", "replace the installed service executable and restart it")
 	flag.Parse()
 	if screenCaptureHelper {
-		if err := screenview.RunCaptureHelper(); err != nil {
+		if err := screenview.RunCaptureHelper(screenview.HelperOptions{RunBanner: runShareBanner}); err != nil {
 			log.Printf("screen capture helper failed: %v", err)
 			os.Exit(1)
 		}
@@ -203,7 +212,7 @@ func Main() {
 	if relayURL == "" {
 		relayURL = defaultRelayURL
 	}
-	opts := agentOptions{RelayURL: relayURL, Proxy: proxyFlag, RDP: rdpFlag, WinRM: winrmFlag, SMB: smbFlag, RoomPasswordFile: roomPasswordFile, TCPForwards: tcpForwards.String(), ScreenView: screenView}
+	opts := agentOptions{RelayURL: relayURL, Proxy: proxyFlag, RDP: rdpFlag, WinRM: winrmFlag, SMB: smbFlag, RoomPasswordFile: roomPasswordFile, TCPForwards: tcpForwards.String(), ScreenView: screenView, ScreenControl: screenControl}
 	// Maintenance actions must take precedence over service-context detection.
 	// A remote administrator may intentionally launch the updater through a
 	// one-shot LocalSystem service so replacement does not depend on the agent's
@@ -395,7 +404,12 @@ func waitForServiceState(s *mgr.Service, want svc.State, timeout time.Duration) 
 }
 
 func loadAgentConfig(opts agentOptions) (config, error) {
-	return loadConfig(opts.RelayURL, opts.Proxy, opts.RDP, opts.ScreenView, opts.WinRM, opts.SMB, opts.RoomPasswordFile, opts.TCPForwards)
+	cfg, err := loadConfig(opts.RelayURL, opts.Proxy, opts.RDP, opts.ScreenView, opts.WinRM, opts.SMB, opts.RoomPasswordFile, opts.TCPForwards)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ScreenControl = opts.ScreenControl
+	return cfg, cfg.validate()
 }
 
 func loadConfig(relayURL, proxyOverride, rdpOverride string, screenView bool, extras ...string) (config, error) {
@@ -475,6 +489,9 @@ func (c config) validate() error {
 	}
 	if c.ScreenView && c.RoomPassword == "" {
 		return fmt.Errorf("screen viewing requires a non-empty room password")
+	}
+	if c.ScreenControl && !c.ScreenView {
+		return fmt.Errorf("screen control requires screen viewing")
 	}
 	if len(c.TCPForwards) > 0 && c.RoomPassword == "" {
 		return fmt.Errorf("TCP forwards require a non-empty room password")
@@ -778,6 +795,13 @@ func runWebSocketPoolsWithSessions(ctx, sessionCtx context.Context, cfg config, 
 	}
 	if cfg.ScreenView {
 		targets = append(targets, serviceTarget{Service: tunnel.ServiceScreen, Address: "interactive desktop", Interactive: true})
+		if cfg.ScreenControl {
+			if changed, err := screenview.EnableSoftwareSAS(); err != nil {
+				log.Printf("screen control: could not allow services to send Ctrl+Alt+Del: %v", err)
+			} else if changed {
+				log.Printf("screen control: set policy SoftwareSASGeneration=1 so remote Ctrl+Alt+Del works")
+			}
+		}
 	}
 	for _, forward := range cfg.TCPForwards {
 		targets = append(targets, serviceTarget{Service: forward.Service(), Address: forward.Target, Forward: true})
@@ -981,7 +1005,11 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 	var localConn net.Conn
 	var err error
 	if target.Interactive {
-		localConn, err = launchScreenCaptureHelper()
+		localConn, err = launchScreenCaptureHelper(screenview.HelperPreamble{
+			DeskFerryHelper: 1,
+			ScreenKey:       screenview.DeriveScreenKeyForRelay(cfg.RelayAddr, cfg.RoomPassword),
+			ControlAllowed:  cfg.ScreenControl,
+		})
 	} else {
 		var dialer net.Dialer
 		localConn, err = dialer.DialContext(sessionCtx, "tcp", target.Address)

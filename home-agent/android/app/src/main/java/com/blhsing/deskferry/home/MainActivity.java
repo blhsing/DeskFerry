@@ -512,7 +512,7 @@ public class MainActivity extends Activity {
         clearRoomPasswordButton = ui.iconButton(R.drawable.ic_df_close, "Clear saved room credential", true);
         clearRoomPasswordButton.setOnClickListener(v -> {
             if (!destinations.isEmpty()) {
-                destinations.get(selectedDestination).roomProof = "";
+                HomePrefs.setRoomCredential(destinations.get(selectedDestination), "", "");
                 roomPasswordField.setText("");
                 HomePrefs.saveDestinations(this, destinations, selectedDestination,
                         parsePortOrDefault(localPortField.getText().toString()));
@@ -637,12 +637,12 @@ public class MainActivity extends Activity {
         if (!destinations.isEmpty()) {
             HomePrefs.Destination destination = destinations.get(selectedDestination);
             String room = roomNameField.getText().toString().trim();
-            if (!destination.room.equalsIgnoreCase(room)) destination.roomProof = "";
+            if (!destination.room.equalsIgnoreCase(room)) HomePrefs.setRoomCredential(destination, "", "");
             destination.relayBases = RelayUrls.joinRelayUrls(relayUrls);
             destination.room = room;
             String password = roomPasswordField.getText().toString();
             if (!password.isEmpty()) {
-                destinations.get(selectedDestination).roomProof = RelayUrls.roomPasswordProof(
+                HomePrefs.setRoomCredential(destinations.get(selectedDestination),
                         RelayUrls.primaryRelayUrl(relayUrl), password);
                 roomPasswordField.setText("");
             }
@@ -671,7 +671,7 @@ public class MainActivity extends Activity {
         if (!destinations.isEmpty() && selectedDestination >= 0 && selectedDestination < destinations.size()) {
             HomePrefs.Destination destination = destinations.get(selectedDestination);
             String room = roomNameField.getText().toString().trim();
-            if (!destination.room.equalsIgnoreCase(room)) destination.roomProof = "";
+            if (!destination.room.equalsIgnoreCase(room)) HomePrefs.setRoomCredential(destination, "", "");
             destination.relayBases = RelayUrls.joinRelayUrls(relayUrls);
             destination.room = room;
         }
@@ -1107,6 +1107,7 @@ public class MainActivity extends Activity {
 					.putExtra(ScreenViewerActivity.EXTRA_RELAY_URLS, relayUrl)
 					.putExtra(ScreenViewerActivity.EXTRA_PROXY, proxy)
 					.putExtra(ScreenViewerActivity.EXTRA_ROOM_PROOF, proof)
+					.putExtra(ScreenViewerActivity.EXTRA_SCREEN_KEY, destinations.get(selectedDestination).screenKey)
 					.putExtra(ScreenViewerActivity.EXTRA_DESTINATION, destinations.get(selectedDestination).name);
 			startActivity(intent);
 		} catch (Exception ex) {

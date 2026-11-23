@@ -19,6 +19,7 @@ const (
 	FrameFull  = "full"
 	FrameDelta = "delta"
 	FrameError = "error"
+	FrameHello = "hello"
 
 	DefaultIntervalMS = 1000
 	DefaultTileSize   = 64
@@ -34,6 +35,12 @@ type Request struct {
 	Mode       string `json:"mode"`
 	IntervalMS int    `json:"interval_ms,omitempty"`
 	TileSize   int    `json:"tile_size,omitempty"`
+	// Protocol 2 asks for the live session in docs/screen-live-protocol.md.
+	// Older Work agents ignore these fields and answer with the legacy stream.
+	Protocol    int    `json:"protocol,omitempty"`
+	Client      string `json:"client,omitempty"`
+	Name        string `json:"name,omitempty"`
+	ClientHello string `json:"client_hello,omitempty"`
 }
 
 func (r *Request) Normalize() error {
@@ -74,6 +81,7 @@ type Frame struct {
 	Height int    `json:"height,omitempty"`
 	Rects  []Rect `json:"rects,omitempty"`
 	Error  string `json:"error,omitempty"`
+	Live   *Hello `json:"live,omitempty"`
 }
 
 func WriteRequest(w io.Writer, request Request) error {

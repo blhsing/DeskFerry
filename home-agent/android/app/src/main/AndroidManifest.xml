@@ -26,7 +26,9 @@
         </activity>
 		<activity
 			android:name=".ScreenViewerActivity"
-			android:exported="false" />
+			android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation"
+			android:exported="false"
+			android:windowSoftInputMode="adjustResize|stateHidden" />
 
         <service
             android:name=".TunnelService"

@@ -56,6 +56,7 @@ type app struct {
 	roomPassword    *walk.LineEdit
 	clearPassword   *walk.CheckBox
 	screenView      *walk.CheckBox
+	screenControl   *walk.CheckBox
 	winrmEnabled    *walk.CheckBox
 	smbEnabled      *walk.CheckBox
 	winrmAddr       *walk.LineEdit
@@ -92,6 +93,7 @@ type actionOptions struct {
 	SMBAddr           string
 	SMBAlias          string
 	ScreenView        bool
+	ScreenControl     bool
 	// TCPForwards lists "forwardPort=host:port" targets separated by
 	// semicolons that Home apps may reach through this PC.
 	TCPForwards string
@@ -170,7 +172,9 @@ func (a *app) run(smokeTest bool) error {
 					Label{},
 					CheckBox{AssignTo: &a.clearPassword, Text: "Clear room password (also disables WinRM, SMB, TCP forwards, and screen viewing)"},
 					uikit.FieldLabel("Screen viewing"),
-					CheckBox{AssignTo: &a.screenView, Text: "Allow authenticated screenshots and delta streaming", Checked: installedOpts.ScreenView},
+					CheckBox{AssignTo: &a.screenView, Text: "Allow authenticated live screen viewing", Checked: installedOpts.ScreenView, OnCheckedChanged: a.updateCapabilityControls},
+					Label{},
+					CheckBox{AssignTo: &a.screenControl, Text: "Allow remote control: viewers and AI agents may use the mouse and keyboard (a banner shows on this PC)", Checked: installedOpts.ScreenControl},
 					CheckBox{AssignTo: &a.winrmEnabled, Text: "WinRM", Checked: installedOpts.WinRMAddr != "", OnCheckedChanged: a.updateCapabilityControls, MinSize: Size{Width: uikit.LabelColumnWidth}},
 					LineEdit{AssignTo: &a.winrmAddr, Text: firstNonEmpty(installedOpts.WinRMAddr, "127.0.0.1:5985"), CueBanner: "local Windows WinRM listener"},
 					CheckBox{AssignTo: &a.smbEnabled, Text: "SMB", Checked: installedOpts.SMBAddr != "", OnCheckedChanged: a.updateCapabilityControls, MinSize: Size{Width: uikit.LabelColumnWidth}},
@@ -292,14 +296,15 @@ func installedServiceOptions() (actionOptions, bool) {
 		return actionOptions{}, false
 	}
 	opts := actionOptions{
-		InstallDir: defaultInstallDir(),
-		AgentPath:  defaultAgentPath(),
-		RelayURL:   serviceCommandLineOption(commandLine, "-relay-url"),
-		Proxy:      firstNonEmpty(serviceCommandLineOption(commandLine, "-proxy"), "env"),
-		WinRMAddr:  serviceCommandLineOption(commandLine, "-winrm"),
-		SMBAddr:    serviceCommandLineOption(commandLine, "-smb"),
-		ScreenView: serviceCommandLineHasFlag(commandLine, "-screen-view"),
-		SMBAlias:   defaultSMBAlias,
+		InstallDir:    defaultInstallDir(),
+		AgentPath:     defaultAgentPath(),
+		RelayURL:      serviceCommandLineOption(commandLine, "-relay-url"),
+		Proxy:         firstNonEmpty(serviceCommandLineOption(commandLine, "-proxy"), "env"),
+		WinRMAddr:     serviceCommandLineOption(commandLine, "-winrm"),
+		SMBAddr:       serviceCommandLineOption(commandLine, "-smb"),
+		ScreenView:    serviceCommandLineHasFlag(commandLine, "-screen-view"),
+		ScreenControl: serviceCommandLineHasFlag(commandLine, "-screen-control"),
+		SMBAlias:      defaultSMBAlias,
 		// The service stores all forwards in one -tcp-forward value.
 		TCPForwards: serviceCommandLineOption(commandLine, "-tcp-forward"),
 	}
@@ -360,6 +365,9 @@ func (a *app) updateCapabilityControls() {
 	}
 	if a.smbAlias != nil {
 		a.smbAlias.SetEnabled(smbEnabled)
+	}
+	if a.screenControl != nil && a.screenView != nil {
+		a.screenControl.SetEnabled(a.screenView.Checked())
 	}
 }
 
@@ -424,6 +432,9 @@ func (a *app) runSelfTest() {
 		}
 		if opts.ScreenView {
 			args = append(args, "-screen-view")
+			if opts.ScreenControl {
+				args = append(args, "-screen-control")
+			}
 		}
 		if opts.TCPForwards != "" {
 			args = append(args, "-tcp-forward", opts.TCPForwards)
@@ -592,6 +603,7 @@ func (a *app) options() actionOptions {
 		SMBAddr:           smbAddr,
 		SMBAlias:          strings.TrimSpace(a.smbAlias.Text()),
 		ScreenView:        a.screenView.Checked(),
+		ScreenControl:     a.screenView.Checked() && a.screenControl.Checked(),
 		TCPForwards:       tunnel.FormatTCPForwards(a.forwards),
 	}
 }
@@ -742,6 +754,7 @@ func runElevatedAction(args []string) {
 	smbAddr := fs.String("smb", "", "SMB target")
 	smbAlias := fs.String("smb-alias", defaultSMBAlias, "SMB server alias")
 	screenView := fs.Bool("screen-view", false, "allow authenticated screen viewing")
+	screenControl := fs.Bool("screen-control", false, "allow remote mouse and keyboard control in live screen sessions")
 	tcpForwards := fs.String("tcp-forward", "", "TCP forwards")
 	noDialog := fs.Bool("no-dialog", false, "write the result to the console instead of displaying a dialog")
 	if err := fs.Parse(args); err != nil {
@@ -759,6 +772,7 @@ func runElevatedAction(args []string) {
 		SMBAddr:           *smbAddr,
 		SMBAlias:          *smbAlias,
 		ScreenView:        *screenView,
+		ScreenControl:     *screenView && *screenControl,
 		TCPForwards:       *tcpForwards,
 	})
 	if err != nil {
@@ -835,6 +849,7 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error)
 	fs.StringVar(&opts.SMBAddr, "smb", "", "SMB target in host:port form")
 	fs.StringVar(&opts.SMBAlias, "smb-alias", defaultSMBAlias, "SMB server alias")
 	fs.BoolVar(&opts.ScreenView, "screen-view", false, "allow authenticated screen viewing")
+	fs.BoolVar(&opts.ScreenControl, "screen-control", false, "allow remote mouse and keyboard control in live screen sessions")
 	fs.Var(&tcpForwards, "tcp-forward", "TCP forward forwardPort=host:port; repeat for more forwards")
 	if err := fs.Parse(args); err != nil {
 		return "", opts, err
@@ -855,7 +870,7 @@ func parseCLIArgs(args []string, stdin io.Reader) (string, actionOptions, error)
 		installOnly := map[string]bool{
 			"agent": true, "relay-url": true, "relay-base-url": true, "room": true, "proxy": true, "room-password-stdin": true,
 			"room-password-blob": true, "clear-room-password": true,
-			"winrm": true, "smb": true, "smb-alias": true, "screen-view": true, "tcp-forward": true,
+			"winrm": true, "smb": true, "smb-alias": true, "screen-view": true, "screen-control": true, "tcp-forward": true,
 		}
 		if *action != "uninstall" {
 			installOnly["install-dir"] = true
@@ -970,7 +985,8 @@ func printCLIUsage(output io.Writer) {
 	fmt.Fprintln(output, "  -winrm HOST:PORT           WinRM target")
 	fmt.Fprintln(output, "  -smb HOST:PORT             SMB target")
 	fmt.Fprintln(output, "  -smb-alias NAME            SMB server alias (default deskferry-work)")
-	fmt.Fprintln(output, "  -screen-view               Allow authenticated screenshots and delta streaming")
+	fmt.Fprintln(output, "  -screen-view               Allow authenticated live screen viewing")
+	fmt.Fprintln(output, "  -screen-control            Also allow remote mouse and keyboard control (requires -screen-view)")
 	fmt.Fprintln(output, "  -tcp-forward PORT=HOST:PORT  Let Home apps reach HOST:PORT as forward PORT; repeat for more")
 	fmt.Fprintln(output, "Omitting all password flags preserves the installed credential.")
 }
@@ -1068,6 +1084,9 @@ func installOrUpdate(opts actionOptions) (string, error) {
 	}
 	if opts.ScreenView {
 		args = append(args, "-screen-view")
+		if opts.ScreenControl {
+			args = append(args, "-screen-control")
+		}
 	}
 	if opts.TCPForwards != "" {
 		args = append(args, "-tcp-forward", opts.TCPForwards)
@@ -1394,6 +1413,9 @@ func relaunchElevatedAction(action string, opts actionOptions, noDialog bool) er
 	}
 	if opts.ScreenView {
 		args = append(args, "-screen-view")
+		if opts.ScreenControl {
+			args = append(args, "-screen-control")
+		}
 	}
 	if opts.TCPForwards != "" {
 		args = append(args, "-tcp-forward", opts.TCPForwards)

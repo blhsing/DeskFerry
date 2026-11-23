@@ -4,10 +4,10 @@ package homewindows
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
-	"image/draw"
 	"image/png"
 	"math"
 	"os"
@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -30,20 +31,23 @@ import (
 )
 
 type screenViewer struct {
-	owner    *clientApp
-	mw       *walk.MainWindow
-	viewport *walk.ScrollView
-	canvas   *walk.CustomWidget
-	status   *walk.Label
-	interval *walk.ComboBox
-	zoomBox  *walk.ComboBox
+	owner      *clientApp
+	mw         *walk.MainWindow
+	viewport   *walk.ScrollView
+	canvas     *walk.CustomWidget
+	status     *walk.Label
+	stats      *walk.Label
+	liveButton *walk.PushButton
+	control    *walk.PushButton
+	cadButton  *walk.PushButton
+	clipSend   *walk.PushButton
+	clipGet    *walk.PushButton
+	zoomBox    *walk.ComboBox
 
 	mu                   sync.Mutex
 	cancel               context.CancelFunc
-	frame                *image.RGBA
-	bitmap               *walk.Bitmap
+	client               *screenview.LiveClient
 	closed               bool
-	streaming            bool
 	zoom                 float64
 	zoomControlUpdating  bool
 	startupSized         bool
@@ -55,6 +59,33 @@ type screenViewer struct {
 	panStart             win.POINT
 	panStartX            int
 	panStartY            int
+
+	// Framebuffer copy in the BGRA layout GDI draws.
+	frameMu     sync.Mutex
+	bgra        []byte
+	frameWidth  int
+	frameHeight int
+	lossless    bool
+	legacy      bool
+
+	cursor        screenview.CursorState
+	cursorBitmap  win.HBITMAP
+	cursorShapeID uint32
+	localCursor   win.HCURSOR
+
+	controlling    atomic.Bool
+	controlAllowed atomic.Bool
+	inputs         chan screenview.InputEvent
+	lastMove       time.Time
+	pendingMove    *screenview.InputEvent
+	keyboardHook   uintptr
+	paintPending   atomic.Bool
+
+	framesShown atomic.Int64
+	statsFrames int64
+	statsBytes  uint64
+	statsAt     time.Time
+	statusText  string
 }
 
 const (
@@ -63,13 +94,45 @@ const (
 	wmGesture     = 0x0119
 	gidZoom       = 3
 	gfBegin       = 1
+	halftone      = 4
+	srcCopy       = 0x00CC0020
+	acSrcOver     = 0
+	acSrcAlpha    = 1
+	wmMouseHWheel = 0x020E
+	wmXButtonDown = 0x020B
+	wmXButtonUp   = 0x020C
+	wmKeyboardLL  = 13
+	llkhfUp       = 0x80
+	llkhfExtended = 0x01
+	llkhfInjected = 0x10
+	wmSetCursor   = 0x0020
+	wmKillFocus   = 0x0008
+	wmActivateApp = 0x001C
+	moveInterval  = 8 * time.Millisecond
 )
 
 var (
 	user32ScreenViewer     = windows.NewLazySystemDLL("user32.dll")
+	gdi32ScreenViewer      = windows.NewLazySystemDLL("gdi32.dll")
+	msimg32ScreenViewer    = windows.NewLazySystemDLL("msimg32.dll")
+	kernel32ScreenViewer   = windows.NewLazySystemDLL("kernel32.dll")
 	getGestureInfoScreen   = user32ScreenViewer.NewProc("GetGestureInfo")
 	closeGestureInfoScreen = user32ScreenViewer.NewProc("CloseGestureInfoHandle")
 	setGestureConfigScreen = user32ScreenViewer.NewProc("SetGestureConfig")
+	stretchDIBitsScreen    = gdi32ScreenViewer.NewProc("StretchDIBits")
+	setStretchModeScreen   = gdi32ScreenViewer.NewProc("SetStretchBltMode")
+	setBrushOrgScreen      = gdi32ScreenViewer.NewProc("SetBrushOrgEx")
+	alphaBlendScreen       = msimg32ScreenViewer.NewProc("AlphaBlend")
+	createIconIndirect     = user32ScreenViewer.NewProc("CreateIconIndirect")
+	destroyCursorScreen    = user32ScreenViewer.NewProc("DestroyCursor")
+	setWindowsHookScreen   = user32ScreenViewer.NewProc("SetWindowsHookExW")
+	unhookScreen           = user32ScreenViewer.NewProc("UnhookWindowsHookEx")
+	callNextHookScreen     = user32ScreenViewer.NewProc("CallNextHookEx")
+	getModuleHandleScreen  = kernel32ScreenViewer.NewProc("GetModuleHandleW")
+
+	// Only one viewer can own the keyboard hook at a time.
+	activeHookViewer atomic.Pointer[screenViewer]
+	keyboardHookProc uintptr
 )
 
 type screenGesturePoint struct {
@@ -95,17 +158,23 @@ type screenGestureConfig struct {
 	Block uint32
 }
 
-type screenZoomCanvas struct {
+type screenCanvasWidget struct {
 	*walk.CustomWidget
 	viewer *screenViewer
 }
 
-func (w *screenZoomCanvas) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
-	if w.viewer.handlePanMessage(hwnd, msg, wParam) {
-		return 0
-	}
-	if w.viewer.handleZoomMessage(msg, wParam, lParam) {
-		return 0
+func (w *screenCanvasWidget) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
+	if w.viewer.controlling.Load() {
+		if handled, result := w.viewer.handleControlMessage(hwnd, msg, wParam, lParam); handled {
+			return result
+		}
+	} else {
+		if w.viewer.handlePanMessage(hwnd, msg, wParam) {
+			return 0
+		}
+		if w.viewer.handleZoomMessage(msg, wParam, lParam) {
+			return 0
+		}
 	}
 	return w.CustomWidget.WndProc(hwnd, msg, wParam, lParam)
 }
@@ -116,7 +185,7 @@ type screenZoomScrollView struct {
 }
 
 func (w *screenZoomScrollView) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
-	if w.viewer.handleZoomMessage(msg, wParam, lParam) {
+	if !w.viewer.controlling.Load() && w.viewer.handleZoomMessage(msg, wParam, lParam) {
 		return 0
 	}
 	return w.ScrollView.WndProc(hwnd, msg, wParam, lParam)
@@ -132,7 +201,7 @@ func (a *clientApp) openScreenViewer() {
 		a.showError(errors.New("save a room password for this destination before viewing its screen"))
 		return
 	}
-	viewer := &screenViewer{owner: a}
+	viewer := &screenViewer{owner: a, inputs: make(chan screenview.InputEvent, 2048)}
 	title := "DeskFerry " + buildinfo.Version + " Screen Viewer - " + cfg.SelectedDestination
 	if err := viewer.createWindow(title, a.mw); err != nil {
 		a.showError(err)
@@ -146,7 +215,58 @@ func (a *clientApp) openScreenViewer() {
 	viewer.mw.Show()
 	win.ShowWindow(viewer.mw.Handle(), win.SW_MAXIMIZE)
 	viewer.activateWindow()
-	viewer.start(false)
+	if cfg.screenKey() == "" {
+		viewer.askForScreenKey()
+	}
+	viewer.start()
+}
+
+// askForScreenKey asks once for the room password so live view and control
+// can use a key the relay never sees. Cancel keeps the read-only stream.
+func (v *screenViewer) askForScreenKey() {
+	var dialog *walk.Dialog
+	var password *walk.LineEdit
+	var message *walk.Label
+	var accept, cancel *walk.PushButton
+	_, err := Dialog{
+		AssignTo:      &dialog,
+		Title:         "Enable live view and control",
+		Font:          uikit.BodyFont(),
+		DefaultButton: &accept,
+		CancelButton:  &cancel,
+		MinSize:       Size{Width: 460},
+		Layout:        VBox{Margins: Margins{Left: uikit.Space16, Top: uikit.Space16, Right: uikit.Space16, Bottom: uikit.Space16}, Spacing: uikit.Space8},
+		Children: []Widget{
+			Label{Text: "Live view and remote control encrypt the screen end to end with a key derived from this destination's room password. Enter the room password once to save that key.", MinSize: Size{Width: 420}},
+			LineEdit{AssignTo: &password, PasswordMode: true, CueBanner: "Room password"},
+			Label{AssignTo: &message, TextColor: uikit.ToneDanger.Palette().Foreground},
+			Composite{
+				Layout: HBox{MarginsZero: true},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{AssignTo: &cancel, Text: "Use read-only view", OnClicked: func() { dialog.Cancel() }},
+					PushButton{AssignTo: &accept, Text: "Save and connect", OnClicked: func() {
+						cfg := v.owner.currentConfig()
+						if err := cfg.saveScreenKey(password.Text()); err != nil {
+							_ = message.SetText(err.Error())
+							return
+						}
+						if err := saveSettingsConfig(cfg); err != nil {
+							_ = message.SetText(err.Error())
+							return
+						}
+						v.owner.mu.Lock()
+						v.owner.cfg = cfg
+						v.owner.mu.Unlock()
+						dialog.Accept()
+					}},
+				},
+			},
+		},
+	}.Run(v.mw)
+	if err != nil {
+		v.setStatus("Could not ask for the room password: " + err.Error())
+	}
 }
 
 // createWindow builds the viewer window with its dark toolbar strip.
@@ -154,8 +274,11 @@ func (v *screenViewer) createWindow(title string, owner *walk.MainWindow) error 
 	toolbarLabel := func(text string) Widget {
 		return Label{Text: text, TextColor: uikit.ColorDarkTextSecondary, Alignment: AlignHNearVCenter}
 	}
-	toolButton := func(text string, onClicked walk.EventHandler) Widget {
-		return PushButton{Text: text, OnClicked: onClicked, MinSize: Size{Width: 84, Height: uikit.ButtonHeight}, MaxSize: Size{Height: uikit.ButtonHeight}}
+	toolButton := func(assign **walk.PushButton, text, tooltip string, onClicked walk.EventHandler) Widget {
+		return PushButton{AssignTo: assign, Text: text, ToolTipText: tooltip, OnClicked: onClicked, MinSize: Size{Width: 84, Height: uikit.ButtonHeight}, MaxSize: Size{Height: uikit.ButtonHeight}}
+	}
+	spacer := func() Widget {
+		return HSpacer{Size: uikit.Space8, MinSize: Size{Width: uikit.Space8}, MaxSize: Size{Width: uikit.Space8}}
 	}
 	window := MainWindow{
 		AssignTo:   &v.mw,
@@ -173,13 +296,13 @@ func (v *screenViewer) createWindow(title string, owner *walk.MainWindow) error 
 				Children: []Widget{
 					uikit.AppMark{Size: 20},
 					Label{Text: "Screen viewer", Font: uikit.TitleFont(), TextColor: uikit.ColorDarkText, Alignment: AlignHNearVCenter},
-					HSpacer{Size: uikit.Space8, MinSize: Size{Width: uikit.Space8}, MaxSize: Size{Width: uikit.Space8}},
-					toolButton("Capture once", func() { v.start(false) }),
-					toolButton("Start stream", func() { v.start(true) }),
-					toolButton("Stop", v.stop),
-					HSpacer{Size: uikit.Space8, MinSize: Size{Width: uikit.Space8}, MaxSize: Size{Width: uikit.Space8}},
-					toolbarLabel("Interval"),
-					ComboBox{AssignTo: &v.interval, Model: []string{"0.5 seconds", "1 second", "2 seconds", "5 seconds"}, CurrentIndex: 1, Alignment: AlignHNearVCenter},
+					spacer(),
+					toolButton(&v.liveButton, "Stop", "Start or stop the live screen", v.toggleLive),
+					toolButton(&v.control, "Take control", "Use this PC's mouse and keyboard on the Work PC (Ctrl+Alt+Shift+C)", v.toggleControl),
+					toolButton(&v.cadButton, "Ctrl+Alt+Del", "Send Ctrl+Alt+Del to the Work PC", v.sendSAS),
+					toolButton(&v.clipSend, "Send clipboard", "Copy this PC's clipboard text to the Work PC", v.sendClipboard),
+					toolButton(&v.clipGet, "Get clipboard", "Copy the Work PC's clipboard text to this PC", v.getClipboard),
+					spacer(),
 					toolbarLabel("Zoom"),
 					ComboBox{
 						AssignTo:              &v.zoomBox,
@@ -193,8 +316,8 @@ func (v *screenViewer) createWindow(title string, owner *walk.MainWindow) error 
 						OnEditingFinished:     v.applyZoomSelection,
 					},
 					HSpacer{},
-					toolButton("Full screen", v.toggleFullscreen),
-					toolButton("Save PNG", v.savePNG),
+					toolButton(nil, "Full screen", "Toggle full screen", v.toggleFullscreen),
+					toolButton(nil, "Save PNG", "Save the current screen as a PNG image", v.savePNG),
 				},
 			},
 			ScrollView{
@@ -211,6 +334,7 @@ func (v *screenViewer) createWindow(title string, owner *walk.MainWindow) error 
 						MinSize:             Size{Width: 1, Height: 1},
 						PaintPixels:         v.paintScreen,
 						InvalidatesOnResize: true,
+						ClearsBackground:    false,
 					},
 				},
 			},
@@ -218,7 +342,9 @@ func (v *screenViewer) createWindow(title string, owner *walk.MainWindow) error 
 				Background: SolidColorBrush{Color: uikit.ColorDarkSurfaceSubtle},
 				Layout:     HBox{Margins: Margins{Left: uikit.Space12, Top: uikit.Space4, Right: uikit.Space12, Bottom: uikit.Space4}},
 				Children: []Widget{
-					Label{AssignTo: &v.status, Text: "Ready. Work-side screen viewing must be enabled.", Font: uikit.CaptionFont(), TextColor: uikit.ColorDarkTextMuted, EllipsisMode: EllipsisEnd},
+					Label{AssignTo: &v.status, Text: "Connecting to the Work screen service...", Font: uikit.CaptionFont(), TextColor: uikit.ColorDarkTextMuted, EllipsisMode: EllipsisEnd},
+					HSpacer{},
+					Label{AssignTo: &v.stats, Font: uikit.CaptionFont(), TextColor: uikit.ColorDarkTextMuted},
 				},
 			},
 		},
@@ -226,13 +352,12 @@ func (v *screenViewer) createWindow(title string, owner *walk.MainWindow) error 
 	if err := window.Create(); err != nil {
 		return err
 	}
-	// Never open larger than the monitor work area.
 	uikit.ResizeWindow(v.mw, 1100, 760)
 	if owner != nil {
 		win.SetWindowLongPtr(v.mw.Handle(), win.GWLP_HWNDPARENT, uintptr(owner.Handle()))
 	}
-	zoomCanvas := &screenZoomCanvas{CustomWidget: v.canvas, viewer: v}
-	if err := walk.InitWrapperWindow(zoomCanvas); err != nil {
+	canvas := &screenCanvasWidget{CustomWidget: v.canvas, viewer: v}
+	if err := walk.InitWrapperWindow(canvas); err != nil {
 		v.mw.Dispose()
 		return err
 	}
@@ -243,42 +368,661 @@ func (v *screenViewer) createWindow(title string, owner *walk.MainWindow) error 
 	}
 	enableScreenZoomGesture(v.canvas.Handle())
 	enableScreenZoomGesture(v.viewport.Handle())
+	v.updateControlButtons()
+	go v.inputSender()
 	v.mw.Closing().Attach(func(_ *bool, _ walk.CloseReason) {
 		v.mu.Lock()
 		v.closed = true
 		cancel := v.cancel
 		v.cancel = nil
-		bitmap := v.bitmap
-		v.bitmap = nil
+		client := v.client
 		v.mu.Unlock()
+		v.setControlling(false)
 		if cancel != nil {
 			cancel()
 		}
-		if bitmap != nil {
-			bitmap.Dispose()
+		if client != nil {
+			_ = client.Close()
 		}
+		close(v.inputs)
+		v.releaseCursorResources()
 	})
 	return nil
 }
 
-func (v *screenViewer) selectedInterval() int {
-	values := []int{500, 1000, 2000, 5000}
-	index := v.interval.CurrentIndex()
-	if index < 0 || index >= len(values) {
-		return screenview.DefaultIntervalMS
-	}
-	return values[index]
-}
-
 func enableScreenZoomGesture(hwnd win.HWND) {
 	config := screenGestureConfig{ID: gidZoom, Want: 1}
-	_, _, _ = setGestureConfigScreen.Call(
-		uintptr(hwnd),
-		0,
-		1,
-		uintptr(unsafe.Pointer(&config)),
-		unsafe.Sizeof(config),
-	)
+	_, _, _ = setGestureConfigScreen.Call(uintptr(hwnd), 0, 1, uintptr(unsafe.Pointer(&config)), unsafe.Sizeof(config))
+}
+
+func (v *screenViewer) liveClient() *screenview.LiveClient {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.client
+}
+
+// start opens the screen session: live and encrypted when a screen key is
+// saved, otherwise the read-only legacy stream.
+func (v *screenViewer) start() {
+	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		return
+	}
+	if v.cancel != nil {
+		v.cancel()
+	}
+	if v.client != nil {
+		_ = v.client.Close()
+		v.client = nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	v.cancel = cancel
+	v.mu.Unlock()
+	v.setStatus("Connecting to the Work screen service...")
+	v.onUI(func() { _ = v.liveButton.SetText("Stop") })
+	go v.run(ctx)
+}
+
+func (v *screenViewer) run(ctx context.Context) {
+	cfg := v.owner.currentConfig()
+	conn, route, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
+	if err != nil {
+		if ctx.Err() == nil {
+			v.setStatus("Screen connection failed: " + err.Error())
+			v.onUI(func() { _ = v.liveButton.SetText("Start") })
+		}
+		return
+	}
+	v.owner.appendLog("Screen connection selected relay=%s proxy=%s protocol=%s relay_protocol=%s.", route.RelayAddr, route.Proxy, route.Protocol, route.RelayProtocol)
+	v.setStatus(fmt.Sprintf("Connected through %s via %s (%s); waiting for the Work PC...", route.RelayAddr, route.Proxy, route.Protocol))
+	hostname, _ := os.Hostname()
+	client, err := screenview.StartLive(ctx, conn, screenview.LiveClientOptions{
+		ScreenKey: cfg.screenKey(),
+		Client:    "viewer",
+		Name:      hostname,
+		OnFrame:   v.onFrame,
+		OnStatus:  v.onStatus,
+		OnCursor:  v.onCursor,
+	})
+	if err != nil {
+		_ = conn.Close()
+		if ctx.Err() == nil {
+			v.setStatus("Screen session failed: " + err.Error())
+			v.onUI(func() { _ = v.liveButton.SetText("Start") })
+		}
+		return
+	}
+	v.mu.Lock()
+	if v.closed || ctx.Err() != nil {
+		v.mu.Unlock()
+		_ = client.Close()
+		return
+	}
+	v.client = client
+	v.mu.Unlock()
+	v.frameMu.Lock()
+	v.legacy = client.Legacy()
+	v.frameMu.Unlock()
+	// Frames that arrived before the client was stored were not copied.
+	v.onFrame(screenview.FrameUpdate{Dirty: []image.Rectangle{image.Rect(0, 0, 1<<15, 1<<15)}})
+	switch {
+	case client.Legacy():
+		v.controlAllowed.Store(false)
+		v.setStatus("Read-only view: the Work PC runs an older DeskFerry without live view and control.")
+	case cfg.screenKey() == "":
+		v.setStatus("Read-only view: save the room password in this viewer to enable live view and control.")
+	default:
+		v.controlAllowed.Store(client.Hello().ControlAllowed)
+		if client.Hello().ControlAllowed {
+			v.setStatus("Live. Select Take control to use the Work PC's mouse and keyboard.")
+		} else {
+			v.setStatus("Live, view only: remote control is turned off in the Work PC's DeskFerry Work Services settings.")
+		}
+	}
+	v.onUI(v.updateControlButtons)
+	v.statsAt = time.Now()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			_ = client.Close()
+			return
+		case <-client.Done():
+			v.setControlling(false)
+			if ctx.Err() == nil {
+				reason := "the connection closed"
+				if err := client.Err(); err != nil {
+					reason = err.Error()
+				}
+				v.setStatus("Screen session ended: " + reason)
+				v.onUI(func() {
+					_ = v.liveButton.SetText("Start")
+					_ = v.stats.SetText("")
+					v.updateControlButtons()
+				})
+			}
+			return
+		case now := <-ticker.C:
+			v.updateStats(client, now)
+		}
+	}
+}
+
+func (v *screenViewer) updateStats(client *screenview.LiveClient, now time.Time) {
+	frames := v.framesShown.Load()
+	received := client.BytesReceived()
+	elapsed := now.Sub(v.statsAt).Seconds()
+	if elapsed <= 0 {
+		return
+	}
+	fps := float64(frames-v.statsFrames) / elapsed
+	mbps := float64(received-v.statsBytes) * 8 / elapsed / 1e6
+	v.statsFrames, v.statsBytes, v.statsAt = frames, received, now
+	v.frameMu.Lock()
+	lossless, legacy, width, height := v.lossless, v.legacy, v.frameWidth, v.frameHeight
+	v.frameMu.Unlock()
+	quality := "lossy"
+	if lossless {
+		quality = "lossless"
+	}
+	mode := "Live"
+	if legacy {
+		mode = "Read-only"
+	}
+	text := fmt.Sprintf("%s · %dx%d · %.0f fps · %.2f Mbit/s · %s", mode, width, height, fps, mbps, quality)
+	v.onUI(func() { _ = v.stats.SetText(text) })
+}
+
+// onFrame copies the dirty rectangles into the GDI buffer.
+func (v *screenViewer) onFrame(update screenview.FrameUpdate) {
+	client := v.liveClient()
+	if client == nil {
+		// The first frame can arrive before StartLive returns; it is drawn
+		// with the next one or on resize.
+		return
+	}
+	resized := false
+	client.WithFramebuffer(func(fb *image.RGBA, _ uint64, lossless bool) {
+		if fb == nil {
+			return
+		}
+		width, height := fb.Bounds().Dx(), fb.Bounds().Dy()
+		v.frameMu.Lock()
+		defer v.frameMu.Unlock()
+		dirty := update.Dirty
+		if v.frameWidth != width || v.frameHeight != height || v.bgra == nil {
+			v.bgra = make([]byte, width*height*4)
+			v.frameWidth, v.frameHeight = width, height
+			dirty = []image.Rectangle{fb.Bounds()}
+			resized = true
+		}
+		v.lossless = lossless
+		for _, rect := range dirty {
+			rect = rect.Intersect(fb.Bounds())
+			for y := rect.Min.Y; y < rect.Max.Y; y++ {
+				src := fb.Pix[fb.PixOffset(rect.Min.X, y):]
+				dst := v.bgra[(y*width+rect.Min.X)*4:]
+				for x := 0; x < rect.Dx()*4; x += 4 {
+					dst[x], dst[x+1], dst[x+2], dst[x+3] = src[x+2], src[x+1], src[x], 255
+				}
+			}
+		}
+	})
+	v.framesShown.Add(1)
+	if !v.paintPending.CompareAndSwap(false, true) && !resized {
+		return
+	}
+	v.onUI(func() {
+		v.paintPending.Store(false)
+		v.frameMu.Lock()
+		width, height := v.frameWidth, v.frameHeight
+		v.frameMu.Unlock()
+		v.sizeWindowForFirstFrame(width, height)
+		v.layoutScreen()
+		if v.canvas != nil {
+			win.InvalidateRect(v.canvas.Handle(), nil, false)
+		}
+	})
+}
+
+func (v *screenViewer) onStatus(status screenview.Status) {
+	v.controlAllowed.Store(status.ControlAllowed)
+	if !status.ControlActive && v.controlling.Load() {
+		// The person at the Work PC stopped control from the banner.
+		v.setControlling(false)
+		v.setStatus("Control was stopped on the Work PC. Viewing continues.")
+	}
+	if status.Locked {
+		v.setStatus("The Work PC shows its lock screen or another secure desktop (" + status.Desktop + ").")
+	}
+	v.onUI(v.updateControlButtons)
+}
+
+func (v *screenViewer) onCursor(cursor screenview.CursorState) {
+	v.frameMu.Lock()
+	previous := v.cursor
+	v.cursor = cursor
+	v.frameMu.Unlock()
+	if previous.X == cursor.X && previous.Y == cursor.Y && previous.ShapeID == cursor.ShapeID && previous.Visible == cursor.Visible {
+		return
+	}
+	v.onUI(func() {
+		v.updateCursorResources(cursor)
+		if v.canvas != nil && !v.controlling.Load() {
+			win.InvalidateRect(v.canvas.Handle(), nil, false)
+		}
+	})
+}
+
+func (v *screenViewer) onUI(fn func()) {
+	v.mu.Lock()
+	closed := v.closed
+	v.mu.Unlock()
+	if closed || v.mw == nil {
+		return
+	}
+	v.mw.Synchronize(func() {
+		v.mu.Lock()
+		closed := v.closed
+		v.mu.Unlock()
+		if !closed {
+			fn()
+		}
+	})
+}
+
+func (v *screenViewer) setStatus(text string) {
+	v.mu.Lock()
+	v.statusText = text
+	v.mu.Unlock()
+	v.onUI(func() { _ = v.status.SetText(text) })
+}
+
+func (v *screenViewer) toggleLive() {
+	if v.liveClient() != nil {
+		v.stop()
+		return
+	}
+	v.start()
+}
+
+func (v *screenViewer) stop() {
+	v.setControlling(false)
+	v.mu.Lock()
+	cancel := v.cancel
+	v.cancel = nil
+	client := v.client
+	v.client = nil
+	v.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if client != nil {
+		_ = client.Close()
+	}
+	_ = v.liveButton.SetText("Start")
+	_ = v.stats.SetText("")
+	v.updateControlButtons()
+	v.setStatus("Screen stopped. Select Start to view the Work PC again.")
+}
+
+func (v *screenViewer) updateControlButtons() {
+	client := v.liveClient()
+	live := client != nil && !client.Legacy()
+	allowed := live && v.controlAllowed.Load()
+	controlling := v.controlling.Load()
+	if v.control != nil {
+		v.control.SetEnabled(allowed)
+		text := "Take control"
+		if controlling {
+			text = "Release control"
+		}
+		_ = v.control.SetText(text)
+	}
+	for _, button := range []*walk.PushButton{v.cadButton, v.clipSend} {
+		if button != nil {
+			button.SetEnabled(allowed && controlling)
+		}
+	}
+	if v.clipGet != nil {
+		v.clipGet.SetEnabled(live)
+	}
+}
+
+func (v *screenViewer) toggleControl() {
+	v.setControlling(!v.controlling.Load())
+}
+
+// setControlling turns control on or off on the Work PC and locally.
+func (v *screenViewer) setControlling(enable bool) {
+	client := v.liveClient()
+	if enable {
+		if client == nil || client.Legacy() || !v.controlAllowed.Load() {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := client.SetControl(ctx, true, false)
+		cancel()
+		if err != nil {
+			v.setStatus("Could not take control: " + err.Error())
+			return
+		}
+		v.controlling.Store(true)
+		v.onUI(func() {
+			v.installKeyboardHook()
+			if v.canvas != nil {
+				_ = v.canvas.SetFocus()
+			}
+			v.updateControlButtons()
+		})
+		v.setStatus("Controlling the Work PC. Press Ctrl+Alt+Shift+C or select Release control to stop.")
+		return
+	}
+	if !v.controlling.Swap(false) {
+		return
+	}
+	v.queueInput(screenview.InputEvent{T: "release_all"})
+	if client != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = client.SetControl(ctx, false, false)
+		}()
+	}
+	v.onUI(func() {
+		v.removeKeyboardHook()
+		v.updateControlButtons()
+		if v.canvas != nil {
+			win.InvalidateRect(v.canvas.Handle(), nil, false)
+		}
+	})
+	v.setStatus("Viewing only. Select Take control to use the Work PC's mouse and keyboard.")
+}
+
+func (v *screenViewer) queueInput(event screenview.InputEvent) {
+	defer func() { _ = recover() }() // the channel closes with the window
+	select {
+	case v.inputs <- event:
+	default:
+	}
+}
+
+// inputSender batches queued input into commands, keeping the UI thread and
+// the keyboard hook free of network writes.
+func (v *screenViewer) inputSender() {
+	for event := range v.inputs {
+		batch := []screenview.InputEvent{event}
+	collect:
+		for len(batch) < 64 {
+			select {
+			case next, ok := <-v.inputs:
+				if !ok {
+					break collect
+				}
+				batch = append(batch, next)
+			default:
+				break collect
+			}
+		}
+		if client := v.liveClient(); client != nil && !client.Legacy() {
+			_ = client.SendInput(batch...)
+		}
+	}
+}
+
+func (v *screenViewer) sendSAS() {
+	client := v.liveClient()
+	if client == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := client.Call(ctx, screenview.Command{Cmd: "sas"}); err != nil {
+			v.setStatus("Ctrl+Alt+Del failed: " + err.Error())
+		}
+	}()
+}
+
+func (v *screenViewer) sendClipboard() {
+	client := v.liveClient()
+	if client == nil {
+		return
+	}
+	text, err := walk.Clipboard().Text()
+	if err != nil {
+		v.setStatus("Could not read this PC's clipboard: " + err.Error())
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := client.Call(ctx, screenview.Command{Cmd: "clipboard_set", Text: text}); err != nil {
+			v.setStatus("Could not set the Work PC's clipboard: " + err.Error())
+			return
+		}
+		v.setStatus(fmt.Sprintf("Sent %d characters to the Work PC's clipboard.", len([]rune(text))))
+	}()
+}
+
+func (v *screenViewer) getClipboard() {
+	client := v.liveClient()
+	if client == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		raw, err := client.Call(ctx, screenview.Command{Cmd: "clipboard_get"})
+		if err != nil {
+			v.setStatus("Could not read the Work PC's clipboard: " + err.Error())
+			return
+		}
+		var result struct {
+			Text string `json:"text"`
+		}
+		_ = json.Unmarshal(raw, &result)
+		v.onUI(func() {
+			if err := walk.Clipboard().SetText(result.Text); err != nil {
+				v.setStatus("Could not set this PC's clipboard: " + err.Error())
+				return
+			}
+			v.setStatus(fmt.Sprintf("Copied %d characters from the Work PC's clipboard.", len([]rune(result.Text))))
+		})
+	}()
+}
+
+// canvasToFrame maps canvas client pixels to Work framebuffer pixels.
+func (v *screenViewer) canvasToFrame(x, y int) (int, int) {
+	v.frameMu.Lock()
+	width, height := v.frameWidth, v.frameHeight
+	v.frameMu.Unlock()
+	if v.renderWidth <= 0 || v.renderHeight <= 0 || width <= 0 || height <= 0 {
+		return 0, 0
+	}
+	fx := int(math.Floor(float64(x) * float64(width) / float64(v.renderWidth)))
+	fy := int(math.Floor(float64(y) * float64(height) / float64(v.renderHeight)))
+	return max(0, min(width-1, fx)), max(0, min(height-1, fy))
+}
+
+func pointFromLParam(lParam uintptr) (int, int) {
+	return int(int16(uint16(lParam))), int(int16(uint16(lParam >> 16)))
+}
+
+func (v *screenViewer) mouseEvent(kind string, lParam uintptr) screenview.InputEvent {
+	x, y := v.canvasToFrame(pointFromLParam(lParam))
+	return screenview.InputEvent{T: kind, X: screenview.At(x), Y: screenview.At(y)}
+}
+
+// handleControlMessage forwards mouse input on the canvas while controlling.
+func (v *screenViewer) handleControlMessage(hwnd win.HWND, msg uint32, wParam, lParam uintptr) (bool, uintptr) {
+	button := func(name string, down bool) {
+		event := v.mouseEvent("button", lParam)
+		event.B, event.Down = name, down
+		v.flushMove()
+		v.queueInput(event)
+		if down {
+			win.SetCapture(hwnd)
+			_ = v.canvas.SetFocus()
+		} else if wParam&(win.MK_LBUTTON|win.MK_RBUTTON|win.MK_MBUTTON|0x20|0x40) == 0 {
+			win.ReleaseCapture()
+		}
+	}
+	switch msg {
+	case win.WM_MOUSEMOVE:
+		event := v.mouseEvent("move", lParam)
+		if time.Since(v.lastMove) >= moveInterval {
+			v.lastMove = time.Now()
+			v.pendingMove = nil
+			v.queueInput(event)
+		} else {
+			if v.pendingMove == nil {
+				time.AfterFunc(moveInterval, func() { v.onUI(v.flushMove) })
+			}
+			v.pendingMove = &event
+		}
+		return true, 0
+	case win.WM_LBUTTONDOWN, win.WM_LBUTTONDBLCLK:
+		button("left", true)
+		return true, 0
+	case win.WM_LBUTTONUP:
+		button("left", false)
+		return true, 0
+	case win.WM_RBUTTONDOWN, win.WM_RBUTTONDBLCLK:
+		button("right", true)
+		return true, 0
+	case win.WM_RBUTTONUP:
+		button("right", false)
+		return true, 0
+	case win.WM_MBUTTONDOWN, win.WM_MBUTTONDBLCLK:
+		button("middle", true)
+		return true, 0
+	case win.WM_MBUTTONUP:
+		button("middle", false)
+		return true, 0
+	case wmXButtonDown, wmXButtonUp:
+		name := "x1"
+		if (wParam>>16)&0xFFFF == 2 {
+			name = "x2"
+		}
+		button(name, msg == wmXButtonDown)
+		return true, 1
+	case win.WM_MOUSEWHEEL, wmMouseHWheel:
+		delta := int(int16(uint16(wParam >> 16)))
+		// Wheel messages carry screen coordinates.
+		point := win.POINT{X: int32(int16(uint16(lParam))), Y: int32(int16(uint16(lParam >> 16)))}
+		win.ScreenToClient(hwnd, &point)
+		x, y := v.canvasToFrame(int(point.X), int(point.Y))
+		event := screenview.InputEvent{T: "wheel", X: screenview.At(x), Y: screenview.At(y)}
+		if msg == win.WM_MOUSEWHEEL {
+			event.DY = delta
+		} else {
+			event.DX = delta
+		}
+		v.queueInput(event)
+		return true, 0
+	case win.WM_KEYDOWN, win.WM_SYSKEYDOWN, win.WM_KEYUP, win.WM_SYSKEYUP, win.WM_CHAR, win.WM_SYSCHAR:
+		// The low-level hook forwards keys; keep them from the local UI.
+		return true, 0
+	case wmSetCursor:
+		if v.localCursor != 0 && uint16(lParam) == win.HTCLIENT {
+			win.SetCursor(v.localCursor)
+			return true, 1
+		}
+	case wmKillFocus:
+		v.queueInput(screenview.InputEvent{T: "release_all"})
+	case win.WM_GETDLGCODE:
+		return true, win.DLGC_WANTALLKEYS
+	}
+	return false, 0
+}
+
+func (v *screenViewer) flushMove() {
+	if v.pendingMove == nil {
+		return
+	}
+	event := *v.pendingMove
+	v.pendingMove = nil
+	v.lastMove = time.Now()
+	v.queueInput(event)
+}
+
+type kbdLLHookStruct struct {
+	VKCode    uint32
+	ScanCode  uint32
+	Flags     uint32
+	Time      uint32
+	ExtraInfo uintptr
+}
+
+func (v *screenViewer) installKeyboardHook() {
+	if v.keyboardHook != 0 {
+		return
+	}
+	if keyboardHookProc == 0 {
+		keyboardHookProc = windows.NewCallback(screenKeyboardHook)
+	}
+	module, _, _ := getModuleHandleScreen.Call(0)
+	hook, _, _ := setWindowsHookScreen.Call(wmKeyboardLL, keyboardHookProc, module, 0)
+	if hook == 0 {
+		v.setStatus("Keyboard forwarding is unavailable; only the mouse controls the Work PC.")
+		return
+	}
+	v.keyboardHook = hook
+	activeHookViewer.Store(v)
+}
+
+func (v *screenViewer) removeKeyboardHook() {
+	if v.keyboardHook == 0 {
+		return
+	}
+	unhookScreen.Call(v.keyboardHook)
+	v.keyboardHook = 0
+	activeHookViewer.CompareAndSwap(v, nil)
+}
+
+var hookModifiers struct {
+	ctrl, alt, shift bool
+}
+
+// screenKeyboardHook forwards every key to the Work PC while a controlling
+// viewer's canvas has the keyboard focus, including Windows, Alt+Tab and
+// other shortcuts the local shell would otherwise take.
+func screenKeyboardHook(code int, wParam, lParam uintptr) uintptr {
+	v := activeHookViewer.Load()
+	if code < 0 || v == nil || lParam == 0 || !v.controlling.Load() || v.canvas == nil {
+		result, _, _ := callNextHookScreen.Call(0, uintptr(code), wParam, lParam)
+		return result
+	}
+	info := (*kbdLLHookStruct)(unsafe.Pointer(lParam))
+	up := info.Flags&llkhfUp != 0
+	switch info.VKCode {
+	case 0x11, 0xA2, 0xA3:
+		hookModifiers.ctrl = !up
+	case 0x12, 0xA4, 0xA5:
+		hookModifiers.alt = !up
+	case 0x10, 0xA0, 0xA1:
+		hookModifiers.shift = !up
+	}
+	if win.GetFocus() != v.canvas.Handle() || info.Flags&llkhfInjected != 0 {
+		result, _, _ := callNextHookScreen.Call(0, uintptr(code), wParam, lParam)
+		return result
+	}
+	if info.VKCode == 'C' && !up && hookModifiers.ctrl && hookModifiers.alt && hookModifiers.shift {
+		v.queueInput(screenview.InputEvent{T: "release_all"})
+		go v.setControlling(false)
+		return 1
+	}
+	v.queueInput(screenview.InputEvent{
+		T:    "key",
+		VK:   int(info.VKCode),
+		Scan: int(info.ScanCode),
+		Ext:  info.Flags&llkhfExtended != 0,
+		Down: !up,
+	})
+	return 1
 }
 
 func (v *screenViewer) handlePanMessage(hwnd win.HWND, msg uint32, wParam uintptr) bool {
@@ -446,37 +1190,41 @@ func (v *screenViewer) setZoom(value float64, updateControl bool) {
 	v.layoutScreen()
 }
 
+func (v *screenViewer) frameSize() (int, int) {
+	v.frameMu.Lock()
+	defer v.frameMu.Unlock()
+	return v.frameWidth, v.frameHeight
+}
+
 func (v *screenViewer) effectiveZoom() float64 {
 	v.mu.Lock()
 	zoom := v.zoom
-	frame := v.frame
 	v.mu.Unlock()
 	if zoom > 0 {
 		return zoom
 	}
-	if frame == nil || v.viewport == nil {
+	width, height := v.frameSize()
+	if width == 0 || v.viewport == nil {
 		return 1
 	}
 	bounds := v.viewport.ClientBoundsPixels()
 	if bounds.Width <= 0 || bounds.Height <= 0 {
 		return 1
 	}
-	return math.Min(float64(bounds.Width)/float64(frame.Bounds().Dx()), float64(bounds.Height)/float64(frame.Bounds().Dy()))
+	return math.Min(float64(bounds.Width)/float64(width), float64(bounds.Height)/float64(height))
 }
 
 func (v *screenViewer) layoutScreen() {
 	if v.viewport == nil || v.canvas == nil {
 		return
 	}
-	v.mu.Lock()
-	frame := v.frame
-	zoom := v.zoom
-	v.mu.Unlock()
-	if frame == nil {
+	sourceWidth, sourceHeight := v.frameSize()
+	if sourceWidth == 0 {
 		return
 	}
-	sourceWidth := frame.Bounds().Dx()
-	sourceHeight := frame.Bounds().Dy()
+	v.mu.Lock()
+	zoom := v.zoom
+	v.mu.Unlock()
 	autoFit := zoom == 0
 	if autoFit {
 		bounds := v.viewport.ClientBoundsPixels()
@@ -491,7 +1239,6 @@ func (v *screenViewer) layoutScreen() {
 		if autoFit {
 			v.setScreenPan(0, 0)
 		}
-		_ = v.canvas.Invalidate()
 		return
 	}
 	v.renderWidth = width
@@ -503,100 +1250,120 @@ func (v *screenViewer) layoutScreen() {
 	if autoFit {
 		v.setScreenPan(0, 0)
 	}
-	_ = v.canvas.Invalidate()
+	win.InvalidateRect(v.canvas.Handle(), nil, false)
 }
 
 func (v *screenViewer) paintScreen(canvas *walk.Canvas, _ walk.Rectangle) error {
-	v.mu.Lock()
-	bitmap := v.bitmap
-	v.mu.Unlock()
-	if bitmap == nil || v.canvas == nil {
+	if v.canvas == nil {
 		return nil
 	}
 	bounds := v.canvas.ClientBoundsPixels()
-	return canvas.DrawImageStretchedPixels(bitmap, walk.Rectangle{Width: bounds.Width, Height: bounds.Height})
-}
-
-func (v *screenViewer) start(stream bool) {
-	v.mu.Lock()
-	if v.closed {
-		v.mu.Unlock()
-		return
-	}
-	if v.cancel != nil {
-		v.cancel()
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	v.cancel = cancel
-	v.streaming = stream
-	v.mu.Unlock()
-	mode := screenview.ModeSingle
-	if stream {
-		mode = screenview.ModeStream
-	}
-	v.setStatus("Connecting to the Work screen service...")
-	request := screenview.Request{Mode: mode, IntervalMS: v.selectedInterval(), TileSize: screenview.DefaultTileSize}
-	go v.receive(ctx, request)
-}
-
-func (v *screenViewer) receive(ctx context.Context, request screenview.Request) {
-	cfg := v.owner.currentConfig()
-	conn, route, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
-	if err != nil {
-		if ctx.Err() == nil {
-			v.setStatus("Screen connection failed: " + err.Error())
-		}
-		return
-	}
-	defer conn.Close()
-	v.owner.appendLog("Screen connection selected relay=%s proxy=%s protocol=%s relay_protocol=%s.", route.RelayAddr, route.Proxy, route.Protocol, route.RelayProtocol)
-	v.setStatus(fmt.Sprintf("Connected through %s via %s (%s); waiting for the first frame...", route.RelayAddr, route.Proxy, route.Protocol))
-	err = screenview.Receive(conn, request, func(frame screenview.Frame, canvas *image.RGBA) error {
-		v.showFrame(canvas, frame.Seq, len(frame.Rects), request.Mode == screenview.ModeStream)
+	hdc := canvas.HDC()
+	v.frameMu.Lock()
+	defer v.frameMu.Unlock()
+	if v.bgra == nil || v.frameWidth == 0 {
 		return nil
-	})
-	if ctx.Err() != nil {
+	}
+	header := win.BITMAPINFOHEADER{
+		BiSize:        uint32(unsafe.Sizeof(win.BITMAPINFOHEADER{})),
+		BiWidth:       int32(v.frameWidth),
+		BiHeight:      -int32(v.frameHeight),
+		BiPlanes:      1,
+		BiBitCount:    32,
+		BiCompression: win.BI_RGB,
+	}
+	setStretchModeScreen.Call(uintptr(hdc), halftone)
+	setBrushOrgScreen.Call(uintptr(hdc), 0, 0, 0)
+	stretchDIBitsScreen.Call(uintptr(hdc), 0, 0, uintptr(bounds.Width), uintptr(bounds.Height),
+		0, 0, uintptr(v.frameWidth), uintptr(v.frameHeight),
+		uintptr(unsafe.Pointer(&v.bgra[0])), uintptr(unsafe.Pointer(&header)), win.DIB_RGB_COLORS, srcCopy)
+	if !v.controlling.Load() && v.cursor.Visible && v.cursorBitmap != 0 && v.cursor.Shape != nil {
+		scaleX := float64(bounds.Width) / float64(v.frameWidth)
+		scaleY := float64(bounds.Height) / float64(v.frameHeight)
+		shape := v.cursor.Shape.Bounds()
+		x := int(float64(v.cursor.X-v.cursor.HotX) * scaleX)
+		y := int(float64(v.cursor.Y-v.cursor.HotY) * scaleY)
+		width := max(1, int(float64(shape.Dx())*math.Max(scaleX, 0.5)))
+		height := max(1, int(float64(shape.Dy())*math.Max(scaleY, 0.5)))
+		memoryDC := win.CreateCompatibleDC(hdc)
+		if memoryDC != 0 {
+			previous := win.SelectObject(memoryDC, win.HGDIOBJ(v.cursorBitmap))
+			blend := uintptr(acSrcOver) | 255<<16 | uintptr(acSrcAlpha)<<24
+			alphaBlendScreen.Call(uintptr(hdc), uintptr(x), uintptr(y), uintptr(width), uintptr(height),
+				uintptr(memoryDC), 0, 0, uintptr(shape.Dx()), uintptr(shape.Dy()), blend)
+			win.SelectObject(memoryDC, previous)
+			win.DeleteDC(memoryDC)
+		}
+	}
+	return nil
+}
+
+// updateCursorResources builds the overlay bitmap and the local cursor for a
+// new remote pointer shape. It runs on the UI thread.
+func (v *screenViewer) updateCursorResources(cursor screenview.CursorState) {
+	if cursor.ShapeID == v.cursorShapeID || cursor.Shape == nil {
 		return
 	}
-	if err != nil {
-		v.setStatus("Screen stream ended: " + err.Error())
+	v.releaseCursorResources()
+	v.cursorShapeID = cursor.ShapeID
+	bitmap, bits := createPremultipliedDIB(cursor.Shape)
+	if bitmap == 0 {
 		return
 	}
-	if request.Mode == screenview.ModeSingle {
-		v.setStatus("Screenshot captured.")
+	v.cursorBitmap = bitmap
+	_ = bits
+	mask := win.CreateBitmap(int32(cursor.Shape.Bounds().Dx()), int32(cursor.Shape.Bounds().Dy()), 1, 1, nil)
+	if mask != 0 {
+		info := struct {
+			IsIcon int32
+			HotX   uint32
+			HotY   uint32
+			_      uint32
+			Mask   win.HBITMAP
+			Color  win.HBITMAP
+		}{HotX: uint32(cursor.HotX), HotY: uint32(cursor.HotY), Mask: mask, Color: bitmap}
+		handle, _, _ := createIconIndirect.Call(uintptr(unsafe.Pointer(&info)))
+		win.DeleteObject(win.HGDIOBJ(mask))
+		v.localCursor = win.HCURSOR(handle)
 	}
 }
 
-func (v *screenViewer) showFrame(source *image.RGBA, sequence uint64, changedTiles int, streaming bool) {
-	copyImage := image.NewRGBA(source.Bounds())
-	draw.Draw(copyImage, copyImage.Bounds(), source, source.Bounds().Min, draw.Src)
-	v.mu.Lock()
-	v.frame = copyImage
-	closed := v.closed
-	v.mu.Unlock()
-	if closed {
-		return
+func (v *screenViewer) releaseCursorResources() {
+	if v.cursorBitmap != 0 {
+		win.DeleteObject(win.HGDIOBJ(v.cursorBitmap))
+		v.cursorBitmap = 0
 	}
-	v.mw.Synchronize(func() {
-		bitmap, err := walk.NewBitmapFromImage(copyImage)
-		if err != nil {
-			v.setStatus("Could not display screen frame: " + err.Error())
-			return
-		}
-		v.mu.Lock()
-		previous := v.bitmap
-		v.bitmap = bitmap
-		v.mu.Unlock()
-		v.sizeWindowForFirstFrame(copyImage.Bounds().Dx(), copyImage.Bounds().Dy())
-		v.layoutScreen()
-		_ = v.canvas.Invalidate()
-		if previous != nil {
-			previous.Dispose()
-		}
-		if streaming {
-			_ = v.status.SetText(fmt.Sprintf("Streaming frame %d (%d changed tiles).", sequence, changedTiles))
-		}
-	})
+	if v.localCursor != 0 {
+		destroyCursorScreen.Call(uintptr(v.localCursor))
+		v.localCursor = 0
+	}
+	v.cursorShapeID = 0
+}
+
+func createPremultipliedDIB(shape *image.RGBA) (win.HBITMAP, []byte) {
+	width, height := shape.Bounds().Dx(), shape.Bounds().Dy()
+	header := win.BITMAPINFOHEADER{
+		BiSize:        uint32(unsafe.Sizeof(win.BITMAPINFOHEADER{})),
+		BiWidth:       int32(width),
+		BiHeight:      -int32(height),
+		BiPlanes:      1,
+		BiBitCount:    32,
+		BiCompression: win.BI_RGB,
+	}
+	var pixels unsafe.Pointer
+	bitmap := win.CreateDIBSection(0, &header, win.DIB_RGB_COLORS, &pixels, 0, 0)
+	if bitmap == 0 || pixels == nil {
+		return 0, nil
+	}
+	bits := unsafe.Slice((*byte)(pixels), width*height*4)
+	for i := 0; i+3 < len(bits) && i+3 < len(shape.Pix); i += 4 {
+		alpha := uint32(shape.Pix[i+3])
+		bits[i] = byte(uint32(shape.Pix[i+2]) * alpha / 255)
+		bits[i+1] = byte(uint32(shape.Pix[i+1]) * alpha / 255)
+		bits[i+2] = byte(uint32(shape.Pix[i]) * alpha / 255)
+		bits[i+3] = byte(alpha)
+	}
+	return bitmap, bits
 }
 
 func (v *screenViewer) sizeWindowForFirstFrame(frameWidth, frameHeight int) {
@@ -621,14 +1388,7 @@ func (v *screenViewer) sizeWindowForFirstFrame(frameWidth, frameHeight int) {
 		Width:  int(monitor.RcWork.Right - monitor.RcWork.Left),
 		Height: int(monitor.RcWork.Bottom - monitor.RcWork.Top),
 	}
-	bounds, maximize := screenViewerStartupBounds(
-		frameWidth,
-		frameHeight,
-		v.mw.BoundsPixels(),
-		v.viewport.ClientBoundsPixels(),
-		work,
-		walk.Size{Width: 720, Height: 500},
-	)
+	bounds, maximize := screenViewerStartupBounds(frameWidth, frameHeight, v.mw.BoundsPixels(), v.viewport.ClientBoundsPixels(), work, walk.Size{Width: 720, Height: 500})
 	if maximize {
 		win.ShowWindow(v.mw.Handle(), win.SW_MAXIMIZE)
 		v.activateWindow()
@@ -646,8 +1406,8 @@ func (v *screenViewer) activateWindow() {
 	win.BringWindowToTop(v.mw.Handle())
 	win.SetForegroundWindow(v.mw.Handle())
 	win.SetActiveWindow(v.mw.Handle())
-	if v.zoomBox != nil {
-		_ = v.zoomBox.SetFocus()
+	if v.canvas != nil {
+		_ = v.canvas.SetFocus()
 	}
 }
 
@@ -667,32 +1427,20 @@ func screenViewerStartupBounds(frameWidth, frameHeight int, window, viewport, wo
 	}, false
 }
 
-func (v *screenViewer) stop() {
-	v.mu.Lock()
-	cancel := v.cancel
-	v.cancel = nil
-	v.streaming = false
-	v.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	v.setStatus("Screen stream stopped.")
-}
-
 func (v *screenViewer) toggleFullscreen() {
 	_ = v.mw.SetFullscreen(!v.mw.Fullscreen())
 }
 
 func (v *screenViewer) savePNG() {
-	v.mu.Lock()
-	if v.frame == nil {
-		v.mu.Unlock()
-		walk.MsgBox(v.mw, "DeskFerry Screen Viewer", "Capture a screenshot before saving.", walk.MsgBoxOK|walk.MsgBoxIconInformation)
+	client := v.liveClient()
+	var frame *image.RGBA
+	if client != nil {
+		frame, _, _ = client.Snapshot()
+	}
+	if frame == nil {
+		walk.MsgBox(v.mw, "DeskFerry Screen Viewer", "Wait for the Work PC's screen before saving.", walk.MsgBoxOK|walk.MsgBoxIconInformation)
 		return
 	}
-	frame := image.NewRGBA(v.frame.Bounds())
-	draw.Draw(frame, frame.Bounds(), v.frame, v.frame.Bounds().Min, draw.Src)
-	v.mu.Unlock()
 	dialog := new(walk.FileDialog)
 	dialog.Title = "Save DeskFerry Screenshot"
 	dialog.Filter = "PNG images (*.png)|*.png"
@@ -726,16 +1474,4 @@ func defaultScreenshotDirectory() string {
 		}
 	}
 	return "."
-}
-
-func (v *screenViewer) setStatus(text string) {
-	v.mu.Lock()
-	closed := v.closed
-	v.mu.Unlock()
-	if closed || v.mw == nil {
-		return
-	}
-	v.mw.Synchronize(func() {
-		_ = v.status.SetText(text)
-	})
 }
