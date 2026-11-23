@@ -4,6 +4,7 @@ package homewindows
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -69,7 +70,24 @@ func TestManualLiveScreenThroughRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("status: %s", status.Text)
-	if _, err := agent.Do(ctx, "left_click", screenagent.Args{}); err == nil || !strings.Contains(err.Error(), "control_not_allowed") {
+	if os.Getenv("DESKFERRY_MANUAL_RELAY_CONTROL") == "1" {
+		// Move the pointer to where it already is: control without a visible effect.
+		position, err := agent.Do(ctx, "cursor_position", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		coordinate, _ := json.Marshal(position.Data.(map[string]any)["coordinate"])
+		moved, err := agent.Do(ctx, "mouse_move", screenagent.Args{"coordinate": coordinate})
+		t.Logf("mouse_move %s: %q, %v", coordinate, moved.Text, err)
+		if err != nil && !strings.Contains(err.Error(), "outside") {
+			t.Fatal(err)
+		}
+		tapped, err := agent.Do(ctx, "key", screenagent.Args{"text": json.RawMessage(`"shift"`)})
+		t.Logf("key shift: %q, %v", tapped.Text, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+	} else if _, err := agent.Do(ctx, "left_click", screenagent.Args{}); err == nil || !strings.Contains(err.Error(), "control_not_allowed") {
 		t.Fatalf("a click without -screen-control = %v; want control_not_allowed", err)
 	}
 	if path := os.Getenv("DESKFERRY_MANUAL_SCREENSHOT"); path != "" {
