@@ -9,23 +9,44 @@ import javax.crypto.spec.SecretKeySpec;
 import okio.ByteString;
 
 /**
- * Live screen key derivation (docs/screen-live-protocol.md). The relay only ever sees the room
- * proof, which is a different derivation, so it cannot recover this key.
+ * Live screen key derivation (docs/screen-live-protocol.md). The key is derived from the room
+ * proof the app already saves, so no extra secret is needed; the relays, which see the proof,
+ * could derive it too.
  */
 final class ScreenKeys {
     private ScreenKeys() {
     }
 
-    /** Returns base64url(HKDF-SHA256(password, "DeskFerry screen key v1\0" + lower(trim(room)))), or "". */
-    static String deriveScreenKey(String room, String password) {
+    /** Returns base64url(HKDF-SHA256(proof, "DeskFerry screen key v2\0")), or "" without a proof. */
+    static String fromProof(String proof) {
+        String value = proof == null ? "" : proof.trim();
+        if (value.isEmpty()) {
+            return "";
+        }
+        byte[] key = hkdf(value.getBytes(StandardCharsets.UTF_8),
+                "DeskFerry screen key v2\u0000".getBytes(StandardCharsets.UTF_8),
+                "DeskFerry live screen PSK".getBytes(StandardCharsets.UTF_8), 32);
+        return base64Url(key);
+    }
+
+    /** The room proof for a room name and password, as RelayUrls.roomPasswordProof computes it. */
+    static String roomProof(String room, String password) {
         if (password == null || password.isEmpty()) {
             return "";
         }
         String normalizedRoom = room == null ? "" : room.trim().toLowerCase(Locale.ROOT);
-        byte[] salt = ("DeskFerry screen key v1\u0000" + normalizedRoom).getBytes(StandardCharsets.UTF_8);
-        byte[] key = hkdf(password.getBytes(StandardCharsets.UTF_8), salt,
-                "DeskFerry live screen PSK".getBytes(StandardCharsets.UTF_8), 32);
-        return base64Url(key);
+        String material = "DeskFerry room credential v1\u0000" + normalizedRoom + "\u0000" + password;
+        try {
+            return base64Url(java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(material.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception ex) {
+            throw new IllegalStateException("SHA-256 is unavailable", ex);
+        }
+    }
+
+    /** Returns the screen key for a room name and password, or "". */
+    static String deriveScreenKey(String room, String password) {
+        return fromProof(roomProof(room, password));
     }
 
     /** Derives the screen key for the room named by a relay room URL, the same room the room proof uses. */

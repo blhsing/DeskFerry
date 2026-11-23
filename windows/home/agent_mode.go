@@ -18,7 +18,7 @@ import (
 // standard input and output, as an MCP server or as JSON lines.
 func runScreenAgent(ctx context.Context, cfg config, mcp bool, opts screenagent.Options) error {
 	if cfg.screenKey() == "" {
-		return errors.New("the selected destination has no live screen key: open DeskFerry, select the destination, and save its room password again (or open its Screen Viewer once)")
+		return errors.New("the selected destination has no saved room password: save it in DeskFerry first")
 	}
 	hostname, _ := os.Hostname()
 	connect := func(ctx context.Context) (*screenview.LiveClient, error) {

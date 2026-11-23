@@ -1107,7 +1107,7 @@ public class MainActivity extends Activity {
 					.putExtra(ScreenViewerActivity.EXTRA_RELAY_URLS, relayUrl)
 					.putExtra(ScreenViewerActivity.EXTRA_PROXY, proxy)
 					.putExtra(ScreenViewerActivity.EXTRA_ROOM_PROOF, proof)
-					.putExtra(ScreenViewerActivity.EXTRA_SCREEN_KEY, destinations.get(selectedDestination).screenKey)
+					.putExtra(ScreenViewerActivity.EXTRA_SCREEN_KEY, ScreenKeys.fromProof(proof))
 					.putExtra(ScreenViewerActivity.EXTRA_DESTINATION, destinations.get(selectedDestination).name);
 			startActivity(intent);
 		} catch (Exception ex) {

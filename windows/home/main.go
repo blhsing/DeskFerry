@@ -81,18 +81,15 @@ type config struct {
 }
 
 type destinationProfile struct {
-	Name       string   `json:"name"`
-	RelayAddrs []string `json:"relay_addrs"`
-	RelayBases []string `json:"relay_bases,omitempty"`
-	Room       string   `json:"room,omitempty"`
-	Proxy      string   `json:"proxy,omitempty"`
-	RoomProof  string   `json:"room_proof,omitempty"`
-	// ScreenKey is the live screen key derived from the room password; the
-	// relay never sees it. See docs/screen-live-protocol.md.
-	ScreenKey       string `json:"screen_key,omitempty"`
-	WindowsUser     string `json:"windows_user,omitempty"`
-	PasswordlessRDP bool   `json:"passwordless_rdp,omitempty"`
-	SMBAlias        string `json:"smb_alias,omitempty"`
+	Name            string   `json:"name"`
+	RelayAddrs      []string `json:"relay_addrs"`
+	RelayBases      []string `json:"relay_bases,omitempty"`
+	Room            string   `json:"room,omitempty"`
+	Proxy           string   `json:"proxy,omitempty"`
+	RoomProof       string   `json:"room_proof,omitempty"`
+	WindowsUser     string   `json:"windows_user,omitempty"`
+	PasswordlessRDP bool     `json:"passwordless_rdp,omitempty"`
+	SMBAlias        string   `json:"smb_alias,omitempty"`
 	// TCPForwards lists loopback listeners as "localPort=forwardPort" entries
 	// separated by semicolons; each reaches the Work agent's forward port.
 	TCPForwards string `json:"tcp_forwards,omitempty"`
@@ -953,7 +950,7 @@ func destinationNames(values []destinationProfile) []string {
 func cloneDestinations(values []destinationProfile) []destinationProfile {
 	out := make([]destinationProfile, len(values))
 	for i, value := range values {
-		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RelayBases: append([]string(nil), value.RelayBases...), Room: value.Room, Proxy: value.Proxy, RoomProof: value.RoomProof, ScreenKey: value.ScreenKey, WindowsUser: value.WindowsUser, PasswordlessRDP: value.PasswordlessRDP, SMBAlias: value.SMBAlias, TCPForwards: value.TCPForwards}
+		out[i] = destinationProfile{Name: value.Name, RelayAddrs: append([]string(nil), value.RelayAddrs...), RelayBases: append([]string(nil), value.RelayBases...), Room: value.Room, Proxy: value.Proxy, RoomProof: value.RoomProof, WindowsUser: value.WindowsUser, PasswordlessRDP: value.PasswordlessRDP, SMBAlias: value.SMBAlias, TCPForwards: value.TCPForwards}
 	}
 	return out
 }
@@ -1085,7 +1082,6 @@ func (a *clientApp) commitDestinationProfile() error {
 		}
 		if !strings.EqualFold(oldRoom, destination.Room) {
 			destination.RoomProof = ""
-			destination.ScreenKey = ""
 		}
 		if err := destination.rebuildRelayAddrs(); err != nil {
 			return err
@@ -1619,15 +1615,12 @@ func (a *clientApp) configFromUI() (config, error) {
 			return config{}, err
 		}
 		proof := cfg.Destinations[a.selectedDestination].RoomProof
-		screenKey := cfg.Destinations[a.selectedDestination].ScreenKey
 		if a.clearRoomPassword.Checked() {
-			proof, screenKey = "", ""
+			proof = ""
 		} else if password := a.roomPass.Text(); password != "" {
 			proof = tunnel.RoomPasswordProof(cfg.primaryRelayAddress(), "", password)
-			screenKey = screenview.DeriveScreenKeyForRelay(cfg.primaryRelayAddress(), password)
 		}
 		cfg.Destinations[a.selectedDestination].RoomProof = proof
-		cfg.Destinations[a.selectedDestination].ScreenKey = screenKey
 		cfg.RoomProof = proof
 	}
 	if _, _, err := net.SplitHostPort(cfg.ListenAddr); err != nil {
@@ -2325,12 +2318,11 @@ func importInstalledWorkProfile(cfg *config) (bool, error) {
 	for suffix := 2; seen[strings.ToLower(name)]; suffix++ {
 		name = fmt.Sprintf("%s %d", baseName, suffix)
 	}
-	proof, screenKey := "", ""
+	proof := ""
 	if passwordPath := commandLineOption(args, "-room-password-file"); passwordPath != "" {
 		if protected, readErr := os.ReadFile(passwordPath); readErr == nil {
 			if password, unprotectErr := winsecret.Unprotect(protected); unprotectErr == nil {
 				proof = tunnel.RoomPasswordProof(relays[0], "", password)
-				screenKey = screenview.DeriveScreenKeyForRelay(relays[0], password)
 			}
 		}
 	}
@@ -2341,7 +2333,6 @@ func importInstalledWorkProfile(cfg *config) (bool, error) {
 		Room:       room,
 		Proxy:      proxy,
 		RoomProof:  proof,
-		ScreenKey:  screenKey,
 		SMBAlias:   homenetwork.DefaultAlias,
 	})
 	return true, nil
@@ -2554,7 +2545,7 @@ func (c *config) ensureDestinations() error {
 		if err != nil {
 			return fmt.Errorf("destination %q: %w", name, err)
 		}
-		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RelayBases: destination.RelayBases, Room: destination.Room, Proxy: destination.Proxy, RoomProof: destination.RoomProof, ScreenKey: destination.ScreenKey, WindowsUser: destination.WindowsUser, PasswordlessRDP: destination.PasswordlessRDP, SMBAlias: alias, TCPForwards: tunnel.FormatTCPForwardListeners(forwards)})
+		normalized = append(normalized, destinationProfile{Name: name, RelayAddrs: relays, RelayBases: destination.RelayBases, Room: destination.Room, Proxy: destination.Proxy, RoomProof: destination.RoomProof, WindowsUser: destination.WindowsUser, PasswordlessRDP: destination.PasswordlessRDP, SMBAlias: alias, TCPForwards: tunnel.FormatTCPForwardListeners(forwards)})
 	}
 	selected := 0
 	for i, destination := range normalized {
@@ -3093,32 +3084,9 @@ func (c config) withRelayAddress(relayAddr string) config {
 	return next
 }
 
-// screenKey returns the selected destination's live screen key.
+// screenKey returns the live screen key, derived from the saved room proof.
 func (c config) screenKey() string {
-	for _, destination := range c.Destinations {
-		if strings.EqualFold(destination.Name, c.SelectedDestination) {
-			return destination.ScreenKey
-		}
-	}
-	return ""
-}
-
-// saveScreenKey stores the live screen key for the selected destination after
-// checking the password against its saved room proof.
-func (c *config) saveScreenKey(password string) error {
-	for index := range c.Destinations {
-		destination := &c.Destinations[index]
-		if !strings.EqualFold(destination.Name, c.SelectedDestination) {
-			continue
-		}
-		relay := c.primaryRelayAddress()
-		if destination.RoomProof != "" && tunnel.RoomPasswordProof(relay, "", password) != destination.RoomProof {
-			return errors.New("that is not the room password saved for this destination")
-		}
-		destination.ScreenKey = screenview.DeriveScreenKeyForRelay(relay, password)
-		return nil
-	}
-	return errors.New("select a destination first")
+	return screenview.ScreenKeyFromProof(c.roomProof())
 }
 
 func (c config) roomProof() string {

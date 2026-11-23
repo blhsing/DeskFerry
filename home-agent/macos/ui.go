@@ -29,7 +29,6 @@ type macProfile struct {
 	RelayBases  []string `json:"relay_bases"`
 	Room        string   `json:"room"`
 	RoomProof   string   `json:"-"`
-	ScreenKey   string   `json:"-"`
 	WindowsUser string   `json:"windows_user,omitempty"`
 }
 
@@ -221,14 +220,13 @@ func (c *macUIController) applySettings(request settingsRequest) error {
 	c.mu.Lock()
 	old := c.settings
 	c.mu.Unlock()
-	proofs := make(map[string][2]string, len(old.Profiles))
+	proofs := make(map[string]string, len(old.Profiles))
 	for _, profile := range old.Profiles {
-		proofs[profile.Name+"\x00"+profile.Room] = [2]string{profile.RoomProof, profile.ScreenKey}
+		proofs[profile.Name+"\x00"+profile.Room] = profile.RoomProof
 	}
 	for index := range settings.Profiles {
 		profile := &settings.Profiles[index]
-		saved := proofs[profile.Name+"\x00"+profile.Room]
-		profile.RoomProof, profile.ScreenKey = saved[0], saved[1]
+		profile.RoomProof = proofs[profile.Name+"\x00"+profile.Room]
 	}
 	// A profile rename keeps its credential when its room and profile count
 	// are unchanged. Add/delete operations intentionally require an exact
@@ -237,19 +235,18 @@ func (c *macUIController) applySettings(request settingsRequest) error {
 		selected := &settings.Profiles[settings.Selected]
 		previous := old.Profiles[old.Selected]
 		if selected.RoomProof == "" && selected.Room == previous.Room {
-			selected.RoomProof, selected.ScreenKey = previous.RoomProof, previous.ScreenKey
+			selected.RoomProof = previous.RoomProof
 		}
 	}
 	selected := &settings.Profiles[settings.Selected]
 	if request.ClearPassword {
-		selected.RoomProof, selected.ScreenKey = "", ""
+		selected.RoomProof = ""
 	} else if request.RoomPassword != "" {
 		relay, composeErr := tunnel.RelayRoomURL(selected.RelayBases[0], selected.Room)
 		if composeErr != nil {
 			return composeErr
 		}
 		selected.RoomProof = tunnel.RoomPasswordProof(relay, "", request.RoomPassword)
-		selected.ScreenKey = screenview.DeriveScreenKeyForRelay(relay, request.RoomPassword)
 	}
 	cfg, err := settingsConfig(settings)
 	if err != nil {
@@ -394,7 +391,7 @@ func settingsConfig(settings macSettings) (config, error) {
 		}
 		relays = append(relays, relay)
 	}
-	cfg := config{RelayAddrs: relays, ListenAddr: settings.ListenAddr, Proxy: settings.Proxy, RoomProof: profile.RoomProof, ScreenKey: profile.ScreenKey}
+	cfg := config{RelayAddrs: relays, ListenAddr: settings.ListenAddr, Proxy: settings.Proxy, RoomProof: profile.RoomProof}
 	cfg.applyDefaults()
 	cfg.setRelayAddresses(relays)
 	return cfg, cfg.validate()
@@ -448,7 +445,6 @@ type persistedProfile struct {
 	RelayBases  []string `json:"relay_bases"`
 	Room        string   `json:"room"`
 	RoomProof   string   `json:"room_proof,omitempty"`
-	ScreenKey   string   `json:"screen_key,omitempty"`
 	WindowsUser string   `json:"windows_user,omitempty"`
 }
 
@@ -477,7 +473,7 @@ func loadMacSettings(initial config) (macSettings, error) {
 	}
 	settings := macSettings{ListenAddr: stored.ListenAddr, Proxy: stored.Proxy, Selected: stored.Selected}
 	for _, profile := range stored.Profiles {
-		settings.Profiles = append(settings.Profiles, macProfile{Name: profile.Name, RelayBases: profile.RelayBases, Room: profile.Room, RoomProof: profile.RoomProof, ScreenKey: profile.ScreenKey, WindowsUser: profile.WindowsUser})
+		settings.Profiles = append(settings.Profiles, macProfile{Name: profile.Name, RelayBases: profile.RelayBases, Room: profile.Room, RoomProof: profile.RoomProof, WindowsUser: profile.WindowsUser})
 	}
 	if _, err := settingsConfig(settings); err != nil {
 		return macSettings{}, err
@@ -495,7 +491,7 @@ func saveMacSettings(settings macSettings) error {
 	}
 	stored := persistedSettings{ListenAddr: settings.ListenAddr, Proxy: settings.Proxy, Selected: settings.Selected}
 	for _, profile := range settings.Profiles {
-		stored.Profiles = append(stored.Profiles, persistedProfile{Name: profile.Name, RelayBases: profile.RelayBases, Room: profile.Room, RoomProof: profile.RoomProof, ScreenKey: profile.ScreenKey, WindowsUser: profile.WindowsUser})
+		stored.Profiles = append(stored.Profiles, persistedProfile{Name: profile.Name, RelayBases: profile.RelayBases, Room: profile.Room, RoomProof: profile.RoomProof, WindowsUser: profile.WindowsUser})
 	}
 	data, err := json.MarshalIndent(stored, "", "  ")
 	if err != nil {

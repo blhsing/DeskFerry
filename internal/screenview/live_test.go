@@ -240,9 +240,9 @@ func TestEncodeTilesIsLosslessWhenRequested(t *testing.T) {
 	}
 }
 
-// The Android Home app derives the same key independently.
+// The Android Home app derives the same key independently, from the room proof.
 func TestDeriveScreenKeyVector(t *testing.T) {
-	if got := DeriveScreenKey(" Room ", "secret"); got != "PItwQOf-jR64vU-hYIMmCb8unUCBQe1pwhe2BbA_iQE" {
+	if got := DeriveScreenKey(" Room ", "secret"); got != "Z2eEzs6T6rqmtt2ZMsMIPsDWsknsfEUvRLfwZxkTmBU" {
 		t.Fatalf("DeriveScreenKey = %s", got)
 	}
 }

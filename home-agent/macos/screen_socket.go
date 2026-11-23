@@ -319,8 +319,6 @@ func (s *macScreenSocket) start(parent context.Context) {
 		switch {
 		case client.Legacy():
 			s.setPhase("legacy", "Read-only: the Work PC runs an older DeskFerry")
-		case cfg.screenKey() == "":
-			s.setPhase("legacy", "Read-only: save the room password again to enable live view and control")
 		case client.Hello().ControlAllowed:
 			s.setPhase("live", "Live through "+relayAddr)
 		default:

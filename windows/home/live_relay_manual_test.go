@@ -40,7 +40,6 @@ func TestManualLiveScreenThroughRelay(t *testing.T) {
 		RelayAddrs: relays,
 		Room:       room,
 		RoomProof:  tunnel.RoomPasswordProof(relays[0], "", password),
-		ScreenKey:  screenview.DeriveScreenKeyForRelay(relays[0], password),
 	}}
 	connect := func(ctx context.Context) (*screenview.LiveClient, error) {
 		conn, route, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)

@@ -41,17 +41,22 @@ helper. The Go implementation is `internal/screenview` (`live_*.go`).
 
 ## Keys and handshake
 
-The pre-shared key is derived from the room password and the room name, so the
-relay (which only ever sees the room proof) cannot derive it:
+The pre-shared key is derived from the room proof, the credential every Home
+app already saves for a room (the Work agent computes the same proof from its
+stored room password), so viewers and agents never ask for anything extra:
 
 ```
-PSK = HKDF-SHA256(secret = UTF-8 room password,
-                  salt   = "DeskFerry screen key v1\x00" + lower(trim(room)),
-                  info   = "DeskFerry live screen PSK", length 32)
+proof = base64url(SHA-256("DeskFerry room credential v1\x00" + lower(trim(room)) + "\x00" + password))
+PSK   = HKDF-SHA256(secret = UTF-8 proof,
+                    salt   = "DeskFerry screen key v2\x00",
+                    info   = "DeskFerry live screen PSK", length 32)
 ```
 
-Home apps store PSK (base64url, no padding) next to the room proof when the
-room password is saved. The Work agent derives it from its stored password.
+The relays see the proof when they pair a room, so they could derive the PSK
+too. The encryption therefore keeps the screen and input private from anyone
+who cannot authenticate to the room, such as other relay users and anyone
+reading traffic to the HTTPS relay, but not from a relay operator or from
+someone who can read the plain-HTTP traffic to the OCI relay.
 
 ECDH uses P-256 with uncompressed points (65 bytes, `0x04 || X || Y`).
 
@@ -68,7 +73,8 @@ K_s2c  = HKDF-Expand(PRK, "DeskFerry s2c", 32)
 ```
 
 The client must verify `S_mac` before using the keys; a mismatch means the
-room password differs (report `room password mismatch`).
+room password differs, or one side runs DeskFerry 0.15.0 or 0.15.1, which
+derived the key from the password itself (report `room password mismatch`).
 
 ## Secure records
 

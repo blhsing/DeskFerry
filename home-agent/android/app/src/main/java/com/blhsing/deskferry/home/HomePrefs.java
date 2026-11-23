@@ -61,7 +61,6 @@ final class HomePrefs {
         String room;
         String roomProof;
         /** Live screen pre-shared key (base64url), derived with the room proof; empty when unknown. */
-        String screenKey = "";
 
         Destination(String name, String relayUrl) {
             this(name, relayUrl, "");
@@ -116,7 +115,6 @@ final class HomePrefs {
                         continue;
                     }
                     Destination loaded = result.get(result.size() - 1);
-                    loaded.screenKey = loaded.roomProof.isEmpty() ? "" : item.optString("screen_key", "").trim();
                 }
             } catch (JSONException ignored) {
                 result.clear();
@@ -161,7 +159,6 @@ final class HomePrefs {
                 item.put("room", destination.room == null ? RelayUrls.DEFAULT_ROOM : destination.room.trim());
                 item.put("room_proof", destination.roomProof == null ? "" : destination.roomProof.trim());
                 String proof = destination.roomProof == null ? "" : destination.roomProof.trim();
-                item.put("screen_key", proof.isEmpty() || destination.screenKey == null ? "" : destination.screenKey.trim());
             } catch (JSONException ignored) {
             }
             array.put(item);
@@ -188,15 +185,13 @@ final class HomePrefs {
         return destinations.get(loadSelectedDestination(context, destinations.size())).roomProof;
     }
 
-    /** Sets or clears the room credential: the relay room proof and the live screen key together. */
+    /** Sets or clears the room credential, the relay room proof; the live screen key derives from it. */
     static void setRoomCredential(Destination destination, String relayUrl, String password) {
         if (password == null || password.isEmpty()) {
             destination.roomProof = "";
-            destination.screenKey = "";
             return;
         }
         destination.roomProof = RelayUrls.roomPasswordProof(relayUrl, password);
-        destination.screenKey = ScreenKeys.deriveScreenKeyForRelay(relayUrl, password);
     }
 
     private static String sanitizeName(String value) {

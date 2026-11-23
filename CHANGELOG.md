@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.15.2 - 2026-11-23
+
+- Fix the Windows Screen Viewer showing a black screen. Frames arrived, but the viewer drew them with a call the window's paint surface rejected; it now draws them through a GDI bitmap, as before 0.15.0.
+- Use the saved room password for live screen sessions on every platform, with no extra prompt. The session key is now derived from the room proof each Home app already saves, so the Windows viewer no longer asks for the room password, destinations saved before 0.15.0 work as they are, and a key typed into 0.15.0's prompt can no longer be lost when settings are saved. Because the relays see the room proof, they could derive this key too; the encryption still keeps the screen private from everyone else. Home apps and Work agents on 0.15.0 or 0.15.1 cannot open live sessions with 0.15.2 until both sides are upgraded.
+- Say why a view is read-only: the viewer no longer blames an older Work PC when the destination simply has no room password.
+
 ## 0.15.1 - 2026-11-23
 
 - Fix `-agent-mcp` and `-agent-json` through the relays. The agent closed its relay connection as soon as the screen session had opened, so every screenshot and action failed with "no screen image has arrived yet". Tests had used an in-memory connection that did not show this. The viewers were not affected.

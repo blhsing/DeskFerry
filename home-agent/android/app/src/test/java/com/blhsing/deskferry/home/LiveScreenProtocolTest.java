@@ -39,9 +39,10 @@ public class LiveScreenProtocolTest {
     @Test
     public void screenKeyMatchesIndependentVector() {
         // Computed independently with Python hmac/hashlib (RFC 5869).
-        assertEquals("PItwQOf-jR64vU-hYIMmCb8unUCBQe1pwhe2BbA_iQE", ScreenKeys.deriveScreenKey("room", "secret"));
-        assertEquals("PItwQOf-jR64vU-hYIMmCb8unUCBQe1pwhe2BbA_iQE", ScreenKeys.deriveScreenKey("  ROOM ", "secret"));
-        assertEquals("xeSigwTbQv08SM4MNl3m9K6_uSN5e9dqZylf9Wklp7U", ScreenKeys.deriveScreenKey("workdesk", "secret"));
+        // Same vector as TestDeriveScreenKeyVector in the Go implementation.
+        assertEquals("Z2eEzs6T6rqmtt2ZMsMIPsDWsknsfEUvRLfwZxkTmBU", ScreenKeys.deriveScreenKey("room", "secret"));
+        assertEquals("Z2eEzs6T6rqmtt2ZMsMIPsDWsknsfEUvRLfwZxkTmBU", ScreenKeys.deriveScreenKey("  ROOM ", "secret"));
+        assertEquals(ScreenKeys.fromProof(ScreenKeys.roomProof("room", "secret")), ScreenKeys.deriveScreenKey("room", "secret"));
         assertEquals("", ScreenKeys.deriveScreenKey("room", ""));
         assertEquals(32, ScreenKeys.decodeScreenKey(ScreenKeys.deriveScreenKey("room", "secret")).length);
         assertNull(ScreenKeys.decodeScreenKey("not a key"));

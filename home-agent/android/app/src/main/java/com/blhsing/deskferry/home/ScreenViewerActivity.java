@@ -469,7 +469,7 @@ public class ScreenViewerActivity extends Activity {
     private String controlUnavailableReason() {
         if (phase == Phase.LEGACY) {
             return screenKey.isEmpty()
-                    ? "save the room password again for this destination to enable live control"
+                    ? "save a room password for this destination to enable live control"
                     : "the Work PC runs an older DeskFerry that only offers a read-only view; upgrade it to enable control";
         }
         if (phase != Phase.LIVE) return "start the live view first";
@@ -1295,7 +1295,7 @@ public class ScreenViewerActivity extends Activity {
             text.append("Read-only view · ").append(rates);
             if (!size.isEmpty()) text.append(" · ").append(size);
             text.append(screenKey.isEmpty()
-                    ? " · Save the room password again for this destination to enable live control."
+                    ? " · Save a room password for this destination to enable live control."
                     : " · The Work PC runs an older DeskFerry; upgrade it to enable live control.");
             tone = Ui.Tone.INFO;
             chip = "Read-only";

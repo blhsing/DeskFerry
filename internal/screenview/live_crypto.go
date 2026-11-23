@@ -30,25 +30,38 @@ const (
 // password than the one this client derived its screen key from.
 var ErrRoomPasswordMismatch = errors.New("room password mismatch: re-enter the room password for this destination")
 
-// DeriveScreenKey derives the live screen pre-shared key from the room name and
-// password. The relay only ever sees the room proof, which is a different
-// derivation, so it cannot recover this key.
-func DeriveScreenKey(room, password string) string {
-	if password == "" {
+// ScreenKeyFromProof derives the live screen pre-shared key from a room
+// proof, the credential Home apps already save, so no extra secret has to be
+// entered. Anyone who holds the proof (which the relays see when they pair a
+// room) can derive this key too: the encryption protects against parties who
+// cannot authenticate to the room, not against the relays.
+func ScreenKeyFromProof(proof string) string {
+	proof = strings.TrimSpace(proof)
+	if proof == "" {
 		return ""
 	}
-	room = strings.ToLower(strings.TrimSpace(room))
-	key, err := hkdf.Key(sha256.New, []byte(password), []byte("DeskFerry screen key v1\x00"+room), "DeskFerry live screen PSK", 32)
+	key, err := hkdf.Key(sha256.New, []byte(proof), []byte("DeskFerry screen key v2\x00"), "DeskFerry live screen PSK", 32)
 	if err != nil {
 		return ""
 	}
 	return base64.RawURLEncoding.EncodeToString(key)
 }
 
+// DeriveScreenKey derives the screen key from a room name and password.
+func DeriveScreenKey(room, password string) string {
+	if password == "" {
+		return ""
+	}
+	return ScreenKeyFromProof(tunnel.RoomPasswordProof("", strings.TrimSpace(room), password))
+}
+
 // DeriveScreenKeyForRelay derives the screen key for the room named by a relay
-// room URL, the same room RoomPasswordProof uses.
+// room URL.
 func DeriveScreenKeyForRelay(relayAddr, password string) string {
-	return DeriveScreenKey(tunnel.RelayRoomToken(relayAddr, ""), password)
+	if password == "" {
+		return ""
+	}
+	return ScreenKeyFromProof(tunnel.RoomPasswordProof(relayAddr, "", password))
 }
 
 func decodeScreenKey(value string) ([]byte, error) {

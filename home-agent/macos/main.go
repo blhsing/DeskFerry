@@ -47,19 +47,11 @@ type config struct {
 	Proxy        string
 	RoomPassword string
 	RoomProof    string
-	// ScreenKey is the saved live screen key; with only a room password the
-	// key is derived on demand.
-	ScreenKey string
 }
 
+// screenKey returns the live screen key, derived from the room proof.
 func (c config) screenKey() string {
-	if c.ScreenKey != "" {
-		return c.ScreenKey
-	}
-	if c.RoomPassword != "" {
-		return screenview.DeriveScreenKeyForRelay(c.primaryRelayAddress(), c.RoomPassword)
-	}
-	return ""
+	return screenview.ScreenKeyFromProof(roomProof(c, c.primaryRelayAddress()))
 }
 
 type relayURLFlag []string
@@ -925,7 +917,7 @@ func emptyAs(value, fallback string) string {
 // input and output, as an MCP server or as JSON lines.
 func runScreenAgent(ctx context.Context, cfg config, mcp bool, opts screenagent.Options) error {
 	if cfg.screenKey() == "" {
-		return errors.New("this destination has no live screen key: save its room password again in the DeskFerry control panel, or pass -room-password")
+		return errors.New("this destination has no saved room password: save it in the DeskFerry control panel, or pass -room-password")
 	}
 	hostname, _ := os.Hostname()
 	connect := func(ctx context.Context) (*screenview.LiveClient, error) {

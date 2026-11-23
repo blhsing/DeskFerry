@@ -61,8 +61,10 @@ type screenViewer struct {
 	panStartY            int
 
 	// Framebuffer copy in the BGRA layout GDI draws.
-	frameMu     sync.Mutex
+	frameMu sync.Mutex
+	// bgra is the pixel memory of frameDIB, a top-down 32-bit DIB section.
 	bgra        []byte
+	frameDIB    win.HBITMAP
 	frameWidth  int
 	frameHeight int
 	lossless    bool
@@ -119,7 +121,6 @@ var (
 	getGestureInfoScreen   = user32ScreenViewer.NewProc("GetGestureInfo")
 	closeGestureInfoScreen = user32ScreenViewer.NewProc("CloseGestureInfoHandle")
 	setGestureConfigScreen = user32ScreenViewer.NewProc("SetGestureConfig")
-	stretchDIBitsScreen    = gdi32ScreenViewer.NewProc("StretchDIBits")
 	setStretchModeScreen   = gdi32ScreenViewer.NewProc("SetStretchBltMode")
 	setBrushOrgScreen      = gdi32ScreenViewer.NewProc("SetBrushOrgEx")
 	alphaBlendScreen       = msimg32ScreenViewer.NewProc("AlphaBlend")
@@ -215,58 +216,7 @@ func (a *clientApp) openScreenViewer() {
 	viewer.mw.Show()
 	win.ShowWindow(viewer.mw.Handle(), win.SW_MAXIMIZE)
 	viewer.activateWindow()
-	if cfg.screenKey() == "" {
-		viewer.askForScreenKey()
-	}
 	viewer.start()
-}
-
-// askForScreenKey asks once for the room password so live view and control
-// can use a key the relay never sees. Cancel keeps the read-only stream.
-func (v *screenViewer) askForScreenKey() {
-	var dialog *walk.Dialog
-	var password *walk.LineEdit
-	var message *walk.Label
-	var accept, cancel *walk.PushButton
-	_, err := Dialog{
-		AssignTo:      &dialog,
-		Title:         "Enable live view and control",
-		Font:          uikit.BodyFont(),
-		DefaultButton: &accept,
-		CancelButton:  &cancel,
-		MinSize:       Size{Width: 460},
-		Layout:        VBox{Margins: Margins{Left: uikit.Space16, Top: uikit.Space16, Right: uikit.Space16, Bottom: uikit.Space16}, Spacing: uikit.Space8},
-		Children: []Widget{
-			Label{Text: "Live view and remote control encrypt the screen end to end with a key derived from this destination's room password. Enter the room password once to save that key.", MinSize: Size{Width: 420}},
-			LineEdit{AssignTo: &password, PasswordMode: true, CueBanner: "Room password"},
-			Label{AssignTo: &message, TextColor: uikit.ToneDanger.Palette().Foreground},
-			Composite{
-				Layout: HBox{MarginsZero: true},
-				Children: []Widget{
-					HSpacer{},
-					PushButton{AssignTo: &cancel, Text: "Use read-only view", OnClicked: func() { dialog.Cancel() }},
-					PushButton{AssignTo: &accept, Text: "Save and connect", OnClicked: func() {
-						cfg := v.owner.currentConfig()
-						if err := cfg.saveScreenKey(password.Text()); err != nil {
-							_ = message.SetText(err.Error())
-							return
-						}
-						if err := saveSettingsConfig(cfg); err != nil {
-							_ = message.SetText(err.Error())
-							return
-						}
-						v.owner.mu.Lock()
-						v.owner.cfg = cfg
-						v.owner.mu.Unlock()
-						dialog.Accept()
-					}},
-				},
-			},
-		},
-	}.Run(v.mw)
-	if err != nil {
-		v.setStatus("Could not ask for the room password: " + err.Error())
-	}
 }
 
 // createWindow builds the viewer window with its dark toolbar strip.
@@ -386,6 +336,12 @@ func (v *screenViewer) createWindow(title string, owner *walk.MainWindow) error 
 		}
 		close(v.inputs)
 		v.releaseCursorResources()
+		v.frameMu.Lock()
+		if v.frameDIB != 0 {
+			win.DeleteObject(win.HGDIOBJ(v.frameDIB))
+			v.frameDIB, v.bgra = 0, nil
+		}
+		v.frameMu.Unlock()
 	})
 	return nil
 }
@@ -470,8 +426,6 @@ func (v *screenViewer) run(ctx context.Context) {
 	case client.Legacy():
 		v.controlAllowed.Store(false)
 		v.setStatus("Read-only view: the Work PC runs an older DeskFerry without live view and control.")
-	case cfg.screenKey() == "":
-		v.setStatus("Read-only view: save the room password in this viewer to enable live view and control.")
 	default:
 		v.controlAllowed.Store(client.Hello().ControlAllowed)
 		if client.Hello().ControlAllowed {
@@ -553,7 +507,14 @@ func (v *screenViewer) onFrame(update screenview.FrameUpdate) {
 		defer v.frameMu.Unlock()
 		dirty := update.Dirty
 		if v.frameWidth != width || v.frameHeight != height || v.bgra == nil {
-			v.bgra = make([]byte, width*height*4)
+			if v.frameDIB != 0 {
+				win.DeleteObject(win.HGDIOBJ(v.frameDIB))
+				v.frameDIB, v.bgra = 0, nil
+			}
+			v.frameDIB, v.bgra = createFrameDIB(width, height)
+			if v.frameDIB == 0 {
+				return
+			}
 			v.frameWidth, v.frameHeight = width, height
 			dirty = []image.Rectangle{fb.Bounds()}
 			resized = true
@@ -1261,22 +1222,21 @@ func (v *screenViewer) paintScreen(canvas *walk.Canvas, _ walk.Rectangle) error 
 	hdc := canvas.HDC()
 	v.frameMu.Lock()
 	defer v.frameMu.Unlock()
-	if v.bgra == nil || v.frameWidth == 0 {
+	if v.frameDIB == 0 || v.frameWidth == 0 {
 		return nil
 	}
-	header := win.BITMAPINFOHEADER{
-		BiSize:        uint32(unsafe.Sizeof(win.BITMAPINFOHEADER{})),
-		BiWidth:       int32(v.frameWidth),
-		BiHeight:      -int32(v.frameHeight),
-		BiPlanes:      1,
-		BiBitCount:    32,
-		BiCompression: win.BI_RGB,
+	// walk's paint DC does not accept StretchDIBits, so stretch the DIB
+	// section from a memory DC instead.
+	frameDC := win.CreateCompatibleDC(hdc)
+	if frameDC == 0 {
+		return nil
 	}
+	previousBitmap := win.SelectObject(frameDC, win.HGDIOBJ(v.frameDIB))
 	setStretchModeScreen.Call(uintptr(hdc), halftone)
 	setBrushOrgScreen.Call(uintptr(hdc), 0, 0, 0)
-	stretchDIBitsScreen.Call(uintptr(hdc), 0, 0, uintptr(bounds.Width), uintptr(bounds.Height),
-		0, 0, uintptr(v.frameWidth), uintptr(v.frameHeight),
-		uintptr(unsafe.Pointer(&v.bgra[0])), uintptr(unsafe.Pointer(&header)), win.DIB_RGB_COLORS, srcCopy)
+	win.StretchBlt(hdc, 0, 0, int32(bounds.Width), int32(bounds.Height), frameDC, 0, 0, int32(v.frameWidth), int32(v.frameHeight), win.SRCCOPY)
+	win.SelectObject(frameDC, previousBitmap)
+	win.DeleteDC(frameDC)
 	if !v.controlling.Load() && v.cursor.Visible && v.cursorBitmap != 0 && v.cursor.Shape != nil {
 		scaleX := float64(bounds.Width) / float64(v.frameWidth)
 		scaleY := float64(bounds.Height) / float64(v.frameHeight)
@@ -1338,6 +1298,25 @@ func (v *screenViewer) releaseCursorResources() {
 		v.localCursor = 0
 	}
 	v.cursorShapeID = 0
+}
+
+// createFrameDIB creates a top-down 32-bit DIB section for the frame and
+// returns its pixel memory.
+func createFrameDIB(width, height int) (win.HBITMAP, []byte) {
+	header := win.BITMAPINFOHEADER{
+		BiSize:        uint32(unsafe.Sizeof(win.BITMAPINFOHEADER{})),
+		BiWidth:       int32(width),
+		BiHeight:      -int32(height),
+		BiPlanes:      1,
+		BiBitCount:    32,
+		BiCompression: win.BI_RGB,
+	}
+	var pixels unsafe.Pointer
+	bitmap := win.CreateDIBSection(0, &header, win.DIB_RGB_COLORS, &pixels, 0, 0)
+	if bitmap == 0 || pixels == nil {
+		return 0, nil
+	}
+	return bitmap, unsafe.Slice((*byte)(pixels), width*height*4)
 }
 
 func createPremultipliedDIB(shape *image.RGBA) (win.HBITMAP, []byte) {
