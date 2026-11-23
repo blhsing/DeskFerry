@@ -43,9 +43,12 @@ type LiveClientOptions struct {
 	// LegacyIntervalMS is the legacy stream interval when live mode is not
 	// available. Zero uses 1000 ms.
 	LegacyIntervalMS int
-	OnFrame          func(FrameUpdate)
-	OnStatus         func(Status)
-	OnCursor         func(CursorState)
+	// MinFPS is the frame rate the Work PC's compression aims for; nil uses
+	// DefaultMinFPS and 0 asks for lossless only.
+	MinFPS   *int
+	OnFrame  func(FrameUpdate)
+	OnStatus func(Status)
+	OnCursor func(CursorState)
 	// OnEncoded receives every frame as it arrives, still encoded, before it
 	// is drawn. Legacy frames arrive as PNG rects. Rect data must not be
 	// modified.
@@ -103,6 +106,7 @@ type LiveClient struct {
 
 	nextID  atomic.Uint64
 	pending sync.Map // id -> chan Message
+	outbox  *recordQueue
 
 	done    chan struct{}
 	err     error
@@ -135,6 +139,7 @@ func StartLive(ctx context.Context, rw io.ReadWriteCloser, opts LiveClientOption
 		request.Name = opts.Name
 		request.ClientHello = base64.RawURLEncoding.EncodeToString(handshake.hello)
 		request.Features = []string{FeatureScaledJPEG}
+		request.MinFPS = opts.MinFPS
 		if request.IntervalMS < MinIntervalMS {
 			request.IntervalMS = MinIntervalMS
 		}
@@ -170,6 +175,7 @@ func StartLive(ctx context.Context, rw io.ReadWriteCloser, opts LiveClientOption
 		if err := client.conn.WriteRecord(recFinish, finish); err != nil {
 			return nil, err
 		}
+		client.outbox = newRecordQueue(client.conn)
 		client.status = Status{Width: frame.Live.Width, Height: frame.Live.Height, ControlAllowed: frame.Live.ControlAllowed}
 		go client.liveLoop()
 		go client.pingLoop()
@@ -218,6 +224,9 @@ func (c *LiveClient) finish(err error) {
 		c.err = err
 		_ = c.rw.Close()
 		close(c.done)
+		if c.outbox != nil {
+			close(c.outbox.records)
+		}
 		c.pending.Range(func(key, value any) bool {
 			select {
 			case value.(chan Message) <- Message{Type: "reply", Error: "failed: " + err.Error()}:
@@ -313,6 +322,14 @@ func (c *LiveClient) Input(ctx context.Context, events ...InputEvent) error {
 // SendInput injects events without waiting, for interactive viewers.
 func (c *LiveClient) SendInput(events ...InputEvent) error {
 	return c.Send(Command{Cmd: "input", Events: events})
+}
+
+// SetMinFPS sets the frame rate the Work PC's compression aims for; 0 asks
+// for lossless only.
+func (c *LiveClient) SetMinFPS(ctx context.Context, fps int) error {
+	fps = max(0, min(MaxMinFPS, fps))
+	_, err := c.Call(ctx, Command{Cmd: "quality", MinFPS: &fps})
+	return err
 }
 
 // SetControl turns control on or off for this session.
@@ -419,8 +436,8 @@ func (c *LiveClient) liveLoop() {
 			c.seq = seq
 			c.lossless = current.Lossless
 			c.fbMu.Unlock()
-			if err := c.conn.WriteRecord(recAck, encodeSeq(seq)); err != nil {
-				c.finish(err)
+			if !c.outbox.send(recAck, encodeSeq(seq)) {
+				c.finish(c.outbox.err)
 				return
 			}
 			if c.opts.OnEncoded != nil {
@@ -467,7 +484,7 @@ func (c *LiveClient) liveLoop() {
 				}
 			}
 		case recPing:
-			_ = c.conn.WriteRecord(recPong, payload)
+			c.outbox.send(recPong, payload)
 		}
 	}
 }

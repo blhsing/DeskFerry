@@ -54,6 +54,7 @@ type macScreenSocket struct {
 	dropFrame bool
 	needKey   bool
 	sentShape map[uint32]bool
+	minFPS    int
 	frames    int
 	lastBytes uint64
 	lastStats time.Time
@@ -75,6 +76,7 @@ func (c *macUIController) serveScreenSocket(w http.ResponseWriter, r *http.Reque
 		status:     "Ready",
 		sentShape:  make(map[uint32]bool),
 		stats:      map[string]float64{},
+		minFPS:     screenview.DefaultMinFPS,
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -92,8 +94,26 @@ func (c *macUIController) serveScreenSocket(w http.ResponseWriter, r *http.Reque
 			Enable bool                    `json:"enable"`
 			Events []screenview.InputEvent `json:"events"`
 			Text   string                  `json:"text"`
+			MinFPS *int                    `json:"min_fps"`
+			Value  *int                    `json:"value"`
 		}
 		if json.Unmarshal(data, &message) != nil {
+			continue
+		}
+		if message.Type == "start" && message.MinFPS != nil {
+			socket.setMinFPS(*message.MinFPS)
+		}
+		if message.Type == "min_fps" && message.Value != nil {
+			socket.setMinFPS(*message.Value)
+			if client := socket.currentClient(); client != nil && !client.Legacy() {
+				go func(value int) {
+					callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					defer cancel()
+					if err := client.SetMinFPS(callCtx, value); err != nil {
+						socket.fail(err)
+					}
+				}(*message.Value)
+			}
 			continue
 		}
 		socket.handle(ctx, message.Type, message.Seq, message.Enable, message.Events, message.Text)
@@ -101,6 +121,12 @@ func (c *macUIController) serveScreenSocket(w http.ResponseWriter, r *http.Reque
 	socket.stop("stopped", "Screen stopped")
 	close(socket.done)
 	_ = ws.Close(websocket.StatusNormalClosure, "")
+}
+
+func (s *macScreenSocket) setMinFPS(value int) {
+	s.mu.Lock()
+	s.minFPS = max(0, min(screenview.MaxMinFPS, value))
+	s.mu.Unlock()
 }
 
 func (s *macScreenSocket) writeLoop(ctx context.Context) {
@@ -291,8 +317,12 @@ func (s *macScreenSocket) start(parent context.Context) {
 		}
 		s.setPhase("connecting", "Connected through "+relayAddr+"; waiting for the Work PC")
 		hostname, _ := os.Hostname()
+		s.mu.Lock()
+		minFPS := s.minFPS
+		s.mu.Unlock()
 		client, err := screenview.StartLive(ctx, conn, screenview.LiveClientOptions{
 			ScreenKey: cfg.screenKey(),
+			MinFPS:    &minFPS,
 			Client:    "viewer",
 			Name:      hostname,
 			OnEncoded: s.forward,

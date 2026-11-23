@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.15.4 - 2026-11-23
+
+- Add **Min fps** to the Screen Viewer on Windows, macOS and Android, and `-agent-min-fps` for agent mode: the frame rate below which the Work PC starts compressing changing areas (default 30, remembered per destination). 0 means no lossy compression at all: everything is sent losslessly at full resolution, using only PNG-style lossless compression. A change applies to the running session at once.
+- Fix live screen sessions that could stop for good after about 10 seconds. When both sides sent their periodic keep-alive at the same moment, each side's reader could block writing its reply while the other side was blocked writing too, so neither read again; a slow link with full buffers made this more likely. Replies and acknowledgements now go out through a separate writer, so readers never block. 0.15.3 has this bug and is superseded by this release.
+
 ## 0.15.3 - 2026-11-23
 
 - Keep the frame rate up when a large area of the screen changes for a long time, such as video or a screen saver. Compression now follows the frame rate that actually reaches the viewer: while changes are waiting and fewer than 30 frames a second arrive, the Work PC tries one step more compression (lower JPEG quality, then moving text areas as JPEG, then moving areas at 1/2, 1/3 or 1/4 resolution, which the viewer scales back up), and keeps the step only if the frame rate measurably rises. With frame rate to spare it steps back toward full quality, and when the screen is still it re-sends everything losslessly at full resolution as before. On a simulated 1.5 MB/s link with the whole 1280x720 screen changing, the frame rate rose from about 4 to about 39 frames a second. Ordinary desktop use, which already reaches 30 frames a second, stays at full quality.

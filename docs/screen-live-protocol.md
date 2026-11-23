@@ -19,7 +19,9 @@ helper. The Go implementation is `internal/screenview` (`live_*.go`).
 
    `client` is `viewer` or `agent`. `name` is shown on the Work PC's sharing
    banner. An optional `features` array lists extra rect encodings the client
-   draws; `"scaled-jpeg"` allows encoding `3`.
+   draws; `"scaled-jpeg"` allows encoding `3`. An optional `min_fps` (0 to
+   120, default 30) sets the frame rate compression aims for; `0` asks for
+   lossless rects only.
 
 2. The Work side answers with a *legacy-framed* message: a 4-byte big-endian
    length, then that many bytes of JSON metadata (the same framing as legacy
@@ -139,7 +141,7 @@ gets exactly one `reply` message.
 | `ui_tree` | `depth` (default 6), `max_nodes` (default 400), `scope` (`foreground`/`focused`/`desktop`) | `{"nodes":[...]}` |
 | `ui_find` | `text`, `max` (default 20) | `{"nodes":[...]}` |
 | `sas` | | sends Ctrl+Alt+Del (secure attention sequence) |
-| `quality` | `max_fps` (1-120), `jpeg_quality` (0 = adaptive, else 20-95) | `{}` |
+| `quality` | `max_fps` (1-120), `min_fps` (0-120; 0 = lossless only), `jpeg_quality` (0 = adaptive, else 20-95) | `{}` |
 
 UI nodes: `{"name","role","value","automation_id","class","enabled","focused",
 "rect":[x,y,w,h],"depth"}` with `rect` in framebuffer pixels.
@@ -181,17 +183,20 @@ waits, so a slow link lowers the frame rate instead of building a queue. It
 keeps the unacknowledged bytes within a window derived from the measured
 delivery rate and round-trip time.
 
-Compression follows the delivered frame rate. At full quality, text-like tiles
+Compression follows the delivered frame rate, measured against the viewer's
+`min_fps` (30 unless the viewer sets it). With `min_fps` 0 every rect is
+lossless (solid, PNG) at full resolution and nothing below applies. At full quality, text-like tiles
 are lossless and photographic tiles are JPEG at quality 80. A tile is *in
 motion* once it has kept changing, with no pause over 300 ms, for 300 ms. Every
 second the Work side counts acknowledged frames; while changes have been
-waiting for most of that second and fewer than 30 frames arrived, it tries one
+waiting for most of that second and fewer than `min_fps` frames arrived, it tries one
 step more compression: lower JPEG quality, then tiles in motion as JPEG even
 when text-like, then tiles in motion at 1/2, 1/3 and 1/4 resolution. It keeps
 a step only if the next second delivers clearly more frames (at least 15% and
 one frame more), and otherwise reverts and waits before trying that step again
-(10 s, doubling up to 2 minutes). With at least 33 frames a second it tries one
-step less compression and keeps it if the rate stays at 30 or more. After 5
+(10 s, doubling up to 2 minutes). With at least 10% more than `min_fps` frames a
+second it tries one step less compression and keeps it if the rate stays at
+`min_fps` or more. After 5
 calm seconds it returns to full quality. Once the screen is still, it re-sends
 every lossy region losslessly at full resolution and marks the frame
 `lossless`. `status.compression` names the current level.

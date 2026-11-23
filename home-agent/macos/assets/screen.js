@@ -47,6 +47,14 @@ function solidColor(data) {
 // Encoding 3 is a JPEG at reduced resolution; drawImage stretches it to the rect.
 function rectMimeType(enc) { return enc === ENC_PNG ? 'image/png' : (enc === ENC_JPEG || enc === 3) ? 'image/jpeg' : ''; }
 
+// parseMinFps accepts "0 (lossless)", "30" or "30 fps"; it returns null when invalid.
+function parseMinFps(text) {
+  const match = /^\s*(\d+)/.exec(String(text));
+  if (!match) return null;
+  const value = Number(match[1]);
+  return value >= 0 && value <= 120 ? value : null;
+}
+
 // backoffDelay is the reconnect wait: 0.5 s doubling to a 10 s ceiling.
 function backoffDelay(attempt) { return Math.min(10000, 500 * Math.pow(2, Math.max(0, Math.min(attempt, 16)))); }
 
@@ -340,9 +348,36 @@ function initViewer() {
   // Reconnect with bounded exponential backoff (0.5 s doubling to 10 s).
   function scheduleReconnect() { setTimeout(connect, backoffDelay(attempt++)); }
 
+  // Min fps: the frame rate below which the Work PC compresses changing areas;
+  // 0 asks for lossless only. Remembered in this browser.
+  const MIN_FPS_SETTING = 'deskferry.minFps';
+  let minFps = 30;
+  try {
+    const saved = parseMinFps(localStorage.getItem(MIN_FPS_SETTING) || '');
+    if (saved !== null) minFps = saved;
+  } catch (error) { /* storage is unavailable */ }
+  const minFpsInput = document.getElementById('minFps');
+  function formatMinFps(value) { return value === 0 ? '0 (lossless)' : String(value); }
+  if (minFpsInput) {
+    minFpsInput.value = formatMinFps(minFps);
+    minFpsInput.addEventListener('focus', () => minFpsInput.select());
+    minFpsInput.addEventListener('keydown', event => { if (event.key === 'Enter') minFpsInput.blur(); });
+    minFpsInput.addEventListener('change', () => {
+      const value = parseMinFps(minFpsInput.value);
+      if (value === null) {
+        minFpsInput.value = formatMinFps(minFps);
+        return;
+      }
+      minFps = value;
+      minFpsInput.value = formatMinFps(minFps);
+      try { localStorage.setItem(MIN_FPS_SETTING, String(minFps)); } catch (error) { /* storage is unavailable */ }
+      send({ type: 'min_fps', value: minFps });
+    });
+  }
+
   function startLive() {
     wantLive = true;
-    if (!send({ type: 'start' })) return;
+    if (!send({ type: 'start', min_fps: minFps })) return;
     startPending = true;
     clearTimeout(startTimer);
     startTimer = setTimeout(() => { startPending = false; render(); }, 6000);

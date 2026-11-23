@@ -261,6 +261,56 @@ func (c *recordConn) WriteRecord(recordType byte, payload []byte) error {
 	return nil
 }
 
+// outgoingRecord is a record waiting for a recordQueue.
+type outgoingRecord struct {
+	recordType byte
+	payload    []byte
+}
+
+// recordQueue writes records from its own goroutine, so read loops never
+// block on a write: a peer that is itself blocked writing to us would
+// otherwise deadlock both sides.
+type recordQueue struct {
+	conn    *recordConn
+	records chan outgoingRecord
+	failed  chan struct{}
+	once    sync.Once
+	err     error
+}
+
+func newRecordQueue(conn *recordConn) *recordQueue {
+	queue := &recordQueue{conn: conn, records: make(chan outgoingRecord, 4096), failed: make(chan struct{})}
+	go func() {
+		for record := range queue.records {
+			if err := conn.WriteRecord(record.recordType, record.payload); err != nil {
+				queue.once.Do(func() {
+					queue.err = err
+					close(queue.failed)
+				})
+				for range queue.records {
+				}
+				return
+			}
+		}
+	}()
+	return queue
+}
+
+// send queues a record; it reports false once the connection has failed.
+func (q *recordQueue) send(recordType byte, payload []byte) bool {
+	select {
+	case <-q.failed:
+		return false
+	default:
+	}
+	select {
+	case q.records <- outgoingRecord{recordType: recordType, payload: payload}:
+		return true
+	case <-q.failed:
+		return false
+	}
+}
+
 // BytesWritten returns the ciphertext bytes written so far.
 func (c *recordConn) BytesWritten() uint64 {
 	c.writeMu.Lock()

@@ -5,6 +5,7 @@ package homewindows
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 
@@ -16,7 +17,10 @@ import (
 
 // runScreenAgent serves the selected destination's screen to an AI agent over
 // standard input and output, as an MCP server or as JSON lines.
-func runScreenAgent(ctx context.Context, cfg config, mcp bool, opts screenagent.Options) error {
+func runScreenAgent(ctx context.Context, cfg config, mcp bool, minFPS int, opts screenagent.Options) error {
+	if minFPS < 0 || minFPS > screenview.MaxMinFPS {
+		return fmt.Errorf("-agent-min-fps must be from 0 to %d", screenview.MaxMinFPS)
+	}
 	if cfg.screenKey() == "" {
 		return errors.New("the selected destination has no saved room password: save it in DeskFerry first")
 	}
@@ -27,7 +31,7 @@ func runScreenAgent(ctx context.Context, cfg config, mcp bool, opts screenagent.
 			return nil, err
 		}
 		log.Printf("agent screen session relay=%s proxy=%s protocol=%s", route.RelayAddr, route.Proxy, route.Protocol)
-		client, err := screenview.StartLive(ctx, conn, screenview.LiveClientOptions{ScreenKey: cfg.screenKey(), Client: "agent", Name: "AI agent on " + hostname})
+		client, err := screenview.StartLive(ctx, conn, screenview.LiveClientOptions{ScreenKey: cfg.screenKey(), MinFPS: &minFPS, Client: "agent", Name: "AI agent on " + hostname})
 		if err != nil {
 			_ = conn.Close()
 			return nil, err

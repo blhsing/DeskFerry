@@ -134,3 +134,63 @@ func TestCompressionRaisesFrameRateOnASlowLink(t *testing.T) {
 func sprintf(format string, args ...any) string {
 	return fmt.Sprintf(format, args...)
 }
+
+func TestMinFPSZeroSendsOnlyLossless(t *testing.T) {
+	var frames []*image.RGBA
+	for seed := int64(1); seed <= 3; seed++ {
+		frames = append(frames, photoFrame(320, 192, seed))
+	}
+	key := DeriveScreenKey("room", "secret")
+	serverSide, clientSide := net.Pipe()
+	go func() {
+		defer serverSide.Close()
+		reader := bufio.NewReader(serverSide)
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		request, err := ReadRequest(bytes.NewReader(line))
+		if err != nil {
+			return
+		}
+		_ = ServeLive(context.Background(), struct {
+			io.Reader
+			io.Writer
+		}{reader, serverSide}, request, LiveServerOptions{ScreenKey: key, Source: &movingSource{frames: frames}, Host: &fakeHost{}, Logf: t.Logf})
+	}()
+	var mu sync.Mutex
+	lossy, total := 0, 0
+	zero := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := StartLive(ctx, clientSide, LiveClientOptions{ScreenKey: key, MinFPS: &zero, OnEncoded: func(event EncodedEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, rect := range event.Rects {
+			total++
+			if rect.Enc == EncJPEG || rect.Enc == EncJPEGScaled {
+				lossy++
+			}
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	time.Sleep(2 * time.Second)
+	if err := client.SetMinFPS(ctx, 30); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	if total == 0 || lossy != 0 {
+		mu.Unlock()
+		t.Fatalf("with min fps 0: %d rects, %d lossy", total, lossy)
+	}
+	mu.Unlock()
+	time.Sleep(time.Second)
+	mu.Lock()
+	defer mu.Unlock()
+	if lossy == 0 {
+		t.Fatal("photo tiles stayed lossless after raising min fps to 30")
+	}
+}

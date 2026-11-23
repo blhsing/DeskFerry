@@ -43,6 +43,9 @@ type Request struct {
 	ClientHello string `json:"client_hello,omitempty"`
 	// Features lists optional rect encodings the client can draw.
 	Features []string `json:"features,omitempty"`
+	// MinFPS is the frame rate compression aims for; 0 sends everything
+	// losslessly. Absent means DefaultMinFPS.
+	MinFPS *int `json:"min_fps,omitempty"`
 }
 
 func (r *Request) Normalize() error {

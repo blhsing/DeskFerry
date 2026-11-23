@@ -246,7 +246,7 @@ func Main() {
 	var setRDPDecodingModeFlag string
 	var tcpForwards tcpForwardFlag
 	var agentMCP, agentJSON, agentYield, agentScreenshotAfter bool
-	var agentMaxWidth, agentMaxHeight int
+	var agentMaxWidth, agentMaxHeight, agentMinFPS int
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.StringVar(&listenAddr, "listen", "", "local RDP listen address")
 	flag.StringVar(&proxyFlag, "proxy", "", "proxy: env, direct, or http(s)://host:port")
@@ -270,6 +270,7 @@ func Main() {
 	flag.IntVar(&agentMaxHeight, "agent-max-height", 1080, "largest agent screenshot height; larger screens are scaled down")
 	flag.BoolVar(&agentYield, "agent-yield", true, "pause agent input while a person uses the Work PC's mouse or keyboard")
 	flag.BoolVar(&agentScreenshotAfter, "agent-screenshot-after", false, "attach a screenshot to every agent action result")
+	flag.IntVar(&agentMinFPS, "agent-min-fps", screenview.DefaultMinFPS, "frame rate below which the Work PC compresses changing areas; 0 sends everything losslessly")
 	flag.Parse()
 	agentMode := agentMCP || agentJSON
 	winRMCommandMode := winRMCommand != "" || winRMCommandFile != ""
@@ -346,7 +347,7 @@ func Main() {
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		err := runScreenAgent(ctx, cfg, agentMCP, screenagent.Options{MaxWidth: agentMaxWidth, MaxHeight: agentMaxHeight, YieldToHuman: agentYield, ScreenshotAfter: agentScreenshotAfter})
+		err := runScreenAgent(ctx, cfg, agentMCP, agentMinFPS, screenagent.Options{MaxWidth: agentMaxWidth, MaxHeight: agentMaxHeight, YieldToHuman: agentYield, ScreenshotAfter: agentScreenshotAfter})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			log.Fatal(err)
 		}

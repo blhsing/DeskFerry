@@ -121,7 +121,7 @@ func main() {
 	var screenInterval time.Duration
 	var screenCount int
 	var agentMCP, agentJSON, agentYield, agentScreenshotAfter bool
-	var agentMaxWidth, agentMaxHeight int
+	var agentMaxWidth, agentMaxHeight, agentMinFPS int
 	flag.Var(&relayURLs, "relay-url", "relay room URL; repeat to add fallback URLs")
 	flag.Var(&relayBases, "relay-base-url", "relay service base URL; repeat to add fallback relay services")
 	flag.StringVar(&roomName, "room", "workdesk", "room name appended to each relay service base URL")
@@ -146,6 +146,7 @@ func main() {
 	flag.IntVar(&agentMaxHeight, "agent-max-height", 1080, "largest agent screenshot height; larger screens are scaled down")
 	flag.BoolVar(&agentYield, "agent-yield", true, "pause agent input while a person uses the Work PC's mouse or keyboard")
 	flag.BoolVar(&agentScreenshotAfter, "agent-screenshot-after", false, "attach a screenshot to every agent action result")
+	flag.IntVar(&agentMinFPS, "agent-min-fps", screenview.DefaultMinFPS, "frame rate below which the Work PC compresses changing areas; 0 sends everything losslessly")
 	flag.Parse()
 	agentMode := agentMCP || agentJSON
 	if path, err := diaglog.Enable("home-agent", false, logRetentionDays, relayLogs); err != nil {
@@ -238,7 +239,7 @@ func main() {
 		if winRMCommandMode || screenCommandMode {
 			log.Fatal("use agent options separately from screenshot and WinRM command options")
 		}
-		err := runScreenAgent(ctx, cfg, agentMCP, screenagent.Options{MaxWidth: agentMaxWidth, MaxHeight: agentMaxHeight, YieldToHuman: agentYield, ScreenshotAfter: agentScreenshotAfter})
+		err := runScreenAgent(ctx, cfg, agentMCP, agentMinFPS, screenagent.Options{MaxWidth: agentMaxWidth, MaxHeight: agentMaxHeight, YieldToHuman: agentYield, ScreenshotAfter: agentScreenshotAfter})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			log.Fatal(err)
 		}
@@ -915,7 +916,10 @@ func emptyAs(value, fallback string) string {
 
 // runScreenAgent serves the Work PC's screen to an AI agent over standard
 // input and output, as an MCP server or as JSON lines.
-func runScreenAgent(ctx context.Context, cfg config, mcp bool, opts screenagent.Options) error {
+func runScreenAgent(ctx context.Context, cfg config, mcp bool, minFPS int, opts screenagent.Options) error {
+	if minFPS < 0 || minFPS > screenview.MaxMinFPS {
+		return fmt.Errorf("-agent-min-fps must be from 0 to %d", screenview.MaxMinFPS)
+	}
 	if cfg.screenKey() == "" {
 		return errors.New("this destination has no saved room password: save it in the DeskFerry control panel, or pass -room-password")
 	}
@@ -926,7 +930,7 @@ func runScreenAgent(ctx context.Context, cfg config, mcp bool, opts screenagent.
 			return nil, err
 		}
 		log.Printf("agent screen session relay=%s", relayAddr)
-		client, err := screenview.StartLive(ctx, conn, screenview.LiveClientOptions{ScreenKey: cfg.screenKey(), Client: "agent", Name: "AI agent on " + hostname})
+		client, err := screenview.StartLive(ctx, conn, screenview.LiveClientOptions{ScreenKey: cfg.screenKey(), MinFPS: &minFPS, Client: "agent", Name: "AI agent on " + hostname})
 		if err != nil {
 			_ = conn.Close()
 			return nil, err

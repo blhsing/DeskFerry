@@ -108,6 +108,7 @@ type Command struct {
 	Max          int          `json:"max,omitempty"`
 	Scope        string       `json:"scope,omitempty"`
 	MaxFPS       int          `json:"max_fps,omitempty"`
+	MinFPS       *int         `json:"min_fps,omitempty"`
 	JPEGQuality  int          `json:"jpeg_quality,omitempty"`
 }
 

@@ -107,6 +107,7 @@ type liveServer struct {
 
 	commands chan Command
 	inputs   chan Command
+	outbox   *recordQueue
 
 	mu        sync.Mutex
 	inflight  []inflightFrame
@@ -177,6 +178,11 @@ func ServeLive(ctx context.Context, rw io.ReadWriter, request Request, opts Live
 		rate:     newFPSController(hasFeature(request.Features, FeatureScaledJPEG), logf),
 		maxFPS:   defaultMaxFPS,
 	}
+	if request.MinFPS != nil {
+		server.rate.setTarget(*request.MinFPS)
+	}
+	server.outbox = newRecordQueue(conn)
+	defer close(server.outbox.records)
 	server.lastReceived.Store(time.Now().UnixNano())
 	server.notifyState(false)
 	defer server.notifyState(true)
@@ -227,7 +233,7 @@ func (s *liveServer) readLoop(ctx context.Context) error {
 				s.handleAck(decodeUint64(payload))
 			}
 		case recPing:
-			_ = s.conn.WriteRecord(recPong, payload)
+			s.outbox.send(recPong, payload)
 		case recPong:
 		case recJSON:
 			var command Command
@@ -377,7 +383,7 @@ func (s *liveServer) sendJSON(value any) {
 	if err != nil {
 		return
 	}
-	_ = s.conn.WriteRecord(recJSON, data)
+	s.outbox.send(recJSON, data)
 }
 
 func (s *liveServer) pushStatusSoon() {
@@ -550,6 +556,10 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 					if command.MaxFPS > 0 {
 						s.maxFPS = max(1, min(120, command.MaxFPS))
 					}
+					if command.MinFPS != nil {
+						s.rate.setTarget(*command.MinFPS)
+						lastStatusAt = time.Time{}
+					}
 					if command.JPEGQuality == 0 {
 						s.fixedQuality = 0
 					} else {
@@ -609,7 +619,7 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 		canSend := inflight < limit && frames < maxFramesInFlight && now.Sub(lastSend) >= minInterval
 		if canSend && (grid.anyDirty() || keyframe) {
 			level := s.rate.current()
-			mode := encodeMode{Quality: level.Quality, MotionLossy: level.MotionLossy, MotionScale: level.MotionScale, Now: now}
+			mode := encodeMode{Quality: level.Quality, MotionLossy: level.MotionLossy, MotionScale: level.MotionScale, Now: now, Lossless: s.rate.lossless()}
 			if s.fixedQuality > 0 {
 				mode.Quality = s.fixedQuality
 			}

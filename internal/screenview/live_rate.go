@@ -29,8 +29,15 @@ var compressionLevels = []compressionLevel{
 // scaledLevelStart is the first level that needs FeatureScaledJPEG.
 const scaledLevelStart = 3
 
+// DefaultMinFPS is the frame rate compression aims for unless a viewer sets
+// another; MaxMinFPS bounds what a viewer may ask for.
 const (
-	targetFPS          = 30
+	DefaultMinFPS = 30
+	MaxMinFPS     = 120
+)
+
+const (
+	targetFPS          = DefaultMinFPS
 	rateWindow         = time.Second
 	busyFraction       = 0.6
 	trialGain          = 1.15
@@ -51,6 +58,8 @@ type fpsController struct {
 	level    int
 	maxLevel int
 	logf     func(string, ...any)
+	// target is the frame rate to keep; 0 means lossless only.
+	target float64
 
 	acks        atomic.Int64
 	windowStart time.Time
@@ -71,6 +80,7 @@ func newFPSController(scaledSupported bool, logf func(string, ...any)) *fpsContr
 		maxLevel = scaledLevelStart - 1
 	}
 	return &fpsController{
+		target:       targetFPS,
 		maxLevel:     maxLevel,
 		logf:         logf,
 		upCooldown:   map[int]time.Time{},
@@ -81,6 +91,27 @@ func newFPSController(scaledSupported bool, logf func(string, ...any)) *fpsContr
 }
 
 func (c *fpsController) current() compressionLevel { return compressionLevels[c.level] }
+
+// lossless reports that the viewer asked for no lossy compression at all.
+func (c *fpsController) lossless() bool { return c.target <= 0 }
+
+// setTarget sets the frame rate to keep; 0 turns lossy compression off.
+func (c *fpsController) setTarget(fps int) {
+	fps = max(0, min(MaxMinFPS, fps))
+	if float64(fps) == c.target {
+		return
+	}
+	c.target = float64(fps)
+	c.trial = nil
+	c.upCooldown, c.upPenalty = map[int]time.Time{}, map[int]time.Duration{}
+	c.downCooldown, c.downPenalty = map[int]time.Time{}, map[int]time.Duration{}
+	if fps == 0 {
+		c.setLevel(0, "the viewer asked for lossless only")
+	}
+	if c.logf != nil {
+		c.logf("screen minimum frame rate set to %d", fps)
+	}
+}
 
 // delivered counts a frame the viewer acknowledged.
 func (c *fpsController) delivered() { c.acks.Add(1) }
@@ -127,6 +158,9 @@ func (c *fpsController) setLevel(level int, reason string) {
 }
 
 func (c *fpsController) decide(now time.Time, fps float64, busy bool, frames int64) {
+	if c.lossless() {
+		return
+	}
 	if !busy {
 		if c.trial != nil {
 			// The screen calmed down mid-trial; the measurement is void.
@@ -154,7 +188,7 @@ func (c *fpsController) decide(now time.Time, fps float64, busy bool, frames int
 			c.setLevel(trial.from, fmt.Sprintf("did not raise the frame rate (%.1f fps, was %.1f)", fps, trial.before))
 			return
 		}
-		if fps >= targetFPS {
+		if fps >= c.target {
 			delete(c.downPenalty, trial.from)
 			return
 		}
@@ -166,10 +200,10 @@ func (c *fpsController) decide(now time.Time, fps float64, busy bool, frames int
 		return
 	}
 	switch {
-	case fps < targetFPS && c.level < c.maxLevel && now.After(c.upCooldown[c.level+1]):
+	case fps < c.target && c.level < c.maxLevel && now.After(c.upCooldown[c.level+1]):
 		c.trial = &rateTrial{from: c.level, to: c.level + 1, before: fps}
 		c.setLevel(c.level+1, fmt.Sprintf("trying more compression at %.1f fps", fps))
-	case fps >= targetFPS*downgradeHeadroom && c.level > 0 && now.After(c.downCooldown[c.level]):
+	case fps >= c.target*downgradeHeadroom && c.level > 0 && now.After(c.downCooldown[c.level]):
 		c.trial = &rateTrial{from: c.level, to: c.level - 1, before: fps}
 		c.setLevel(c.level-1, fmt.Sprintf("trying less compression at %.1f fps", fps))
 	}
@@ -178,6 +212,8 @@ func (c *fpsController) decide(now time.Time, fps float64, busy bool, frames int
 func (c *fpsController) describe(level int) string {
 	value := compressionLevels[level]
 	switch {
+	case c.lossless():
+		return "lossless only"
 	case level == 0:
 		return "full quality"
 	case value.MotionScale > 1:

@@ -155,6 +155,11 @@ public class ScreenViewerActivity extends Activity {
     private ImageButton keyboardButton;
     private ImageButton cadButton;
     private ImageButton clipboardButton;
+    private android.widget.Button minFpsButton;
+    /** Frame rate below which the Work PC compresses changing areas; 0 asks for lossless only. */
+    private int minFps = 30;
+    static final int DEFAULT_MIN_FPS = 30;
+    static final int MAX_MIN_FPS = 120;
     private HorizontalScrollView extraKeysScroll;
     private Button ctrlKey;
     private Button altKey;
@@ -321,6 +326,11 @@ public class ScreenViewerActivity extends Activity {
         clipboardButton = ui.iconButton(R.drawable.ic_df_clipboard, "Clipboard", true);
         clipboardButton.setOnClickListener(this::showClipboardMenu);
         controls.addView(clipboardButton, ui.fixed(44, 44, 6));
+        minFps = loadMinFps();
+        minFpsButton = ui.quietButton(minFpsLabel(minFps), 0);
+        minFpsButton.setContentDescription("Minimum frames per second");
+        minFpsButton.setOnClickListener(v -> showMinFpsChooser());
+        controls.addView(minFpsButton, ui.fixed(-1, 44, 6));
         bar.addView(controls, ui.matchWrap(8));
 
         LinearLayout zoomControls = ui.horizontal();
@@ -873,7 +883,8 @@ public class ScreenViewerActivity extends Activity {
                         .put("client", "viewer")
                         .put("name", deviceName)
                         .put("client_hello", ScreenKeys.base64Url(handshake.hello))
-                        .put("features", new org.json.JSONArray().put(LiveScreenProtocol.FEATURE_SCALED_JPEG));
+                        .put("features", new org.json.JSONArray().put(LiveScreenProtocol.FEATURE_SCALED_JPEG))
+                        .put("min_fps", minFps);
             }
             if (!webSocket.send(ByteString.encodeUtf8(request.toString() + "\n"))) {
                 throw new IOException("could not send the screen request");
@@ -1383,6 +1394,63 @@ public class ScreenViewerActivity extends Activity {
                 refreshStatusLine();
             });
             if (!sent) Toast.makeText(this, "The screen session is not connected.", Toast.LENGTH_SHORT).show();
+        } catch (Exception ex) {
+            Toast.makeText(this, ex.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    static String minFpsLabel(int value) {
+        return value == 0 ? "Min fps: lossless" : "Min fps: " + value;
+    }
+
+    private String minFpsPreferenceKey() {
+        return "min_fps:" + empty(getIntent().getStringExtra(EXTRA_DESTINATION)).toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private int loadMinFps() {
+        int value = getSharedPreferences("screen_viewer", MODE_PRIVATE).getInt(minFpsPreferenceKey(), DEFAULT_MIN_FPS);
+        return value < 0 || value > MAX_MIN_FPS ? DEFAULT_MIN_FPS : value;
+    }
+
+    private void showMinFpsChooser() {
+        final int[] values = {0, 15, 24, 30, 45, 60};
+        String[] labels = {"0 (lossless: never compress)", "15", "24", "30", "45", "60", "Custom…"};
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Minimum frames per second")
+                .setItems(labels, (dialog, which) -> {
+                    if (which < values.length) {
+                        setMinFps(values[which]);
+                        return;
+                    }
+                    android.widget.EditText input = new android.widget.EditText(this);
+                    input.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+                    input.setText(String.valueOf(minFps));
+                    new android.app.AlertDialog.Builder(this)
+                            .setTitle("Minimum frames per second (0 to " + MAX_MIN_FPS + ")")
+                            .setView(input)
+                            .setPositiveButton("Apply", (inner, button) -> {
+                                try {
+                                    int value = Integer.parseInt(input.getText().toString().trim());
+                                    if (value < 0 || value > MAX_MIN_FPS) throw new NumberFormatException();
+                                    setMinFps(value);
+                                } catch (NumberFormatException ex) {
+                                    Toast.makeText(this, "Enter a whole number from 0 to " + MAX_MIN_FPS + ".", Toast.LENGTH_SHORT).show();
+                                }
+                            })
+                            .setNegativeButton("Cancel", null)
+                            .show();
+                })
+                .show();
+    }
+
+    private void setMinFps(int value) {
+        minFps = value;
+        minFpsButton.setText(minFpsLabel(value));
+        getSharedPreferences("screen_viewer", MODE_PRIVATE).edit().putInt(minFpsPreferenceKey(), value).apply();
+        try {
+            sendCommand(new JSONObject().put("cmd", "quality").put("min_fps", value), (ok, result, error) -> {
+                if (!ok) Toast.makeText(this, describeError(error), Toast.LENGTH_SHORT).show();
+            });
         } catch (Exception ex) {
             Toast.makeText(this, ex.getMessage(), Toast.LENGTH_SHORT).show();
         }

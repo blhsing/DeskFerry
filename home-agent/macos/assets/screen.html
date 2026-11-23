@@ -72,6 +72,11 @@
       <button type="button" id="zoomIn" title="Zoom in" aria-label="Zoom in"><svg class="ico" aria-hidden="true"><use href="#i-plus"/></svg></button>
       <button type="button" id="fitBtn" title="Auto fit to window" aria-label="Auto fit"><svg class="ico" aria-hidden="true"><use href="#i-fit"/></svg><span class="lbl opt">Fit</span></button>
     </div>
+    <div class="seg zoom" role="group" aria-label="Minimum frame rate">
+      <span class="lbl">Min fps</span>
+      <input id="minFps" value="30" list="min-fps-levels" aria-label="Minimum frames per second" title="Lowest frame rate before the Work PC compresses changing areas; 0 sends everything losslessly" spellcheck="false" autocomplete="off">
+    </div>
+    <datalist id="min-fps-levels"><option>0 (lossless)</option><option>15</option><option>24</option><option>30</option><option>45</option><option>60</option></datalist>
     <datalist id="zoom-levels"><option>Auto Fit</option><option>25%</option><option>50%</option><option>75%</option><option>100%</option><option>125%</option><option>150%</option><option>200%</option><option>300%</option><option>400%</option></datalist>
 
     <div class="seg" role="group" aria-label="View">

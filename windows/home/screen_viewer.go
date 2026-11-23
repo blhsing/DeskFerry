@@ -43,6 +43,8 @@ type screenViewer struct {
 	clipSend   *walk.PushButton
 	clipGet    *walk.PushButton
 	zoomBox    *walk.ComboBox
+	minFPSBox  *walk.ComboBox
+	minFPS     int
 
 	mu                   sync.Mutex
 	cancel               context.CancelFunc
@@ -265,6 +267,19 @@ func (v *screenViewer) createWindow(title string, owner *walk.MainWindow) error 
 						OnCurrentIndexChanged: v.applyZoomSelection,
 						OnEditingFinished:     v.applyZoomSelection,
 					},
+					spacer(),
+					toolbarLabel("Min fps"),
+					ComboBox{
+						AssignTo:              &v.minFPSBox,
+						Editable:              true,
+						Model:                 minFPSChoices,
+						MinSize:               Size{Width: 110},
+						MaxSize:               Size{Width: 130},
+						Alignment:             AlignHNearVCenter,
+						ToolTipText:           "Lowest frame rate before the Work PC compresses changing areas; 0 sends everything losslessly",
+						OnCurrentIndexChanged: v.applyMinFPSSelection,
+						OnEditingFinished:     v.applyMinFPSSelection,
+					},
 					HSpacer{},
 					toolButton(nil, "Full screen", "Toggle full screen", v.toggleFullscreen),
 					toolButton(nil, "Save PNG", "Save the current screen as a PNG image", v.savePNG),
@@ -318,6 +333,8 @@ func (v *screenViewer) createWindow(title string, owner *walk.MainWindow) error 
 	}
 	enableScreenZoomGesture(v.canvas.Handle())
 	enableScreenZoomGesture(v.viewport.Handle())
+	v.minFPS = loadViewerMinFPS(v.owner.currentConfig().SelectedDestination)
+	v.showMinFPS()
 	v.updateControlButtons()
 	go v.inputSender()
 	v.mw.Closing().Attach(func(_ *bool, _ walk.CloseReason) {
@@ -393,8 +410,10 @@ func (v *screenViewer) run(ctx context.Context) {
 	v.owner.appendLog("Screen connection selected relay=%s proxy=%s protocol=%s relay_protocol=%s.", route.RelayAddr, route.Proxy, route.Protocol, route.RelayProtocol)
 	v.setStatus(fmt.Sprintf("Connected through %s via %s (%s); waiting for the Work PC...", route.RelayAddr, route.Proxy, route.Protocol))
 	hostname, _ := os.Hostname()
+	minFPS := v.minFPS
 	client, err := screenview.StartLive(ctx, conn, screenview.LiveClientOptions{
 		ScreenKey: cfg.screenKey(),
+		MinFPS:    &minFPS,
 		Client:    "viewer",
 		Name:      hostname,
 		OnFrame:   v.onFrame,
@@ -1100,6 +1119,74 @@ func (v *screenViewer) handleZoomMessage(msg uint32, wParam, lParam uintptr) boo
 		return true
 	}
 	return false
+}
+
+var minFPSChoices = []string{"0 (lossless)", "15", "24", "30", "45", "60"}
+
+// parseMinFPS accepts "0 (lossless)", "30", "30 fps" and similar.
+func parseMinFPS(text string) (int, bool) {
+	text = strings.TrimSpace(strings.ToLower(text))
+	if index := strings.IndexAny(text, " (f"); index > 0 {
+		text = text[:index]
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(text))
+	if err != nil || value < 0 || value > screenview.MaxMinFPS {
+		return 0, false
+	}
+	return value, true
+}
+
+func formatMinFPS(value int) string {
+	if value == 0 {
+		return minFPSChoices[0]
+	}
+	return strconv.Itoa(value)
+}
+
+func (v *screenViewer) showMinFPS() {
+	if v.minFPSBox == nil {
+		return
+	}
+	v.zoomControlUpdating = true
+	_ = v.minFPSBox.SetText(formatMinFPS(v.minFPS))
+	v.zoomControlUpdating = false
+}
+
+func (v *screenViewer) applyMinFPSSelection() {
+	if v.minFPSBox == nil || v.zoomControlUpdating {
+		return
+	}
+	value, ok := parseMinFPS(v.minFPSBox.Text())
+	if !ok {
+		v.setStatus(fmt.Sprintf("Min fps must be a whole number from 0 (lossless) to %d.", screenview.MaxMinFPS))
+		v.showMinFPS()
+		return
+	}
+	if value == v.minFPS {
+		return
+	}
+	v.minFPS = value
+	v.showMinFPS()
+	if err := saveViewerMinFPS(v.owner.currentConfig().SelectedDestination, value); err != nil {
+		v.setStatus("Could not save Min fps: " + err.Error())
+	}
+	client := v.liveClient()
+	if client == nil || client.Legacy() {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := client.SetMinFPS(ctx, value); err != nil {
+			v.setStatus("Could not change Min fps: " + err.Error())
+			return
+		}
+		if value == 0 {
+			v.setStatus("Min fps 0: the Work PC now sends everything losslessly.")
+		} else {
+			v.setStatus(fmt.Sprintf("Min fps %d: the Work PC compresses changing areas only when fewer frames arrive.", value))
+		}
+	}()
 }
 
 func (v *screenViewer) applyZoomSelection() {
