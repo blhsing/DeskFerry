@@ -8,6 +8,7 @@ import (
 	"image/png"
 	"runtime"
 	"sync"
+	"time"
 )
 
 // LiveTileSize is the change-detection tile size of the live session.
@@ -18,6 +19,10 @@ const (
 	// and may be sent as JPEG; others are text-like and always lossless.
 	photoColorThreshold = 1024
 	maxStripTiles       = 16
+	// A tile is in motion once it has kept changing, with no pause longer
+	// than motionGap, for at least motionMin.
+	motionGap = 300 * time.Millisecond
+	motionMin = 300 * time.Millisecond
 )
 
 type tileClass uint8
@@ -179,6 +184,39 @@ func opaqueCopy(img *image.RGBA, rect image.Rectangle) *image.RGBA {
 	return out
 }
 
+// encodeScaledJPEG box-filters rect down by scale and encodes it as JPEG.
+func encodeScaledJPEG(img *image.RGBA, rect image.Rectangle, scale, quality int) ([]byte, error) {
+	width := (rect.Dx() + scale - 1) / scale
+	height := (rect.Dy() + scale - 1) / scale
+	small := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		y0 := rect.Min.Y + y*scale
+		y1 := min(rect.Max.Y, y0+scale)
+		for x := 0; x < width; x++ {
+			x0 := rect.Min.X + x*scale
+			x1 := min(rect.Max.X, x0+scale)
+			var r, g, b, count uint32
+			for yy := y0; yy < y1; yy++ {
+				offset := img.PixOffset(x0, yy)
+				for xx := x0; xx < x1; xx++ {
+					r += uint32(img.Pix[offset])
+					g += uint32(img.Pix[offset+1])
+					b += uint32(img.Pix[offset+2])
+					offset += 4
+					count++
+				}
+			}
+			offset := small.PixOffset(x, y)
+			small.Pix[offset], small.Pix[offset+1], small.Pix[offset+2], small.Pix[offset+3] = byte(r/count), byte(g/count), byte(b/count), 255
+		}
+	}
+	var output bytes.Buffer
+	if err := jpeg.Encode(&output, small, &jpeg.Options{Quality: quality}); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
+
 func encodeJPEG(img *image.RGBA, rect image.Rectangle, quality int) ([]byte, error) {
 	var output bytes.Buffer
 	sub := img.SubImage(rect)
@@ -194,9 +232,24 @@ type tileJob struct {
 	class tileClass
 	solid uint32
 	lossy bool
+	scale int
 	tiles []int
 	out   EncodedRect
 	err   error
+}
+
+// encodeMode says how lossy an encode may be.
+type encodeMode struct {
+	// Lossless forbids JPEG entirely.
+	Lossless bool
+	// Quality is the JPEG quality.
+	Quality int
+	// MotionLossy lets text-like tiles in motion go as JPEG too.
+	MotionLossy bool
+	// MotionScale sends JPEG tiles in motion at 1/MotionScale resolution.
+	MotionScale int
+	// Now decides which tiles are in motion.
+	Now time.Time
 }
 
 // tileGrid tracks per-tile change and quality state.
@@ -205,12 +258,33 @@ type tileGrid struct {
 	cols, rows    int
 	dirty         []bool
 	lossy         []bool
+	lastChange    []time.Time
+	motionSince   []time.Time
 }
 
 func newTileGrid(width, height int) *tileGrid {
 	cols := (width + LiveTileSize - 1) / LiveTileSize
 	rows := (height + LiveTileSize - 1) / LiveTileSize
-	return &tileGrid{width: width, height: height, cols: cols, rows: rows, dirty: make([]bool, cols*rows), lossy: make([]bool, cols*rows)}
+	count := cols * rows
+	return &tileGrid{width: width, height: height, cols: cols, rows: rows, dirty: make([]bool, count), lossy: make([]bool, count),
+		lastChange: make([]time.Time, count), motionSince: make([]time.Time, count)}
+}
+
+// moving reports whether a tile has kept changing recently.
+func (g *tileGrid) moving(index int, now time.Time) bool {
+	last := g.lastChange[index]
+	return !last.IsZero() && now.Sub(last) <= motionGap && now.Sub(g.motionSince[index]) >= motionMin
+}
+
+// movingCount counts tiles in motion.
+func (g *tileGrid) movingCount(now time.Time) int {
+	count := 0
+	for index := range g.lastChange {
+		if g.moving(index, now) {
+			count++
+		}
+	}
+	return count
 }
 
 func (g *tileGrid) tileRect(index int) image.Rectangle {
@@ -245,7 +319,7 @@ func (g *tileGrid) anyLossy() bool {
 
 // diffInto compares current against reference tile by tile, copies changed
 // tiles into reference, marks them dirty and returns the changed tile count.
-func (g *tileGrid) diffInto(reference, current *image.RGBA) int {
+func (g *tileGrid) diffInto(reference, current *image.RGBA, now time.Time) int {
 	changed := 0
 	for index := range g.dirty {
 		rect := g.tileRect(index)
@@ -257,6 +331,10 @@ func (g *tileGrid) diffInto(reference, current *image.RGBA) int {
 			copy(reference.Pix[start:start+rect.Dx()*4], current.Pix[current.PixOffset(rect.Min.X, y):])
 		}
 		g.dirty[index] = true
+		if g.lastChange[index].IsZero() || now.Sub(g.lastChange[index]) > motionGap {
+			g.motionSince[index] = now
+		}
+		g.lastChange[index] = now
 		changed++
 	}
 	return changed
@@ -281,10 +359,12 @@ func (g *tileGrid) dirtyRects() []image.Rectangle {
 	return rects
 }
 
-// encodeTiles encodes the selected tiles of img. When lossless is false,
-// photographic tiles are sent as JPEG at quality and marked lossy. It returns
-// the encoded rects in raster order and clears the encoded tiles' dirty flags.
-func (g *tileGrid) encodeTiles(img *image.RGBA, selected func(int) bool, lossless bool, quality int) ([]EncodedRect, int, error) {
+// encodeTiles encodes the selected tiles of img. Unless mode.Lossless,
+// photographic tiles (and, with MotionLossy, text-like tiles in motion) are
+// sent as JPEG and marked lossy; tiles in motion go at reduced resolution when
+// MotionScale > 1. It returns the encoded rects in raster order and clears
+// the encoded tiles' dirty flags.
+func (g *tileGrid) encodeTiles(img *image.RGBA, selected func(int) bool, mode encodeMode) ([]EncodedRect, int, error) {
 	set := colorSetPool.Get().(*colorSet)
 	var jobs []*tileJob
 	lossyCount := 0
@@ -298,15 +378,20 @@ func (g *tileGrid) encodeTiles(img *image.RGBA, selected func(int) bool, lossles
 			}
 			rect := g.tileRect(index)
 			class, solid := classifyTile(img, rect, set)
-			lossy := class == classPhoto && !lossless
+			moving := !mode.Lossless && g.moving(index, mode.Now)
+			lossy := !mode.Lossless && (class == classPhoto || (class == classText && moving && mode.MotionLossy))
+			scale := 1
+			if lossy && moving && mode.MotionScale > 1 {
+				scale = mode.MotionScale
+			}
 			extend := current != nil && current.class == class && len(current.tiles) < maxStripTiles &&
-				(class != classSolid || current.solid == solid) && current.lossy == lossy
+				(class != classSolid || current.solid == solid) && current.lossy == lossy && current.scale == scale
 			if extend {
 				current.rect = current.rect.Union(rect)
 				current.tiles = append(current.tiles, index)
 				continue
 			}
-			current = &tileJob{rect: rect, class: class, solid: solid, lossy: lossy, tiles: []int{index}}
+			current = &tileJob{rect: rect, class: class, solid: solid, lossy: lossy, scale: scale, tiles: []int{index}}
 			jobs = append(jobs, current)
 		}
 	}
@@ -326,9 +411,12 @@ func (g *tileGrid) encodeTiles(img *image.RGBA, selected func(int) bool, lossles
 				switch {
 				case job.class == classSolid:
 					job.out.Enc, job.out.Data = EncSolid, encodeSolid(job.solid)
+				case job.lossy && job.scale > 1:
+					job.out.Enc = EncJPEGScaled
+					job.out.Data, job.err = encodeScaledJPEG(img, job.rect, job.scale, mode.Quality)
 				case job.lossy:
 					job.out.Enc = EncJPEG
-					job.out.Data, job.err = encodeJPEG(img, job.rect, quality)
+					job.out.Data, job.err = encodeJPEG(img, job.rect, mode.Quality)
 				default:
 					job.out.Enc = EncPNG
 					job.out.Data, job.err = encodeLossless(img, job.rect, localSet)

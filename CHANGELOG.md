@@ -1,5 +1,11 @@
 # Release Notes
 
+## 0.15.3 - 2026-11-23
+
+- Keep the frame rate up when a large area of the screen changes for a long time, such as video or a screen saver. Compression now follows the frame rate that actually reaches the viewer: while changes are waiting and fewer than 30 frames a second arrive, the Work PC tries one step more compression (lower JPEG quality, then moving text areas as JPEG, then moving areas at 1/2, 1/3 or 1/4 resolution, which the viewer scales back up), and keeps the step only if the frame rate measurably rises. With frame rate to spare it steps back toward full quality, and when the screen is still it re-sends everything losslessly at full resolution as before. On a simulated 1.5 MB/s link with the whole 1280x720 screen changing, the frame rate rose from about 4 to about 39 frames a second. Ordinary desktop use, which already reaches 30 frames a second, stays at full quality.
+- Show the current compression in the Windows viewer's status bar.
+- Reduced-resolution tiles are offered only to viewers that announce them: the Windows, macOS and Android viewers and agent mode from this version. Older viewers keep receiving full-resolution tiles.
+
 ## 0.15.2 - 2026-11-23
 
 - Fix the Windows Screen Viewer showing a black screen. Frames arrived, but the viewer drew them with a call the window's paint surface rejected; it now draws them through a GDI bitmap, as before 0.15.0.

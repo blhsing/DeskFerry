@@ -70,9 +70,6 @@ type LiveServerOptions struct {
 
 const (
 	defaultMaxFPS        = 60
-	minJPEGQuality       = 30
-	maxJPEGQuality       = 85
-	initialJPEGQuality   = 70
 	refineDelay          = 250 * time.Millisecond
 	humanYieldWindow     = 1500 * time.Millisecond
 	livePingInterval     = 10 * time.Second
@@ -118,7 +115,7 @@ type liveServer struct {
 	bandwidth float64 // bytes per second
 	acked     chan struct{}
 
-	quality      int
+	rate         *fpsController
 	fixedQuality int
 	maxFPS       int
 }
@@ -177,7 +174,7 @@ func ServeLive(ctx context.Context, rw io.ReadWriter, request Request, opts Live
 		commands: make(chan Command, 64),
 		inputs:   make(chan Command, 256),
 		acked:    make(chan struct{}, 1),
-		quality:  initialJPEGQuality,
+		rate:     newFPSController(hasFeature(request.Features, FeatureScaledJPEG), logf),
 		maxFPS:   defaultMaxFPS,
 	}
 	server.lastReceived.Store(time.Now().UnixNano())
@@ -399,6 +396,7 @@ func (s *liveServer) handleAck(seq uint64) {
 			keep = append(keep, frame)
 			continue
 		}
+		s.rate.delivered()
 		if frame.seq != seq {
 			continue
 		}
@@ -513,6 +511,7 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 	lastStatus := ""
 	lastStatusAt := time.Time{}
 	lastPing := time.Now()
+	lastIteration := time.Now()
 
 	for {
 		if ctx.Err() != nil {
@@ -586,11 +585,13 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 			keyframe = true
 			changed = true
 		} else if changed {
-			if grid.diffInto(reference, frame) == 0 {
+			if grid.diffInto(reference, frame, time.Now()) == 0 {
 				changed = false
 			}
 		}
 		now := time.Now()
+		s.rate.observe(now, grid.anyDirty(), now.Sub(lastIteration))
+		lastIteration = now
 		if changed {
 			lastChange = now
 			if len(waiters) > 0 {
@@ -607,11 +608,12 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 		minInterval := time.Second / time.Duration(max(1, s.maxFPS))
 		canSend := inflight < limit && frames < maxFramesInFlight && now.Sub(lastSend) >= minInterval
 		if canSend && (grid.anyDirty() || keyframe) {
-			quality := s.quality
+			level := s.rate.current()
+			mode := encodeMode{Quality: level.Quality, MotionLossy: level.MotionLossy, MotionScale: level.MotionScale, Now: now}
 			if s.fixedQuality > 0 {
-				quality = s.fixedQuality
+				mode.Quality = s.fixedQuality
 			}
-			rects, lossy, err := grid.encodeTiles(reference, func(index int) bool { return grid.dirty[index] }, false, quality)
+			rects, _, err := grid.encodeTiles(reference, func(index int) bool { return grid.dirty[index] }, mode)
 			if err != nil {
 				return err
 			}
@@ -620,13 +622,11 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 			if !grid.anyLossy() {
 				flags |= frameEndLossless
 			}
-			bytesSent, err := s.sendFrame(seq, grid, rects, keyframe, flags)
-			if err != nil {
+			if _, err := s.sendFrame(seq, grid, rects, keyframe, flags); err != nil {
 				return err
 			}
 			keyframe = false
 			lastSend = now
-			s.adjustQuality(bytesSent, lossy)
 		} else if canSend && grid.anyLossy() && now.Sub(lastChange) >= refineDelay {
 			budget := max(64<<10, limit/refineBudgetFraction)
 			selected := make(map[int]bool)
@@ -641,7 +641,7 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 					break
 				}
 			}
-			rects, _, err := grid.encodeTiles(reference, func(index int) bool { return selected[index] }, true, 0)
+			rects, _, err := grid.encodeTiles(reference, func(index int) bool { return selected[index] }, encodeMode{Lossless: true})
 			if err != nil {
 				return err
 			}
@@ -739,6 +739,7 @@ func (s *liveServer) status(grid *tileGrid) Status {
 		ForegroundTitle: foreground,
 		Cursor:          [2]int{cursor.X, cursor.Y},
 		Capture:         s.opts.Source.Method(),
+		Compression:     s.rate.describe(s.rate.level),
 	}
 }
 
@@ -785,19 +786,13 @@ func (s *liveServer) sendFrame(seq uint64, grid *tileGrid, rects []EncodedRect, 
 	return size, nil
 }
 
-// adjustQuality steers JPEG quality so a lossy frame takes about 1/30 s of the
-// measured bandwidth.
-func (s *liveServer) adjustQuality(frameBytes, lossyTiles int) {
-	if lossyTiles == 0 || s.fixedQuality > 0 {
-		return
+func hasFeature(features []string, name string) bool {
+	for _, feature := range features {
+		if feature == name {
+			return true
+		}
 	}
-	target := s.bandwidthEstimate() / 30
-	switch {
-	case float64(frameBytes) > target*2 && s.quality > minJPEGQuality:
-		s.quality = max(minJPEGQuality, s.quality-8)
-	case float64(frameBytes) < target/2 && s.quality < maxJPEGQuality:
-		s.quality = min(maxJPEGQuality, s.quality+3)
-	}
+	return false
 }
 
 func mergeRects(rects []image.Rectangle) [][4]int {

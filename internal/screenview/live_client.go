@@ -79,7 +79,7 @@ func EncodeKeyframe(img *image.RGBA) ([]EncodedRect, error) {
 	}
 	grid := newTileGrid(bounds.Dx(), bounds.Dy())
 	grid.markAll()
-	rects, _, err := grid.encodeTiles(img, func(int) bool { return true }, true, 0)
+	rects, _, err := grid.encodeTiles(img, func(int) bool { return true }, encodeMode{Lossless: true})
 	return rects, err
 }
 
@@ -134,6 +134,7 @@ func StartLive(ctx context.Context, rw io.ReadWriteCloser, opts LiveClientOption
 		request.Client = opts.Client
 		request.Name = opts.Name
 		request.ClientHello = base64.RawURLEncoding.EncodeToString(handshake.hello)
+		request.Features = []string{FeatureScaledJPEG}
 		if request.IntervalMS < MinIntervalMS {
 			request.IntervalMS = MinIntervalMS
 		}
@@ -536,6 +537,17 @@ func decodeRect(rect EncodedRect) decodedRect {
 		result.image, result.err = png.Decode(bytes.NewReader(rect.Data))
 	case EncJPEG:
 		result.image, result.err = jpeg.Decode(bytes.NewReader(rect.Data))
+	case EncJPEGScaled:
+		var small image.Image
+		small, result.err = jpeg.Decode(bytes.NewReader(rect.Data))
+		if result.err == nil {
+			bounds := small.Bounds()
+			if bounds.Dx() <= 0 || bounds.Dy() <= 0 || bounds.Dx() > rect.W || bounds.Dy() > rect.H {
+				result.err = errors.New("invalid scaled screen rect")
+			} else {
+				result.image = upscaleBilinear(toRGBA(small), rect.W, rect.H)
+			}
+		}
 	default:
 		result.err = fmt.Errorf("unsupported rect encoding %d", rect.Enc)
 	}
@@ -603,4 +615,42 @@ func (c *LiveClient) applyLegacy(frame Frame, payloads [][]byte) error {
 		c.opts.OnFrame(FrameUpdate{Seq: frame.Seq, Width: frame.Width, Height: frame.Height, Dirty: dirty, Keyframe: frame.Type == FrameFull, Lossless: true, Bytes: total, Legacy: true})
 	}
 	return nil
+}
+
+// upscaleBilinear scales src up to width x height.
+func upscaleBilinear(src *image.RGBA, width, height int) *image.RGBA {
+	out := image.NewRGBA(image.Rect(0, 0, width, height))
+	sw, sh := src.Bounds().Dx(), src.Bounds().Dy()
+	xRatio := float64(sw) / float64(width)
+	yRatio := float64(sh) / float64(height)
+	for y := 0; y < height; y++ {
+		fy := (float64(y)+0.5)*yRatio - 0.5
+		y0 := int(fy)
+		if fy < 0 {
+			fy, y0 = 0, 0
+		}
+		y1 := min(y0+1, sh-1)
+		wy := fy - float64(y0)
+		for x := 0; x < width; x++ {
+			fx := (float64(x)+0.5)*xRatio - 0.5
+			x0 := int(fx)
+			if fx < 0 {
+				fx, x0 = 0, 0
+			}
+			x1 := min(x0+1, sw-1)
+			wx := fx - float64(x0)
+			p00 := src.PixOffset(x0, y0)
+			p01 := src.PixOffset(x1, y0)
+			p10 := src.PixOffset(x0, y1)
+			p11 := src.PixOffset(x1, y1)
+			offset := out.PixOffset(x, y)
+			for channel := 0; channel < 3; channel++ {
+				top := float64(src.Pix[p00+channel])*(1-wx) + float64(src.Pix[p01+channel])*wx
+				bottom := float64(src.Pix[p10+channel])*(1-wx) + float64(src.Pix[p11+channel])*wx
+				out.Pix[offset+channel] = uint8(top*(1-wy) + bottom*wy + 0.5)
+			}
+			out.Pix[offset+3] = 255
+		}
+	}
+	return out
 }

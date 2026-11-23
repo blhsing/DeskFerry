@@ -44,7 +44,8 @@ function solidColor(data) {
   return 'rgba(' + data[0] + ',' + data[1] + ',' + data[2] + ',' + Math.round(alpha / 255 * 1000) / 1000 + ')';
 }
 
-function rectMimeType(enc) { return enc === ENC_PNG ? 'image/png' : enc === ENC_JPEG ? 'image/jpeg' : ''; }
+// Encoding 3 is a JPEG at reduced resolution; drawImage stretches it to the rect.
+function rectMimeType(enc) { return enc === ENC_PNG ? 'image/png' : (enc === ENC_JPEG || enc === 3) ? 'image/jpeg' : ''; }
 
 // backoffDelay is the reconnect wait: 0.5 s doubling to a 10 s ceiling.
 function backoffDelay(attempt) { return Math.min(10000, 500 * Math.pow(2, Math.max(0, Math.min(attempt, 16)))); }

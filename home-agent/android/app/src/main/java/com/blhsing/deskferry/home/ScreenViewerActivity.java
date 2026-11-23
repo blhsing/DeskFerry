@@ -16,6 +16,7 @@ import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffXfermode;
+import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Build;
@@ -137,6 +138,7 @@ public class ScreenViewerActivity extends Activity {
     private final Map<Long, ReplyHandler> pendingReplies = new ConcurrentHashMap<>();
     private final AtomicLong nextCommandId = new AtomicLong();
     private final Paint srcPaint = new Paint();
+    private final Paint scaledPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final Paint fillPaint = new Paint();
     private ExecutorService decoders;
     private ZoomImageView imageView;
@@ -218,6 +220,7 @@ public class ScreenViewerActivity extends Activity {
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
                 | WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN);
         srcPaint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC));
+        scaledPaint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC));
         fillPaint.setStyle(Paint.Style.FILL);
         fillPaint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC));
         decoders = Executors.newFixedThreadPool(Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors())));
@@ -869,7 +872,8 @@ public class ScreenViewerActivity extends Activity {
                 request.put("protocol", LiveScreenProtocol.PROTOCOL)
                         .put("client", "viewer")
                         .put("name", deviceName)
-                        .put("client_hello", ScreenKeys.base64Url(handshake.hello));
+                        .put("client_hello", ScreenKeys.base64Url(handshake.hello))
+                        .put("features", new org.json.JSONArray().put(LiveScreenProtocol.FEATURE_SCALED_JPEG));
             }
             if (!webSocket.send(ByteString.encodeUtf8(request.toString() + "\n"))) {
                 throw new IOException("could not send the screen request");
@@ -944,7 +948,7 @@ public class ScreenViewerActivity extends Activity {
                     }
                     byte[] payload = new byte[length];
                     in.readFully(payload);
-                    batch.ops.add(new DrawOp(x, y, w, h, decodeTile(payload, 0, length, w, h), 0));
+                    batch.ops.add(new DrawOp(x, y, w, h, decodeTile(payload, 0, length, w, h, false), 0));
                 }
             } catch (Exception ex) {
                 batch.recycle();
@@ -1041,15 +1045,19 @@ public class ScreenViewerActivity extends Activity {
             if (rect.enc == LiveScreenProtocol.ENC_SOLID) {
                 return new DrawOp(rect.x, rect.y, rect.w, rect.h, null, rect.solidArgb());
             }
-            return new DrawOp(rect.x, rect.y, rect.w, rect.h, decodeTile(rect.data, rect.dataOffset, rect.dataLength, rect.w, rect.h), 0);
+            return new DrawOp(rect.x, rect.y, rect.w, rect.h, decodeTile(rect.data, rect.dataOffset, rect.dataLength, rect.w, rect.h,
+                    rect.enc == LiveScreenProtocol.ENC_JPEG_SCALED), 0);
         }
 
-        private Bitmap decodeTile(byte[] data, int offset, int length, int width, int height) throws IOException {
+        private Bitmap decodeTile(byte[] data, int offset, int length, int width, int height, boolean scaled) throws IOException {
             BitmapFactory.Options options = new BitmapFactory.Options();
             options.inPreferredConfig = Bitmap.Config.ARGB_8888;
             Bitmap tile = BitmapFactory.decodeByteArray(data, offset, length, options);
             if (tile == null) throw new IOException("invalid screen tile image");
-            if (tile.getWidth() != width || tile.getHeight() != height) {
+            boolean fits = scaled
+                    ? tile.getWidth() > 0 && tile.getHeight() > 0 && tile.getWidth() <= width && tile.getHeight() <= height
+                    : tile.getWidth() == width && tile.getHeight() == height;
+            if (!fits) {
                 tile.recycle();
                 throw new IOException("screen tile does not match its size");
             }
@@ -1192,7 +1200,11 @@ public class ScreenViewerActivity extends Activity {
                     throw new IllegalStateException("screen rect outside the framebuffer");
                 }
                 if (op.tile != null) {
-                    currentCanvas.drawBitmap(op.tile, op.x, op.y, srcPaint);
+                    if (op.tile.getWidth() == op.w && op.tile.getHeight() == op.h) {
+                        currentCanvas.drawBitmap(op.tile, op.x, op.y, srcPaint);
+                    } else {
+                        currentCanvas.drawBitmap(op.tile, null, new Rect(op.x, op.y, op.x + op.w, op.y + op.h), scaledPaint);
+                    }
                 } else {
                     fillPaint.setColor(op.color);
                     currentCanvas.drawRect(op.x, op.y, op.x + op.w, op.y + op.h, fillPaint);

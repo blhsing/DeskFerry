@@ -227,7 +227,7 @@ func TestEncodeTilesIsLosslessWhenRequested(t *testing.T) {
 	source := newFakeSource(130, 70)
 	grid := newTileGrid(130, 70)
 	grid.markAll()
-	rects, lossy, err := grid.encodeTiles(source.frame, func(index int) bool { return grid.dirty[index] }, true, 50)
+	rects, lossy, err := grid.encodeTiles(source.frame, func(index int) bool { return grid.dirty[index] }, encodeMode{Lossless: true})
 	if err != nil || lossy != 0 {
 		t.Fatalf("encode = %d lossy, %v", lossy, err)
 	}

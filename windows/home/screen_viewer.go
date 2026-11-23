@@ -485,6 +485,9 @@ func (v *screenViewer) updateStats(client *screenview.LiveClient, now time.Time)
 	if legacy {
 		mode = "Read-only"
 	}
+	if compression := client.Status().Compression; compression != "" && compression != "full quality" && !legacy {
+		quality = compression
+	}
 	text := fmt.Sprintf("%s · %dx%d · %.0f fps · %.2f Mbit/s · %s", mode, width, height, fps, mbps, quality)
 	v.onUI(func() { _ = v.stats.SetText(text) })
 }

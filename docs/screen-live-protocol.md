@@ -18,7 +18,8 @@ helper. The Go implementation is `internal/screenview` (`live_*.go`).
    ```
 
    `client` is `viewer` or `agent`. `name` is shown on the Work PC's sharing
-   banner.
+   banner. An optional `features` array lists extra rect encodings the client
+   draws; `"scaled-jpeg"` allows encoding `3`.
 
 2. The Work side answers with a *legacy-framed* message: a 4-byte big-endian
    length, then that many bytes of JSON metadata (the same framing as legacy
@@ -112,7 +113,9 @@ All integers are big-endian and unsigned unless marked signed.
 | `0x7E` | ping | any bytes |
 | `0x7F` | pong | echo |
 
-Rect encodings: `0` solid (`data` = R,G,B,A), `1` PNG, `2` JPEG. Rects of one
+Rect encodings: `0` solid (`data` = R,G,B,A), `1` PNG, `2` JPEG, `3` JPEG at
+reduced resolution (only when the client listed `"scaled-jpeg"`): the image is
+smaller than the rect and the client stretches it to the rect. Rects of one
 frame are drawn in order; a client may draw them as they arrive but should
 present the frame at `frame end`. The client acks each frame after it has drawn
 it; the Work side uses acks for flow control, so a client that never acks
@@ -176,9 +179,22 @@ Web and Android clients map their key codes to Windows virtual-key codes.
 The Work side keeps capturing the latest screen and merges changes while it
 waits, so a slow link lowers the frame rate instead of building a queue. It
 keeps the unacknowledged bytes within a window derived from the measured
-delivery rate and round-trip time, picks JPEG quality from the same
-measurements, and sends text-like tiles losslessly. Once the screen is still,
-it re-sends every lossy region losslessly and marks the frame `lossless`.
+delivery rate and round-trip time.
+
+Compression follows the delivered frame rate. At full quality, text-like tiles
+are lossless and photographic tiles are JPEG at quality 80. A tile is *in
+motion* once it has kept changing, with no pause over 300 ms, for 300 ms. Every
+second the Work side counts acknowledged frames; while changes have been
+waiting for most of that second and fewer than 30 frames arrived, it tries one
+step more compression: lower JPEG quality, then tiles in motion as JPEG even
+when text-like, then tiles in motion at 1/2, 1/3 and 1/4 resolution. It keeps
+a step only if the next second delivers clearly more frames (at least 15% and
+one frame more), and otherwise reverts and waits before trying that step again
+(10 s, doubling up to 2 minutes). With at least 33 frames a second it tries one
+step less compression and keeps it if the rate stays at 30 or more. After 5
+calm seconds it returns to full quality. Once the screen is still, it re-sends
+every lossy region losslessly at full resolution and marks the frame
+`lossless`. `status.compression` names the current level.
 
 ## macOS Home viewer socket
 

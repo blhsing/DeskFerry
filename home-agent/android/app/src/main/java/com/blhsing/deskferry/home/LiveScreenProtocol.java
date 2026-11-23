@@ -46,6 +46,9 @@ final class LiveScreenProtocol {
     static final int ENC_SOLID = 0;
     static final int ENC_PNG = 1;
     static final int ENC_JPEG = 2;
+    /** A JPEG at reduced resolution, drawn stretched to its rect. */
+    static final int ENC_JPEG_SCALED = 3;
+    static final String FEATURE_SCALED_JPEG = "scaled-jpeg";
 
     static final int FRAME_FLAG_KEY = 1;
     static final int FRAME_END_LOSSLESS = 1;
@@ -373,7 +376,7 @@ final class LiveScreenProtocol {
             pos += RECT_HEADER_SIZE;
             if (size > end - pos || w <= 0 || h <= 0) throw new IOException("invalid rect in rects record");
             if (enc == ENC_SOLID && size != 4) throw new IOException("invalid solid rect");
-            if (enc != ENC_SOLID && enc != ENC_PNG && enc != ENC_JPEG) throw new IOException("unsupported rect encoding " + enc);
+            if (enc != ENC_SOLID && enc != ENC_PNG && enc != ENC_JPEG && enc != ENC_JPEG_SCALED) throw new IOException("unsupported rect encoding " + enc);
             rects.add(new Rect(x, y, w, h, enc, payload, pos, (int) size));
             pos += (int) size;
         }

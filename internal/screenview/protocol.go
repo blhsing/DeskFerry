@@ -41,6 +41,8 @@ type Request struct {
 	Client      string `json:"client,omitempty"`
 	Name        string `json:"name,omitempty"`
 	ClientHello string `json:"client_hello,omitempty"`
+	// Features lists optional rect encodings the client can draw.
+	Features []string `json:"features,omitempty"`
 }
 
 func (r *Request) Normalize() error {

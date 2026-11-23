@@ -31,7 +31,13 @@ const (
 	EncSolid byte = 0
 	EncPNG   byte = 1
 	EncJPEG  byte = 2
+	// EncJPEGScaled is a JPEG of the rect at reduced resolution; the client
+	// scales it up to the rect's size.
+	EncJPEGScaled byte = 3
 )
+
+// FeatureScaledJPEG is the request feature for EncJPEGScaled rects.
+const FeatureScaledJPEG = "scaled-jpeg"
 
 const (
 	frameFlagKey      byte = 1
@@ -118,7 +124,9 @@ type Status struct {
 	ForegroundTitle string `json:"foreground_title,omitempty"`
 	Cursor          [2]int `json:"cursor"`
 	Capture         string `json:"capture,omitempty"`
-	Viewers         int    `json:"viewers,omitempty"`
+	// Compression describes the current compression level.
+	Compression string `json:"compression,omitempty"`
+	Viewers     int    `json:"viewers,omitempty"`
 }
 
 // Message is a Work-to-client JSON message.
