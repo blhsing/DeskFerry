@@ -683,6 +683,13 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 			if s.fixedQuality > 0 {
 				mode.Quality = s.fixedQuality
 			}
+			if keyframe && !s.rate.lossless() && mode.Lossless {
+				// A whole lossless screen can take seconds on a slow link; the
+				// first picture sends photographic areas as JPEG and refines them
+				// losslessly right after.
+				mode.Lossless = false
+				mode.Quality = max(mode.Quality, 80)
+			}
 			encodeStarted := time.Now()
 			if keyframe {
 				s.stopVideo()

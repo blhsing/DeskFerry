@@ -49,6 +49,8 @@ const (
 	maximumCooldown    = 2 * time.Minute
 	downgradeHeadroom  = 1.1
 	minimumTrialFrames = 2
+	// maxTrialExtensions bounds how long a trial waits for frames to arrive.
+	maxTrialExtensions = 4
 	// headroomWindows is how many consecutive windows must have frame rate
 	// to spare before the controller tries less compression, so it does not
 	// bounce between levels (restarting a video stream each time).
@@ -65,6 +67,10 @@ type rateTrial struct {
 	// warmup is how many windows to ignore first: a video stream starts with
 	// a large key frame, so its first second says little.
 	warmup int
+	// extended counts windows added because nothing reached the viewer at
+	// either level (a large frame still draining), which says nothing about
+	// the trial.
+	extended int
 }
 
 // fpsController picks the compression level from the delivered frame rate.
@@ -265,6 +271,16 @@ func (c *fpsController) decide(now time.Time, fps float64, busy, active bool, fr
 	if trial := c.trial; trial != nil {
 		c.trial = nil
 		if trial.to > trial.from {
+			if fps < 1 && trial.before < 1 {
+				// Nothing arrived before or during the trial: a large frame is
+				// still on its way. Keep measuring; if nothing ever arrives the
+				// stronger level cannot hurt, so it stays.
+				if trial.extended < maxTrialExtensions {
+					trial.extended++
+					c.trial = trial
+				}
+				return
+			}
 			if fps >= trial.before*trialGain && fps >= trial.before+1 {
 				delete(c.upPenalty, trial.to)
 				c.keptTiles[trial.to] = max(tiles, 1)
@@ -279,6 +295,9 @@ func (c *fpsController) decide(now time.Time, fps float64, busy, active bool, fr
 		}
 		if fps >= c.target || (!busy && fps >= trial.before*0.9) {
 			delete(c.downPenalty, trial.from)
+			if c.logf != nil {
+				c.logf("screen compression level %d kept: %.1f fps", trial.to, fps)
+			}
 			return
 		}
 		penalize(c.downCooldown, c.downPenalty, trial.from, now)
@@ -290,7 +309,14 @@ func (c *fpsController) decide(now time.Time, fps float64, busy, active bool, fr
 	}
 	// Spare capacity: frames to spare, or the link keeping up with motion
 	// that has shrunk well below what the current level was kept for.
-	spare := fps >= c.target*downgradeHeadroom || (!busy && c.level > 0 && tiles*2 <= c.keptTiles[c.level])
+	shrunk := c.level > 0 && tiles*2 <= c.keptTiles[c.level]
+	spare := fps >= c.target*downgradeHeadroom || (!busy && shrunk)
+	if c.levels[c.level].Video {
+		// Video already sends the moving area at the rate the link allows;
+		// spare frame rate there does not mean JPEG could keep it. Try
+		// lighter levels only once the moving area has shrunk.
+		spare = shrunk
+	}
 	if spare {
 		c.headroom++
 	} else {
@@ -312,7 +338,9 @@ func (c *fpsController) decide(now time.Time, fps float64, busy, active bool, fr
 		c.setLevel(next, fmt.Sprintf("trying more compression at %.1f fps", fps))
 	case spare && c.level > 0 && now.After(c.downCooldown[c.level]) && c.headroom >= headroomWindows:
 		c.headroom = 0
-		c.trial = &rateTrial{from: c.level, to: c.level - 1, before: fps}
+		// Frames encoded at the stronger level are still arriving during the
+		// first window, so the lighter level is judged from the second.
+		c.trial = &rateTrial{from: c.level, to: c.level - 1, before: fps, warmup: 1}
 		c.setLevel(c.level-1, fmt.Sprintf("trying less compression at %.1f fps", fps))
 	}
 }

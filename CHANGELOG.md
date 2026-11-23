@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.15.7 - 2026-11-23
+
+- Reach video quickly when a busy screen is opened. Since 0.15.6 the first picture was lossless, which for a 2880x1800 screen saver is several megabytes and kept anything else from arriving for seconds; every compression step tried meanwhile measured 0 frames a second, was judged useless and put on cooldown, so video could take more than a minute to win. The first picture now sends photographic areas as JPEG and refines them losslessly right after (Min fps 0 stays lossless throughout), and a trial during which nothing arrives at either level keeps measuring instead of failing.
+- Stop the regular frame-rate dips while video is running. With frame rate above Min fps, the controller used to try JPEG every half minute, judged the trial from frames that were still arriving as video, kept JPEG, and fell to a few frames a second until it returned to video. Lighter levels are now judged only after the stronger level's frames have drained, and from video they are tried only once the moving area has shrunk.
+
 ## 0.15.6 - 2026-11-23
 
 - Keep the picture lossless while the frame rate is above Min fps. At full quality the Work PC used to send photographic-looking areas as JPEG whenever they changed, even with plenty of frame rate and bandwidth to spare; full quality is now lossless (PNG-style), and JPEG, then video, are used only when fewer frames than Min fps get through.

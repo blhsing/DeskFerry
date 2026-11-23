@@ -361,6 +361,7 @@ func TestControllerKeepsVideoWhileMotionLasts(t *testing.T) {
 	if c.level != video-1 {
 		t.Fatalf("level = %d with little motion, want a trial of %d", c.level, video-1)
 	}
+	c.decide(second(), 20, false, true, 20, 40) // frames still arriving from video
 	c.decide(second(), 20, false, true, 20, 40)
 	if c.level != video-1 || c.trial != nil {
 		t.Fatalf("lighter level was not kept (level %d)", c.level)
@@ -482,5 +483,47 @@ func TestStillAreasAreRefinedWhileAClockTicks(t *testing.T) {
 			t.Fatalf("%d rows of the still photo were not refined losslessly while the corner kept changing", differ)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestControllerKeepsVideoAboveALowMinFPS: with Min fps 15 and video at 18
+// fps over the whole screen, a JPEG level cannot keep up, so the controller
+// must not try one just because 18 is above 15.
+func TestControllerKeepsVideoAboveALowMinFPS(t *testing.T) {
+	c := newFPSController([]string{FeatureH264}, true, nil)
+	c.setTarget(15)
+	video := c.maxLevel
+	c.setLevel(video, "test")
+	c.keptTiles[video] = 1200
+	now := time.Now()
+	for range 120 {
+		now = now.Add(time.Second)
+		c.decide(now, 18, false, true, 18, 1100)
+		if c.level != video {
+			t.Fatalf("tried level %d although the whole screen still moves", c.level)
+		}
+	}
+}
+
+// TestControllerWaitsWhileNothingArrives: at the start a large first frame
+// can keep anything from arriving for seconds; a trial must not count that
+// against the stronger level.
+func TestControllerWaitsWhileNothingArrives(t *testing.T) {
+	c := newFPSController([]string{FeatureH264}, true, nil)
+	c.totalTiles = 1000
+	now := time.Now()
+	c.decide(now, 0, true, true, 0, 900)
+	video := c.maxLevel
+	if c.level != video {
+		t.Fatalf("level = %d, want a trial of video", c.level)
+	}
+	for second := 1; second <= 8; second++ {
+		c.decide(now.Add(time.Duration(second)*time.Second), 0, true, true, 0, 900)
+		if c.level != video {
+			t.Fatalf("left video after %d s although nothing arrived at either level", second)
+		}
+	}
+	if !now.Add(9 * time.Second).After(c.upCooldown[video]) {
+		t.Fatal("video was put on cooldown")
 	}
 }
