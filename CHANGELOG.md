@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.15.1 - 2026-11-23
+
+- Fix `-agent-mcp` and `-agent-json` through the relays. The agent closed its relay connection as soon as the screen session had opened, so every screenshot and action failed with "no screen image has arrived yet". Tests had used an in-memory connection that did not show this. The viewers were not affected.
+
 ## 0.15.0 - 2026-11-23
 
 - Turn the Screen Viewer into a live remote-desktop client. The Work PC now streams its screen continuously at the best frame rate and quality the connection allows: it sends only changed tiles, keeps text lossless, sends photographic areas as JPEG at a quality chosen from the measured bandwidth, re-sends them losslessly as soon as the screen is still, and waits for the viewer's acknowledgements so a slow link lowers the frame rate instead of building a backlog. Desktop Duplication capture is event-driven, and the remote pointer is drawn separately. The Windows, macOS and Android viewers all use it; the interval selector and one-shot capture are gone.

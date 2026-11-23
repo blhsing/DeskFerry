@@ -118,12 +118,37 @@ func (a *Agent) session(ctx context.Context) (*screenview.LiveClient, error) {
 			return a.client, nil
 		}
 	}
-	connectCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
-	client, err := a.connect(connectCtx)
-	if err != nil {
-		return nil, fail("work_offline", "could not open the Work PC's screen: %v", err)
+	// The connection lives as long as the session, so it gets its own
+	// context; only the wait for it is bounded.
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	type connected struct {
+		client *screenview.LiveClient
+		err    error
 	}
+	result := make(chan connected, 1)
+	go func() {
+		client, err := a.connect(sessionCtx)
+		result <- connected{client, err}
+	}()
+	var client *screenview.LiveClient
+	select {
+	case outcome := <-result:
+		if outcome.err != nil {
+			cancel()
+			return nil, fail("work_offline", "could not open the Work PC's screen: %v", outcome.err)
+		}
+		client = outcome.client
+	case <-time.After(90 * time.Second):
+		cancel()
+		return nil, fail("work_offline", "the Work PC's screen did not answer within 90 seconds")
+	case <-ctx.Done():
+		cancel()
+		return nil, ctx.Err()
+	}
+	go func() {
+		<-client.Done()
+		cancel()
+	}()
 	if client.Legacy() {
 		_ = client.Close()
 		return nil, fail("unsupported", "the Work PC runs an older DeskFerry without live screen control; upgrade DeskFerry on the Work PC")
