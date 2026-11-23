@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 	"unsafe"
@@ -40,7 +41,18 @@ func TestManualScreenViewerWindow(t *testing.T) {
 	}
 	viewer.mw.Show()
 	viewer.start()
-	time.AfterFunc(15*time.Second, func() { viewer.mw.Synchronize(func() { report(t, viewer); viewer.mw.Close() }) })
+	seconds := 15
+	if value, err := strconv.Atoi(os.Getenv("DESKFERRY_MANUAL_VIEWER_SECONDS")); err == nil && value > 0 {
+		seconds = value
+	}
+	ticker := time.NewTicker(4 * time.Second)
+	defer ticker.Stop()
+	go func() {
+		for range ticker.C {
+			viewer.mw.Synchronize(func() { t.Logf("%s | %s", viewer.stats.Text(), viewer.status.Text()) })
+		}
+	}()
+	time.AfterFunc(time.Duration(seconds)*time.Second, func() { viewer.mw.Synchronize(func() { report(t, viewer); viewer.mw.Close() }) })
 	viewer.mw.Run()
 }
 
