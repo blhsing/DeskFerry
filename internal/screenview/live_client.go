@@ -45,10 +45,16 @@ type LiveClientOptions struct {
 	LegacyIntervalMS int
 	// MinFPS is the frame rate the Work PC's compression aims for; nil uses
 	// DefaultMinFPS and 0 asks for lossless only.
-	MinFPS   *int
-	OnFrame  func(FrameUpdate)
-	OnStatus func(Status)
-	OnCursor func(CursorState)
+	MinFPS  *int
+	OnFrame func(FrameUpdate)
+	// VideoDecoder decodes H.264 rects; with it the client offers video.
+	VideoDecoder VideoDecoderFactory
+	// PassthroughVideo offers video for OnEncoded consumers (such as a web
+	// page) without decoding it: video rects do not update the framebuffer
+	// until the area is refined losslessly.
+	PassthroughVideo bool
+	OnStatus         func(Status)
+	OnCursor         func(CursorState)
 	// OnEncoded receives every frame as it arrives, still encoded, before it
 	// is drawn. Legacy frames arrive as PNG rects. Rect data must not be
 	// modified.
@@ -107,6 +113,7 @@ type LiveClient struct {
 	nextID  atomic.Uint64
 	pending sync.Map // id -> chan Message
 	outbox  *recordQueue
+	video   VideoDecoder
 
 	done    chan struct{}
 	err     error
@@ -139,6 +146,9 @@ func StartLive(ctx context.Context, rw io.ReadWriteCloser, opts LiveClientOption
 		request.Name = opts.Name
 		request.ClientHello = base64.RawURLEncoding.EncodeToString(handshake.hello)
 		request.Features = []string{FeatureScaledJPEG}
+		if opts.VideoDecoder != nil || opts.PassthroughVideo {
+			request.Features = append(request.Features, FeatureH264)
+		}
 		request.MinFPS = opts.MinFPS
 		if request.IntervalMS < MinIntervalMS {
 			request.IntervalMS = MinIntervalMS
@@ -224,8 +234,11 @@ func (c *LiveClient) finish(err error) {
 		c.err = err
 		_ = c.rw.Close()
 		close(c.done)
+		if c.video != nil {
+			c.video.Close()
+		}
 		if c.outbox != nil {
-			close(c.outbox.records)
+			c.outbox.stop()
 		}
 		c.pending.Range(func(key, value any) bool {
 			select {
@@ -437,7 +450,11 @@ func (c *LiveClient) liveLoop() {
 			c.lossless = current.Lossless
 			c.fbMu.Unlock()
 			if !c.outbox.send(recAck, encodeSeq(seq)) {
-				c.finish(c.outbox.err)
+				err := c.outbox.err
+				if err == nil {
+					err = errors.New("screen session closed")
+				}
+				c.finish(err)
 				return
 			}
 			if c.opts.OnEncoded != nil {
@@ -496,6 +513,59 @@ type decodedRect struct {
 }
 
 func (c *LiveClient) drawRects(rects []EncodedRect) ([]image.Rectangle, error) {
+	// Video rects depend on stream state, so they decode in order here.
+	var tiles []EncodedRect
+	var dirty []image.Rectangle
+	for _, rect := range rects {
+		if rect.Enc != EncH264 {
+			tiles = append(tiles, rect)
+			continue
+		}
+		if picture := c.decodeVideo(rect); picture != nil {
+			target := image.Rect(rect.X, rect.Y, rect.X+rect.W, rect.Y+rect.H)
+			c.fbMu.Lock()
+			if c.fb != nil && target.In(c.fb.Bounds()) {
+				draw.Draw(c.fb, target, picture, image.Point{}, draw.Src)
+				dirty = append(dirty, target)
+			}
+			c.fbMu.Unlock()
+		}
+	}
+	tileDirty, err := c.drawTiles(tiles)
+	return append(dirty, tileDirty...), err
+}
+
+// decodeVideo decodes one access unit; a broken stream only costs its
+// pictures until the next stream starts or the area is refined.
+func (c *LiveClient) decodeVideo(rect EncodedRect) *image.RGBA {
+	if c.opts.VideoDecoder == nil || len(rect.Data) < 2 {
+		return nil
+	}
+	if rect.Data[0]&videoStreamStart != 0 && c.video != nil {
+		c.video.Close()
+		c.video = nil
+	}
+	if c.video == nil {
+		if rect.Data[0]&videoStreamStart == 0 {
+			return nil
+		}
+		decoder, err := c.opts.VideoDecoder()
+		if err != nil {
+			return nil
+		}
+		c.video = decoder
+	}
+	picture, err := c.video.Decode(rect.Data[1:], rect.W, rect.H)
+	if err != nil {
+		c.video.Close()
+		c.video = nil
+		_ = c.Send(Command{Cmd: "refresh", Keyframe: true})
+		return nil
+	}
+	return picture
+}
+
+func (c *LiveClient) drawTiles(rects []EncodedRect) ([]image.Rectangle, error) {
 	decoded := make([]decodedRect, len(rects))
 	var wg sync.WaitGroup
 	workers := max(1, min(runtime.NumCPU(), len(rects)))

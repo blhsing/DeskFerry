@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"deskferry/internal/buildinfo"
+	"deskferry/internal/mfcodec"
 )
 
 var (
@@ -354,6 +355,7 @@ func RunCaptureHelper(opts HelperOptions) error {
 			Host:           host,
 			OnState:        publish,
 			Control:        control,
+			VideoEncoder:   mediaFoundationEncoder,
 		})
 	}
 	publish(SessionState{ClientName: request.Name, ClientKind: request.Client})
@@ -434,4 +436,23 @@ func enablePhysicalDesktopCoordinates() {
 	if procSetProcessDPIAware.Find() == nil {
 		_, _, _ = procSetProcessDPIAware.Call()
 	}
+}
+
+// mediaFoundationEncoder opens a Media Foundation H.264 encoder, preferring
+// hardware.
+func mediaFoundationEncoder(width, height, fps, bitrate int) (VideoEncoder, error) {
+	encoder, err := mfcodec.NewEncoder(mfcodec.EncoderOptions{Width: width, Height: height, FPS: fps, Bitrate: bitrate})
+	if err != nil {
+		return nil, err
+	}
+	return encoder, nil
+}
+
+// MediaFoundationDecoder opens a Media Foundation H.264 decoder.
+func MediaFoundationDecoder() (VideoDecoder, error) {
+	decoder, err := mfcodec.NewDecoder()
+	if err != nil {
+		return nil, err
+	}
+	return decoder, nil
 }

@@ -426,6 +426,7 @@ func (a *Agent) Do(ctx context.Context, action string, args Args) (Result, error
 			"control_allowed": status.ControlAllowed, "control_active": status.ControlActive,
 			"human_input_ms_ago": status.HumanInputMSAgo, "desktop": status.Desktop, "locked": status.Locked,
 			"foreground_title": status.ForegroundTitle, "cursor": cursor, "capture": status.Capture,
+			"compression": status.Compression, "perf": status.Perf,
 		}
 		text, _ := json.Marshal(data)
 		return Result{Text: string(text), Data: data}, nil

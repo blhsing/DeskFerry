@@ -271,24 +271,30 @@ type outgoingRecord struct {
 // block on a write: a peer that is itself blocked writing to us would
 // otherwise deadlock both sides.
 type recordQueue struct {
-	conn    *recordConn
-	records chan outgoingRecord
-	failed  chan struct{}
-	once    sync.Once
-	err     error
+	conn     *recordConn
+	records  chan outgoingRecord
+	failed   chan struct{}
+	once     sync.Once
+	err      error
+	stopped  chan struct{}
+	stopOnce sync.Once
 }
 
 func newRecordQueue(conn *recordConn) *recordQueue {
-	queue := &recordQueue{conn: conn, records: make(chan outgoingRecord, 4096), failed: make(chan struct{})}
+	queue := &recordQueue{conn: conn, records: make(chan outgoingRecord, 4096), failed: make(chan struct{}), stopped: make(chan struct{})}
 	go func() {
-		for record := range queue.records {
+		for {
+			var record outgoingRecord
+			select {
+			case <-queue.stopped:
+				return
+			case record = <-queue.records:
+			}
 			if err := conn.WriteRecord(record.recordType, record.payload); err != nil {
 				queue.once.Do(func() {
 					queue.err = err
 					close(queue.failed)
 				})
-				for range queue.records {
-				}
 				return
 			}
 		}
@@ -296,10 +302,18 @@ func newRecordQueue(conn *recordConn) *recordQueue {
 	return queue
 }
 
+// stop ends the writer. The records channel is never closed, so senders
+// racing with the end of a session cannot panic.
+func (q *recordQueue) stop() {
+	q.stopOnce.Do(func() { close(q.stopped) })
+}
+
 // send queues a record; it reports false once the connection has failed.
 func (q *recordQueue) send(recordType byte, payload []byte) bool {
 	select {
 	case <-q.failed:
+		return false
+	case <-q.stopped:
 		return false
 	default:
 	}
@@ -307,6 +321,8 @@ func (q *recordQueue) send(recordType byte, payload []byte) bool {
 	case q.records <- outgoingRecord{recordType: recordType, payload: payload}:
 		return true
 	case <-q.failed:
+		return false
+	case <-q.stopped:
 		return false
 	}
 }

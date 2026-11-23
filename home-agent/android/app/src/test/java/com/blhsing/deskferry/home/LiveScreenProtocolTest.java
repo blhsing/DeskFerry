@@ -209,6 +209,42 @@ public class LiveScreenProtocolTest {
     }
 
     @Test
+    public void parsesH264Rects() throws Exception {
+        byte[] start = new byte[]{1, 0, 0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x68, 0, 0, 1, 0x65, (byte) 0x88};
+        byte[] next = new byte[]{0, 0, 0, 0, 1, 0x41, (byte) 0x9A};
+        ByteBuffer rects = ByteBuffer.allocate(2 + 13 + start.length + 13 + next.length);
+        rects.putShort((short) 2);
+        rects.putShort((short) 8).putShort((short) 16).putShort((short) 100).putShort((short) 50).put((byte) 4).putInt(start.length);
+        rects.put(start);
+        rects.putShort((short) 8).putShort((short) 16).putShort((short) 100).putShort((short) 50).put((byte) 4).putInt(next.length);
+        rects.put(next);
+        List<LiveScreenProtocol.Rect> parsed = LiveScreenProtocol.parseRects(rects.array(), 0, rects.capacity());
+        assertEquals(2, parsed.size());
+        LiveScreenProtocol.Rect first = parsed.get(0);
+        assertEquals(LiveScreenProtocol.ENC_H264, first.enc);
+        assertEquals(100, first.w);
+        assertEquals(50, first.h);
+        assertTrue(first.videoStreamStart());
+        assertEquals(start.length - 1, first.videoLength());
+        assertArrayEquals(Arrays.copyOfRange(start, 1, start.length),
+                Arrays.copyOfRange(first.data, first.videoOffset(), first.videoOffset() + first.videoLength()));
+        LiveScreenProtocol.Rect second = parsed.get(1);
+        assertFalse(second.videoStreamStart());
+        assertEquals(next.length - 1, second.videoLength());
+        assertEquals(VideoFrames.NAL_SLICE, VideoFrames.nalUnits(second.data, second.videoOffset(), second.videoLength()).get(0).type);
+        assertEquals("h264", LiveScreenProtocol.FEATURE_H264);
+
+        ByteBuffer unknown = ByteBuffer.allocate(2 + 13 + 1);
+        unknown.putShort((short) 1);
+        unknown.putShort((short) 0).putShort((short) 0).putShort((short) 1).putShort((short) 1).put((byte) 5).putInt(1).put((byte) 0);
+        try {
+            LiveScreenProtocol.parseRects(unknown.array(), 0, unknown.capacity());
+            fail("unknown rect encoding accepted");
+        } catch (IOException expected) {
+        }
+    }
+
+    @Test
     public void parsesCursor() throws Exception {
         byte[] png = new byte[]{1, 2, 3};
         ByteBuffer cursor = ByteBuffer.allocate(21 + png.length);

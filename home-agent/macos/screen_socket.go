@@ -55,6 +55,8 @@ type macScreenSocket struct {
 	needKey   bool
 	sentShape map[uint32]bool
 	minFPS    int
+	// video says the page can decode H.264 (WebCodecs).
+	video     bool
 	frames    int
 	lastBytes uint64
 	lastStats time.Time
@@ -96,12 +98,18 @@ func (c *macUIController) serveScreenSocket(w http.ResponseWriter, r *http.Reque
 			Text   string                  `json:"text"`
 			MinFPS *int                    `json:"min_fps"`
 			Value  *int                    `json:"value"`
+			Video  bool                    `json:"video"`
 		}
 		if json.Unmarshal(data, &message) != nil {
 			continue
 		}
-		if message.Type == "start" && message.MinFPS != nil {
-			socket.setMinFPS(*message.MinFPS)
+		if message.Type == "start" {
+			if message.MinFPS != nil {
+				socket.setMinFPS(*message.MinFPS)
+			}
+			socket.mu.Lock()
+			socket.video = message.Video
+			socket.mu.Unlock()
 		}
 		if message.Type == "min_fps" && message.Value != nil {
 			socket.setMinFPS(*message.Value)
@@ -319,15 +327,17 @@ func (s *macScreenSocket) start(parent context.Context) {
 		hostname, _ := os.Hostname()
 		s.mu.Lock()
 		minFPS := s.minFPS
+		video := s.video
 		s.mu.Unlock()
 		client, err := screenview.StartLive(ctx, conn, screenview.LiveClientOptions{
-			ScreenKey: cfg.screenKey(),
-			MinFPS:    &minFPS,
-			Client:    "viewer",
-			Name:      hostname,
-			OnEncoded: s.forward,
-			OnStatus:  func(screenview.Status) { s.pushState() },
-			OnCursor:  s.forwardCursor,
+			ScreenKey:        cfg.screenKey(),
+			MinFPS:           &minFPS,
+			PassthroughVideo: video,
+			Client:           "viewer",
+			Name:             hostname,
+			OnEncoded:        s.forward,
+			OnStatus:         func(screenview.Status) { s.pushState() },
+			OnCursor:         s.forwardCursor,
 		})
 		if err != nil {
 			_ = conn.Close()

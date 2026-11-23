@@ -412,13 +412,14 @@ func (v *screenViewer) run(ctx context.Context) {
 	hostname, _ := os.Hostname()
 	minFPS := v.minFPS
 	client, err := screenview.StartLive(ctx, conn, screenview.LiveClientOptions{
-		ScreenKey: cfg.screenKey(),
-		MinFPS:    &minFPS,
-		Client:    "viewer",
-		Name:      hostname,
-		OnFrame:   v.onFrame,
-		OnStatus:  v.onStatus,
-		OnCursor:  v.onCursor,
+		ScreenKey:    cfg.screenKey(),
+		MinFPS:       &minFPS,
+		VideoDecoder: screenview.MediaFoundationDecoder,
+		Client:       "viewer",
+		Name:         hostname,
+		OnFrame:      v.onFrame,
+		OnStatus:     v.onStatus,
+		OnCursor:     v.onCursor,
 	})
 	if err != nil {
 		_ = conn.Close()

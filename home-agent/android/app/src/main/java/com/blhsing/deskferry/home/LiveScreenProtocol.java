@@ -49,6 +49,11 @@ final class LiveScreenProtocol {
     /** A JPEG at reduced resolution, drawn stretched to its rect. */
     static final int ENC_JPEG_SCALED = 3;
     static final String FEATURE_SCALED_JPEG = "scaled-jpeg";
+    /** One access unit of an H.264 stream: a flags byte, then Annex B NAL units. */
+    static final int ENC_H264 = 4;
+    static final String FEATURE_H264 = "h264";
+    /** Flag of an encoding-4 rect's first data byte: a new H.264 stream starts with this unit. */
+    static final int VIDEO_STREAM_START = 1;
 
     static final int FRAME_FLAG_KEY = 1;
     static final int FRAME_END_LOSSLESS = 1;
@@ -352,6 +357,20 @@ final class LiveScreenProtocol {
             this.dataLength = dataLength;
         }
 
+        /** For an H.264 rect: whether this access unit starts a new stream. */
+        boolean videoStreamStart() {
+            return enc == ENC_H264 && dataLength > 0 && (data[dataOffset] & VIDEO_STREAM_START) != 0;
+        }
+
+        /** For an H.264 rect: offset and length of the Annex B access unit after the flags byte. */
+        int videoOffset() {
+            return dataOffset + 1;
+        }
+
+        int videoLength() {
+            return Math.max(0, dataLength - 1);
+        }
+
         /** Solid fill as an Android ARGB colour (opaque). */
         int solidArgb() {
             return 0xFF000000 | (data[dataOffset] & 0xFF) << 16 | (data[dataOffset + 1] & 0xFF) << 8 | (data[dataOffset + 2] & 0xFF);
@@ -376,7 +395,7 @@ final class LiveScreenProtocol {
             pos += RECT_HEADER_SIZE;
             if (size > end - pos || w <= 0 || h <= 0) throw new IOException("invalid rect in rects record");
             if (enc == ENC_SOLID && size != 4) throw new IOException("invalid solid rect");
-            if (enc != ENC_SOLID && enc != ENC_PNG && enc != ENC_JPEG && enc != ENC_JPEG_SCALED) throw new IOException("unsupported rect encoding " + enc);
+            if (enc != ENC_SOLID && enc != ENC_PNG && enc != ENC_JPEG && enc != ENC_JPEG_SCALED && enc != ENC_H264) throw new IOException("unsupported rect encoding " + enc);
             rects.add(new Rect(x, y, w, h, enc, payload, pos, (int) size));
             pos += (int) size;
         }

@@ -36,8 +36,18 @@ const (
 	EncJPEGScaled byte = 3
 )
 
-// FeatureScaledJPEG is the request feature for EncJPEGScaled rects.
-const FeatureScaledJPEG = "scaled-jpeg"
+// EncH264 carries one access unit of an H.264 (Annex B) stream for the
+// rect; data starts with a flags byte (1 = a new stream starts here).
+const EncH264 byte = 4
+
+// Request features: optional rect encodings a client can draw.
+const (
+	FeatureScaledJPEG = "scaled-jpeg"
+	FeatureH264       = "h264"
+)
+
+// videoStreamStart marks the first access unit of a new H.264 stream.
+const videoStreamStart byte = 1
 
 const (
 	frameFlagKey      byte = 1
@@ -127,7 +137,9 @@ type Status struct {
 	Capture         string `json:"capture,omitempty"`
 	// Compression describes the current compression level.
 	Compression string `json:"compression,omitempty"`
-	Viewers     int    `json:"viewers,omitempty"`
+	// Perf summarizes recent per-frame timings on the Work PC.
+	Perf    string `json:"perf,omitempty"`
+	Viewers int    `json:"viewers,omitempty"`
 }
 
 // Message is a Work-to-client JSON message.

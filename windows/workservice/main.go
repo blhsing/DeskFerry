@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -181,6 +182,15 @@ func Main() {
 	flag.StringVar(&updateServiceTarget, "update-service", "", "replace the installed service executable and restart it")
 	flag.Parse()
 	if screenCaptureHelper {
+		// The helper's standard error is discarded, so keep its log, including
+		// a crash's stack trace, in its own diagnostic log.
+		if path, err := diaglog.Enable("screen-helper", true, logRetentionDays); err == nil {
+			if crashLog, openErr := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0); openErr == nil {
+				_ = debug.SetCrashOutput(crashLog, debug.CrashOptions{})
+				crashLog.Close()
+			}
+		}
+		log.Printf("DeskFerry screen helper version=%s", buildinfo.Version)
 		if err := screenview.RunCaptureHelper(screenview.HelperOptions{RunBanner: runShareBanner}); err != nil {
 			log.Printf("screen capture helper failed: %v", err)
 			os.Exit(1)
@@ -362,7 +372,13 @@ func updateServiceBinary(target string) error {
 		return fmt.Errorf("updated service did not reach running state (previous executable restored): %w", err)
 	}
 	if err := os.Remove(previous); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove previous service executable: %w", err)
+		// The update itself succeeded; another DeskFerry process (the desktop
+		// app or the network service) still runs from the old file.
+		if path, pathErr := windows.UTF16PtrFromString(previous); pathErr == nil && windows.MoveFileEx(path, nil, windows.MOVEFILE_DELAY_UNTIL_REBOOT) == nil {
+			fmt.Printf("Previous executable %s is still in use; it will be deleted at the next restart\n", previous)
+		} else {
+			fmt.Printf("Previous executable %s is still in use and was not deleted: %v\n", previous, err)
+		}
 	}
 	fmt.Printf("Updated and started DeskFerry Agent service at %s\n", target)
 	return nil

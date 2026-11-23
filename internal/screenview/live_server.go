@@ -12,6 +12,7 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,18 +66,24 @@ type LiveServerOptions struct {
 	OnState func(SessionState)
 	// Control receives banner requests: false stops control for the session.
 	Control <-chan bool
-	Logf    func(format string, args ...any)
+	// VideoEncoder opens an H.264 encoder; nil disables video.
+	VideoEncoder VideoEncoderFactory
+	Logf         func(format string, args ...any)
 }
 
 const (
-	defaultMaxFPS        = 60
-	refineDelay          = 250 * time.Millisecond
-	humanYieldWindow     = 1500 * time.Millisecond
-	livePingInterval     = 10 * time.Second
-	liveIdleTimeout      = 60 * time.Second
-	minWindowBytes       = 192 << 10
-	maxWindowBytes       = 32 << 20
-	maxFramesInFlight    = 16
+	defaultMaxFPS     = 60
+	refineDelay       = 250 * time.Millisecond
+	humanYieldWindow  = 1500 * time.Millisecond
+	livePingInterval  = 10 * time.Second
+	liveIdleTimeout   = 60 * time.Second
+	minWindowBytes    = 192 << 10
+	maxWindowBytes    = 32 << 20
+	maxFramesInFlight = 16
+	// pipelinedFrames is how many typical frames may always be in flight.
+	pipelinedFrames = 3
+	// maxQueuedFrames lets one frame be encoded while another is written.
+	maxQueuedFrames      = 2
 	statusPushInterval   = 500 * time.Millisecond
 	refineBudgetFraction = 2
 )
@@ -108,6 +115,23 @@ type liveServer struct {
 	commands chan Command
 	inputs   chan Command
 	outbox   *recordQueue
+
+	// frames carries encoded frames, and replies that must follow them, to
+	// the sender goroutine, so capturing and encoding the next frame overlap
+	// with sending this one.
+	frames chan frameJob
+	perf   framePerf
+	video  *videoStream
+	// videoFailures counts encoder failures in this session.
+	videoFailures int
+	// ackedBytes counts acknowledged frame bytes; throughput is the
+	// delivered rate (bytes per second) measured while changes were waiting.
+	ackedBytes atomic.Int64
+	throughput float64
+	tpStart    time.Time
+	queued     atomic.Int32
+	sendErr    atomic.Value
+	frameBytes float64 // moving average of sent frame sizes
 
 	mu        sync.Mutex
 	inflight  []inflightFrame
@@ -151,7 +175,7 @@ func ServeLive(ctx context.Context, rw io.ReadWriter, request Request, opts Live
 		Width:          bounds.Dx(),
 		Height:         bounds.Dy(),
 		ControlAllowed: opts.ControlAllowed,
-		Capabilities:   []string{"control", "clipboard", "ui", "sas", "settle", "cursor"},
+		Capabilities:   liveCapabilities(opts.VideoEncoder != nil),
 	}
 	if err := WriteFrame(rw, Frame{Type: FrameHello, Live: &hello}, nil); err != nil {
 		return err
@@ -175,14 +199,15 @@ func ServeLive(ctx context.Context, rw io.ReadWriter, request Request, opts Live
 		commands: make(chan Command, 64),
 		inputs:   make(chan Command, 256),
 		acked:    make(chan struct{}, 1),
-		rate:     newFPSController(hasFeature(request.Features, FeatureScaledJPEG), logf),
+		rate:     newFPSController(request.Features, opts.VideoEncoder != nil, logf),
 		maxFPS:   defaultMaxFPS,
 	}
 	if request.MinFPS != nil {
 		server.rate.setTarget(*request.MinFPS)
 	}
 	server.outbox = newRecordQueue(conn)
-	defer close(server.outbox.records)
+	server.frames = make(chan frameJob, 8)
+	defer server.outbox.stop()
 	server.lastReceived.Store(time.Now().UnixNano())
 	server.notifyState(false)
 	defer server.notifyState(true)
@@ -191,6 +216,7 @@ func ServeLive(ctx context.Context, rw io.ReadWriter, request Request, opts Live
 	readErr := make(chan error, 1)
 	go func() { readErr <- server.readLoop(ctx) }()
 	go server.inputLoop(ctx)
+	go server.frameSender(ctx)
 	loopErr := make(chan error, 1)
 	go func() { loopErr <- server.frameLoop(ctx, frame) }()
 	select {
@@ -200,6 +226,7 @@ func ServeLive(ctx context.Context, rw io.ReadWriter, request Request, opts Live
 		err = ctx.Err()
 	}
 	cancel()
+	server.stopVideo()
 	opts.Host.ReleaseAll()
 	if errors.Is(err, io.EOF) {
 		return nil
@@ -403,6 +430,7 @@ func (s *liveServer) handleAck(seq uint64) {
 			continue
 		}
 		s.rate.delivered()
+		s.ackedBytes.Add(int64(frame.bytes))
 		if frame.seq != seq {
 			continue
 		}
@@ -457,6 +485,10 @@ func (s *liveServer) window() (int, int, int) {
 		rtt = 20 * time.Millisecond
 	}
 	limit := int(bandwidth * rtt.Seconds() * 2)
+	// Always allow a few typical frames in flight. With a single frame in
+	// flight every frame waits a full round trip plus the viewer's decode,
+	// and that wait also makes the link look slower than it is.
+	limit = max(limit, int(s.frameBytes*pipelinedFrames))
 	limit = max(minWindowBytes, min(maxWindowBytes, limit))
 	return limit, inflight, len(s.inflight)
 }
@@ -583,10 +615,13 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 		if pending || len(waiters) > 0 || lossyPending {
 			timeout = time.Second / time.Duration(max(1, s.maxFPS))
 		}
+		captureStarted := time.Now()
 		frame, changed, err := s.opts.Source.Next(timeout)
 		if err != nil {
 			return err
 		}
+		captureTime := time.Since(captureStarted)
+		diffStarted := time.Now()
 		if fb := frame.Bounds(); fb.Dx() != grid.width || fb.Dy() != grid.height {
 			reference = image.NewRGBA(image.Rect(0, 0, fb.Dx(), fb.Dy()))
 			copy(reference.Pix, frame.Pix)
@@ -598,9 +633,20 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 			if grid.diffInto(reference, frame, time.Now()) == 0 {
 				changed = false
 			}
+		} else {
+			grid.markCalm(time.Now())
 		}
 		now := time.Now()
-		s.rate.observe(now, grid.anyDirty(), now.Sub(lastIteration))
+		if changed {
+			s.perf.add(&s.perf.capture, captureTime)
+			s.perf.add(&s.perf.diff, now.Sub(diffStarted))
+		}
+		s.rate.totalTiles = len(grid.lastChange)
+		s.rate.observe(now, grid.anyDirty(), changed, now.Sub(lastIteration), func() int {
+			_, count := grid.motionBounds(now)
+			return count
+		})
+		s.measureThroughput(now, grid.anyDirty())
 		lastIteration = now
 		if changed {
 			lastChange = now
@@ -616,23 +662,38 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 
 		limit, inflight, frames := s.window()
 		minInterval := time.Second / time.Duration(max(1, s.maxFPS))
-		canSend := inflight < limit && frames < maxFramesInFlight && now.Sub(lastSend) >= minInterval
+		if err := s.senderError(); err != nil {
+			return err
+		}
+		canSend := inflight < limit && frames < maxFramesInFlight && now.Sub(lastSend) >= minInterval && s.queued.Load() < maxQueuedFrames
 		if canSend && (grid.anyDirty() || keyframe) {
 			level := s.rate.current()
 			mode := encodeMode{Quality: level.Quality, MotionLossy: level.MotionLossy, MotionScale: level.MotionScale, Now: now, Lossless: s.rate.lossless()}
 			if s.fixedQuality > 0 {
 				mode.Quality = s.fixedQuality
 			}
+			encodeStarted := time.Now()
+			if keyframe {
+				s.stopVideo()
+			}
+			var videoRects []EncodedRect
+			if level.Video && !mode.Lossless {
+				videoRects = s.encodeVideo(grid, reference, now)
+			} else {
+				s.stopVideo()
+			}
 			rects, _, err := grid.encodeTiles(reference, func(index int) bool { return grid.dirty[index] }, mode)
 			if err != nil {
 				return err
 			}
+			rects = append(videoRects, rects...)
+			s.perf.add(&s.perf.encode, time.Since(encodeStarted))
 			seq++
 			flags := byte(0)
 			if !grid.anyLossy() {
 				flags |= frameEndLossless
 			}
-			if _, err := s.sendFrame(seq, grid, rects, keyframe, flags); err != nil {
+			if err := s.sendFrame(seq, grid, rects, keyframe, flags); err != nil {
 				return err
 			}
 			keyframe = false
@@ -660,7 +721,7 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 			if !grid.anyLossy() {
 				flags |= frameEndLossless
 			}
-			if _, err := s.sendFrame(seq, grid, rects, false, flags); err != nil {
+			if err := s.sendFrame(seq, grid, rects, false, flags); err != nil {
 				return err
 			}
 			lastSend = now
@@ -675,7 +736,7 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 			for _, waiter := range waiters {
 				settled := clean && quietFor >= waiter.quiet
 				if settled || now.After(waiter.deadline) {
-					s.reply(waiter.id, SettleResult{Seq: seq, Settled: settled, Changed: mergeRects(waiter.changed)}, nil)
+					s.replyAfterFrames(waiter.id, SettleResult{Seq: seq, Settled: settled, Changed: mergeRects(waiter.changed)})
 					continue
 				}
 				kept = append(kept, waiter)
@@ -702,6 +763,7 @@ func (s *liveServer) frameLoop(ctx context.Context, first *image.RGBA) error {
 		if since := time.Since(time.Unix(0, s.lastReceived.Load())); since > liveIdleTimeout {
 			return fmt.Errorf("live screen client silent for %s", since.Round(time.Second))
 		}
+		s.perf.sample(!canSend && (grid.anyDirty() || keyframe), inflight >= limit || frames >= maxFramesInFlight)
 		if !canSend && (grid.anyDirty() || keyframe) {
 			// Wait briefly for an ack instead of spinning on capture.
 			select {
@@ -750,6 +812,7 @@ func (s *liveServer) status(grid *tileGrid) Status {
 		Cursor:          [2]int{cursor.X, cursor.Y},
 		Capture:         s.opts.Source.Method(),
 		Compression:     s.rate.describe(s.rate.level),
+		Perf:            s.perf.String(s.rate.lastFPS),
 	}
 }
 
@@ -772,28 +835,163 @@ func (s *liveServer) sendCursor(tracker *cursorTracker) {
 	}
 }
 
-func (s *liveServer) sendFrame(seq uint64, grid *tileGrid, rects []EncodedRect, keyframe bool, endFlags byte) (int, error) {
+// frameJob is an encoded frame, or a JSON reply that must follow the frames
+// queued before it.
+type frameJob struct {
+	seq           uint64
+	width, height int
+	rects         []EncodedRect
+	keyframe      bool
+	endFlags      byte
+	message       []byte
+}
+
+// sendFrame queues an encoded frame for the sender goroutine.
+func (s *liveServer) sendFrame(seq uint64, grid *tileGrid, rects []EncodedRect, keyframe bool, endFlags byte) error {
+	if err := s.senderError(); err != nil {
+		return err
+	}
+	s.queued.Add(1)
+	s.frames <- frameJob{seq: seq, width: grid.width, height: grid.height, rects: rects, keyframe: keyframe, endFlags: endFlags}
+	return nil
+}
+
+// replyAfterFrames sends a reply after every frame queued so far.
+func (s *liveServer) replyAfterFrames(id uint64, result any) {
+	message := Message{Type: "reply", ID: id, OK: true}
+	if data, err := json.Marshal(result); err == nil {
+		message.Result = data
+	}
+	data, err := json.Marshal(message)
+	if err != nil {
+		return
+	}
+	s.frames <- frameJob{message: data}
+}
+
+func (s *liveServer) senderError() error {
+	if err, ok := s.sendErr.Load().(error); ok {
+		return err
+	}
+	return nil
+}
+
+func (s *liveServer) frameSender(ctx context.Context) {
+	for {
+		var job frameJob
+		select {
+		case <-ctx.Done():
+			return
+		case job = <-s.frames:
+		}
+		if s.senderError() != nil {
+			if job.message == nil {
+				s.queued.Add(-1)
+			}
+			continue
+		}
+		if job.message != nil {
+			if err := s.conn.WriteRecord(recJSON, job.message); err != nil {
+				s.sendErr.Store(err)
+			}
+			continue
+		}
+		size, err := s.writeFrame(job)
+		if err != nil {
+			s.sendErr.Store(err)
+			s.queued.Add(-1)
+			continue
+		}
+		s.mu.Lock()
+		s.inflight = append(s.inflight, inflightFrame{seq: job.seq, bytes: size, sentAt: time.Now()})
+		if s.frameBytes == 0 {
+			s.frameBytes = float64(size)
+		} else {
+			s.frameBytes = s.frameBytes*0.8 + float64(size)*0.2
+		}
+		s.mu.Unlock()
+		s.queued.Add(-1)
+	}
+}
+
+func (s *liveServer) writeFrame(job frameJob) (int, error) {
 	startFlags := byte(0)
-	if keyframe {
+	if job.keyframe {
 		startFlags |= frameFlagKey
 	}
 	before := s.conn.BytesWritten()
-	if err := s.conn.WriteRecord(recFrameStart, encodeFrameStart(seq, grid.width, grid.height, startFlags)); err != nil {
+	if err := s.conn.WriteRecord(recFrameStart, encodeFrameStart(job.seq, job.width, job.height, startFlags)); err != nil {
 		return 0, err
 	}
-	for _, record := range packRects(rects) {
+	for _, record := range packRects(job.rects) {
 		if err := s.conn.WriteRecord(recRects, record); err != nil {
 			return 0, err
 		}
 	}
-	if err := s.conn.WriteRecord(recFrameEnd, encodeFrameEnd(seq, endFlags)); err != nil {
+	if err := s.conn.WriteRecord(recFrameEnd, encodeFrameEnd(job.seq, job.endFlags)); err != nil {
 		return 0, err
 	}
-	size := int(s.conn.BytesWritten() - before)
-	s.mu.Lock()
-	s.inflight = append(s.inflight, inflightFrame{seq: seq, bytes: size, sentAt: time.Now()})
-	s.mu.Unlock()
-	return size, nil
+	return int(s.conn.BytesWritten() - before), nil
+}
+
+// framePerf keeps moving averages of the frame loop's stages.
+type framePerf struct {
+	mu                   sync.Mutex
+	capture, diff        float64
+	encode, video        float64
+	videoBytes           float64
+	samples, held, acked float64
+}
+
+func (p *framePerf) add(field *float64, value time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ms := float64(value) / float64(time.Millisecond)
+	if *field == 0 {
+		*field = ms
+	} else {
+		*field = *field*0.9 + ms*0.1
+	}
+}
+
+// sample records whether changes were held back, and whether by acks.
+func (p *framePerf) sample(held, byAcks bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.samples = p.samples*0.98 + 1
+	value, acked := 0.0, 0.0
+	if held {
+		value = 1
+		if byAcks {
+			acked = 1
+		}
+	}
+	p.held = p.held*0.98 + value
+	p.acked = p.acked*0.98 + acked
+}
+
+// heldFraction is how often changes recently waited to be sent.
+func (p *framePerf) heldFraction() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.samples == 0 {
+		return 0
+	}
+	return p.held / p.samples
+}
+
+func (p *framePerf) String(fps float64) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.samples == 0 {
+		return ""
+	}
+	video := ""
+	if p.video > 0 {
+		video = fmt.Sprintf(", video encode %.0f ms for %.0f KiB", p.video, p.videoBytes/1024)
+	}
+	return fmt.Sprintf("%.0f fps acked; capture %.0f ms, diff %.0f ms, encode %.0f ms%s; changes held %.0f%% of loops (%.0f%% waiting for acks); %d cores",
+		fps, p.capture, p.diff, p.encode, video, 100*p.held/p.samples, 100*p.acked/p.samples, runtime.NumCPU())
 }
 
 func hasFeature(features []string, name string) bool {

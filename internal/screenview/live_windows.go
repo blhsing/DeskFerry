@@ -274,7 +274,6 @@ func (s *liveSource) next(timeout time.Duration) (*image.RGBA, bool, error) {
 		err := s.dxgi.captureInto(s.buffer, waitMS)
 		switch {
 		case err == nil:
-			forceOpaque(s.buffer)
 			s.last = s.buffer
 			s.failingSince = time.Time{}
 			s.setMethod("dxgi")
@@ -315,12 +314,6 @@ func (s *liveSource) next(timeout time.Duration) (*image.RGBA, bool, error) {
 		return s.last, false, nil
 	}
 	return nil, false, explainRemoteSessionCaptureFailure(err)
-}
-
-func forceOpaque(img *image.RGBA) {
-	for i := 3; i < len(img.Pix); i += 4 {
-		img.Pix[i] = 255
-	}
 }
 
 type cursorInfo struct {

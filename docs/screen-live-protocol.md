@@ -19,7 +19,7 @@ helper. The Go implementation is `internal/screenview` (`live_*.go`).
 
    `client` is `viewer` or `agent`. `name` is shown on the Work PC's sharing
    banner. An optional `features` array lists extra rect encodings the client
-   draws; `"scaled-jpeg"` allows encoding `3`. An optional `min_fps` (0 to
+   draws; `"scaled-jpeg"` allows encoding `3` and `"h264"` allows encoding `4`. An optional `min_fps` (0 to
    120, default 30) sets the frame rate compression aims for; `0` asks for
    lossless rects only.
 
@@ -117,7 +117,17 @@ All integers are big-endian and unsigned unless marked signed.
 
 Rect encodings: `0` solid (`data` = R,G,B,A), `1` PNG, `2` JPEG, `3` JPEG at
 reduced resolution (only when the client listed `"scaled-jpeg"`): the image is
-smaller than the rect and the client stretches it to the rect. Rects of one
+smaller than the rect and the client stretches it to the rect. `4` is one
+access unit of an H.264 stream (only when the client listed `"h264"` and the
+Work side offers `h264` in its hello capabilities): `data` is one flags byte
+(`1` = a new stream starts with this unit, so the client opens a new decoder)
+followed by Annex B NAL units (start codes, SPS/PPS before each IDR,
+Constrained Baseline profile, no B-frames). The coded picture is the rect
+rounded up to multiples of 16 pixels; the client draws its top-left `w x h`
+at the rect. A stream covers one rect until a unit with the start flag
+begins the next stream. A client that cannot decode a unit (or missed the
+stream start) skips the stream's units; the area is refined losslessly once
+it stops changing, and the client may also send `refresh` with `keyframe`. Rects of one
 frame are drawn in order; a client may draw them as they arrive but should
 present the frame at `frame end`. The client acks each frame after it has drawn
 it; the Work side uses acks for flow control, so a client that never acks
@@ -191,7 +201,8 @@ motion* once it has kept changing, with no pause over 300 ms, for 300 ms. Every
 second the Work side counts acknowledged frames; while changes have been
 waiting for most of that second and fewer than `min_fps` frames arrived, it tries one
 step more compression: lower JPEG quality, then tiles in motion as JPEG even
-when text-like, then tiles in motion at 1/2, 1/3 and 1/4 resolution. It keeps
+when text-like, then the region in motion as H.264 video (when both sides
+support it), then tiles in motion at 1/2, 1/3 and 1/4 resolution. It keeps
 a step only if the next second delivers clearly more frames (at least 15% and
 one frame more), and otherwise reverts and waits before trying that step again
 (10 s, doubling up to 2 minutes). With at least 10% more than `min_fps` frames a
@@ -199,7 +210,7 @@ second it tries one step less compression and keeps it if the rate stays at
 `min_fps` or more. After 5
 calm seconds it returns to full quality. Once the screen is still, it re-sends
 every lossy region losslessly at full resolution and marks the frame
-`lossless`. `status.compression` names the current level.
+`lossless`. `status.compression` names the current level, and `status.perf` summarizes recent frame timings on the Work side.
 
 ## macOS Home viewer socket
 

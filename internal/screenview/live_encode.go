@@ -8,6 +8,7 @@ import (
 	"image/png"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -260,6 +261,10 @@ type tileGrid struct {
 	lossy         []bool
 	lastChange    []time.Time
 	motionSince   []time.Time
+	// calmSince is when a capture first saw the tile unchanged; zero while
+	// it keeps changing. Only captures count, so pauses of the frame loop
+	// itself (such as starting a video encoder) do not end motion.
+	calmSince []time.Time
 }
 
 func newTileGrid(width, height int) *tileGrid {
@@ -267,13 +272,25 @@ func newTileGrid(width, height int) *tileGrid {
 	rows := (height + LiveTileSize - 1) / LiveTileSize
 	count := cols * rows
 	return &tileGrid{width: width, height: height, cols: cols, rows: rows, dirty: make([]bool, count), lossy: make([]bool, count),
-		lastChange: make([]time.Time, count), motionSince: make([]time.Time, count)}
+		lastChange: make([]time.Time, count), motionSince: make([]time.Time, count), calmSince: make([]time.Time, count)}
 }
 
 // moving reports whether a tile has kept changing recently.
 func (g *tileGrid) moving(index int, now time.Time) bool {
-	last := g.lastChange[index]
-	return !last.IsZero() && now.Sub(last) <= motionGap && now.Sub(g.motionSince[index]) >= motionMin
+	if g.lastChange[index].IsZero() || now.Sub(g.motionSince[index]) < motionMin {
+		return false
+	}
+	calm := g.calmSince[index]
+	return calm.IsZero() || now.Sub(calm) <= motionGap
+}
+
+// markCalm records a capture in which nothing changed.
+func (g *tileGrid) markCalm(now time.Time) {
+	for index := range g.calmSince {
+		if g.calmSince[index].IsZero() {
+			g.calmSince[index] = now
+		}
+	}
 }
 
 // movingCount counts tiles in motion.
@@ -320,24 +337,54 @@ func (g *tileGrid) anyLossy() bool {
 // diffInto compares current against reference tile by tile, copies changed
 // tiles into reference, marks them dirty and returns the changed tile count.
 func (g *tileGrid) diffInto(reference, current *image.RGBA, now time.Time) int {
-	changed := 0
-	for index := range g.dirty {
+	var changed atomic.Int64
+	parallelRange(len(g.dirty), func(index int) {
 		rect := g.tileRect(index)
 		if rgbaRegionEqual(reference, current, rect) {
-			continue
+			if g.calmSince[index].IsZero() {
+				g.calmSince[index] = now
+			}
+			return
 		}
 		for y := rect.Min.Y; y < rect.Max.Y; y++ {
 			start := reference.PixOffset(rect.Min.X, y)
 			copy(reference.Pix[start:start+rect.Dx()*4], current.Pix[current.PixOffset(rect.Min.X, y):])
 		}
 		g.dirty[index] = true
-		if g.lastChange[index].IsZero() || now.Sub(g.lastChange[index]) > motionGap {
+		calm := g.calmSince[index]
+		if g.lastChange[index].IsZero() || (!calm.IsZero() && now.Sub(calm) > motionGap) {
 			g.motionSince[index] = now
 		}
+		g.calmSince[index] = time.Time{}
 		g.lastChange[index] = now
-		changed++
+		changed.Add(1)
+	})
+	return int(changed.Load())
+}
+
+// parallelRange runs fn for 0..count-1 across the CPU cores in contiguous
+// chunks; fn must only touch state owned by its index.
+func parallelRange(count int, fn func(int)) {
+	workers := max(1, min(runtime.NumCPU(), count/16))
+	if workers == 1 {
+		for index := 0; index < count; index++ {
+			fn(index)
+		}
+		return
 	}
-	return changed
+	var wg sync.WaitGroup
+	chunk := (count + workers - 1) / workers
+	for start := 0; start < count; start += chunk {
+		end := min(count, start+chunk)
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for index := start; index < end; index++ {
+				fn(index)
+			}
+		}(start, end)
+	}
+	wg.Wait()
 }
 
 // dirtyRects merges dirty tiles into horizontal runs for reporting.
@@ -365,19 +412,33 @@ func (g *tileGrid) dirtyRects() []image.Rectangle {
 // MotionScale > 1. It returns the encoded rects in raster order and clears
 // the encoded tiles' dirty flags.
 func (g *tileGrid) encodeTiles(img *image.RGBA, selected func(int) bool, mode encodeMode) ([]EncodedRect, int, error) {
-	set := colorSetPool.Get().(*colorSet)
+	// Classify the selected tiles in parallel, then group them in order.
+	classes := make([]tileClass, len(g.dirty))
+	solids := make([]uint32, len(g.dirty))
+	picked := make([]bool, len(g.dirty))
+	for index := range picked {
+		picked[index] = selected(index)
+	}
+	parallelRange(len(g.dirty), func(index int) {
+		if !picked[index] {
+			return
+		}
+		local := colorSetPool.Get().(*colorSet)
+		classes[index], solids[index] = classifyTile(img, g.tileRect(index), local)
+		colorSetPool.Put(local)
+	})
 	var jobs []*tileJob
 	lossyCount := 0
 	for row := 0; row < g.rows; row++ {
 		var current *tileJob
 		for col := 0; col < g.cols; col++ {
 			index := row*g.cols + col
-			if !selected(index) {
+			if !picked[index] {
 				current = nil
 				continue
 			}
 			rect := g.tileRect(index)
-			class, solid := classifyTile(img, rect, set)
+			class, solid := classes[index], solids[index]
 			moving := !mode.Lossless && g.moving(index, mode.Now)
 			lossy := !mode.Lossless && (class == classPhoto || (class == classText && moving && mode.MotionLossy))
 			scale := 1
@@ -395,8 +456,6 @@ func (g *tileGrid) encodeTiles(img *image.RGBA, selected func(int) bool, mode en
 			jobs = append(jobs, current)
 		}
 	}
-	colorSetPool.Put(set)
-
 	workers := max(1, min(runtime.NumCPU(), len(jobs)))
 	var wg sync.WaitGroup
 	next := make(chan *tileJob)

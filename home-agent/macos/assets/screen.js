@@ -47,6 +47,31 @@ function solidColor(data) {
 // Encoding 3 is a JPEG at reduced resolution; drawImage stretches it to the rect.
 function rectMimeType(enc) { return enc === ENC_PNG ? 'image/png' : (enc === ENC_JPEG || enc === 3) ? 'image/jpeg' : ''; }
 
+// Encoding 4 is one access unit of an H.264 (Annex B) stream for its rect;
+// the first byte holds flags (1 = a new stream starts).
+const ENC_H264 = 4;
+
+// annexBNalTypes lists the NAL unit types in an Annex B byte stream.
+function annexBNalTypes(bytes) {
+  const types = [];
+  for (let i = 0; i + 3 < bytes.length; i++) {
+    if (bytes[i] === 0 && bytes[i + 1] === 0 && (bytes[i + 2] === 1 || (bytes[i + 2] === 0 && bytes[i + 3] === 1))) {
+      const start = bytes[i + 2] === 1 ? i + 3 : i + 4;
+      if (start < bytes.length) types.push({ type: bytes[start] & 0x1f, offset: start });
+      i = start;
+    }
+  }
+  return types;
+}
+
+// avcCodecString builds the WebCodecs codec string from the stream's SPS.
+function avcCodecString(bytes) {
+  const sps = annexBNalTypes(bytes).find(nal => nal.type === 7);
+  if (!sps || sps.offset + 3 >= bytes.length) return '';
+  const hex = value => value.toString(16).padStart(2, '0').toUpperCase();
+  return 'avc1.' + hex(bytes[sps.offset + 1]) + hex(bytes[sps.offset + 2]) + hex(bytes[sps.offset + 3]);
+}
+
 // parseMinFps accepts "0 (lossless)", "30" or "30 fps"; it returns null when invalid.
 function parseMinFps(text) {
   const match = /^\s*(\d+)/.exec(String(text));
@@ -377,7 +402,7 @@ function initViewer() {
 
   function startLive() {
     wantLive = true;
-    if (!send({ type: 'start', min_fps: minFps })) return;
+    if (!send({ type: 'start', min_fps: minFps, video: typeof VideoDecoder === 'function' && typeof EncodedVideoChunk === 'function' })) return;
     startPending = true;
     clearTimeout(startTimer);
     startTimer = setTimeout(() => { startPending = false; render(); }, 6000);
@@ -471,7 +496,9 @@ function initViewer() {
   // bitmap is applied later, in order, when its frame is presented.
   function prepareRect(message) {
     const rect = { x: message.x, y: message.y, w: message.w, h: message.h, enc: message.enc, color: null, image: null };
-    if (message.enc === ENC_SOLID) {
+    if (message.enc === ENC_H264) {
+      rect.video = new Uint8Array(message.data);
+    } else if (message.enc === ENC_SOLID) {
       rect.color = solidColor(message.data);
     } else {
       const type = rectMimeType(message.enc);
@@ -500,7 +527,9 @@ function initViewer() {
         }
         done.rects.forEach((rect, index) => {
           const image = images[index];
-          if (rect.enc === ENC_SOLID && rect.color) {
+          if (rect.enc === ENC_H264) {
+            if (!feedVideo(rect)) failed++;
+          } else if (rect.enc === ENC_SOLID && rect.color) {
             ctx.fillStyle = rect.color;
             ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
           } else if (image) {
@@ -518,6 +547,55 @@ function initViewer() {
     if (socketGeneration !== generation) return;
     send({ type: 'ack', seq: end.seq });
     if (failed) requestRefresh();
+  }
+
+  // Video: one WebCodecs decoder per stream; decoded pictures are drawn into
+  // the rect of the access unit they came from.
+  let videoDecoder = null;
+  let videoRect = null;
+  let videoTimestamp = 0;
+
+  function closeVideo() {
+    if (videoDecoder) {
+      try { videoDecoder.close(); } catch (error) { /* already closed */ }
+    }
+    videoDecoder = null;
+  }
+
+  // feedVideo queues one access unit; it reports false when the picture
+  // cannot be shown (no decoder support, or the stream start was missed).
+  function feedVideo(rect) {
+    if (typeof VideoDecoder !== 'function' || !rect.video || rect.video.length < 2) return false;
+    const start = (rect.video[0] & 1) !== 0;
+    const payload = rect.video.subarray(1);
+    if (start) closeVideo();
+    if (!videoDecoder) {
+      if (!start) return true; // wait for the next stream; refinement fills the area
+      const decoder = new VideoDecoder({
+        output: picture => {
+          if (videoRect && decoder === videoDecoder) {
+            ctx.drawImage(picture, 0, 0, videoRect.w, videoRect.h, videoRect.x, videoRect.y, videoRect.w, videoRect.h);
+          }
+          picture.close();
+        },
+        error: () => { if (decoder === videoDecoder) videoDecoder = null; requestRefresh(); },
+      });
+      try {
+        decoder.configure({ codec: avcCodecString(payload) || 'avc1.42E01F', optimizeForLatency: true });
+      } catch (error) {
+        return false;
+      }
+      videoDecoder = decoder;
+    }
+    videoRect = { x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+    const key = annexBNalTypes(payload).some(nal => nal.type === 5);
+    try {
+      videoDecoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: (videoTimestamp += 33333), data: payload }));
+    } catch (error) {
+      closeVideo();
+      return false;
+    }
+    return true;
   }
 
   // requestRefresh asks for a full redraw, at most once every two seconds.

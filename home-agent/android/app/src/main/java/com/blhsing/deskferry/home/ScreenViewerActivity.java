@@ -104,6 +104,7 @@ public class ScreenViewerActivity extends Activity {
     private static final long PING_INTERVAL_MS = 10_000;
     private static final int LEGACY_INTERVAL_MS = 1000;
     private static final int MAX_PENDING_FRAMES = 2;
+    private static final long KEYFRAME_REQUEST_INTERVAL_MS = 2000;
     static final String EXTRA_RELAY_URLS = "relay_urls";
     static final String EXTRA_PROXY = "proxy";
     static final String EXTRA_ROOM_PROOF = "room_proof";
@@ -141,6 +142,8 @@ public class ScreenViewerActivity extends Activity {
     private final Paint scaledPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final Paint fillPaint = new Paint();
     private ExecutorService decoders;
+    /** Set while the activity is stopped: video streams release their codec and are skipped. */
+    private volatile boolean videoSuspended;
     private ZoomImageView imageView;
     private TextView status;
     private Spinner zoomPreset;
@@ -259,8 +262,22 @@ public class ScreenViewerActivity extends Activity {
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        videoSuspended = false;
+        Session value = session;
+        // Video streams were dropped while stopped; ask for a keyframe so the area is current.
+        if (value != null && value.videoDroppedWhileSuspended) {
+            value.videoDroppedWhileSuspended = false;
+            value.requestKeyframe();
+        }
+    }
+
+    @Override
     protected void onStop() {
         releaseAllInput();
+        // The session thread releases its H.264 codec and skips video until the activity returns.
+        videoSuspended = true;
         super.onStop();
     }
 
@@ -780,14 +797,30 @@ public class ScreenViewerActivity extends Activity {
         final int h;
         final Bitmap tile;
         final int color;
+        /** Where {@link #tile} goes back after drawing (video pictures), or null to recycle it. */
+        final H264StreamDecoder.BitmapPool pool;
 
         DrawOp(int x, int y, int w, int h, Bitmap tile, int color) {
+            this(x, y, w, h, tile, color, null);
+        }
+
+        DrawOp(int x, int y, int w, int h, Bitmap tile, int color, H264StreamDecoder.BitmapPool pool) {
             this.x = x;
             this.y = y;
             this.w = w;
             this.h = h;
             this.tile = tile;
             this.color = color;
+            this.pool = pool;
+        }
+
+        void releaseTile() {
+            if (tile == null || tile.isRecycled()) return;
+            if (pool != null) {
+                pool.release(tile);
+            } else {
+                tile.recycle();
+            }
         }
     }
 
@@ -810,9 +843,7 @@ public class ScreenViewerActivity extends Activity {
         }
 
         void recycle() {
-            for (DrawOp op : ops) {
-                if (op.tile != null && !op.tile.isRecycled()) op.tile.recycle();
-            }
+            for (DrawOp op : ops) op.releaseTile();
             ops.clear();
         }
     }
@@ -835,6 +866,11 @@ public class ScreenViewerActivity extends Activity {
         private volatile boolean cancelled;
         private volatile boolean live;
         private Thread thread;
+        /** Session thread only: the H.264 stream of encoding-4 rects. */
+        private final H264StreamDecoder video = new H264StreamDecoder();
+        private final Object keyframeLock = new Object();
+        private long lastKeyframeRequest = -KEYFRAME_REQUEST_INTERVAL_MS;
+        volatile boolean videoDroppedWhileSuspended;
 
         Session(int run, WebSocket webSocket, String relay, String key) {
             this.run = run;
@@ -879,11 +915,13 @@ public class ScreenViewerActivity extends Activity {
             byte[] psk = ScreenKeys.decodeScreenKey(key);
             if (psk != null) {
                 handshake = new LiveScreenProtocol.ClientHandshake(psk);
+                JSONArray features = new JSONArray().put(LiveScreenProtocol.FEATURE_SCALED_JPEG);
+                if (H264StreamDecoder.available()) features.put(LiveScreenProtocol.FEATURE_H264);
                 request.put("protocol", LiveScreenProtocol.PROTOCOL)
                         .put("client", "viewer")
                         .put("name", deviceName)
                         .put("client_hello", ScreenKeys.base64Url(handshake.hello))
-                        .put("features", new org.json.JSONArray().put(LiveScreenProtocol.FEATURE_SCALED_JPEG))
+                        .put("features", features)
                         .put("min_fps", minFps);
             }
             if (!webSocket.send(ByteString.encodeUtf8(request.toString() + "\n"))) {
@@ -1030,10 +1068,17 @@ public class ScreenViewerActivity extends Activity {
                 }
             } finally {
                 if (batch != null) batch.recycle();
+                video.close();
             }
         }
 
         private void decodeRects(FrameBatch batch, List<LiveScreenProtocol.Rect> rects) throws Exception {
+            boolean hasVideo = false;
+            for (LiveScreenProtocol.Rect rect : rects) hasVideo |= rect.enc == LiveScreenProtocol.ENC_H264;
+            if (hasVideo) {
+                decodeRectsWithVideo(batch, rects);
+                return;
+            }
             if (rects.size() <= 1 || decoders == null) {
                 for (LiveScreenProtocol.Rect rect : rects) batch.ops.add(decodeRect(rect));
                 return;
@@ -1050,6 +1095,108 @@ public class ScreenViewerActivity extends Activity {
                 }
             }
             if (failure != null) throw failure;
+        }
+
+        /**
+         * Decodes image rects on the decoder pool while this thread feeds the H.264 units in
+         * order (the stream has state); the ops keep the rects' order and skipped units add none.
+         */
+        private void decodeRectsWithVideo(FrameBatch batch, List<LiveScreenProtocol.Rect> rects) throws Exception {
+            int count = rects.size();
+            int images = 0;
+            for (LiveScreenProtocol.Rect rect : rects) if (rect.enc != LiveScreenProtocol.ENC_H264) images++;
+            boolean parallel = images > 1 && decoders != null;
+            DrawOp[] ops = new DrawOp[count];
+            ArrayList<Future<DrawOp>> pending = new ArrayList<>();
+            int[] pendingIndex = new int[count];
+            Exception failure = null;
+            try {
+                if (parallel) {
+                    for (int i = 0; i < count; i++) {
+                        LiveScreenProtocol.Rect rect = rects.get(i);
+                        if (rect.enc == LiveScreenProtocol.ENC_H264) continue;
+                        pendingIndex[pending.size()] = i;
+                        pending.add(decoders.submit(() -> decodeRect(rect)));
+                    }
+                }
+                for (int i = 0; i < count; i++) {
+                    LiveScreenProtocol.Rect rect = rects.get(i);
+                    if (rect.enc == LiveScreenProtocol.ENC_H264) {
+                        ops[i] = decodeVideo(rect);
+                    } else if (!parallel && failure == null) {
+                        try {
+                            ops[i] = decodeRect(rect);
+                        } catch (Exception ex) {
+                            failure = ex;
+                        }
+                    }
+                }
+            } finally {
+                for (int p = 0; p < pending.size(); p++) {
+                    try {
+                        ops[pendingIndex[p]] = pending.get(p).get();
+                    } catch (Exception ex) {
+                        if (failure == null) failure = ex;
+                    }
+                }
+                for (DrawOp op : ops) if (op != null) batch.ops.add(op);
+            }
+            if (failure != null) throw failure;
+        }
+
+        /**
+         * Feeds one H.264 access unit; returns its newest picture as a DrawOp, or null when no
+         * picture is ready or the unit is skipped (before a stream start, after a decoder error,
+         * or while the activity is stopped). A decoder error asks for a keyframe; never throws.
+         */
+        private DrawOp decodeVideo(LiveScreenProtocol.Rect rect) {
+            if (rect.dataLength < 2) return null;
+            boolean start = rect.videoStreamStart();
+            if (videoSuspended) {
+                if (video.active() || start) videoDroppedWhileSuspended = true;
+                video.release();
+                return null;
+            }
+            if (start) video.release();
+            if (!video.active()) {
+                if (!start) return null;
+                try {
+                    video.open(rect.w, rect.h, rect.data, rect.videoOffset(), rect.videoLength());
+                } catch (IOException ex) {
+                    Log.w(LOG_TAG, "screen video stream could not start: " + ex.getMessage());
+                    requestKeyframe();
+                    return null;
+                }
+            } else if (!video.matches(rect.w, rect.h)) {
+                Log.w(LOG_TAG, "screen video unit does not match its stream size");
+                video.release();
+                requestKeyframe();
+                return null;
+            }
+            try {
+                Bitmap picture = video.decode(rect.data, rect.videoOffset(), rect.videoLength());
+                if (picture == null) return null;
+                return new DrawOp(rect.x, rect.y, rect.w, rect.h, picture, 0, video.pool());
+            } catch (IOException ex) {
+                Log.w(LOG_TAG, "screen video decoding failed: " + ex.getMessage());
+                video.release();
+                requestKeyframe();
+                return null;
+            }
+        }
+
+        /** Sends {"cmd":"refresh","keyframe":true}, at most once every two seconds. Any thread. */
+        void requestKeyframe() {
+            synchronized (keyframeLock) {
+                long now = SystemClock.elapsedRealtime();
+                if (now - lastKeyframeRequest < KEYFRAME_REQUEST_INTERVAL_MS) return;
+                lastKeyframeRequest = now;
+            }
+            try {
+                sendJson(new JSONObject().put("cmd", "refresh").put("keyframe", true));
+            } catch (Exception ex) {
+                Log.w(LOG_TAG, "screen keyframe request failed: " + ex.getMessage());
+            }
         }
 
         private DrawOp decodeRect(LiveScreenProtocol.Rect rect) throws IOException {
