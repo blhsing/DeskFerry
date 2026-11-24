@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.15.8 - 2026-11-24
+
+- Fix the Windows Screen Viewer's pointer turning into a black box over anything that is not black while you have control. The viewer builds a local pointer from the Work PC's pointer shape but gave it an empty mask, so whenever Windows drew it without its transparency every transparent pixel came out black. The pointer now has a real mask and stays transparent around its shape.
+- Capture the Work PC's pointer by drawing it the way Windows does, over black and over white, and deriving its colors and transparency from the two, instead of interpreting the pointer's bitmaps. This handles pointers with alpha, masked color and monochrome pointers, including inverting ones such as the text cursor, the same way.
+
 ## 0.15.7 - 2026-11-23
 
 - Reach video quickly when a busy screen is opened. Since 0.15.6 the first picture was lossless, which for a 2880x1800 screen saver is several megabytes and kept anything else from arriving for seconds; every compression step tried meanwhile measured 0 frames a second, was judged useless and put on cooldown, so video could take more than a minute to win. The first picture now sends photographic areas as JPEG and refines them losslessly right after (Min fps 0 stays lossless throughout), and a trial during which nothing arrives at either level keeps measuring instead of failing.

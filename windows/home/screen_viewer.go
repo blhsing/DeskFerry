@@ -1363,7 +1363,19 @@ func (v *screenViewer) updateCursorResources(cursor screenview.CursorState) {
 	}
 	v.cursorBitmap = bitmap
 	_ = bits
-	mask := win.CreateBitmap(int32(cursor.Shape.Bounds().Dx()), int32(cursor.Shape.Bounds().Dy()), 1, 1, nil)
+	// The local cursor gets a real AND mask (transparent where the pointer
+	// is) and straight-alpha color that is black where transparent. With an
+	// empty mask, Windows draws every pixel opaque whenever it draws the
+	// cursor without its alpha channel, which shows as a black box over
+	// anything that is not black.
+	width, height := cursor.Shape.Bounds().Dx(), cursor.Shape.Bounds().Dy()
+	color, _ := createCursorColorDIB(cursor.Shape)
+	if color == 0 {
+		return
+	}
+	defer win.DeleteObject(win.HGDIOBJ(color))
+	maskBits := cursorMaskBits(cursor.Shape)
+	mask := win.CreateBitmap(int32(width), int32(height), 1, 1, unsafe.Pointer(&maskBits[0]))
 	if mask != 0 {
 		info := struct {
 			IsIcon int32
@@ -1372,7 +1384,7 @@ func (v *screenViewer) updateCursorResources(cursor screenview.CursorState) {
 			_      uint32
 			Mask   win.HBITMAP
 			Color  win.HBITMAP
-		}{HotX: uint32(cursor.HotX), HotY: uint32(cursor.HotY), Mask: mask, Color: bitmap}
+		}{HotX: uint32(cursor.HotX), HotY: uint32(cursor.HotY), Mask: mask, Color: color}
 		handle, _, _ := createIconIndirect.Call(uintptr(unsafe.Pointer(&info)))
 		win.DeleteObject(win.HGDIOBJ(mask))
 		v.localCursor = win.HCURSOR(handle)
@@ -1434,6 +1446,50 @@ func createPremultipliedDIB(shape *image.RGBA) (win.HBITMAP, []byte) {
 		bits[i+3] = byte(alpha)
 	}
 	return bitmap, bits
+}
+
+// createCursorColorDIB returns the pointer's color as a 32-bit DIB section
+// with straight alpha, black where the pointer is fully transparent.
+func createCursorColorDIB(shape *image.RGBA) (win.HBITMAP, []byte) {
+	width, height := shape.Bounds().Dx(), shape.Bounds().Dy()
+	header := win.BITMAPINFOHEADER{
+		BiSize:        uint32(unsafe.Sizeof(win.BITMAPINFOHEADER{})),
+		BiWidth:       int32(width),
+		BiHeight:      -int32(height),
+		BiPlanes:      1,
+		BiBitCount:    32,
+		BiCompression: win.BI_RGB,
+	}
+	var pixels unsafe.Pointer
+	bitmap := win.CreateDIBSection(0, &header, win.DIB_RGB_COLORS, &pixels, 0, 0)
+	if bitmap == 0 || pixels == nil {
+		return 0, nil
+	}
+	bits := unsafe.Slice((*byte)(pixels), width*height*4)
+	for i := 0; i+3 < len(bits) && i+3 < len(shape.Pix); i += 4 {
+		if shape.Pix[i+3] == 0 {
+			bits[i], bits[i+1], bits[i+2], bits[i+3] = 0, 0, 0, 0
+			continue
+		}
+		bits[i], bits[i+1], bits[i+2], bits[i+3] = shape.Pix[i+2], shape.Pix[i+1], shape.Pix[i], shape.Pix[i+3]
+	}
+	return bitmap, bits
+}
+
+// cursorMaskBits returns a monochrome AND mask for the pointer: 1 (keep the
+// screen) where it is mostly transparent, rows padded to 16 bits.
+func cursorMaskBits(shape *image.RGBA) []byte {
+	width, height := shape.Bounds().Dx(), shape.Bounds().Dy()
+	stride := (width + 15) / 16 * 2
+	bits := make([]byte, max(1, stride*height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			if shape.Pix[shape.PixOffset(x, y)+3] < 128 {
+				bits[y*stride+x/8] |= 0x80 >> (x % 8)
+			}
+		}
+	}
+	return bits
 }
 
 func (v *screenViewer) sizeWindowForFirstFrame(frameWidth, frameHeight int) {

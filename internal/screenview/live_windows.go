@@ -25,6 +25,8 @@ var (
 	procGetUserObjectInfo    = user32.NewProc("GetUserObjectInformationW")
 	procGetCursorInfo        = user32.NewProc("GetCursorInfo")
 	procGetIconInfo          = user32.NewProc("GetIconInfo")
+	procDrawIconEx           = user32.NewProc("DrawIconEx")
+	procGdiFlush             = gdi32.NewProc("GdiFlush")
 	procSendInput            = user32.NewProc("SendInput")
 	procMapVirtualKeyW       = user32.NewProc("MapVirtualKeyW")
 	procVkKeyScanW           = user32.NewProc("VkKeyScanW")
@@ -385,6 +387,15 @@ func readCursorShape(cursor uintptr) cursorShape {
 	}
 	defer win.ReleaseDC(0, screenDC)
 	maskPixels, maskWidth, maskHeight := bitmapPixels(screenDC, icon.Mask)
+	width, height := maskWidth, maskHeight
+	if icon.Color == 0 {
+		height = maskHeight / 2
+	} else if _, colorWidth, colorHeight := bitmapPixels(screenDC, icon.Color); colorWidth > 0 {
+		width, height = colorWidth, colorHeight
+	}
+	if rendered := renderCursor(screenDC, cursor, width, height); rendered != nil {
+		return cursorShape{image: rendered, hotX: int(icon.HotX), hotY: int(icon.HotY), id: CursorShapeID(rendered, int(icon.HotX), int(icon.HotY))}
+	}
 	var out *image.RGBA
 	if icon.Color != 0 {
 		colorPixels, width, height := bitmapPixels(screenDC, icon.Color)
@@ -435,6 +446,55 @@ func readCursorShape(cursor uintptr) cursorShape {
 		return cursorShape{}
 	}
 	return cursorShape{image: out, hotX: int(icon.HotX), hotY: int(icon.HotY), id: CursorShapeID(out, int(icon.HotX), int(icon.HotY))}
+}
+
+// renderCursor draws the cursor as Windows does, over black and over white,
+// and derives its colors and transparency from the two; this works for every
+// kind of cursor (alpha, masked color, monochrome) without interpreting its
+// bitmaps.
+func renderCursor(screenDC win.HDC, cursor uintptr, width, height int) *image.RGBA {
+	if width <= 0 || height <= 0 || width > 512 || height > 512 {
+		return nil
+	}
+	dc := win.CreateCompatibleDC(screenDC)
+	if dc == 0 {
+		return nil
+	}
+	defer win.DeleteDC(dc)
+	header := win.BITMAPINFOHEADER{
+		BiSize:        uint32(unsafe.Sizeof(win.BITMAPINFOHEADER{})),
+		BiWidth:       int32(width),
+		BiHeight:      -int32(height),
+		BiPlanes:      1,
+		BiBitCount:    32,
+		BiCompression: win.BI_RGB,
+	}
+	var bits unsafe.Pointer
+	bitmap := win.CreateDIBSection(dc, &header, win.DIB_RGB_COLORS, &bits, 0, 0)
+	if bitmap == 0 || bits == nil {
+		return nil
+	}
+	defer win.DeleteObject(win.HGDIOBJ(bitmap))
+	previous := win.SelectObject(dc, win.HGDIOBJ(bitmap))
+	defer win.SelectObject(dc, previous)
+	pixels := unsafe.Slice((*byte)(bits), width*height*4)
+	draw := func(background byte) []byte {
+		for i := range pixels {
+			pixels[i] = background
+		}
+		const diNormal = 0x0003
+		if ok, _, _ := procDrawIconEx.Call(uintptr(dc), 0, 0, cursor, uintptr(width), uintptr(height), 0, 0, diNormal); ok == 0 {
+			return nil
+		}
+		procGdiFlush.Call()
+		return append([]byte(nil), pixels...)
+	}
+	black := draw(0)
+	white := draw(255)
+	if black == nil || white == nil {
+		return nil
+	}
+	return cursorFromBlackWhite(black, white, width, height)
 }
 
 func bitmapPixels(dc win.HDC, bitmap uintptr) ([]byte, int, int) {

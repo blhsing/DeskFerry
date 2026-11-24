@@ -2,7 +2,10 @@
 
 package homewindows
 
-import "testing"
+import (
+	"image"
+	"testing"
+)
 
 func TestParseMinFPS(t *testing.T) {
 	for text, want := range map[string]int{"0 (lossless)": 0, "30": 30, " 45 fps": 45, "60fps": 60, "120": 120} {
@@ -30,5 +33,21 @@ func TestViewerMinFPSIsRememberedPerDestination(t *testing.T) {
 	}
 	if loadViewerMinFPS("px13") != 0 || loadViewerMinFPS("Home") != 30 {
 		t.Fatal("Min fps was not remembered per destination")
+	}
+}
+
+func TestCursorMaskBitsMarksTransparentPixels(t *testing.T) {
+	shape := image.NewRGBA(image.Rect(0, 0, 18, 2))
+	shape.Pix[shape.PixOffset(0, 0)+3] = 255  // opaque
+	shape.Pix[shape.PixOffset(17, 1)+3] = 200 // mostly opaque
+	bits := cursorMaskBits(shape)
+	if len(bits) != 8 {
+		t.Fatalf("mask is %d bytes, want 2 rows of 4", len(bits))
+	}
+	if bits[0] != 0x7F || bits[1] != 0xFF || bits[2] != 0xC0 {
+		t.Fatalf("first row = % X, want 7F FF C0", bits[:4])
+	}
+	if bits[4] != 0xFF || bits[5] != 0xFF || bits[6] != 0x80 {
+		t.Fatalf("second row = % X, want FF FF 80", bits[4:8])
 	}
 }
