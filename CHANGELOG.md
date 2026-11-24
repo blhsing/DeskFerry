@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.15.9 - 2026-11-24
+
+- Fix `-update-service` failing, and restoring the old version, when the copy an earlier update left as `DeskFerry.exe.previous` is still open, for example by a desktop app or network service started from that version. The update now moves the running executable to a uniquely named copy in that case, which is deleted at the next restart, and removes such copies left by earlier updates.
+
 ## 0.15.8 - 2026-11-24
 
 - Fix the Windows Screen Viewer's pointer turning into a black box over anything that is not black while you have control. The viewer builds a local pointer from the Work PC's pointer shape but gave it an empty mask, so whenever Windows drew it without its transparency every transparent pixel came out black. The pointer now has a real mask and stays transparent around its shape.

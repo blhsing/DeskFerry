@@ -328,7 +328,7 @@ func updateServiceBinary(target string) error {
 	defer s.Close()
 
 	staged := target + ".update"
-	previous := target + ".previous"
+	previous := previousExecutablePath(target, time.Now())
 	if err := copyExecutable(source, staged); err != nil {
 		return fmt.Errorf("stage service executable: %w", err)
 	}
@@ -347,7 +347,6 @@ func updateServiceBinary(target string) error {
 		}
 	}
 
-	_ = os.Remove(previous)
 	if err := os.Rename(target, previous); err != nil {
 		_ = s.Start()
 		return fmt.Errorf("preserve previous service executable: %w", err)
@@ -382,6 +381,23 @@ func updateServiceBinary(target string) error {
 	}
 	fmt.Printf("Updated and started DeskFerry Agent service at %s\n", target)
 	return nil
+}
+
+// previousExecutablePath returns where the running executable is moved
+// during an update. It removes copies left by earlier updates; when the usual
+// name is still in use (a DeskFerry process started from an earlier version
+// keeps it open), a unique name is used instead so the update can proceed.
+func previousExecutablePath(target string, now time.Time) string {
+	previous := target + ".previous"
+	if matches, _ := filepath.Glob(target + ".previous-*"); len(matches) > 0 {
+		for _, match := range matches {
+			_ = os.Remove(match)
+		}
+	}
+	if err := os.Remove(previous); err == nil || os.IsNotExist(err) {
+		return previous
+	}
+	return fmt.Sprintf("%s-%s", previous, now.Format("20060102-150405"))
 }
 
 func copyExecutable(source, target string) error {
