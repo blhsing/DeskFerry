@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.15.11 - 2026-11-24
+
+- Reconnect the screen viewer within about half a minute when its session cannot resume, such as after the Work PC's DeskFerry restarted. Screen sessions used RDP's five-minute resume window, so the picture stayed frozen for up to five minutes before the viewer opened a new session. Home apps on Windows, macOS and Android now give a screen session 30 seconds to resume; RDP and SMB keep five minutes.
+
 ## 0.15.10 - 2026-11-24
 
 - Keep screen sessions running through dropped connections. A proxy or relay cutting the connection used to end the session (`failed to read frame header: EOF`); screen sessions are now resumable like RDP: the Home app and the Work PC reattach the same session over a new connection and replay anything not yet delivered, and heartbeats detect a dead path. On a live session to a Work PC through the relay, a cut connection resumed in under half a second with the picture continuing. Work agents and relays already supported this; only the Home apps changed.

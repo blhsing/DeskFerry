@@ -9,8 +9,10 @@ The session's byte stream is carried like RDP's: Home clients ask the relay
 for a resumable session with heartbeats (`X-DeskFerry-Resumable`,
 `X-DeskFerry-Heartbeat`), so when a proxy or relay drops the WebSocket both
 sides resume the same session over a new one and replay what the other side
-has not acknowledged. Everything below sees one unbroken stream. Only when
-resuming fails (for example after the Work PC restarted) does the session end;
+has not acknowledged. Everything below sees one unbroken stream. Home apps
+give a screen session 30 seconds to resume (RDP gets five minutes), since a
+new session only costs a full redraw. Only when resuming fails (for example
+after the Work PC's DeskFerry restarted) does the session end;
 the Windows, macOS and Android viewers then open a new session, waiting 2, 4,
 8, 16 and then 30 seconds between attempts until the user stops the view.
 

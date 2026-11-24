@@ -70,6 +70,11 @@ type ResumableWebSocketOptions struct {
 	RoomProof           string
 	Service             string
 	Heartbeat           bool
+	// ResumeWindow is how long a lost transport may take to resume before
+	// the session ends; zero means the default of five minutes. Sessions that
+	// are cheap to reopen, such as the live screen, use a shorter window so the
+	// Home app reconnects soon when the other side is gone for good.
+	ResumeWindow time.Duration
 	// Logf receives abnormal transport and data-progress diagnostics only.
 	Logf func(string, ...any)
 
@@ -307,15 +312,16 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 		}
 		lostAt := c.lostAt
 		c.mu.Unlock()
-		if time.Since(lostAt) >= resumableWindow {
-			c.setTerminal(fmt.Errorf("relay session %s could not resume within %s", c.opts.SessionID, resumableWindow))
+		window := c.resumeWindow()
+		if time.Since(lostAt) >= window {
+			c.setTerminal(fmt.Errorf("relay session %s could not resume within %s", c.opts.SessionID, window))
 			return
 		}
 
 		if lostRelay < 0 {
 			lostRelay = c.relayIndex
 		}
-		remaining := resumableWindow - time.Since(lostAt)
+		remaining := window - time.Since(lostAt)
 		dialTimeout := resumableDialAttemptTimeout(remaining, c.opts.Service, dialTimeouts)
 		relay := c.relays[c.relayIndex]
 		dialCtx, cancelDial := context.WithTimeout(c.ctx, dialTimeout)
@@ -397,6 +403,26 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 			}
 		}
 	}
+}
+
+// ScreenResumeWindow bounds how long Home apps wait to resume a live screen
+// session; a new session only costs a full redraw.
+const ScreenResumeWindow = 30 * time.Second
+
+// HomeResumeWindow returns the resume window a Home app uses for a service:
+// ScreenResumeWindow for the live screen, otherwise the default.
+func HomeResumeWindow(service string) time.Duration {
+	if service == ServiceScreen {
+		return ScreenResumeWindow
+	}
+	return 0
+}
+
+func (c *resumableWebSocketConn) resumeWindow() time.Duration {
+	if c.opts.ResumeWindow > 0 {
+		return c.opts.ResumeWindow
+	}
+	return resumableWindow
 }
 
 func resumableDialAttemptTimeout(remaining time.Duration, service string, consecutiveTimeouts int) time.Duration {

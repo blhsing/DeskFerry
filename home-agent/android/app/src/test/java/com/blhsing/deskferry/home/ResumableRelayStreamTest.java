@@ -223,6 +223,13 @@ public class ResumableRelayStreamTest {
     }
 
     @Test
+    public void onlyTheScreenUsesAShortResumeWindow() {
+        assertEquals(30_000L, ResumableRelayStream.resumeWindowMs("screen"));
+        assertEquals(TunnelService.RESUMABLE_WINDOW_MS, ResumableRelayStream.resumeWindowMs("rdp"));
+        assertEquals(TunnelService.RESUMABLE_WINDOW_MS, ResumableRelayStream.resumeWindowMs("smb"));
+    }
+
+    @Test
     public void screenSessionRequiresTheRelayToConfirmTheService() throws Exception {
         FakeHost host = new FakeHost();
         ResumableRelayStream stream = new ResumableRelayStream(host, "screen", data -> { }, termination -> { });

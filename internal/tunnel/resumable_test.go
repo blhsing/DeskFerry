@@ -502,3 +502,58 @@ func TestRDPHeartbeatTimeoutFitsRemoteDesktopReconnectWindow(t *testing.T) {
 		t.Fatalf("SMB heartbeat timeout = %s", smb.opts.heartbeatTimeout)
 	}
 }
+
+// TestResumableSessionEndsAfterItsResumeWindow: when the other side is gone
+// for good (a Work agent restarted), a session with a short resume window ends
+// soon instead of retrying for the default five minutes.
+func TestResumableSessionEndsAfterItsResumeWindow(t *testing.T) {
+	const sessionID = "0123456789abcdef0123456789abcdef"
+	var connections atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if connections.Add(1) > 1 {
+			// Resume attempts: the relay has no partner for the session.
+			http.Error(w, "no session", http.StatusServiceUnavailable)
+			return
+		}
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = ws.Write(ctx, websocket.MessageText, []byte("start "+sessionID))
+		_, _, _ = ws.Read(ctx) // initial acknowledgement
+		_ = ws.CloseNow()      // the transport drops
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	initial, err := DialMessageConnWithHeaders(ctx, server.URL+"/relay/p", "direct", RoleClient, "", http.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := initial.Read(ctx); err != nil { // "start <session>"
+		t.Fatal(err)
+	}
+	conn := NewResumableWebSocketConn(ctx, initial, ResumableWebSocketOptions{
+		RelayAddr: server.URL + "/relay/p", Proxy: "direct", SessionID: sessionID, Side: "client",
+		Service: ServiceScreen, ResumeWindow: 2 * time.Second,
+	})
+	defer conn.Close()
+	started := time.Now()
+	buffer := make([]byte, 16)
+	_, err = conn.Read(buffer)
+	if err == nil {
+		t.Fatal("read succeeded although the session could not resume")
+	}
+	if elapsed := time.Since(started); elapsed > 15*time.Second {
+		t.Fatalf("the session ended after %s; want about its 2 s resume window", elapsed)
+	}
+	t.Logf("ended after %s: %v", time.Since(started).Round(time.Millisecond), err)
+}
+
+func TestHomeResumeWindowIsShortOnlyForTheScreen(t *testing.T) {
+	if HomeResumeWindow(ServiceScreen) != ScreenResumeWindow || HomeResumeWindow(ServiceRDP) != 0 || HomeResumeWindow(ServiceSMB) != 0 {
+		t.Fatal("only the live screen should use a short resume window")
+	}
+}

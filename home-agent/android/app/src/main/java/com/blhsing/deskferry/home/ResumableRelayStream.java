@@ -79,6 +79,14 @@ final class ResumableRelayStream {
         return ready;
     };
 
+    /** How long a live screen session may take to resume; a new one only costs a redraw. */
+    static final long SCREEN_RESUME_WINDOW_MS = 30_000L;
+
+    /** The resume window for a service: short for the live screen, otherwise the default. */
+    static long resumeWindowMs(String service) {
+        return "screen".equals(service) ? SCREEN_RESUME_WINDOW_MS : TunnelService.RESUMABLE_WINDOW_MS;
+    }
+
     final String service;
     private final String serviceLabel;
     private final boolean requireServiceEcho;
@@ -650,7 +658,7 @@ final class ResumableRelayStream {
             return;
         }
         new Thread(() -> {
-            long deadline = SystemClock.elapsedRealtime() + TunnelService.RESUMABLE_WINDOW_MS;
+            long deadline = SystemClock.elapsedRealtime() + resumeWindowMs(service);
             long backoff = 250;
             // Try the session's relay first, then the room's other relays in
             // the configured order, as the Work agent does; relays rebuild the
