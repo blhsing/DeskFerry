@@ -5,6 +5,7 @@ package homewindows
 import (
 	"image"
 	"testing"
+	"time"
 )
 
 func TestParseMinFPS(t *testing.T) {
@@ -49,5 +50,14 @@ func TestCursorMaskBitsMarksTransparentPixels(t *testing.T) {
 	}
 	if bits[4] != 0xFF || bits[5] != 0xFF || bits[6] != 0x80 {
 		t.Fatalf("second row = % X, want FF FF 80", bits[4:8])
+	}
+}
+
+func TestScreenReconnectDelayGrowsToThirtySeconds(t *testing.T) {
+	want := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}
+	for attempt, delay := range want {
+		if got := screenReconnectDelay(attempt); got != delay {
+			t.Fatalf("attempt %d: %s, want %s", attempt, got, delay)
+		}
 	}
 }

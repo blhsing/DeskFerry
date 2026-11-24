@@ -5,6 +5,15 @@ This document specifies the live screen session that runs inside the relay's
 end-to-end between a Home client (viewer or agent) and the Work agent's screen
 helper. The Go implementation is `internal/screenview` (`live_*.go`).
 
+The session's byte stream is carried like RDP's: Home clients ask the relay
+for a resumable session with heartbeats (`X-DeskFerry-Resumable`,
+`X-DeskFerry-Heartbeat`), so when a proxy or relay drops the WebSocket both
+sides resume the same session over a new one and replay what the other side
+has not acknowledged. Everything below sees one unbroken stream. Only when
+resuming fails (for example after the Work PC restarted) does the session end;
+the Windows, macOS and Android viewers then open a new session, waiting 2, 4,
+8, 16 and then 30 seconds between attempts until the user stops the view.
+
 ## Compatibility and negotiation
 
 1. The Home client sends one JSON line (UTF-8, terminated by `\n`), the

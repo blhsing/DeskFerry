@@ -397,15 +397,68 @@ func (v *screenViewer) start() {
 	go v.run(ctx)
 }
 
+// run keeps a screen session open until the user stops it: when a session
+// drops on its own (a proxy or the relay cut the connection), it reconnects
+// with a growing delay.
 func (v *screenViewer) run(ctx context.Context) {
+	attempt := 0
+	reconnecting := false
+	for {
+		started := time.Now()
+		established, reason := v.runSession(ctx, reconnecting)
+		if ctx.Err() != nil {
+			return
+		}
+		if !established && !reconnecting {
+			// The first connection failed; runSession reported why. This run
+			// is still the current one (a newer Start would have cancelled
+			// ctx), so mark the viewer as not running.
+			v.mu.Lock()
+			cancel := v.cancel
+			v.cancel = nil
+			v.mu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+			v.onUI(func() { _ = v.liveButton.SetText("Start") })
+			return
+		}
+		if established && time.Since(started) > time.Minute {
+			attempt = 0
+		}
+		delay := screenReconnectDelay(attempt)
+		attempt++
+		reconnecting = true
+		v.owner.appendLog("Screen session ended: %s; reconnecting in %s.", reason, delay)
+		v.setStatus(fmt.Sprintf("Connection lost (%s); reconnecting in %d s... Select Stop to stop.", reason, int(delay.Seconds())))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		v.setStatus("Reconnecting to the Work screen service...")
+	}
+}
+
+// screenReconnectDelay returns the wait before reconnect attempt n: 2, 4, 8,
+// 16, then 30 seconds.
+func screenReconnectDelay(attempt int) time.Duration {
+	if attempt >= 4 {
+		return 30 * time.Second
+	}
+	return 2 * time.Second << attempt
+}
+
+// runSession opens one screen session and returns when it ends: whether it
+// was established, and why it ended.
+func (v *screenViewer) runSession(ctx context.Context, reconnecting bool) (bool, string) {
 	cfg := v.owner.currentConfig()
 	conn, route, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
 	if err != nil {
-		if ctx.Err() == nil {
+		if ctx.Err() == nil && !reconnecting {
 			v.setStatus("Screen connection failed: " + err.Error())
-			v.onUI(func() { _ = v.liveButton.SetText("Start") })
 		}
-		return
+		return false, err.Error()
 	}
 	v.owner.appendLog("Screen connection selected relay=%s proxy=%s protocol=%s relay_protocol=%s.", route.RelayAddr, route.Proxy, route.Protocol, route.RelayProtocol)
 	v.setStatus(fmt.Sprintf("Connected through %s via %s (%s); waiting for the Work PC...", route.RelayAddr, route.Proxy, route.Protocol))
@@ -423,17 +476,16 @@ func (v *screenViewer) run(ctx context.Context) {
 	})
 	if err != nil {
 		_ = conn.Close()
-		if ctx.Err() == nil {
+		if ctx.Err() == nil && !reconnecting {
 			v.setStatus("Screen session failed: " + err.Error())
-			v.onUI(func() { _ = v.liveButton.SetText("Start") })
 		}
-		return
+		return false, err.Error()
 	}
 	v.mu.Lock()
 	if v.closed || ctx.Err() != nil {
 		v.mu.Unlock()
 		_ = client.Close()
-		return
+		return false, "stopped"
 	}
 	v.client = client
 	v.mu.Unlock()
@@ -462,22 +514,25 @@ func (v *screenViewer) run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			_ = client.Close()
-			return
+			return true, "stopped"
 		case <-client.Done():
-			v.setControlling(false)
-			if ctx.Err() == nil {
-				reason := "the connection closed"
-				if err := client.Err(); err != nil {
-					reason = err.Error()
-				}
-				v.setStatus("Screen session ended: " + reason)
-				v.onUI(func() {
-					_ = v.liveButton.SetText("Start")
-					_ = v.stats.SetText("")
-					v.updateControlButtons()
-				})
+			reason := "the connection closed"
+			if err := client.Err(); err != nil {
+				reason = err.Error()
 			}
-			return
+			// Forget the ended session, so the controls stop offering it and
+			// Start/Stop act on what is really running.
+			v.mu.Lock()
+			if v.client == client {
+				v.client = nil
+			}
+			v.mu.Unlock()
+			v.setControlling(false)
+			v.onUI(func() {
+				_ = v.stats.SetText("")
+				v.updateControlButtons()
+			})
+			return true, reason
 		case now := <-ticker.C:
 			v.updateStats(client, now)
 		}
@@ -625,7 +680,11 @@ func (v *screenViewer) setStatus(text string) {
 }
 
 func (v *screenViewer) toggleLive() {
-	if v.liveClient() != nil {
+	// A session, or reconnecting to one, is running while its context is.
+	v.mu.Lock()
+	running := v.cancel != nil
+	v.mu.Unlock()
+	if running {
 		v.stop()
 		return
 	}

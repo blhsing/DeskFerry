@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"image/png"
+	"log"
 	"net/http"
 	"os"
 	"sync"
@@ -315,69 +316,121 @@ func (s *macScreenSocket) start(parent context.Context) {
 	s.unacked, s.dropping, s.needKey = 0, false, false
 	s.sentShape = make(map[uint32]bool)
 	s.mu.Unlock()
-	go func() {
-		conn, relayAddr, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
-		if err != nil {
-			if ctx.Err() == nil {
-				s.setPhase("error", "Screen connection failed: "+err.Error())
-			}
-			return
-		}
-		s.setPhase("connecting", "Connected through "+relayAddr+"; waiting for the Work PC")
-		hostname, _ := os.Hostname()
-		s.mu.Lock()
-		minFPS := s.minFPS
-		video := s.video
-		s.mu.Unlock()
-		client, err := screenview.StartLive(ctx, conn, screenview.LiveClientOptions{
-			ScreenKey:        cfg.screenKey(),
-			MinFPS:           &minFPS,
-			PassthroughVideo: video,
-			Client:           "viewer",
-			Name:             hostname,
-			OnEncoded:        s.forward,
-			OnStatus:         func(screenview.Status) { s.pushState() },
-			OnCursor:         s.forwardCursor,
-		})
-		if err != nil {
-			_ = conn.Close()
-			if ctx.Err() == nil {
-				s.setPhase("error", "Screen session failed: "+err.Error())
-			}
-			return
-		}
-		s.mu.Lock()
+	go s.run(ctx, cfg)
+}
+
+// run keeps the screen session open until it is stopped: when a session
+// drops on its own and cannot resume, it reconnects with a growing delay.
+func (s *macScreenSocket) run(ctx context.Context, cfg config) {
+	attempt := 0
+	reconnecting := false
+	for {
+		started := time.Now()
+		established, reason := s.runSession(ctx, cfg, reconnecting)
 		if ctx.Err() != nil {
-			s.mu.Unlock()
-			_ = client.Close()
 			return
 		}
-		s.client = client
-		s.needKey = true
-		s.mu.Unlock()
-		s.controller.setScreenClient(client)
-		switch {
-		case client.Legacy():
-			s.setPhase("legacy", "Read-only: the Work PC runs an older DeskFerry")
-		case client.Hello().ControlAllowed:
-			s.setPhase("live", "Live through "+relayAddr)
-		default:
-			s.setPhase("live", "Live, view only: remote control is turned off on the Work PC")
+		if !established && !reconnecting {
+			return // runSession reported why the first connection failed
 		}
-		s.resync()
+		if established && time.Since(started) > time.Minute {
+			attempt = 0
+		}
+		delay := screenReconnectDelay(attempt)
+		attempt++
+		reconnecting = true
+		log.Printf("screen session ended: %s; reconnecting in %s", reason, delay)
+		s.setPhase("connecting", fmt.Sprintf("Connection lost (%s); reconnecting in %d s", reason, int(delay.Seconds())))
 		select {
-		case <-client.Done():
-			if ctx.Err() == nil {
-				reason := "the connection closed"
-				if err := client.Err(); err != nil {
-					reason = err.Error()
-				}
-				s.setPhase("error", "Screen session ended: "+reason)
-			}
 		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+	}
+}
+
+// screenReconnectDelay returns the wait before reconnect attempt n: 2, 4, 8,
+// 16, then 30 seconds.
+func screenReconnectDelay(attempt int) time.Duration {
+	if attempt >= 4 {
+		return 30 * time.Second
+	}
+	return 2 * time.Second << attempt
+}
+
+// runSession opens one screen session and returns when it ends: whether it
+// was established, and why it ended.
+func (s *macScreenSocket) runSession(ctx context.Context, cfg config, reconnecting bool) (bool, string) {
+	conn, relayAddr, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
+	if err != nil {
+		if ctx.Err() == nil && !reconnecting {
+			s.setPhase("error", "Screen connection failed: "+err.Error())
+		}
+		return false, err.Error()
+	}
+	s.setPhase("connecting", "Connected through "+relayAddr+"; waiting for the Work PC")
+	hostname, _ := os.Hostname()
+	s.mu.Lock()
+	minFPS := s.minFPS
+	video := s.video
+	s.unacked, s.dropping = 0, false
+	s.sentShape = make(map[uint32]bool)
+	s.mu.Unlock()
+	client, err := screenview.StartLive(ctx, conn, screenview.LiveClientOptions{
+		ScreenKey:        cfg.screenKey(),
+		MinFPS:           &minFPS,
+		PassthroughVideo: video,
+		Client:           "viewer",
+		Name:             hostname,
+		OnEncoded:        s.forward,
+		OnStatus:         func(screenview.Status) { s.pushState() },
+		OnCursor:         s.forwardCursor,
+	})
+	if err != nil {
+		_ = conn.Close()
+		if ctx.Err() == nil && !reconnecting {
+			s.setPhase("error", "Screen session failed: "+err.Error())
+		}
+		return false, err.Error()
+	}
+	s.mu.Lock()
+	if ctx.Err() != nil {
+		s.mu.Unlock()
+		_ = client.Close()
+		return false, "stopped"
+	}
+	s.client = client
+	s.needKey = true
+	s.mu.Unlock()
+	s.controller.setScreenClient(client)
+	switch {
+	case client.Legacy():
+		s.setPhase("legacy", "Read-only: the Work PC runs an older DeskFerry")
+	case client.Hello().ControlAllowed:
+		s.setPhase("live", "Live through "+relayAddr)
+	default:
+		s.setPhase("live", "Live, view only: remote control is turned off on the Work PC")
+	}
+	s.resync()
+	select {
+	case <-client.Done():
+		reason := "the connection closed"
+		if err := client.Err(); err != nil {
+			reason = err.Error()
 		}
 		_ = client.Close()
-	}()
+		// Forget the ended session so nothing is sent to it any more.
+		s.mu.Lock()
+		if s.client == client {
+			s.client = nil
+		}
+		s.mu.Unlock()
+		s.controller.setScreenClient(nil)
+		return true, reason
+	case <-ctx.Done():
+		_ = client.Close()
+		return true, "stopped"
+	}
 }
 
 func (s *macScreenSocket) stop(phase, status string) {

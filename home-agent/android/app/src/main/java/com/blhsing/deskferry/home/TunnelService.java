@@ -79,23 +79,23 @@ public class TunnelService extends Service {
     private static final String LOG_TAG = "DeskFerryHome";
     private static final long MAX_DIAGNOSTIC_LOG_BYTES = 8L * 1024L * 1024L;
     private static final long PRESENCE_CONFIRM_MILLIS = 2L * 1000L;
-    private static final int RESUMABLE_MAX_BUFFER = 8 * 1024 * 1024;
-    private static final int RESUMABLE_CHUNK_SIZE = 64 * 1024;
-    private static final long RESUMABLE_WINDOW_MS = 5L * 60L * 1000L;
-    private static final long HEARTBEAT_INTERVAL_MS = 5L * 1000L;
-    private static final long DIAGNOSTIC_STALL_MS = 3L * 1000L;
-    private static final long RDP_ACK_RECOVERY_MS = 5L * 1000L;
+    static final int RESUMABLE_MAX_BUFFER = 8 * 1024 * 1024;
+    static final int RESUMABLE_CHUNK_SIZE = 64 * 1024;
+    static final long RESUMABLE_WINDOW_MS = 5L * 60L * 1000L;
+    static final long HEARTBEAT_INTERVAL_MS = 5L * 1000L;
+    static final long DIAGNOSTIC_STALL_MS = 3L * 1000L;
+    static final long RDP_ACK_RECOVERY_MS = 5L * 1000L;
     // Proxy-routed HTTP-stream fallback has ~4.7s round trips and self-healing ack stalls of up to ~6s.
-    private static final long RDP_HTTP_STREAM_ACK_RECOVERY_MS = 8L * 1000L;
-    private static final long DEFAULT_ACK_RECOVERY_MS = 10L * 1000L;
-    private static final long HEARTBEAT_TIMEOUT_MS = 15L * 1000L;
+    static final long RDP_HTTP_STREAM_ACK_RECOVERY_MS = 8L * 1000L;
+    static final long DEFAULT_ACK_RECOVERY_MS = 10L * 1000L;
+    static final long HEARTBEAT_TIMEOUT_MS = 15L * 1000L;
     // Remote Desktop clients reset about 16s after data stops; notice a frozen path in time to resume.
-    private static final long RDP_HEARTBEAT_TIMEOUT_MS = 8L * 1000L;
+    static final long RDP_HEARTBEAT_TIMEOUT_MS = 8L * 1000L;
     private static final long RESUME_ATTEMPT_TIMEOUT_MS = 8L * 1000L;
     private static final long FAILOVER_ATTEMPT_BASE_MS = 4L * 1000L;
     private static final long FAILOVER_ATTEMPT_STEP_MS = 3L * 1000L;
     private static final long FAILOVER_ATTEMPT_MAX_MS = 15L * 1000L;
-    private static final long FAILOVER_UNREACHABLE_ATTEMPT_MS = 12L * 1000L;
+    static final long FAILOVER_UNREACHABLE_ATTEMPT_MS = 12L * 1000L;
     private static final int MAX_CONCURRENT_BRIDGES_PER_SERVICE = 2;
     private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss", Locale.ROOT);
     private static final SimpleDateFormat DIAGNOSTIC_TIME_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.ROOT);
@@ -1027,26 +1027,26 @@ public class TunnelService extends Service {
         }
     }
 
-    private static long elapsedMillis(long started) {
+    static long elapsedMillis(long started) {
         return Math.max(0, SystemClock.elapsedRealtime() - started);
     }
 
-    private static String throwableText(Throwable throwable) {
+    static String throwableText(Throwable throwable) {
         if (throwable == null) {
             return "none";
         }
         return throwable.getClass().getSimpleName() + ": " + emptyAs(throwable.getMessage(), "no message");
     }
 
-    private static String responseStatus(Response response) {
+    static String responseStatus(Response response) {
         return response == null ? "none" : response.code() + " " + response.message();
     }
 
-    private static String quoted(String value) {
+    static String quoted(String value) {
         return "\"" + emptyAs(value, "").replace("\r", " ").replace("\n", " ") + "\"";
     }
 
-    private static void sleepQuietly(long millis) {
+    static void sleepQuietly(long millis) {
         try {
             Thread.sleep(millis);
         } catch (InterruptedException ex) {
@@ -1072,7 +1072,7 @@ public class TunnelService extends Service {
         }
     }
 
-    private static String emptyAs(String value, String fallback) {
+    static String emptyAs(String value, String fallback) {
         return value == null || value.trim().isEmpty() ? fallback : value;
     }
 
@@ -1123,860 +1123,86 @@ public class TunnelService extends Service {
         }
     }
 
-    private final class BridgeSession implements Runnable {
+    /**
+     * One local RDP or SMB connection carried over a resumable relay stream.
+     * The stream does the relay work; this class adds the service's
+     * bookkeeping (permits, wake lock, connection counts) and the local socket.
+     */
+    private final class BridgeSession implements Runnable, ResumableRelayStream.Host {
         private final Socket localSocket;
-		private final String service;
-		private final String serviceLabel;
-		private final Semaphore permits;
-        private final AtomicBoolean closed = new AtomicBoolean(false);
-        private final AtomicLong localToRelayBytes = new AtomicLong();
-        private final AtomicLong localToRelayMessages = new AtomicLong();
-        private final AtomicLong relayToLocalBytes = new AtomicLong();
-        private final AtomicLong relayToLocalMessages = new AtomicLong();
-		private final AtomicLong pendingLocalBytes = new AtomicLong();
-        private final AtomicReference<String> termination = new AtomicReference<>("running");
-        private final AtomicBoolean reconnecting = new AtomicBoolean(false);
-        private final Object resumeLock = new Object();
-		private final Object receiveLock = new Object();
-		private final LinkedBlockingQueue<ReceivedChunk> localWriteQueue = new LinkedBlockingQueue<>();
+        private final String serviceLabel;
+        private final Semaphore permits;
         private final long startedAt = SystemClock.elapsedRealtime();
-        private volatile WebSocket webSocket;
-        private volatile WebSocket pendingResumeSocket;
-		private volatile CountDownLatch pendingResumeReady;
-		private volatile Thread localWriterThread;
-        private volatile String selectedRelay = "none";
-        private volatile String sessionId = "";
-        private byte[] sendBuffer = new byte[0];
-        private long sendBase;
-        private long sendEnd;
-        private long receiveOffset;
-		private long receiveQueuedOffset;
-		private boolean heartbeatEnabled;
-		private long transportGeneration;
-		private long heartbeatNonce;
-		private long heartbeatAcknowledged;
-		private long lastAckProgressMs;
-		private boolean ackStallLogged;
-		private long ackStallAtMs;
-		private long lastTransportLostMs;
+        private final AtomicBoolean finished = new AtomicBoolean(false);
+        private final ResumableRelayStream stream;
 
-		BridgeSession(Socket localSocket, String service) {
+        BridgeSession(Socket localSocket, String service) {
             this.localSocket = localSocket;
-			this.service = "smb".equals(service) ? "smb" : "rdp";
-			this.serviceLabel = this.service.toUpperCase(Locale.ROOT);
-			this.permits = "smb".equals(this.service) ? smbBridgePermits : rdpBridgePermits;
-			startLocalWriter();
-			startAckMonitor();
+            String normalized = "smb".equals(service) ? "smb" : "rdp";
+            this.serviceLabel = normalized.toUpperCase(Locale.ROOT);
+            this.permits = "smb".equals(normalized) ? smbBridgePermits : rdpBridgePermits;
+            this.stream = new ResumableRelayStream(this, normalized, this::writeLocal, termination -> finish());
         }
 
-		private void startAckMonitor() {
-			new Thread(() -> {
-				while (!closed.get()) {
-					sleepQuietly(1000);
-					long now = SystemClock.elapsedRealtime();
-					long pending;
-					long generation;
-					long noProgress;
-					WebSocket stalledSocket;
-					boolean shouldLog;
-					synchronized (resumeLock) {
-						pending = sendEnd - sendBase;
-						noProgress = now - lastAckProgressMs;
-						if (pending == 0 || webSocket == null || noProgress < DIAGNOSTIC_STALL_MS) {
-							continue;
-						}
-						stalledSocket = webSocket;
-						shouldLog = !ackStallLogged;
-						if (shouldLog) {
-							ackStallLogged = true;
-							ackStallAtMs = now;
-						}
-						generation = transportGeneration;
-					}
-					if (shouldLog) {
-						append(serviceLabel + " relay acknowledgements stalled session=" + sessionId + " relay=" + selectedRelay
-								+ " generation=" + generation + " pending_bytes=" + pending + " no_progress_ms=" + noProgress + ".");
-					}
-					long recoveryDeadline = DEFAULT_ACK_RECOVERY_MS;
-					if ("rdp".equals(service)) {
-						recoveryDeadline = "http-stream".equals(relayProtocol(stalledSocket)) ? RDP_HTTP_STREAM_ACK_RECOVERY_MS : RDP_ACK_RECOVERY_MS;
-					}
-					if (noProgress >= recoveryDeadline) {
-						markTransportLost(stalledSocket, "data acknowledgements made no progress for " + noProgress + "ms");
-					}
-				}
-			}, "DeskFerry-" + serviceLabel + "-AckMonitor").start();
-		}
+        @Override
+        public List<String> relayUrls() {
+            return relayUrlsSnapshot();
+        }
 
-		private final class ReceivedChunk {
-			final long offset;
-			final byte[] data;
-			final boolean resumable;
+        @Override
+        public Request request(String relayUrl, String role) throws Exception {
+            return webSocketRequest(relayUrl, role);
+        }
 
-			ReceivedChunk(long offset, byte[] data, boolean resumable) {
-				this.offset = offset;
-				this.data = data;
-				this.resumable = resumable;
-			}
-		}
+        @Override
+        public WebSocket open(Request request, WebSocketListener listener) {
+            return newRelayWebSocket(request, listener);
+        }
 
-		private void startLocalWriter() {
-			Thread writer = new Thread(() -> {
-				while (!closed.get()) {
-					ReceivedChunk chunk;
-					try {
-						chunk = localWriteQueue.take();
-					} catch (InterruptedException interrupted) {
-						if (!closed.get()) {
-							Thread.currentThread().interrupt();
-						}
-						return;
-					}
-					try {
-						writeLocal(chunk.data);
-						if (chunk.resumable) {
-							long acknowledgedOffset;
-							synchronized (receiveLock) {
-								if (chunk.offset != receiveOffset) {
-									throw new IOException("out-of-order local delivery");
-								}
-								receiveOffset += chunk.data.length;
-								acknowledgedOffset = receiveOffset;
-							}
-							acknowledgeLocalDelivery(acknowledgedOffset);
-						}
-					} catch (IOException ex) {
-						if (!closed.get()) {
-							recordTermination("relay_to_local_write_error=" + throwableText(ex));
-							append(serviceLabel + " local delivery failed: " + throwableText(ex));
-							close();
-						}
-						return;
-					} finally {
-						pendingLocalBytes.addAndGet(-chunk.data.length);
-					}
-				}
-			}, "DeskFerry-" + serviceLabel + "-LocalWriter");
-			localWriterThread = writer;
-			writer.start();
-		}
+        @Override
+        public void log(String line) {
+            append(line);
+        }
 
         @Override
         public void run() {
             String remote = String.valueOf(localSocket.getRemoteSocketAddress());
             boolean permitAcquired = false;
-			boolean wakeLockAcquired = acquireActiveBridgeWakeLock();
+            boolean wakeLockAcquired = acquireActiveBridgeWakeLock();
             activeConnections++;
             totalConnections++;
             updateState("Running", null, null, null);
-			append(serviceLabel + " connection from " + remote + ".");
+            append(serviceLabel + " connection from " + remote + ".");
             try {
-				if (!permits.tryAcquire()) {
-					append(serviceLabel + " connection from " + remote + " queued behind active/retry sockets.");
-					permits.acquire();
+                if (!permits.tryAcquire()) {
+                    append(serviceLabel + " connection from " + remote + " queued behind active/retry sockets.");
+                    permits.acquire();
                 }
                 permitAcquired = true;
-                if (closed.get()) {
+                if (stream.isClosed()) {
                     return;
                 }
-                boolean connected = false;
-                String lastError = "";
-                for (String candidate : relayUrlsSnapshot()) {
-                    if (closed.get()) {
-                        break;
-                    }
-                    try {
-                        long dialStarted = SystemClock.elapsedRealtime();
-                        connectRelay(candidate);
-                        selectedRelay = candidate;
-						append("Relay attempt selected relay=" + candidate + " service=" + service + " protocol_v2=true elapsed_ms=" + elapsedMillis(dialStarted) + ".");
-                    } catch (Exception ex) {
-                        lastError = candidate + ": " + ex.getMessage();
-                        closeWebSocketOnly();
-                        if (!closed.get()) {
-							append("Relay attempt failed relay=" + candidate + " service=" + service + " result=" + relayAttemptResult(ex) + " error=" + ex.getMessage() + ".");
-                        }
-                        if (ex instanceof SessionRejectedException && ((SessionRejectedException) ex).terminal()) {
-                            throw ex;
-                        }
-                        continue;
-                    }
-					append("Bridging local " + serviceLabel + " connection from " + remote + " through " + candidate + ".");
-                    connected = true;
-                    break;
-                }
-                if (connected) {
-                    pipeLocalToRelay();
-                }
-                if (!connected && !closed.get()) {
-                    recordTermination("all_relay_urls_failed error=" + emptyAs(lastError, "unknown"));
-					append(serviceLabel + " bridge failed: " + emptyAs(lastError, "all relay URLs failed"));
-                }
+                String relay = stream.connect();
+                append("Bridging local " + serviceLabel + " connection from " + remote + " through " + relay + ".");
+                pipeLocalToRelay();
             } catch (Exception ex) {
-                recordTermination("bridge_error=" + throwableText(ex));
-                if (!closed.get()) {
-					append(serviceLabel + " bridge failed: " + ex.getMessage());
+                stream.recordTermination("bridge_error=" + throwableText(ex));
+                if (!stream.isClosed()) {
+                    append(serviceLabel + " bridge failed: " + ex.getMessage());
                 }
             } finally {
                 if (permitAcquired) {
-					permits.release();
+                    permits.release();
                 }
-				try {
-					close();
-					append(serviceLabel + " session remote=" + remote + " relay=" + selectedRelay + " ended duration_ms=" + elapsedMillis(startedAt) + " termination=" + termination.get() + " local_to_relay_bytes=" + localToRelayBytes.get() + " local_to_relay_messages=" + localToRelayMessages.get() + " relay_to_local_bytes=" + relayToLocalBytes.get() + " relay_to_local_messages=" + relayToLocalMessages.get() + ".");
-				} finally {
-					if (wakeLockAcquired) {
-						releaseActiveBridgeWakeLock();
-					}
-				}
-            }
-        }
-
-        private void connectRelay(String candidate) throws Exception {
-            CountDownLatch paired = new CountDownLatch(1);
-            AtomicBoolean started = new AtomicBoolean(false);
-            AtomicReference<Throwable> failure = new AtomicReference<>();
-            Request request = webSocketRequest(candidate, "client").newBuilder()
-					.header("X-DeskFerry-Service", service)
-                    .header("X-DeskFerry-Resumable", "1")
-					.header("X-DeskFerry-Heartbeat", "1")
-                    .header("X-DeskFerry-Protocol", "2")
-                    .build();
-            WebSocket socket = newRelayWebSocket(request, bridgeListener(paired, started, failure, true));
-            webSocket = socket;
-            if (!paired.await(12, TimeUnit.SECONDS)) {
-                throw new IOException("relay did not pair with a work agent");
-            }
-            Throwable err = failure.get();
-            if (err != null) {
-                if (err instanceof SessionRejectedException) {
-                    throw (SessionRejectedException) err;
-                }
-                throw new IOException("relay connection failed", err);
-            }
-            if (!started.get()) {
-                throw new IOException("relay closed before pairing");
-            }
-        }
-
-        private WebSocketListener bridgeListener(CountDownLatch ready, AtomicBoolean started, AtomicReference<Throwable> failure, boolean initial) {
-            return new WebSocketListener() {
-                private final AtomicBoolean closeHandled = new AtomicBoolean(false);
-
-                @Override
-                public void onMessage(WebSocket socket, String text) {
-                    String value = text.trim();
-                    if (initial && ("start".equals(value) || value.startsWith("start ") || value.startsWith("{"))) {
-                        if (value.startsWith("{")) {
-                            try {
-                                JSONObject message = new JSONObject(value);
-                                String result = message.optString("type", "invalid-request");
-                                if (!"session-ready".equals(result)) {
-                                    failure.set(new SessionRejectedException(result, message.optString("reason", "")));
-                                    ready.countDown();
-                                    return;
-                                }
-								String confirmedService = message.optString("service", "").trim();
-								if (!confirmedService.isEmpty() && !service.equals(confirmedService)) {
-									failure.set(new IOException("relay confirmed " + confirmedService + " instead of " + service));
-									ready.countDown();
-									return;
-								}
-                                sessionId = message.optString("session_id", "").trim();
-								heartbeatEnabled = message.optBoolean("heartbeat", false);
-                                if (sessionId.isEmpty()) {
-                                    failure.set(new IOException("relay session-ready result omitted the session ID"));
-                                    ready.countDown();
-                                    return;
-                                }
-                            } catch (Exception ex) {
-                                failure.set(ex);
-                                ready.countDown();
-                                return;
-                            }
-                        } else if (value.startsWith("start ")) {
-                            sessionId = value.substring("start ".length()).trim();
-                        }
-                        if (!sessionId.isEmpty()) {
-                            if (!attachTransport(socket)) {
-                                failure.set(new IOException("failed to initialize resumable relay stream"));
-                            }
-                        }
-                        started.set(true);
-                        ready.countDown();
-                    } else if (!initial && value.equals("resume " + sessionId)) {
-                        if (!attachTransport(socket)) {
-                            failure.set(new IOException("failed to replay resumable relay stream"));
-                        }
-                        started.set(true);
-                        ready.countDown();
-                    }
-                }
-
-                @Override
-                public void onMessage(WebSocket socket, ByteString bytes) {
-                    try {
-                        handleRelayPayload(socket, bytes.toByteArray());
-                    } catch (IOException ex) {
-                        failure.set(ex);
-                        recordTermination("relay_to_local_write_error=" + throwableText(ex));
-                        close();
-                    }
-                }
-
-                @Override
-                public void onClosing(WebSocket socket, int code, String reason) {
-                    // OkHttp waits for the application to acknowledge a peer-initiated
-                    // close before invoking onClosed. Handle it here so a completed
-                    // session or rejected resume does not sit through repeated resume
-                    // timeouts while the stale local RDP socket remains open.
-                    socket.close(code, reason);
-                    handleClose(socket, code, reason);
-                }
-
-                @Override
-                public void onClosed(WebSocket socket, int code, String reason) {
-                    handleClose(socket, code, reason);
-                }
-
-                private void handleClose(WebSocket socket, int code, String reason) {
-                    if (!closeHandled.compareAndSet(false, true)) {
-                        return;
-                    }
-                    if (!started.get()) {
-                        if (failure.get() == null) {
-                            IOException error = !initial && isTerminalResumeClose(code)
-                                    ? new TerminalResumeException("relay resume rejected code=" + code + " reason=" + reason)
-                                    : new IOException("relay closed before pairing code=" + code + " reason=" + reason);
-                            failure.set(error);
-                        }
-                        ready.countDown();
-                        return;
-                    }
-                    if (!sessionId.isEmpty() && code != 1008 && !isLogicalSessionClose(code, reason) && !closed.get()) {
-                        markTransportLost(socket, "websocket_closed code=" + code + " reason=" + quoted(reason));
-                    } else {
-                        recordTermination("websocket_closed code=" + code + " reason=" + quoted(reason));
-                        close();
-                    }
-                }
-
-                @Override
-                public void onFailure(WebSocket socket, Throwable t, Response response) {
-                    int status = response == null ? 0 : response.code();
-                    Throwable reported = !initial && (status == 401 || status == 403)
-                            ? new TerminalResumeException("relay resume authentication failed http_status=" + status, t)
-                            : t;
-                    failure.compareAndSet(null, reported);
-                    ready.countDown();
-                    if (closeHandled.get()) {
-                        return;
-                    }
-                    if (!started.get()) {
-                        return;
-                    }
-                    if (!sessionId.isEmpty() && status != 401 && status != 403 && !closed.get()) {
-                        markTransportLost(socket, "websocket_failure error=" + throwableText(t) + " http_status=" + responseStatus(response));
-                    } else {
-                        recordTermination("websocket_failure error=" + throwableText(t) + " http_status=" + responseStatus(response));
-                        close();
-                    }
-                }
-            };
-        }
-
-        private String relayAttemptResult(Exception error) {
-            if (error instanceof SessionRejectedException) {
-                return ((SessionRejectedException) error).result;
-            }
-            String text = String.valueOf(error.getMessage()).toLowerCase(Locale.ROOT);
-            return text.contains("did not pair") || text.contains("timeout") ? "timeout" : "transport-failure";
-        }
-
-        private final class SessionRejectedException extends IOException {
-            final String result;
-
-            SessionRejectedException(String result, String reason) {
-                super("relay session rejected: " + result + (reason.isEmpty() ? "" : " (" + reason + ")"));
-                this.result = result;
-            }
-
-            boolean terminal() {
-                return "authentication-failed".equals(result) || "service-disabled".equals(result) || "invalid-request".equals(result);
-            }
-        }
-
-        private final class TerminalResumeException extends IOException {
-            TerminalResumeException(String message) {
-                super(message);
-            }
-
-            TerminalResumeException(String message, Throwable cause) {
-                super(message, cause);
-            }
-        }
-
-        private boolean attachTransport(WebSocket socket) {
-			long generation;
-			int replayBytes;
-			long lostDurationMs;
-			long acknowledgedOffset;
-			synchronized (receiveLock) {
-				acknowledgedOffset = receiveOffset;
-			}
-            synchronized (resumeLock) {
-                if (closed.get()) {
-                    return false;
-                }
-				webSocket = socket;
-				generation = ++transportGeneration;
-				replayBytes = sendBuffer.length;
-				lostDurationMs = lastTransportLostMs == 0 ? 0 : SystemClock.elapsedRealtime() - lastTransportLostMs;
-                if (!socket.send(frame((byte) 2, acknowledgedOffset, null))) {
-                    webSocket = null;
-                    return false;
-                }
-                int position = 0;
-                long offset = sendBase;
-                while (position < sendBuffer.length) {
-                    int size = Math.min(RESUMABLE_CHUNK_SIZE, sendBuffer.length - position);
-                    byte[] payload = Arrays.copyOfRange(sendBuffer, position, position + size);
-                    if (!socket.send(frame((byte) 1, offset, payload))) {
-                        webSocket = null;
-                        return false;
-                    }
-                    position += size;
-                    offset += size;
-                }
-				resumeLock.notifyAll();
-            }
-			if (generation > 1) {
-				append(serviceLabel + " relay transport resumed session=" + sessionId + " relay=" + selectedRelay
-						+ " protocol=" + relayProtocol(socket) + " generation=" + generation + " lost_ms=" + lostDurationMs + " replay_bytes=" + replayBytes + ".");
-			}
-			if (heartbeatEnabled) {
-				startHeartbeat(socket, generation);
-			}
-			return true;
-        }
-
-		private void startHeartbeat(WebSocket socket, long generation) {
-			new Thread(() -> {
-				while (!closed.get()) {
-					sleepQuietly(HEARTBEAT_INTERVAL_MS);
-					long nonce;
-					synchronized (resumeLock) {
-						if (closed.get() || webSocket != socket || transportGeneration != generation) {
-							return;
-						}
-						if (heartbeatNonce == Long.MAX_VALUE) {
-							heartbeatNonce = 0;
-							heartbeatAcknowledged = 0;
-						}
-						nonce = ++heartbeatNonce;
-					}
-					if (!socket.send(frame((byte) 3, nonce, null))) {
-						markTransportLost(socket, "heartbeat send failed");
-						return;
-					}
-					long pingAt = SystemClock.elapsedRealtime();
-					long deadline = SystemClock.elapsedRealtime() + ("rdp".equals(service) ? RDP_HEARTBEAT_TIMEOUT_MS : HEARTBEAT_TIMEOUT_MS);
-					synchronized (resumeLock) {
-						while (!closed.get() && webSocket == socket && transportGeneration == generation
-								&& heartbeatAcknowledged < nonce) {
-							long remaining = deadline - SystemClock.elapsedRealtime();
-							if (remaining <= 0) {
-								break;
-							}
-							try {
-								resumeLock.wait(remaining);
-							} catch (InterruptedException interrupted) {
-								Thread.currentThread().interrupt();
-								return;
-							}
-						}
-						if (closed.get() || webSocket != socket || transportGeneration != generation) {
-							return;
-						}
-						if (heartbeatAcknowledged < nonce) {
-							markTransportLost(socket, "end-to-end heartbeat timed out");
-							return;
-						}
-					}
-					long roundTripMs = SystemClock.elapsedRealtime() - pingAt;
-					if (roundTripMs >= DIAGNOSTIC_STALL_MS) {
-						append(serviceLabel + " slow relay heartbeat session=" + sessionId + " relay=" + selectedRelay
-								+ " generation=" + generation + " round_trip_ms=" + roundTripMs + ".");
-					}
-				}
-			}, "DeskFerry-" + serviceLabel + "-Heartbeat").start();
-		}
-
-        private void markTransportLost(WebSocket socket, String reason) {
-			long pending;
-			long generation;
-            synchronized (resumeLock) {
-                if (webSocket != socket || closed.get()) {
-                    return;
-                }
-                webSocket = null;
-				lastTransportLostMs = SystemClock.elapsedRealtime();
-				pending = sendEnd - sendBase;
-				generation = transportGeneration;
-                resumeLock.notifyAll();
-            }
-			append(serviceLabel + " relay transport lost session=" + sessionId + " relay=" + selectedRelay
-					+ " protocol=" + relayProtocol(socket) + " generation=" + generation + " pending_bytes=" + pending + " reason=" + reason + ".");
-			append(serviceLabel + " relay stream interrupted; retrying transparently: " + reason);
-            startReconnectLoop();
-        }
-
-        private void replaceTransportForNetworkChange(String reason) {
-            WebSocket active;
-            WebSocket pending;
-			CountDownLatch pendingReady;
-			long pendingBytes;
-			long generation;
-            synchronized (resumeLock) {
-                if (closed.get()) {
-                    return;
-                }
-                active = webSocket;
-                webSocket = null;
-				if (active != null) {
-					lastTransportLostMs = SystemClock.elapsedRealtime();
-				}
-				pendingBytes = sendEnd - sendBase;
-				generation = transportGeneration;
-                pending = pendingResumeSocket;
-                pendingResumeSocket = null;
-				pendingReady = pendingResumeReady;
-				pendingResumeReady = null;
-                resumeLock.notifyAll();
-            }
-            if (active != null) {
-                active.cancel();
-				append(serviceLabel + " relay transport replaced after network change session=" + sessionId
-						+ " relay=" + selectedRelay + " protocol=" + relayProtocol(active) + " generation=" + generation + " pending_bytes=" + pendingBytes
-						+ " reason=" + reason + ".");
-            }
-            if (pending != null && pending != active) {
-                pending.cancel();
-            }
-			// OkHttp may not deliver the cancellation callback until the obsolete
-			// network finishes failing. Wake the resume worker immediately so its
-			// next attempt is created on the newly available Android network.
-			if (pendingReady != null) {
-				pendingReady.countDown();
-			}
-            if (!sessionId.isEmpty()) {
-				append(serviceLabel + " relay stream interrupted; retrying transparently: " + reason);
-                startReconnectLoop();
-            }
-        }
-
-        private void startReconnectLoop() {
-            if (!reconnecting.compareAndSet(false, true)) {
-                return;
-            }
-            new Thread(() -> {
-                long deadline = SystemClock.elapsedRealtime() + RESUMABLE_WINDOW_MS;
-                long backoff = 250;
-                // Try the session's relay first, then the room's other relays in
-                // the configured order, as the Work agent does; relays rebuild the
-                // session from both sides' resume attachments.
-                List<String> resumeRelays = resumeRelayOrder(selectedRelay, relayUrlsSnapshot());
-                int relayIndex = 0;
-                int waitRound = 0;
-                // A phone that cannot reach the session's relay cannot return
-                // there, so it waits longer at the others for the Work agent.
-                boolean sessionRelayUnreachable = false;
                 try {
-                    while (!closed.get() && SystemClock.elapsedRealtime() < deadline) {
-                        boolean attemptTimedOut = false;
-                        String relay = resumeRelays.get(relayIndex);
-                        CountDownLatch ready = new CountDownLatch(1);
-                        AtomicBoolean started = new AtomicBoolean(false);
-                        AtomicReference<Throwable> failure = new AtomicReference<>();
-						long attemptStarted = SystemClock.elapsedRealtime();
-                        try {
-                            Request request = webSocketRequest(relay, "resume").newBuilder()
-									.header("X-DeskFerry-Service", service)
-                                    .header("X-DeskFerry-Session", sessionId)
-                                    .header("X-DeskFerry-Session-Side", "client")
-                                    .build();
-                            WebSocket candidate = newRelayWebSocket(request, bridgeListener(ready, started, failure, false));
-							synchronized (resumeLock) {
-								pendingResumeSocket = candidate;
-								pendingResumeReady = ready;
-							}
-                            long remaining = Math.max(1, deadline - SystemClock.elapsedRealtime());
-							long attemptWait = resumeRelays.size() > 1
-									? failoverAttemptWaitMillis(waitRound, remaining)
-									: resumeAttemptWaitMillis(remaining);
-							if (sessionRelayUnreachable && relayIndex != 0) {
-								attemptWait = Math.max(attemptWait, Math.min(FAILOVER_UNREACHABLE_ATTEMPT_MS, remaining));
-							}
-							boolean signaled = ready.await(attemptWait, TimeUnit.MILLISECONDS);
-							if (signaled && started.get() && failure.get() == null) {
-								clearPendingResume(candidate, ready);
-								selectedRelay = relay;
-								append(serviceLabel + " relay stream resumed through " + relay + ".");
-                                return;
-                            }
-							clearPendingResume(candidate, ready);
-                            candidate.cancel();
-                            Throwable resumeFailure = failure.get();
-                            if (resumeFailure instanceof TerminalResumeException) {
-                                recordTermination("resume_rejected error=" + throwableText(resumeFailure));
-								append(serviceLabel + " relay session cannot resume; closing the stale local connection: " + throwableText(resumeFailure));
-                                close();
-                                return;
-                            }
-							if (!closed.get()) {
-								attemptTimedOut = !signaled;
-								if (relayIndex == 0 && signaled) {
-									sessionRelayUnreachable = true;
-								}
-								String result = !signaled ? "attempt_timeout" : "transport_failure";
-								append(serviceLabel + " relay resume attempt failed relay=" + relay
-										+ " result=" + result + " elapsed_ms=" + elapsedMillis(attemptStarted)
-										+ (resumeFailure == null ? "" : " error=" + throwableText(resumeFailure)) + ".");
-							}
-                        } catch (Exception ex) {
-                            WebSocket candidate = pendingResumeSocket;
-                            pendingResumeSocket = null;
-							CountDownLatch pendingReady = pendingResumeReady;
-							pendingResumeReady = null;
-                            if (candidate != null) {
-                                candidate.cancel();
-                            }
-							if (pendingReady != null) {
-								pendingReady.countDown();
-							}
-							if (relayIndex == 0) {
-								sessionRelayUnreachable = true;
-							}
-							if (!closed.get()) {
-								append(serviceLabel + " relay resume attempt failed relay=" + relay
-										+ " result=exception elapsed_ms=" + elapsedMillis(attemptStarted)
-										+ " error=" + throwableText(ex) + ".");
-							}
-                        }
-                        if (attemptTimedOut) {
-                            waitRound++;
-                        }
-                        relayIndex = (relayIndex + 1) % resumeRelays.size();
-                        sleepQuietly(backoff);
-                        // An attempt that ran out its whole wait has already waited.
-                        if (!attemptTimedOut) {
-                            backoff = Math.min(5000, backoff * 2);
-                        }
-                    }
-                    if (!closed.get()) {
-                        recordTermination("resume_window_expired");
-                        close();
-                    }
+                    close();
+                    append(serviceLabel + " session remote=" + remote + " relay=" + stream.selectedRelay() + " ended duration_ms="
+                            + elapsedMillis(startedAt) + " termination=" + stream.termination() + " " + stream.stats() + ".");
                 } finally {
-                    reconnecting.set(false);
-                    synchronized (resumeLock) {
-                        resumeLock.notifyAll();
+                    if (wakeLockAcquired) {
+                        releaseActiveBridgeWakeLock();
                     }
                 }
-		}, "DeskFerry-" + serviceLabel + "-Resume").start();
-        }
-
-		private void clearPendingResume(WebSocket candidate, CountDownLatch ready) {
-			synchronized (resumeLock) {
-				if (pendingResumeSocket == candidate) {
-					pendingResumeSocket = null;
-				}
-				if (pendingResumeReady == ready) {
-					pendingResumeReady = null;
-				}
-			}
-		}
-
-        private void handleRelayPayload(WebSocket socket, byte[] payload) throws IOException {
-            if (sessionId.isEmpty()) {
-				enqueueLocalDelivery(0, payload, false);
-                return;
-            }
-            if (payload.length < 9 || payload.length > 9 + RESUMABLE_CHUNK_SIZE) {
-                markTransportLost(socket, "invalid resumable frame");
-                return;
-            }
-            ByteBuffer frame = ByteBuffer.wrap(payload);
-            byte type = frame.get();
-            long offset = frame.getLong();
-            if (offset < 0) {
-                markTransportLost(socket, "invalid resumable offset");
-                return;
-            }
-            if (type == 2) {
-                if (frame.hasRemaining()) {
-                    markTransportLost(socket, "invalid resumable acknowledgement");
-                    return;
-                }
-                applyAcknowledgement(offset);
-                return;
-            }
-			if (type == 3 || type == 4) {
-				if (frame.hasRemaining()) {
-					markTransportLost(socket, "invalid heartbeat frame");
-					return;
-				}
-				if (type == 3) {
-					if (!socket.send(frame((byte) 4, offset, null))) {
-						markTransportLost(socket, "heartbeat response failed");
-					}
-				} else {
-					synchronized (resumeLock) {
-						heartbeatAcknowledged = Math.max(heartbeatAcknowledged, offset);
-						resumeLock.notifyAll();
-					}
-				}
-				return;
-			}
-            if (type != 1) {
-                markTransportLost(socket, "unknown resumable frame");
-                return;
-            }
-            byte[] data = new byte[frame.remaining()];
-            frame.get(data);
-			boolean sequenceGap = false;
-			synchronized (receiveLock) {
-                long end = offset + data.length;
-				if (offset > receiveQueuedOffset) {
-					sequenceGap = true;
-				} else if (end > receiveQueuedOffset) {
-					int trim = (int) (receiveQueuedOffset - offset);
-                    byte[] fresh = Arrays.copyOfRange(data, trim, data.length);
-					enqueueLocalDelivery(receiveQueuedOffset, fresh, true);
-					receiveQueuedOffset += fresh.length;
-                }
-			}
-			if (sequenceGap) {
-				markTransportLost(socket, "resumable sequence gap");
-				return;
-			}
-        }
-
-		private void enqueueLocalDelivery(long offset, byte[] payload, boolean resumable) throws IOException {
-			long queued = pendingLocalBytes.addAndGet(payload.length);
-			if (queued > RESUMABLE_MAX_BUFFER) {
-				pendingLocalBytes.addAndGet(-payload.length);
-				throw new IOException("local consumer stalled with more than " + RESUMABLE_MAX_BUFFER + " queued bytes");
-			}
-			if (!localWriteQueue.offer(new ReceivedChunk(offset, payload, resumable))) {
-				pendingLocalBytes.addAndGet(-payload.length);
-				throw new IOException("local delivery queue rejected data");
-			}
-		}
-
-		private void acknowledgeLocalDelivery(long offset) {
-			WebSocket current;
-			synchronized (resumeLock) {
-				current = webSocket;
-			}
-			if (current != null && !current.send(frame((byte) 2, offset, null))) {
-				markTransportLost(current, "acknowledgement send failed");
-			}
-		}
-
-        private void writeLocal(byte[] payload) throws IOException {
-            OutputStream output = localSocket.getOutputStream();
-            synchronized (output) {
-                output.write(payload);
-                output.flush();
-            }
-            relayToLocalBytes.addAndGet(payload.length);
-            relayToLocalMessages.incrementAndGet();
-        }
-
-		private void applyAcknowledgement(long offset) {
-			boolean recovered;
-			long stalledMs;
-			long pending;
-            synchronized (resumeLock) {
-                if (offset < sendBase || offset > sendEnd) {
-                    WebSocket current = webSocket;
-                    if (current != null) {
-                        markTransportLost(current, "invalid resumable acknowledgement");
-                    }
-                    return;
-                }
-                int drop = (int) (offset - sendBase);
-				recovered = drop > 0 && ackStallLogged;
-				stalledMs = recovered ? SystemClock.elapsedRealtime() - ackStallAtMs : 0;
-                sendBuffer = Arrays.copyOfRange(sendBuffer, drop, sendBuffer.length);
-                sendBase = offset;
-				if (drop > 0) {
-					lastAckProgressMs = SystemClock.elapsedRealtime();
-					ackStallLogged = false;
-				}
-				pending = sendEnd - sendBase;
-                resumeLock.notifyAll();
-            }
-			if (recovered) {
-				append(serviceLabel + " relay acknowledgement progress resumed session=" + sessionId + " relay=" + selectedRelay
-						+ " stalled_ms=" + stalledMs + " pending_bytes=" + pending + ".");
-			}
-        }
-
-		private String relayProtocol(WebSocket socket) {
-			return socket instanceof FallbackWebSocket ? ((FallbackWebSocket) socket).protocol() : "websocket";
-		}
-
-        private ByteString frame(byte type, long offset, byte[] payload) {
-            int length = payload == null ? 0 : payload.length;
-            ByteBuffer buffer = ByteBuffer.allocate(9 + length);
-            buffer.put(type);
-            buffer.putLong(offset);
-            if (payload != null) {
-                buffer.put(payload);
-            }
-            return ByteString.of(buffer.array());
-        }
-
-        void close() {
-            recordTermination("closed_by_app");
-            if (!closed.compareAndSet(false, true)) {
-                return;
-            }
-            WebSocket socket = webSocket;
-            WebSocket pending = pendingResumeSocket;
-			CountDownLatch pendingReady = pendingResumeReady;
-            pendingResumeSocket = null;
-			pendingResumeReady = null;
-            if (socket != null) {
-                socket.close(1000, "session closed");
-            }
-            if (pending != null && pending != socket) {
-                pending.cancel();
-            }
-			if (pendingReady != null) {
-				pendingReady.countDown();
-			}
-            synchronized (resumeLock) {
-                webSocket = null;
-                resumeLock.notifyAll();
-            }
-            closeQuietly(localSocket);
-			Thread writer = localWriterThread;
-			if (writer != null && writer != Thread.currentThread()) {
-				writer.interrupt();
-			}
-            sessions.remove(this);
-            activeConnections = Math.max(0, activeConnections - 1);
-            updateState("Running", null, null, null);
-        }
-
-        private void closeWebSocketOnly() {
-            WebSocket socket = webSocket;
-            webSocket = null;
-            if (socket != null) {
-                socket.close(1000, "retrying");
             }
         }
 
@@ -1984,76 +1210,40 @@ public class TunnelService extends Service {
             InputStream input = localSocket.getInputStream();
             byte[] buffer = new byte[16 * 1024];
             int read;
-            while (!closed.get() && (read = input.read(buffer)) >= 0) {
-                if (sessionId.isEmpty()) {
-                    WebSocket socket = webSocket;
-                    if (socket == null || !socket.send(ByteString.of(buffer, 0, read))) {
-                        recordTermination("local_to_relay_send_failed");
-                        throw new IOException("relay WebSocket send failed");
-                    }
-                    while (!closed.get() && socket.queueSize() > 4L * 1024L * 1024L) {
-                        sleepQuietly(10);
-                    }
-                } else {
-                    sendReliable(Arrays.copyOf(buffer, read));
-                }
-                localToRelayBytes.addAndGet(read);
-                localToRelayMessages.incrementAndGet();
+            while (!stream.isClosed() && (read = input.read(buffer)) >= 0) {
+                stream.write(Arrays.copyOf(buffer, read));
             }
-            if (!closed.get()) {
-                recordTermination("local_tcp_eof");
+            if (!stream.isClosed()) {
+                stream.recordTermination("local_tcp_eof");
             }
         }
 
-        private void sendReliable(byte[] payload) throws IOException {
-            long offset;
-            synchronized (resumeLock) {
-                while (!closed.get() && sendBuffer.length + payload.length > RESUMABLE_MAX_BUFFER) {
-                    try {
-                        resumeLock.wait(1000);
-                    } catch (InterruptedException ex) {
-                        Thread.currentThread().interrupt();
-                        throw new IOException("interrupted while waiting for relay acknowledgement", ex);
-                    }
-                }
-                if (closed.get()) {
-					throw new IOException(serviceLabel + " bridge closed");
-                }
-                offset = sendEnd;
-				if (sendEnd == sendBase) {
-					lastAckProgressMs = SystemClock.elapsedRealtime();
-				}
-                byte[] combined = Arrays.copyOf(sendBuffer, sendBuffer.length + payload.length);
-                System.arraycopy(payload, 0, combined, sendBuffer.length, payload.length);
-                sendBuffer = combined;
-                sendEnd += payload.length;
+        private void writeLocal(byte[] payload) throws IOException {
+            OutputStream output = localSocket.getOutputStream();
+            synchronized (output) {
+                output.write(payload);
+                output.flush();
             }
-            ByteString framed = frame((byte) 1, offset, payload);
-            while (!closed.get()) {
-                WebSocket socket;
-                synchronized (resumeLock) {
-                    while (!closed.get() && webSocket == null) {
-                        try {
-                            resumeLock.wait(1000);
-                        } catch (InterruptedException ex) {
-                            Thread.currentThread().interrupt();
-                            throw new IOException("interrupted while resuming relay", ex);
-                        }
-                    }
-                    socket = webSocket;
-                }
-                if (socket != null && socket.send(framed)) {
-                    return;
-                }
-                if (socket != null) {
-                    markTransportLost(socket, "data send failed");
-                }
-            }
-			throw new IOException(serviceLabel + " bridge closed");
         }
 
-        private void recordTermination(String cause) {
-            termination.compareAndSet("running", cause);
+        void replaceTransportForNetworkChange(String reason) {
+            stream.replaceTransportForNetworkChange(reason);
+        }
+
+        void close() {
+            stream.close();
+            finish();
+        }
+
+        /** Runs once, when the stream closed (by either side). */
+        private void finish() {
+            if (!finished.compareAndSet(false, true)) {
+                return;
+            }
+            closeQuietly(localSocket);
+            sessions.remove(this);
+            activeConnections = Math.max(0, activeConnections - 1);
+            updateState("Running", null, null, null);
         }
     }
 

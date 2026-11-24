@@ -1,3 +1,3 @@
 package buildinfo
 
-const Version = "0.15.9"
+const Version = "0.15.10"

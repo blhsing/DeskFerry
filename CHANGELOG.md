@@ -1,5 +1,12 @@
 # Release Notes
 
+## 0.15.10 - 2026-11-24
+
+- Keep screen sessions running through dropped connections. A proxy or relay cutting the connection used to end the session (`failed to read frame header: EOF`); screen sessions are now resumable like RDP: the Home app and the Work PC reattach the same session over a new connection and replay anything not yet delivered, and heartbeats detect a dead path. On a live session to a Work PC through the relay, a cut connection resumed in under half a second with the picture continuing. Work agents and relays already supported this; only the Home apps changed.
+- Reconnect the screen viewer by itself when a session cannot resume (for example after the Work PC restarts), on Windows, macOS and Android alike: after 2, 4, 8, 16 and then every 30 seconds until you stop the view, logging why the session ended. The Android viewer used to give up after two attempts.
+- Fix the Windows viewer's Start button doing nothing after a session ended on its own: the first click only stopped the ended session, and Take control and the remote-control banner stayed enabled for it.
+- On Android, RDP, SMB and the screen viewer now share one resumable relay stream implementation, and the screen viewer requires the relay to confirm the screen service.
+
 ## 0.15.9 - 2026-11-24
 
 - Fix `-update-service` failing, and restoring the old version, when the copy an earlier update left as `DeskFerry.exe.previous` is still open, for example by a desktop app or network service started from that version. The update now moves the running executable to a uniquely named copy in that case, which is deleted at the next restart, and removes such copies left by earlier updates.

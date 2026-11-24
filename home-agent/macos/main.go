@@ -475,10 +475,10 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 			attemptCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 			headers := http.Header{}
 			tunnel.AddProtocolV2Header(headers)
-			if service != tunnel.ServiceScreen {
-				headers.Set(tunnel.HeaderResumable, "1")
-				tunnel.AddHeartbeatHeader(headers)
-			}
+			// Every service, the live screen included, resumes over a new
+			// transport when a proxy or relay drops the connection.
+			headers.Set(tunnel.HeaderResumable, "1")
+			tunnel.AddHeartbeatHeader(headers)
 			addRoomCredentialHeader(headers, cfg, relayAddr)
 			tunnel.AddServiceHeader(headers, service)
 			ws, err := tunnel.DialMessageConnWithHeaders(attemptCtx, relayAddr, cfg.Proxy, tunnel.RoleClient, "", headers)
@@ -493,7 +493,7 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 			if err == nil {
 				cancel()
 				log.Printf("relay attempt selected relay=%s service=%s protocol_v2=%t heartbeat=%t via=%s elapsed=%s", relayAddr, service, ready.ProtocolV2, ready.Heartbeat, tunnel.ProxySpecForLog(cfg.Proxy), time.Since(attemptStarted).Round(time.Millisecond))
-				if ready.SessionID != "" && service != tunnel.ServiceScreen {
+				if ready.SessionID != "" {
 					return tunnel.NewResumableWebSocketConn(ctx, ws, tunnel.ResumableWebSocketOptions{
 						RelayAddr:           relayAddr,
 						AlternateRelayAddrs: cfg.relayAddresses(),

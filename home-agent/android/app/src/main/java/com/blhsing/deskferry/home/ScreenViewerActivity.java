@@ -99,8 +99,6 @@ import okio.ByteString;
  */
 public class ScreenViewerActivity extends Activity {
     private static final String LOG_TAG = "DeskFerryScreen";
-    private static final int MAX_RECOVERY_RETRIES = 2;
-    private static final long RECOVERY_DELAY_MS = 600;
     private static final long PING_INTERVAL_MS = 10_000;
     private static final int LEGACY_INTERVAL_MS = 1000;
     private static final int MAX_PENDING_FRAMES = 2;
@@ -169,7 +167,8 @@ public class ScreenViewerActivity extends Activity {
     private Button winKey;
     private KeyCaptureView keyCapture;
     private OkHttpClient client;
-    private volatile WebSocket socket;
+    /** The relay stream of the current session; it resumes over new transports by itself. */
+    private volatile ResumableRelayStream stream;
     private volatile Session session;
     private Bitmap current;
     private Canvas currentCanvas;
@@ -178,7 +177,6 @@ public class ScreenViewerActivity extends Activity {
     private String roomProof;
     private String screenKey;
     private String deviceName;
-    private int candidateIndex;
     private volatile boolean paired;
     private volatile boolean closing;
     private volatile int generation;
@@ -544,7 +542,6 @@ public class ScreenViewerActivity extends Activity {
     private void startLive() {
         stopLive(false);
         int run = ++generation;
-        candidateIndex = 0;
         recoveryAttempts = 0;
         paired = false;
         closing = false;
@@ -553,124 +550,121 @@ public class ScreenViewerActivity extends Activity {
         phase = Phase.CONNECTING;
         updateControls();
         showStatus("Connecting to the Work screen service...", Ui.Tone.WARNING, "Connecting");
-        connectNext(run, null);
+        openStream(run);
     }
 
-    private void connectNext(int run, Throwable previous) {
-        if (run != generation || closing) {
-            return;
+    /** Relay access for the screen stream: this view's relays, room proof and HTTP client. */
+    private final ResumableRelayStream.Host relayHost = new ResumableRelayStream.Host() {
+        @Override
+        public List<String> relayUrls() {
+            return relayUrls;
         }
-        if (candidateIndex >= relayUrls.size()) {
-            failFinal("Screen connection failed: " + (previous == null ? "all relay services failed" : message(previous)));
-            return;
-        }
-        String relay = relayUrls.get(candidateIndex++);
-        try {
-            Request request = new Request.Builder()
-                    .url(RelayUrls.webSocketEndpoint(relay))
-                    .header("Authorization", "Bearer " + RelayUrls.roomToken(relay, ""))
-                    .header("X-DeskFerry-Role", "client")
-                    .header("X-TunnelDesktop-Role", "client")
-                    .header("X-DeskFerry-Protocol", "2")
-                    .header("X-DeskFerry-Service", "screen")
+
+        @Override
+        public Request request(String relayUrl, String role) throws Exception {
+            return new Request.Builder()
+                    .url(RelayUrls.webSocketEndpoint(relayUrl))
+                    .header("Authorization", "Bearer " + RelayUrls.roomToken(relayUrl, ""))
+                    .header("X-DeskFerry-Role", role)
+                    .header("X-TunnelDesktop-Role", role)
                     .header("X-DeskFerry-Room-Proof", roomProof)
                     .header("User-Agent", "DeskFerry-Android/" + BuildConfig.VERSION_NAME)
                     .build();
-            socket = client.newWebSocket(request, new ScreenListener(relay, run));
-        } catch (Exception ex) {
-            connectNext(run, ex);
-        }
-    }
-
-    private final class ScreenListener extends WebSocketListener {
-        private final String relay;
-        private final int run;
-        private Session listenerSession;
-
-        ScreenListener(String relay, int run) { this.relay = relay; this.run = run; }
-
-        @Override
-        public void onMessage(WebSocket webSocket, String text) {
-            if (run != generation || webSocket != socket) return;
-            try {
-                JSONObject result = new JSONObject(text);
-                if (!"session-ready".equals(result.optString("type"))) {
-                    throw new IllegalStateException(result.optString("reason", result.optString("type", "relay rejected screen session")));
-                }
-                if (!"screen".equals(result.optString("service"))) {
-                    throw new IllegalStateException("relay did not confirm screen-service support");
-                }
-                if (listenerSession != null) return;
-                paired = true;
-                Session created = new Session(run, webSocket, relay, screenKey);
-                listenerSession = created;
-                session = created;
-                setStatus("Connected through " + relay + "; waiting for the Work PC...", Ui.Tone.WARNING, "Connecting");
-                created.start();
-            } catch (Exception ex) {
-                if (!paired) {
-                    webSocket.cancel();
-                    connectNext(run, ex);
-                } else {
-                    recoverScreenSession(run, webSocket, "Screen request failed", ex);
-                }
-            }
         }
 
         @Override
-        public void onMessage(WebSocket webSocket, ByteString bytes) {
-            Session value = listenerSession;
-            if (value != null) value.pipe.write(bytes);
+        public WebSocket open(Request request, WebSocketListener listener) {
+            return new FallbackWebSocket(client, request, listener);
         }
 
         @Override
-        public void onFailure(WebSocket webSocket, Throwable error, Response response) {
-            Session value = listenerSession;
-            if (value != null) value.pipe.close(new IOException(message(error)));
-            if (run != generation || closing || webSocket != socket) return;
-            if (!paired) connectNext(run, error); else recoverScreenSession(run, webSocket, "Screen stream ended", error);
+        public void log(String line) {
+            Log.i(LOG_TAG, line);
         }
+    };
 
-        @Override
-        public void onClosed(WebSocket webSocket, int code, String reason) {
-            Session value = listenerSession;
-            if (value != null) value.pipe.close(new EOFException("relay closed the screen session"));
-            if (run == generation && webSocket == socket && !closing) {
-                recoverScreenSession(run, webSocket, "Screen stream ended",
-                        new IllegalStateException("relay closed code=" + code + (reason.isEmpty() ? "" : " reason=" + reason)));
-            }
-        }
-    }
-
-    private void recoverScreenSession(int run, WebSocket failedSocket, String label, Throwable failure) {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            mainHandler.post(() -> recoverScreenSession(run, failedSocket, label, failure));
+    /**
+     * Opens a screen session over a resumable relay stream. A dropped
+     * transport resumes inside the stream without the session noticing; only
+     * when that fails does the stream close and the view reconnect.
+     */
+    private void openStream(int run) {
+        if (run != generation || closing) {
             return;
         }
-        if (run != generation || closing || failedSocket != socket) return;
+        Session[] box = new Session[1];
+        ResumableRelayStream created = new ResumableRelayStream(relayHost, "screen",
+                data -> box[0].pipe.write(ByteString.of(data)),
+                termination -> box[0].pipe.close(new EOFException("relay stream ended: " + termination)));
+        box[0] = new Session(run, created, screenKey);
+        stream = created;
+        Thread connector = new Thread(() -> {
+            try {
+                String relay = created.connect();
+                mainHandler.post(() -> onStreamPaired(run, created, box[0], relay));
+            } catch (Exception ex) {
+                created.close();
+                mainHandler.post(() -> onStreamFailed(run, created, ex));
+            }
+        }, "DeskFerryScreenConnect");
+        connector.setDaemon(true);
+        connector.start();
+    }
+
+    private void onStreamPaired(int run, ResumableRelayStream paired, Session created, String relay) {
+        if (run != generation || closing || paired != stream) {
+            paired.close();
+            return;
+        }
+        this.paired = true;
+        created.relay = relay;
+        session = created;
+        setStatus("Connected through " + relay + "; waiting for the Work PC...", Ui.Tone.WARNING, "Connecting");
+        created.start();
+    }
+
+    private void onStreamFailed(int run, ResumableRelayStream failed, Exception error) {
+        if (run != generation || closing || failed != stream) {
+            return;
+        }
+        boolean rejected = error instanceof ResumableRelayStream.SessionRejectedException
+                && ((ResumableRelayStream.SessionRejectedException) error).terminal();
+        if (rejected || recoveryAttempts == 0) {
+            failFinal("Screen connection failed: " + message(error));
+            return;
+        }
+        recoverScreenSession(run, failed, "Screen reconnect failed", error);
+    }
+
+    private void recoverScreenSession(int run, ResumableRelayStream failedStream, String label, Throwable failure) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post(() -> recoverScreenSession(run, failedStream, label, failure));
+            return;
+        }
+        if (run != generation || closing || failedStream != stream) return;
         String detail = message(failure);
         recoveryAttempts++;
         Log.w(LOG_TAG, label + ": " + detail + " recovery_attempt=" + recoveryAttempts, failure);
-        socket = null;
-        failedSocket.cancel();
+        stream = null;
+        failedStream.close();
         endSession();
         paired = false;
-        if (!canRetryScreenSession(recoveryAttempts)) {
-            failFinal(label + " after recovery attempts: " + detail);
-            return;
-        }
-        candidateIndex = 0;
+        // Keep reconnecting until the user stops the view, like the Windows
+        // and macOS viewers; the count resets once a session is live again.
+        long delay = screenReconnectDelayMs(recoveryAttempts - 1);
         phase = Phase.CONNECTING;
         updateControls();
-        showStatus(label + ": " + detail + ". Retrying (" + recoveryAttempts + "/" + MAX_RECOVERY_RETRIES + ")...",
-                Ui.Tone.WARNING, "Retrying");
+        showStatus(label + ": " + detail + ". Reconnecting in " + (delay / 1000) + " s...",
+                Ui.Tone.WARNING, "Reconnecting");
         mainHandler.postDelayed(() -> {
-            if (run == generation && !closing && socket == null) connectNext(run, failure);
-        }, RECOVERY_DELAY_MS * recoveryAttempts);
+            if (run == generation && !closing && stream == null) openStream(run);
+        }, delay);
     }
 
-    static boolean canRetryScreenSession(int failedSessions) {
-        return failedSessions <= MAX_RECOVERY_RETRIES;
+    /** The wait before reconnect attempt n (from 0): 2, 4, 8, 16, then 30 seconds. */
+    static long screenReconnectDelayMs(int attempt) {
+        if (attempt >= 4) return 30_000;
+        return 2_000L << Math.max(0, attempt);
     }
 
     /** Ends the current session without retrying and shows why. Safe from any thread. */
@@ -692,10 +686,10 @@ public class ScreenViewerActivity extends Activity {
         releaseAllInput();
         generation++;
         closing = true;
-        WebSocket value = socket;
-        socket = null;
+        ResumableRelayStream value = stream;
+        stream = null;
         endSession();
-        if (value != null) value.cancel();
+        if (value != null) value.close();
         running = false;
         if (announce) {
             phase = Phase.STOPPED;
@@ -856,8 +850,8 @@ public class ScreenViewerActivity extends Activity {
 
     private final class Session implements Runnable {
         final int run;
-        final WebSocket webSocket;
-        final String relay;
+        final ResumableRelayStream stream;
+        volatile String relay = "";
         final StreamPipe pipe = new StreamPipe();
         final Semaphore frameSlots = new Semaphore(MAX_PENDING_FRAMES);
         private final String key;
@@ -872,10 +866,9 @@ public class ScreenViewerActivity extends Activity {
         private long lastKeyframeRequest = -KEYFRAME_REQUEST_INTERVAL_MS;
         volatile boolean videoDroppedWhileSuspended;
 
-        Session(int run, WebSocket webSocket, String relay, String key) {
+        Session(int run, ResumableRelayStream stream, String key) {
             this.run = run;
-            this.webSocket = webSocket;
-            this.relay = relay;
+            this.stream = stream;
             this.key = key;
         }
 
@@ -924,9 +917,7 @@ public class ScreenViewerActivity extends Activity {
                         .put("features", features)
                         .put("min_fps", minFps);
             }
-            if (!webSocket.send(ByteString.encodeUtf8(request.toString() + "\n"))) {
-                throw new IOException("could not send the screen request");
-            }
+            stream.writeNow((request.toString() + "\n").getBytes(StandardCharsets.UTF_8));
             JSONObject first = readLegacyMetadata(in);
             String type = first.optString("type");
             if ("hello".equals(type)) {
@@ -1242,7 +1233,7 @@ public class ScreenViewerActivity extends Activity {
             synchronized (sendLock) {
                 if (sendCipher == null) throw new IOException("live screen session is not ready");
                 byte[] record = sendCipher.seal(type, payload);
-                if (!webSocket.send(ByteString.of(record))) throw new IOException("screen session is closed");
+                stream.writeNow(record);
             }
         }
 
@@ -1290,7 +1281,7 @@ public class ScreenViewerActivity extends Activity {
             failFinal("The Work PC refused the screen session: " + error.getMessage());
             return;
         }
-        recoverScreenSession(failed.run, failed.webSocket, "Screen stream ended", error);
+        recoverScreenSession(failed.run, failed.stream, "Screen stream ended", error);
     }
 
     private void onLiveStarted(Session started, int width, int height, boolean allowed, String version) {
@@ -1372,7 +1363,7 @@ public class ScreenViewerActivity extends Activity {
             if (emptyView != null) emptyView.setVisibility(View.GONE);
         } catch (Exception ex) {
             batch.recycle();
-            recoverScreenSession(from.run, from.webSocket, "Screen frame failed", ex);
+            recoverScreenSession(from.run, from.stream, "Screen frame failed", ex);
             return;
         }
         batch.recycle();
