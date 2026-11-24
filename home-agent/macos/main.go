@@ -503,7 +503,7 @@ func dialRelayService(ctx context.Context, cfg config, service string) (net.Conn
 						RoomProof:           roomProof(cfg, relayAddr),
 						Service:             service,
 						Heartbeat:           ready.Heartbeat,
-						ResumeWindow:        tunnel.HomeResumeWindow(service),
+						ResumeWindow:        tunnel.SessionResumeWindow(service),
 						Logf:                log.Printf,
 					}), relayAddr, nil
 				}

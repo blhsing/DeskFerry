@@ -552,8 +552,56 @@ func TestResumableSessionEndsAfterItsResumeWindow(t *testing.T) {
 	t.Logf("ended after %s: %v", time.Since(started).Round(time.Millisecond), err)
 }
 
-func TestHomeResumeWindowIsShortOnlyForTheScreen(t *testing.T) {
-	if HomeResumeWindow(ServiceScreen) != ScreenResumeWindow || HomeResumeWindow(ServiceRDP) != 0 || HomeResumeWindow(ServiceSMB) != 0 {
+func TestSessionResumeWindowIsShortOnlyForTheScreen(t *testing.T) {
+	if SessionResumeWindow(ServiceScreen) != ScreenResumeWindow || SessionResumeWindow(ServiceRDP) != 0 || SessionResumeWindow(ServiceSMB) != 0 {
 		t.Fatal("only the live screen should use a short resume window")
+	}
+}
+
+// TestResumableClosesCleanlyWhenItsContextEnds: stopping a session by
+// cancelling its context must tell the other side the session is over, or it
+// would wait out its resume window (keeping a screen helper and banner alive).
+func TestResumableClosesCleanlyWhenItsContextEnds(t *testing.T) {
+	const sessionID = "0123456789abcdef0123456789abcdef"
+	closed := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = ws.Write(ctx, websocket.MessageText, []byte("start "+sessionID))
+		for {
+			if _, _, err := ws.Read(ctx); err != nil {
+				closed <- err
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dialCancel()
+	initial, err := DialMessageConnWithHeaders(dialCtx, server.URL+"/relay/p", "direct", RoleClient, "", http.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := initial.Read(dialCtx); err != nil {
+		t.Fatal(err)
+	}
+	sessionCtx, stop := context.WithCancel(context.Background())
+	conn := NewResumableWebSocketConn(sessionCtx, initial, ResumableWebSocketOptions{
+		RelayAddr: server.URL + "/relay/p", Proxy: "direct", SessionID: sessionID, Side: "client", Service: ServiceScreen,
+	})
+	defer conn.Close()
+	time.Sleep(200 * time.Millisecond)
+	stop()
+	select {
+	case err := <-closed:
+		if websocket.CloseStatus(err) != websocket.StatusNormalClosure || !isLogicalSessionClose(err) {
+			t.Fatalf("the other side saw %v; want a normal close with the session-closed marker", err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("the other side never learned that the session ended")
 	}
 }

@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.15.12 - 2026-11-24
+
+- Remove the Work PC's sharing banner as soon as the viewer stops or closes. Stopping a session dropped its connection instead of closing it, so the Work PC took it for a network loss and kept the session, its capture helper and the banner for five minutes while waiting for the viewer to come back. Resumable sessions now close with an explicit "session closed" when they are stopped, on both sides and for every service (also RDP, WinRM and SMB when the Home app quits, and Home sessions when the Work service stops).
+- Give screen sessions 30 seconds to resume on the Work side too, so a viewer that crashed or lost its network no longer leaves the banner up for five minutes.
+
 ## 0.15.11 - 2026-11-24
 
 - Reconnect the screen viewer within about half a minute when its session cannot resume, such as after the Work PC's DeskFerry restarted. Screen sessions used RDP's five-minute resume window, so the picture stayed frozen for up to five minutes before the viewer opened a new session. Home apps on Windows, macOS and Android now give a screen session 30 seconds to resume; RDP and SMB keep five minutes.

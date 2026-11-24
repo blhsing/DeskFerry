@@ -1090,7 +1090,7 @@ func serveOfferedSession(parent context.Context, cfg config, agentID string, tar
 	cancel()
 	stream := net.Conn(tunnel.MessageNetConn(parent, ws))
 	if offer.Resumable {
-		stream = tunnel.NewResumableWebSocketConn(parent, ws, tunnel.ResumableWebSocketOptions{RelayAddr: cfg.RelayAddr, AlternateRelayAddrs: cfg.FailoverRelayAddrs, Proxy: cfg.Proxy, SessionID: offer.SessionID, Side: "agent", RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword), Service: target.Service, Heartbeat: ready.Heartbeat, Logf: log.Printf})
+		stream = tunnel.NewResumableWebSocketConn(parent, ws, tunnel.ResumableWebSocketOptions{RelayAddr: cfg.RelayAddr, AlternateRelayAddrs: cfg.FailoverRelayAddrs, Proxy: cfg.Proxy, SessionID: offer.SessionID, Side: "agent", RoomProof: tunnel.RoomPasswordProof(cfg.RelayAddr, "", cfg.RoomPassword), Service: target.Service, Heartbeat: ready.Heartbeat, ResumeWindow: tunnel.SessionResumeWindow(target.Service), Logf: log.Printf})
 	}
 	log.Printf("session ready relay=%s session=%s service=%s target=%s heartbeat=%t setup_duration=%s", cfg.RelayAddr, offer.SessionID, target.Service, target.Address, ready.Heartbeat, time.Since(started).Round(time.Millisecond))
 	pipeStream := stream

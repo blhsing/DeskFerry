@@ -85,8 +85,13 @@ type ResumableWebSocketOptions struct {
 // NewResumableWebSocketConn exposes a reliable byte stream over replaceable
 // WebSockets. Sequence acknowledgements and a bounded replay buffer hide
 // transient proxy disconnects from the local TCP peer.
+//
+// Cancelling ctx closes the session cleanly, telling the other side it ended,
+// rather than dropping the transport: a dropped transport looks like a network
+// loss, so the other side would keep the session (for a screen session, its
+// capture helper and sharing banner) while it waits to resume.
 func NewResumableWebSocketConn(ctx context.Context, initial MessageConn, opts ResumableWebSocketOptions) net.Conn {
-	childCtx, cancel := context.WithCancel(ctx)
+	childCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	c := &resumableWebSocketConn{
 		ctx:        childCtx,
 		cancel:     cancel,
@@ -109,6 +114,13 @@ func NewResumableWebSocketConn(ctx context.Context, initial MessageConn, opts Re
 	c.cond = sync.NewCond(&c.mu)
 	go c.connectionLoop(initial)
 	go c.watchAckProgress()
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = c.Close()
+		case <-childCtx.Done():
+		}
+	}()
 	return c
 }
 
@@ -405,13 +417,14 @@ func (c *resumableWebSocketConn) connectionLoop(initial MessageConn) {
 	}
 }
 
-// ScreenResumeWindow bounds how long Home apps wait to resume a live screen
-// session; a new session only costs a full redraw.
+// ScreenResumeWindow bounds how long either side waits to resume a live
+// screen session; a new session only costs a full redraw, and the Work PC's
+// sharing banner should not outlast a viewer that is gone.
 const ScreenResumeWindow = 30 * time.Second
 
-// HomeResumeWindow returns the resume window a Home app uses for a service:
+// SessionResumeWindow returns the resume window for a service:
 // ScreenResumeWindow for the live screen, otherwise the default.
-func HomeResumeWindow(service string) time.Duration {
+func SessionResumeWindow(service string) time.Duration {
 	if service == ServiceScreen {
 		return ScreenResumeWindow
 	}

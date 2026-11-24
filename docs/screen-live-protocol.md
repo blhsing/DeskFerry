@@ -11,7 +11,10 @@ for a resumable session with heartbeats (`X-DeskFerry-Resumable`,
 sides resume the same session over a new one and replay what the other side
 has not acknowledged. Everything below sees one unbroken stream. Home apps
 give a screen session 30 seconds to resume (RDP gets five minutes), since a
-new session only costs a full redraw. Only when resuming fails (for example
+new session only costs a full redraw; the Work agent uses the same window, so
+its sharing banner does not outlast a viewer that is gone. Stopping or closing
+a viewer ends the session explicitly (a normal close marked `session closed`),
+so the Work PC ends it at once instead of waiting to resume. Only when resuming fails (for example
 after the Work PC's DeskFerry restarted) does the session end;
 the Windows, macOS and Android viewers then open a new session, waiting 2, 4,
 8, 16 and then 30 seconds between attempts until the user stops the view.
