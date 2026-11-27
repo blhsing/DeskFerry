@@ -92,3 +92,28 @@ func (s *surface) setAlphaChannel(alpha []byte) {
 		s.pix[i*4+3] = value
 	}
 }
+
+// capsuleDistance is the signed distance from (px, py) to the edge of a
+// capsule: the segment (x1, y1)-(x2, y2) widened to thickness with round caps.
+func capsuleDistance(px, py, x1, y1, x2, y2, thickness float64) float64 {
+	dx, dy := x2-x1, y2-y1
+	t := 0.0
+	if length := dx*dx + dy*dy; length > 0 {
+		t = math.Max(0, math.Min(1, ((px-x1)*dx+(py-y1)*dy)/length))
+	}
+	return math.Hypot(px-(x1+t*dx), py-(y1+t*dy)) - thickness/2
+}
+
+// fillCapsule paints an anti-aliased stroke from (x1, y1) to (x2, y2) with
+// round caps, thickness wide.
+func (s *surface) fillCapsule(x1, y1, x2, y2, thickness float64, color walk.Color) {
+	half := thickness/2 + 1
+	left, right := span(math.Min(x1, x2)-half, math.Max(x1, x2)+half, s.width)
+	top, bottom := span(math.Min(y1, y2)-half, math.Max(y1, y2)+half, s.height)
+	for row := top; row < bottom; row++ {
+		for column := left; column < right; column++ {
+			distance := capsuleDistance(float64(column)+0.5, float64(row)+0.5, x1, y1, x2, y2, thickness)
+			s.blend((row*s.width+column)*4, color, 0.5-distance)
+		}
+	}
+}

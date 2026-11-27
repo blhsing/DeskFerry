@@ -40,8 +40,9 @@ const (
 	buttonMinWidth = 104
 	buttonGap      = uikit.Space8
 	minTextWidth   = 96
-	topGap         = uikit.Space8  // gap between the work-area top and the banner
-	screenMargin   = uikit.Space16 // minimum gap to the work-area sides
+	toggleSize     = uikit.ButtonHeight // the full banner's minimize button
+	topGap         = uikit.Space8       // gap between the work-area top and the banner
+	screenMargin   = uikit.Space16      // minimum gap to the work-area sides
 	dragThreshold  = 3
 )
 
@@ -147,6 +148,14 @@ type banner struct {
 	stopControlPending bool
 	stopSharingPending bool
 
+	// compact is the minimized form: icon buttons only. Every session starts
+	// with the full banner, and it comes back when remote control starts.
+	compact bool
+	// tooltip names the icon buttons; tooltipShown is each tool's text.
+	tooltip      win.HWND
+	tooltipShown [buttonCount]string
+	infoShown    string
+
 	rendering   bool
 	renderAgain bool
 
@@ -155,6 +164,7 @@ type banner struct {
 	captionFont win.HFONT
 	badgeFont   win.HFONT
 	icon        win.HICON
+	smallIcon   win.HICON // the app mark of the compact form
 }
 
 func registerClass() error {
@@ -195,6 +205,7 @@ func newBanner(actions Actions, initial screenview.SessionState) (*banner, error
 		return nil, errors.New("create the sharing banner window")
 	}
 	b.hwnd = hwnd
+	b.markOrder()
 	banners.Store(hwnd, b)
 	if dpi := win.GetDpiForWindow(hwnd); dpi != 0 {
 		b.dpi = int(dpi)
@@ -259,6 +270,7 @@ func (b *banner) handle(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintp
 	case win.WM_DESTROY:
 		win.KillTimer(hwnd, timerTopmost)
 		win.KillTimer(hwnd, timerPending)
+		b.clearProps()
 		banners.Delete(hwnd)
 		b.releaseResources()
 		win.PostQuitMessage(0)
@@ -269,6 +281,7 @@ func (b *banner) handle(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintp
 		switch wParam {
 		case timerTopmost:
 			b.assertTopmost()
+			b.restack()
 		case timerPending:
 			win.KillTimer(hwnd, timerPending)
 			if b.stopControlPending || b.stopSharingPending {
@@ -331,6 +344,12 @@ func (b *banner) applyPending() {
 	}
 	view := describe(state)
 	changed := view != b.view
+	if view.control && !b.view.control && b.compact {
+		// Remote control just started: show the full banner so the person at
+		// this PC notices.
+		b.compact = false
+		changed = true
+	}
 	b.view = view
 	if !view.control {
 		if b.stopControlPending {
@@ -358,18 +377,25 @@ func (b *banner) assertTopmost() {
 // Buttons.
 
 func (b *banner) buttonVisible(index int) bool {
-	return index == buttonStopSharing || b.view.control
+	return index != buttonStopControl || b.view.control
 }
 
 func (b *banner) buttonEnabled(index int) bool {
-	if index == buttonStopControl {
+	switch index {
+	case buttonStopControl:
 		return !b.stopControlPending && !b.stopSharingPending
+	case buttonToggle:
+		return true
 	}
 	return !b.stopSharingPending
 }
 
 func (b *banner) buttonLabel(index int) string {
 	switch {
+	case index == buttonToggle && b.compact:
+		return labelExpand
+	case index == buttonToggle:
+		return labelMinimize
 	case index == buttonStopControl && b.stopControlPending, index == buttonStopSharing && b.stopSharingPending:
 		return labelStopping
 	case index == buttonStopControl:
@@ -456,6 +482,11 @@ func (b *banner) mouseUp(x, y int32) {
 // slow callback never freezes the banner; the button shows "Stopping…" until
 // the session reports the change, or a timeout re-enables it.
 func (b *banner) click(index int) {
+	if index == buttonToggle {
+		b.compact = !b.compact
+		b.hover = -1
+		return
+	}
 	var action func()
 	switch index {
 	case buttonStopControl:
@@ -481,6 +512,9 @@ func (b *banner) drag() {
 	dx, dy := cursor.X-b.dragCursor.X, cursor.Y-b.dragCursor.Y
 	if !b.userMoved && max(dx, -dx)+max(dy, -dy) < b.px(dragThreshold) {
 		return
+	}
+	if !b.userMoved {
+		b.markMoved()
 	}
 	b.userMoved = true
 	b.anchorX, b.anchorY = b.dragAnchorX+dx, b.dragAnchorY+dy
@@ -532,13 +566,14 @@ func (b *banner) currentWorkArea() win.RECT {
 }
 
 // clampAnchor places the banner at the top centre of the primary work area,
-// or keeps a banner the user moved inside its monitor's work area.
+// below any banners shown before it, or keeps a banner the user moved inside
+// its monitor's work area.
 func (b *banner) clampAnchor() {
 	work := b.currentWorkArea()
 	width, height := b.layout.width, b.layout.height
 	if !b.userMoved {
 		b.anchorX = (work.Left + work.Right) / 2
-		b.anchorY = work.Top + b.px(topGap)
+		b.anchorY = stackedTop(b.anchorX, work.Top+b.px(topGap), width, height, b.px(topGap), b.otherBanners())
 		return
 	}
 	half := width / 2
@@ -587,6 +622,8 @@ func (b *banner) ensureResources() {
 	b.badgeFont = createFont(strong.Family, strong.PointSize, strong.Bold, b.dpi)
 	size := b.px(markSize)
 	b.icon = win.HICON(win.LoadImage(win.GetModuleHandle(nil), win.MAKEINTRESOURCE(uikit.AppIconResourceID), imageIcon, size, size, 0))
+	small := b.px(compactMarkSize)
+	b.smallIcon = win.HICON(win.LoadImage(win.GetModuleHandle(nil), win.MAKEINTRESOURCE(uikit.AppIconResourceID), imageIcon, small, small, 0))
 }
 
 func (b *banner) releaseResources() {
@@ -596,9 +633,11 @@ func (b *banner) releaseResources() {
 			*font = 0
 		}
 	}
-	if b.icon != 0 {
-		win.DestroyIcon(b.icon)
-		b.icon = 0
+	for _, icon := range []*win.HICON{&b.icon, &b.smallIcon} {
+		if *icon != 0 {
+			win.DestroyIcon(*icon)
+			*icon = 0
+		}
 	}
 	b.resourceDPI = 0
 }
@@ -633,10 +672,13 @@ func (b *banner) computeLayout(hdc win.HDC) layout {
 	dotSpace := px(dotSize) + px(dotGap)
 	textWidthTotal := max(badgeSpace+titleWidth, dotSpace+captionWidth)
 
+	if b.compact {
+		return b.computeCompactLayout()
+	}
 	// Buttons keep the width of their normal label while they show "Stopping…".
 	var buttonWidths [buttonCount]int32
 	var buttonsWidth int32
-	for index, label := range [buttonCount]string{labelStopControl, labelStopSharing} {
+	for index, label := range [...]string{labelStopControl, labelStopSharing} {
 		if !b.buttonVisible(index) {
 			continue
 		}
@@ -648,7 +690,7 @@ func (b *banner) computeLayout(hdc win.HDC) layout {
 	}
 
 	textLeft := px(bodyPadLeft) + px(markSize) + px(markGap)
-	fixed := textLeft + px(textButtonGap) + buttonsWidth + px(bodyPadRight)
+	fixed := textLeft + px(textButtonGap) + buttonsWidth + px(buttonGap) + px(toggleSize) + px(bodyPadRight)
 	work := b.currentWorkArea()
 	available := work.Right - work.Left - 2*px(screenMargin) - fixed
 	textWidthTotal = max(px(minTextWidth), min(textWidthTotal, available))
@@ -681,6 +723,8 @@ func (b *banner) computeLayout(hdc win.HDC) layout {
 		l.buttons[index] = win.RECT{Left: buttonLeft, Top: buttonTop, Right: buttonLeft + width, Bottom: buttonTop + px(buttonHeight)}
 		buttonLeft += width + px(buttonGap)
 	}
+	toggleTop := (l.height - px(toggleSize)) / 2
+	l.buttons[buttonToggle] = win.RECT{Left: buttonLeft, Top: toggleTop, Right: buttonLeft + px(toggleSize), Bottom: toggleTop + px(toggleSize)}
 	return l
 }
 
@@ -761,6 +805,7 @@ func (b *banner) renderOnce() {
 	if text, err := syscall.UTF16PtrFromString(b.view.accessibleText()); err == nil {
 		_, _, _ = procSetWindowTextW.Call(uintptr(b.hwnd), uintptr(unsafe.Pointer(text)))
 	}
+	b.updateTooltips()
 }
 
 func fillRect(canvas *surface, rect win.RECT, radius float64, color walk.Color) {
@@ -774,6 +819,9 @@ func inset(rect win.RECT, amount int32) win.RECT {
 // paintShapes paints everything except text and the icon, and returns the
 // style each button was painted with.
 func (b *banner) paintShapes(canvas *surface, colors scheme) [buttonCount]buttonStyle {
+	if b.compact {
+		return b.paintCompactShapes(canvas, colors)
+	}
 	l := b.layout
 	body := win.RECT{Right: l.width, Bottom: l.height}
 	radius := float64(b.px(bodyRadius))
@@ -790,14 +838,26 @@ func (b *banner) paintShapes(canvas *surface, colors scheme) [buttonCount]button
 	}
 	fillRect(canvas, l.dot, float64(l.dot.Right-l.dot.Left)/2, colors.dot)
 
+	styles := b.paintButtons(canvas, colors)
+	b.paintIcon(canvas, buttonToggle, styles[buttonToggle].text)
+	return styles
+}
+
+// paintButtons paints the visible buttons' backgrounds and returns their
+// styles.
+func (b *banner) paintButtons(canvas *surface, colors scheme) [buttonCount]buttonStyle {
 	var styles [buttonCount]buttonStyle
 	buttonRadius := float64(b.px(uikit.ControlRadius))
-	for index, rect := range l.buttons {
+	for index, rect := range b.layout.buttons {
 		if !b.buttonVisible(index) {
 			continue
 		}
 		hover := b.hover == index
-		style := buttonStyleFor(index, b.view, colors, hover, hover && b.pressed == index, b.buttonEnabled(index))
+		pressed := hover && b.pressed == index
+		style := buttonStyleFor(index, b.view, colors, hover, pressed, b.buttonEnabled(index))
+		if index == buttonToggle {
+			style = quietStyleFor(b.view, colors, hover, pressed)
+		}
 		styles[index] = style
 		if style.bordered {
 			line := max(1, b.px(1))
@@ -824,6 +884,13 @@ func drawText(hdc win.HDC, font win.HFONT, text string, color walk.Color, rect w
 func (b *banner) paintText(hdc win.HDC, colors scheme, styles [buttonCount]buttonStyle) {
 	l := b.layout
 	win.SetBkMode(hdc, win.TRANSPARENT)
+	if b.compact {
+		// The compact form draws no text, only the app mark.
+		if b.smallIcon != 0 {
+			win.DrawIconEx(hdc, l.mark.Left, l.mark.Top, b.smallIcon, l.mark.Right-l.mark.Left, l.mark.Bottom-l.mark.Top, 0, 0, diNormal)
+		}
+		return
+	}
 	if b.icon != 0 {
 		win.DrawIconEx(hdc, l.mark.Left, l.mark.Top, b.icon, l.mark.Right-l.mark.Left, l.mark.Bottom-l.mark.Top, 0, 0, diNormal)
 	}
@@ -833,7 +900,7 @@ func (b *banner) paintText(hdc win.HDC, colors scheme, styles [buttonCount]butto
 	drawText(hdc, b.titleFont, b.view.title, colors.title, l.title, win.DT_LEFT|win.DT_END_ELLIPSIS)
 	drawText(hdc, b.captionFont, b.view.caption, colors.caption, l.caption, win.DT_LEFT|win.DT_END_ELLIPSIS)
 	for index, rect := range l.buttons {
-		if b.buttonVisible(index) {
+		if b.buttonVisible(index) && index != buttonToggle {
 			drawText(hdc, b.titleFont, b.buttonLabel(index), styles[index].text, rect, win.DT_CENTER)
 		}
 	}

@@ -22,6 +22,8 @@ const (
 	labelStopControl = "Stop control"
 	labelStopSharing = "Stop sharing"
 	labelStopping    = "Stopping…"
+	labelMinimize    = "Minimize the sharing banner"
+	labelExpand      = "Show the full sharing banner"
 )
 
 // clientKind says who is on the remote side.
@@ -176,6 +178,8 @@ type buttonStyle struct {
 const (
 	buttonStopControl = iota
 	buttonStopSharing
+	// buttonToggle minimizes the full banner, or expands the compact one.
+	buttonToggle
 	buttonCount
 )
 
@@ -220,6 +224,26 @@ func buttonStyleFor(index int, c content, colors scheme, hover, pressed, enabled
 		style.fill = mix(colors.fill, white, 0.24)
 	case hover:
 		style.fill = mix(colors.fill, white, 0.14)
+	}
+	return style
+}
+
+// quietStyleFor is the minimize/expand button: the banner fill, lightened
+// on hover and press, with a secondary icon (white while control is on).
+func quietStyleFor(c content, colors scheme, hover, pressed bool) buttonStyle {
+	white := uikit.ColorPrimaryOn
+	style := buttonStyle{fill: colors.fill, text: uikit.ColorDarkTextSecondary}
+	if c.control {
+		style.text = white
+	}
+	switch {
+	case pressed:
+		style.fill = mix(colors.fill, white, 0.24)
+	case hover:
+		style.fill = mix(colors.fill, white, 0.14)
+	}
+	if (hover || pressed) && !c.control {
+		style.text = uikit.ColorDarkText
 	}
 	return style
 }

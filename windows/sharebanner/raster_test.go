@@ -78,3 +78,18 @@ func TestAlphaChannelRoundTrip(t *testing.T) {
 		t.Fatalf("restored corner alpha = %d, want less than 255", a)
 	}
 }
+
+func TestFillCapsuleCoversTheStrokeOnly(t *testing.T) {
+	s := &surface{width: 20, height: 20, pix: make([]byte, 20*20*4)}
+	s.fillCapsule(4, 4, 16, 16, 2, walk.RGB(255, 0, 0))
+	alpha := func(x, y int) byte { return s.pix[(y*20+x)*4+3] }
+	if alpha(10, 10) < 250 {
+		t.Fatalf("the stroke's middle has alpha %d; want opaque", alpha(10, 10))
+	}
+	if alpha(16, 4) != 0 || alpha(4, 16) != 0 {
+		t.Fatal("pixels far from the stroke were painted")
+	}
+	if alpha(16, 16) == 0 {
+		t.Fatal("the round cap at the end was not painted")
+	}
+}
