@@ -49,3 +49,21 @@ func TestControlStartingExpandsTheCompactBanner(t *testing.T) {
 		t.Fatal("an unchanged state expanded a banner the user minimized")
 	}
 }
+
+func TestMinimizedChoiceIsRemembered(t *testing.T) {
+	path := t.TempDir() + `\share-banner.json`
+	saved := settingsPath
+	settingsPath = func() string { return path }
+	defer func() { settingsPath = saved }()
+	if loadMinimized() {
+		t.Fatal("a missing settings file reads as minimized")
+	}
+	saveMinimized(true)
+	if !loadMinimized() {
+		t.Fatal("the minimized choice was not remembered")
+	}
+	saveMinimized(false)
+	if loadMinimized() {
+		t.Fatal("expanding again was not remembered")
+	}
+}

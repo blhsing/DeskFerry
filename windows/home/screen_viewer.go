@@ -31,7 +31,11 @@ import (
 )
 
 type screenViewer struct {
-	owner      *clientApp
+	owner *clientApp
+	// cfg is the destination the viewer was opened for. The viewer keeps it,
+	// so choosing another destination in the main window, which stays usable,
+	// does not redirect an open viewer.
+	cfg        config
 	mw         *walk.MainWindow
 	viewport   *walk.ScrollView
 	canvas     *walk.CustomWidget
@@ -207,16 +211,29 @@ func (a *clientApp) openScreenViewer() {
 		a.showError(errors.New("save a room password for this destination before viewing its screen"))
 		return
 	}
-	viewer := &screenViewer{owner: a, inputs: make(chan screenview.InputEvent, 2048)}
+	key := strings.ToLower(cfg.SelectedDestination)
+	if open, ok := a.viewers[key]; ok && open.mw != nil {
+		// One viewer per destination: bring the open one forward.
+		if win.IsIconic(open.mw.Handle()) {
+			win.ShowWindow(open.mw.Handle(), win.SW_RESTORE)
+		}
+		open.activateWindow()
+		return
+	}
+	viewer := &screenViewer{owner: a, cfg: cfg, inputs: make(chan screenview.InputEvent, 2048)}
 	title := "DeskFerry " + buildinfo.Version + " Screen Viewer - " + cfg.SelectedDestination
 	if err := viewer.createWindow(title, a.mw); err != nil {
 		a.showError(err)
 		return
 	}
-	win.EnableWindow(a.mw.Handle(), false)
+	if a.viewers == nil {
+		a.viewers = make(map[string]*screenViewer)
+	}
+	a.viewers[key] = viewer
 	viewer.mw.Closing().Attach(func(_ *bool, _ walk.CloseReason) {
-		win.EnableWindow(a.mw.Handle(), true)
-		win.SetForegroundWindow(a.mw.Handle())
+		if a.viewers[key] == viewer {
+			delete(a.viewers, key)
+		}
 	})
 	viewer.mw.Show()
 	win.ShowWindow(viewer.mw.Handle(), win.SW_MAXIMIZE)
@@ -336,7 +353,7 @@ func (v *screenViewer) createWindow(title string, owner *walk.MainWindow) error 
 	}
 	enableScreenZoomGesture(v.canvas.Handle())
 	enableScreenZoomGesture(v.viewport.Handle())
-	v.minFPS = loadViewerMinFPS(v.owner.currentConfig().SelectedDestination)
+	v.minFPS = loadViewerMinFPS(v.cfg.SelectedDestination)
 	v.showMinFPS()
 	v.updateControlButtons()
 	go v.inputSender()
@@ -455,7 +472,7 @@ func screenReconnectDelay(attempt int) time.Duration {
 // runSession opens one screen session and returns when it ends: whether it
 // was established, and why it ended.
 func (v *screenViewer) runSession(ctx context.Context, reconnecting bool) (bool, string) {
-	cfg := v.owner.currentConfig()
+	cfg := v.cfg
 	conn, route, err := dialRelayService(ctx, cfg, tunnel.ServiceScreen)
 	if err != nil {
 		if ctx.Err() == nil && !reconnecting {
@@ -1236,7 +1253,7 @@ func (v *screenViewer) applyMinFPSSelection() {
 	}
 	v.minFPS = value
 	v.showMinFPS()
-	if err := saveViewerMinFPS(v.owner.currentConfig().SelectedDestination, value); err != nil {
+	if err := saveViewerMinFPS(v.cfg.SelectedDestination, value); err != nil {
 		v.setStatus("Could not save Min fps: " + err.Error())
 	}
 	client := v.liveClient()

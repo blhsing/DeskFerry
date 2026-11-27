@@ -35,7 +35,7 @@ func TestManualScreenViewerWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner := &clientApp{cfg: cfg}
-	viewer := &screenViewer{owner: owner, inputs: make(chan screenview.InputEvent, 2048)}
+	viewer := &screenViewer{owner: owner, cfg: cfg, inputs: make(chan screenview.InputEvent, 2048)}
 	if err := viewer.createWindow("DeskFerry viewer test", nil); err != nil {
 		t.Fatal(err)
 	}

@@ -148,8 +148,9 @@ type banner struct {
 	stopControlPending bool
 	stopSharingPending bool
 
-	// compact is the minimized form: icon buttons only. Every session starts
-	// with the full banner, and it comes back when remote control starts.
+	// compact is the minimized form: icon buttons only. Sessions open in the
+	// form the person last chose; the full banner comes back when remote
+	// control starts, without changing that choice.
 	compact bool
 	// tooltip names the icon buttons; tooltipShown is each tool's text.
 	tooltip      win.HWND
@@ -195,7 +196,7 @@ func newBanner(actions Actions, initial screenview.SessionState) (*banner, error
 	if err := registerClass(); err != nil {
 		return nil, err
 	}
-	b := &banner{actions: actions, dpi: 96, hover: -1, pressed: -1}
+	b := &banner{actions: actions, dpi: 96, hover: -1, pressed: -1, compact: loadMinimized()}
 	work := primaryWorkArea()
 	hwnd := win.CreateWindowEx(
 		wsExLayered|wsExTopmost|wsExToolWindow|wsExNoActivate,
@@ -485,6 +486,7 @@ func (b *banner) click(index int) {
 	if index == buttonToggle {
 		b.compact = !b.compact
 		b.hover = -1
+		saveMinimized(b.compact)
 		return
 	}
 	var action func()

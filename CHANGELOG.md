@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.15.15 - 2026-11-27
+
+- Remember a minimized sharing banner. Once the person at the Work PC minimizes it, later sessions open as the compact pill too, until they expand it again; the choice is kept in `C:\ProgramData\DeskFerry\share-banner.json`. The banner still expands when remote control starts, without changing the remembered choice.
+- Keep the main DeskFerry window usable while a Screen Viewer is open. The viewer used to disable it until the viewer closed. Each viewer now keeps the destination it was opened for, so choosing another destination in the main window no longer affects it, and opening the viewer again for a destination that already has one brings that window to the front.
+
 ## 0.15.14 - 2026-11-27
 
 - Stack the Work PC's sharing banners instead of drawing them on top of each other. With a person and an AI agent connected at once, each session's banner used to sit at the same spot, so one hid the other; banners the user has not dragged now line up from the top of the screen in the order they appeared, and move up when one above them closes.

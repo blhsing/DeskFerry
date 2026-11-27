@@ -110,6 +110,9 @@ type clientApp struct {
 	mw *walk.MainWindow
 	ni *walk.NotifyIcon
 
+	// viewers are the open Screen Viewer windows by destination (UI thread).
+	viewers map[string]*screenViewer
+
 	relayList          *walk.ListBox
 	relayEdit          *walk.LineEdit
 	relayAdd           *walk.PushButton

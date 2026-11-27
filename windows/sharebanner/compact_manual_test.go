@@ -27,6 +27,9 @@ func TestManualCompactBanners(t *testing.T) {
 	if dir == "" {
 		t.Skip("set DESKFERRY_MANUAL_BANNER_SHOTS to a folder to show banners on this PC")
 	}
+	saved := settingsPath
+	settingsPath = func() string { return filepath.Join(dir, "share-banner.json") }
+	defer func() { settingsPath = saved }()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	show := func(state screenview.SessionState) chan screenview.SessionState {
@@ -103,4 +106,63 @@ func shot(t *testing.T, path string) {
 		return true
 	})
 	t.Logf("%s: banners %+v", filepath.Base(path), rects)
+}
+
+// TestManualMinimizedBannerIsRemembered minimizes a banner, ends its session
+// and checks that the next session's banner opens minimized. It uses a
+// temporary settings file. Set DESKFERRY_MANUAL_BANNERS=1 to run it.
+func TestManualMinimizedBannerIsRemembered(t *testing.T) {
+	if os.Getenv("DESKFERRY_MANUAL_BANNERS") == "" {
+		t.Skip("set DESKFERRY_MANUAL_BANNERS=1 to show banners on this PC")
+	}
+	saved := settingsPath
+	path := filepath.Join(t.TempDir(), "share-banner.json")
+	settingsPath = func() string { return path }
+	defer func() { settingsPath = saved }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	open := func() (chan screenview.SessionState, chan struct{}) {
+		states := make(chan screenview.SessionState, 2)
+		states <- screenview.SessionState{ClientName: "m50-ben_hsing", ClientKind: "viewer", Live: true}
+		done := make(chan struct{})
+		go func() {
+			runtime.LockOSThread()
+			Run(ctx, states, Actions{StopControl: func() {}, StopSharing: func() {}})
+			close(done)
+		}()
+		time.Sleep(1500 * time.Millisecond)
+		return states, done
+	}
+	heights := func() []int32 {
+		var result []int32
+		banners.Range(func(key, value any) bool {
+			var rect win.RECT
+			win.GetWindowRect(value.(*banner).hwnd, &rect)
+			result = append(result, rect.Bottom-rect.Top)
+			return true
+		})
+		return result
+	}
+	first, done := open()
+	t.Logf("first session: banner heights %v", heights())
+	banners.Range(func(key, value any) bool {
+		b := value.(*banner)
+		r := b.layout.buttons[buttonToggle]
+		point := uintptr(uint16((r.Left+r.Right)/2)) | uintptr(uint16((r.Top+r.Bottom)/2))<<16
+		win.PostMessage(b.hwnd, win.WM_LBUTTONDOWN, 1, point)
+		win.PostMessage(b.hwnd, win.WM_LBUTTONUP, 0, point)
+		return true
+	})
+	time.Sleep(time.Second)
+	t.Logf("after minimizing: banner heights %v", heights())
+	first <- screenview.SessionState{Ended: true}
+	<-done
+	second, done := open()
+	got := heights()
+	t.Logf("next session: banner heights %v", got)
+	second <- screenview.SessionState{Ended: true}
+	<-done
+	if len(got) != 1 || got[0] > 40 {
+		t.Fatalf("the next session's banner is %v high; want the compact pill (32)", got)
+	}
 }
