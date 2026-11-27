@@ -75,6 +75,9 @@ type screenViewer struct {
 	cursor        screenview.CursorState
 	cursorBitmap  win.HBITMAP
 	cursorShapeID uint32
+	// secureDesktop remembers that the status line shows the lock-screen
+	// message, so it can be replaced once the Work PC is back.
+	secureDesktop atomic.Bool
 	localCursor   win.HCURSOR
 
 	controlling    atomic.Bool
@@ -635,6 +638,12 @@ func (v *screenViewer) onStatus(status screenview.Status) {
 	}
 	if status.Locked {
 		v.setStatus("The Work PC shows its lock screen or another secure desktop (" + status.Desktop + ").")
+	} else if v.secureDesktop.Swap(false) {
+		// Back on the normal desktop: replace the lock-screen message.
+		v.setStatus("Live. The Work PC is back on its desktop.")
+	}
+	if status.Locked {
+		v.secureDesktop.Store(true)
 	}
 	v.onUI(v.updateControlButtons)
 }

@@ -3,8 +3,10 @@
 package screenview
 
 import (
+	"bytes"
 	"errors"
 	"image"
+	"log"
 	"runtime"
 	"strings"
 	"sync"
@@ -189,6 +191,9 @@ type liveSource struct {
 	method       string
 	lastGDI      time.Time
 	failingSince time.Time
+	// stall tells a still screen from Desktop Duplication that stopped
+	// delivering frames (a laptop with its lid closed).
+	stall dxgiStallDetector
 
 	cursorMu    sync.Mutex
 	cursor      CursorState
@@ -259,6 +264,7 @@ func (s *liveSource) next(timeout time.Duration) (*image.RGBA, bool, error) {
 		s.lastDXGITry = time.Now()
 		if capturer, err := newDXGICapturerWithPointer(false); err == nil {
 			s.dxgi = capturer
+			s.stall.started(time.Now())
 		}
 	}
 	if s.dxgi != nil {
@@ -273,15 +279,24 @@ func (s *liveSource) next(timeout time.Duration) (*image.RGBA, bool, error) {
 		if s.last == nil {
 			waitMS = 250
 		}
+		if s.stall.stalled {
+			waitMS = 0 // only check whether it delivers again; GDI paces the loop
+		}
 		err := s.dxgi.captureInto(s.buffer, waitMS)
 		switch {
 		case err == nil:
+			if s.stall.frame(time.Now()) {
+				log.Printf("screen capture: Desktop Duplication delivers frames again; leaving GDI capture")
+			}
 			s.last = s.buffer
 			s.failingSince = time.Time{}
 			s.setMethod("dxgi")
 			return s.buffer, true, nil
 		case errors.Is(err, outputduplication.ErrNoImageYet) && s.last != nil:
-			return s.last, false, nil
+			if !s.stall.useGDI(time.Now()) {
+				return s.last, false, nil
+			}
+			// Quiet for a while, or stalled: sample the screen through GDI.
 		case errors.Is(err, outputduplication.ErrNoImageYet):
 			// A new duplication delivers nothing until the desktop changes;
 			// take the first frame through GDI.
@@ -300,6 +315,17 @@ func (s *liveSource) next(timeout time.Duration) (*image.RGBA, bool, error) {
 	s.lastGDI = time.Now()
 	frame, err := captureDesktopGDI()
 	if err == nil {
+		if s.dxgi != nil && s.last != nil {
+			// Desktop Duplication is open but quiet: did the screen change?
+			changed := frame.Bounds() != s.last.Bounds() || !bytes.Equal(frame.Pix, s.last.Pix)
+			if s.stall.sampled(changed) {
+				log.Printf("screen capture: the screen changed but Desktop Duplication delivers no frames (display off or lid closed?); capturing through GDI")
+				s.setMethod("gdi")
+			}
+			if !changed {
+				return s.last, false, nil
+			}
+		}
 		s.last = frame
 		s.failingSince = time.Time{}
 		if s.dxgi == nil {

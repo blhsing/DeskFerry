@@ -1,5 +1,10 @@
 # Release Notes
 
+## 0.15.13 - 2026-11-27
+
+- Keep the live screen moving on a laptop whose lid is closed. With the display off, Windows stops delivering frames through Desktop Duplication even though the desktop keeps changing and input still works, so the viewer showed a frozen picture and clicks seemed to do nothing. When Desktop Duplication has been quiet for two seconds, the Work PC now samples the screen through GDI twice a second; if the screen changed without it, capture switches to GDI (up to 15 frames a second) until Desktop Duplication delivers again. The switch is logged and shown as the capture method in the screen status. On a 2880x1800 laptop with its lid closed, the view went from one frame in 70 seconds to about 6 frames a second, and opening the Start menu showed at once.
+- Clear the Windows viewer's "lock screen or another secure desktop" message once the Work PC is back on its normal desktop; it used to stay in the status line.
+
 ## 0.15.12 - 2026-11-24
 
 - Remove the Work PC's sharing banner as soon as the viewer stops or closes. Stopping a session dropped its connection instead of closing it, so the Work PC took it for a network loss and kept the session, its capture helper and the banner for five minutes while waiting for the viewer to come back. Resumable sessions now close with an explicit "session closed" when they are stopped, on both sides and for every service (also RDP, WinRM and SMB when the Home app quits, and Home sessions when the Work service stops).
